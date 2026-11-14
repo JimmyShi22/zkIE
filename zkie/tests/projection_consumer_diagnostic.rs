@@ -30,8 +30,14 @@ use zkie_ops::proof::column_session::fp_from_signed_word;
 use zkie_ops::proof::hidden_send_session::{
     prove_hidden_lin, prove_hidden_lin_hidden, verify_hidden_lin, verify_hidden_lin_hidden,
     ActivationShape, CommittedActivation, DotMapPlan, HiddenLinPlan, HiddenOutputShape,
-    HiddenProximityPlan, HiddenSendPlan, HiddenTableProver, IndexMaskPlan, MaskEntryAllocation,
-    WShape,
+    HiddenProximityPlan, HiddenSendPlan, HiddenTableProver, IndexMaskPlan, IoppStagePlan,
+    MaskEntryAllocation, WShape,
+};
+use zkie_ops::proof::proximity_planner::{
+    assemble_proximity, AssemblyInput, AssemblyMember, AssemblyOwnObject, SolvedStage,
+};
+use zkie::lm_head_stage::{
+    read_manifest, write_manifest, ManifestFile, VerificationManifest,
 };
 use zkie_ops::proof::model_commitment::{
     verify_shared_trace_outputs, ModelCommitmentPublic, SharedTrace,
@@ -99,6 +105,7 @@ fn artifacts() -> Option<PathBuf> {
     dirs.into_iter()
         .rev()
         .find(|dir| complete(&dir.join("smoke/gpt2-seq16")))
+        .map(|dir| dir.join("smoke/gpt2-seq16"))
 }
 
 fn complete(base: &Path) -> bool {
@@ -136,31 +143,15 @@ fn w_shape(positions: u32) -> WShape {
     WShape::new(COLUMNS, code(), 1, positions, SALT, 100, 1, W_RUN, W_CONFIGURATION).unwrap()
 }
 
-fn tree_plan(tree_number: u64, leaf_class: u32, main_rows: u64) -> RuntimeTreePlan {
-    RuntimeTreePlan {
-        tree_number,
-        leaf_class,
-        log_n: CODE_LOG_N,
-        log_n_zk: CODE_LOG_N,
-        parts: vec![RuntimeTreePart {
-            main_symbols: main_rows * E_DEGREE as u64,
-            mask_symbols: 0,
-        }],
-        salt_bytes: SALT,
-        run: Digest([0x61; 32]),
-        configuration: Digest([0x62; 32]),
-    }
-}
-
-fn gu_shape() -> GuShape {
+fn gu_shape(code: CodeParams, mask_log_n: u32) -> GuShape {
     GuShape {
         oracle: GU_ORACLE,
         group: GU_GROUP,
-        tree: tree_plan(300, 2, 1),
+        tree: tree_plan_with_depth(300, 2, 1, code.log_n, mask_log_n),
         part: 0,
         rows_high: true,
         u: GuOracleShape {
-            code: code(),
+            code,
             main_rows: 1,
             main_deg: E_DEGREE as u32,
             mask_rows: 0,
@@ -171,13 +162,13 @@ fn gu_shape() -> GuShape {
     }
 }
 
-fn omega_shape() -> OmegaShapePlan {
+fn omega_shape(code: CodeParams, mask_log_n: u32) -> OmegaShapePlan {
     OmegaShapePlan {
         oracle: OMEGA_ORACLE,
         group: GU_GROUP,
-        tree: tree_plan(301, 2, 1),
+        tree: tree_plan_with_depth(301, 2, 1, code.log_n, mask_log_n),
         u: GuOracleShape {
-            code: code(),
+            code,
             main_rows: 1,
             main_deg: E_DEGREE as u32,
             mask_rows: 0,
@@ -190,12 +181,34 @@ fn omega_shape() -> OmegaShapePlan {
     }
 }
 
-fn mask_tree(tree_number: u64) -> MaskTreePlan {
+fn tree_plan_with_depth(
+    tree_number: u64,
+    leaf_class: u32,
+    main_rows: u64,
+    log_n: u32,
+    log_n_zk: u32,
+) -> RuntimeTreePlan {
+    RuntimeTreePlan {
+        tree_number,
+        leaf_class,
+        log_n,
+        log_n_zk,
+        parts: vec![RuntimeTreePart {
+            main_symbols: main_rows * E_DEGREE as u64,
+            mask_symbols: 0,
+        }],
+        salt_bytes: SALT,
+        run: Digest([0x61; 32]),
+        configuration: Digest([0x62; 32]),
+    }
+}
+
+fn mask_tree(tree_number: u64, log_n: u32, mask_rows: u64) -> MaskTreePlan {
     MaskTreePlan {
         tree_number,
         leaf_class: 3,
-        log_n: CODE_LOG_N,
-        mask_rows: 1,
+        log_n,
+        mask_rows,
         salt_bytes: SALT,
         run: Digest([0x63; 32]),
         configuration: Digest([0x64; 32]),
@@ -501,12 +514,12 @@ fn plan_for(
         masks: vec![Vec::new(); positions as usize],
         weights: field_rows(activation_rows),
         proximity: HiddenProximityPlan {
-            gu: gu_shape(),
-            omega: omega_shape(),
+            gu: gu_shape(code(), CODE_LOG_N),
+            omega: omega_shape(code(), CODE_LOG_N),
             code: code(),
             mask_code: code(),
-            shared_mask_tree: mask_tree(200),
-            own_mask_tree: mask_tree(201),
+            shared_mask_tree: mask_tree(200, CODE_LOG_N, 1),
+            own_mask_tree: mask_tree(201, CODE_LOG_N, 1),
             shared_fresh: 90,
             own_fresh: 91,
             column_draws: 2,
@@ -541,19 +554,19 @@ const INDEX_MASK_RUN: Digest = Digest([0x66; 32]);
 const DOT_ORACLE: u64 = 12;
 const DOT_RUN: Digest = Digest([0x67; 32]);
 
-fn index_mask_plan(positions: u32) -> IndexMaskPlan {
+fn index_mask_plan(positions: u32, mask_code: CodeParams) -> IndexMaskPlan {
     IndexMaskPlan {
         oracle: INDEX_MASK_ORACLE,
         group: GROUP,
-        mask_code: code(),
+        mask_code,
         mask_rows: 4,
         answers: 1,
         openings: 1,
         tree: RuntimeTreePlan {
             tree_number: INDEX_MASK_TREE,
             leaf_class: 1,
-            log_n: CODE_LOG_N,
-            log_n_zk: CODE_LOG_N,
+            log_n: mask_code.log_n,
+            log_n_zk: mask_code.log_n,
             parts: vec![RuntimeTreePart {
                 main_symbols: 0,
                 mask_symbols: 4 * E_DEGREE as u64,
@@ -570,13 +583,13 @@ fn index_mask_plan(positions: u32) -> IndexMaskPlan {
     }
 }
 
-fn dot_plan(positions: u32) -> DotMapPlan {
+fn dot_plan(positions: u32, code: CodeParams) -> DotMapPlan {
     DotMapPlan {
         oracle: DOT_ORACLE,
         group: GROUP,
         shape: WShape::new(
             positions as u64 * HIDDEN as u64,
-            code(),
+            code,
             1,
             positions,
             SALT,
@@ -590,11 +603,101 @@ fn dot_plan(positions: u32) -> DotMapPlan {
     }
 }
 
+/// The production assembly input of the projection consumer's hidden
+/// session. The own group is one test over the request's W messages, so the
+/// request count is one; Omega is also opened by the shared test.
+fn assembly_input(positions: u32) -> AssemblyInput {
+    let mut own_objects = Vec::new();
+    for _ in 0..positions {
+        own_objects.push(AssemblyOwnObject {
+            member: AssemblyMember::Columns {
+                entries: COLUMNS,
+                answers: 1,
+            },
+            shared_too: false,
+            spent: 2,
+        });
+    }
+    own_objects.push(AssemblyOwnObject {
+        member: AssemblyMember::Fixed {
+            main_rows: 1,
+            mask_rows: 0,
+        },
+        shared_too: true,
+        spent: 0,
+    });
+    own_objects.push(AssemblyOwnObject {
+        member: AssemblyMember::Fixed {
+            main_rows: 0,
+            mask_rows: 4,
+        },
+        shared_too: false,
+        spent: 1,
+    });
+    own_objects.push(AssemblyOwnObject {
+        member: AssemblyMember::Columns {
+            entries: positions as u64 * HIDDEN as u64,
+            answers: 1,
+        },
+        shared_too: false,
+        spent: 0,
+    });
+    AssemblyInput {
+        shared_members: vec![
+            AssemblyMember::Fixed {
+                main_rows: 1,
+                mask_rows: 0,
+            },
+            AssemblyMember::Fixed {
+                main_rows: 1,
+                mask_rows: 0,
+            },
+        ],
+        own_objects,
+        shared_mask_spent: 0,
+        requests: 1,
+        samples: 1,
+        columns: COLUMNS,
+        circle: false,
+    }
+}
+
+fn stage_plan(stage: &SolvedStage) -> IoppStagePlan {
+    IoppStagePlan {
+        main: CodeParams {
+            log_n: stage.log_n,
+            ell: stage.main_ell,
+            r: stage.main_r,
+        },
+        mask: CodeParams {
+            log_n: stage.mask_log_n,
+            ell: stage.mask_ell,
+            r: stage.mask_r,
+        },
+        k: stage.k,
+        h: stage.h,
+        positions: stage.positions as usize,
+        samples: 1,
+        work_bits: 0,
+    }
+}
+
+fn w_shape_with(positions: u32, code: CodeParams) -> WShape {
+    WShape::new(COLUMNS, code, 1, positions, SALT, 100, 1, W_RUN, W_CONFIGURATION).unwrap()
+}
+
+/// The production hidden session plan: the trusted assembly fixes both codes,
+/// the fold bits, the position counts and the BASE counts from the real member
+/// layout. `planner_checked` is on, so the verifier re-derives every value.
 fn hidden_plan_for(
     activation: &CommittedActivation,
     table: &Table,
     positions: u32,
 ) -> HiddenLinPlan {
+    let assembled = assemble_proximity(&assembly_input(positions))
+        .expect("the trusted assembly finds the production proximity plan");
+    let code = assembled.first_main;
+    let mask_code = assembled.first_mask;
     let mut plan = HiddenLinPlan {
         norm: None,
         send: HiddenSendPlan {
@@ -610,7 +713,7 @@ fn hidden_plan_for(
             group: GROUP,
             oracle_base: ORACLE_BASE,
             openings_per_oracle: 2,
-            w: w_shape(positions),
+            w: w_shape_with(positions, code),
             index_mask: None,
             dot: None,
             expected_dot_root: None,
@@ -623,29 +726,32 @@ fn hidden_plan_for(
         masks: vec![Vec::new(); positions as usize],
         weights: Vec::new(),
         proximity: HiddenProximityPlan {
-            gu: gu_shape(),
-            omega: omega_shape(),
-            code: code(),
-            mask_code: code(),
-            shared_mask_tree: mask_tree(200),
-            own_mask_tree: mask_tree(201),
+            gu: gu_shape(code, mask_code.log_n),
+            omega: omega_shape(code, mask_code.log_n),
+            code,
+            mask_code,
+            shared_mask_tree: mask_tree(
+                200,
+                mask_code.log_n,
+                1u64 << assembled.shared[0].h,
+            ),
+            own_mask_tree: mask_tree(201, mask_code.log_n, 1u64 << assembled.own[0].h),
             shared_fresh: 90,
             own_fresh: 91,
             column_draws: 2,
             column_budget: 4,
             column_work_bits: 0,
-            shared_base_positions: 2,
-            own_base_positions: 2,
-            shared_stages: Vec::new(),
-            own_stages: Vec::new(),
-            planner_checked: false,
+            shared_base_positions: assembled.shared.last().unwrap().positions as usize,
+            own_base_positions: assembled.own.last().unwrap().positions as usize,
+            shared_stages: assembled.shared.iter().map(stage_plan).collect(),
+            own_stages: assembled.own.iter().map(stage_plan).collect(),
+            planner_checked: true,
         },
         output_relation: None,
         closure: None,
     };
-    plan.send.index_mask = Some(index_mask_plan(positions));
-    plan.send.dot = Some(dot_plan(positions));
-    plan.proximity.own_mask_tree.mask_rows = 4;
+    plan.send.index_mask = Some(index_mask_plan(positions, mask_code));
+    plan.send.dot = Some(dot_plan(positions, code));
     plan
 }
 
@@ -742,6 +848,102 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
     let outcome = verify_hidden_lin_hidden(&verifier_plan, session_table.reader(), &messages)
         .expect("hidden verify");
     assert!(!outcome.eval_rows.is_empty());
+
+    // The session slot after the trusted table: the canonical session
+    // encoding enters the verification package as session.bin, and the
+    // verifier consumes it from the package, not from the in-memory proof.
+    let session_bytes = messages.encode().expect("session encoding");
+    if let Some(path) = std::env::var_os("ZKIE_PROJECTION_SESSION_DUMP") {
+        fs::write(path, &session_bytes).expect("write session dump");
+    }
+    let package_dir = base.join(format!(".session-package-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&package_dir);
+    fs::create_dir_all(package_dir.join("public")).expect("package dir");
+    fs::hard_link(
+        base.join("commit/public/model-commitment.bin"),
+        package_dir.join("public/model-commitment.bin"),
+    )
+    .expect("link public commitment");
+    fs::hard_link(
+        base.join("proof/proof.bin"),
+        package_dir.join("proof.bin"),
+    )
+    .expect("link trace");
+    fs::write(package_dir.join("session.bin"), &session_bytes).expect("write session");
+    let entry = |role: &str, rel: &str| {
+        let data = fs::read(package_dir.join(rel)).expect("read package file");
+        ManifestFile {
+            role: role.to_string(),
+            path: rel.to_string(),
+            bytes: data.len() as u64,
+            digest: zkie_core::artifact::digest_bytes(&data),
+        }
+    };
+    let manifest = VerificationManifest::new(vec![
+        entry("public-commitment", "public/model-commitment.bin"),
+        entry("trace", "proof.bin"),
+        entry("lin-session", "session.bin"),
+    ])
+    .expect("session package manifest");
+    write_manifest(&package_dir, &manifest).expect("write session manifest");
+    read_manifest(&package_dir)
+        .expect("read session manifest")
+        .verify(&package_dir)
+        .expect("verify session manifest");
+    let package_total: u64 = manifest.files.iter().map(|file| file.bytes).sum();
+    println!("session_package_total_bytes={package_total}");
+    println!("session_bin_bytes={}", session_bytes.len());
+    // The verifier decodes the session from the package and checks the proof
+    // again from those bytes alone.
+    let packaged = fs::read(package_dir.join("session.bin")).expect("read session.bin");
+    let decoded =
+        zkie_ops::proof::hidden_send_session::HiddenLinMessages::decode(&hidden_plan, &packaged)
+            .expect("decode session.bin");
+    let from_package = verify_hidden_lin_hidden(&verifier_plan, session_table.reader(), &decoded)
+        .expect("verify from session.bin");
+    assert_eq!(from_package.seal, outcome.seal);
+    assert_eq!(from_package.eval_rows.len(), positions as usize);
+    let mut tampered_session = packaged.clone();
+    tampered_session[0] ^= 1;
+    fs::write(package_dir.join("session.bin"), &tampered_session).expect("tamper session");
+    assert!(manifest.verify(&package_dir).is_err());
+    let mut trailing_session = packaged.clone();
+    trailing_session.push(0);
+    assert!(
+        zkie_ops::proof::hidden_send_session::HiddenLinMessages::decode(
+            &hidden_plan,
+            &trailing_session
+        )
+        .is_err()
+    );
+    fs::write(package_dir.join("session.bin"), &packaged).expect("restore session");
+    manifest.verify(&package_dir).expect("restored session package");
+    fs::remove_dir_all(&package_dir).expect("remove package");
+
+    // The planner-checked stage lists are re-derived by the verifier: a
+    // changed position, tail, code or BASE count no longer matches.
+    let plan_fault = |plan: &HiddenLinPlan| plan.proximity.fault(&plan.send, None, None);
+    let mut changed = hidden_plan.clone();
+    changed.proximity.own_stages[0].positions += 1;
+    assert!(plan_fault(&changed).is_some());
+    let mut changed = hidden_plan.clone();
+    changed.proximity.code.r += 1;
+    assert!(plan_fault(&changed).is_some());
+    let mut changed = hidden_plan.clone();
+    changed.proximity.mask_code.r += 1;
+    assert!(plan_fault(&changed).is_some());
+    let mut changed = hidden_plan.clone();
+    changed.proximity.own_stages[1].main.ell *= 2;
+    assert!(plan_fault(&changed).is_some());
+    let mut changed = hidden_plan.clone();
+    changed.proximity.own_base_positions += 1;
+    assert!(plan_fault(&changed).is_some());
+    let mut changed = hidden_plan.clone();
+    changed.proximity.shared_stages[0].k = 2;
+    assert!(plan_fault(&changed).is_some());
+    let mut changed = hidden_plan.clone();
+    changed.proximity.planner_checked = false;
+    assert!(plan_fault(&changed).is_none());
 
     // The hidden mode requires the sampled index-mask message.
     let mut missing_mask = hidden_plan.clone();

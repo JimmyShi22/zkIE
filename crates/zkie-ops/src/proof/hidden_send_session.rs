@@ -804,17 +804,8 @@ impl WShape {
         if answers == 0 || answers as u64 > code.ell {
             return Err(Error::InvalidConfig);
         }
-        let capacity = code.ell - answers as u64;
-        if capacity == 0 {
-            return Err(Error::InvalidConfig);
-        }
-        let rows_needed = columns
-            .checked_add(capacity - 1)
-            .ok_or(Error::ResourceLimit)?
-            / capacity;
-        let main_rows = rows_needed
-            .checked_next_power_of_two()
-            .ok_or(Error::ResourceLimit)?;
+        let main_rows =
+            crate::proof::proximity_planner::rows_for_columns(columns, code.ell, answers)?;
         let shape = Self {
             code,
             main_rows,
@@ -4631,55 +4622,8 @@ impl HiddenProximityPlan {
             }
         }
         if self.planner_checked {
-            let own = &self.own_stages;
-            if own.len() != 2
-                || own[0].main != self.code
-                || own[0].mask != self.mask_code
-                || own[0].k == 0
-                || own[0].h > own[0].k
-                || own[0].samples != 1
-                || own[1].k != 0
-                || own[1].h != 0
-                || own[1].samples != 1
-            {
-                return Some("the planner-checked own stage list is not the two-stage shape");
-            }
-            let mut max_zero = self.code.r.min(self.mask_code.r);
-            max_zero = max_zero
-                .checked_sub(send.openings_per_oracle as u64)
-                .unwrap_or(0);
-            if let Some(index) = &send.index_mask {
-                let room = index.mask_code.r.saturating_sub(index.openings as u64);
-                max_zero = max_zero.min(room);
-            }
-            if let Some(closure) = closure {
-                let room = closure
-                    .mask
-                    .mask_code
-                    .r
-                    .saturating_sub(closure.mask.openings as u64);
-                max_zero = max_zero.min(room);
-            }
-            let planned = match crate::proof::proximity_planner::plan_own_two_stage(
-                self.code,
-                self.mask_code,
-                own[1].main,
-                own[1].mask,
-                own[0].k,
-                own[0].h,
-                max_zero as usize,
-            ) {
-                Ok(planned) => planned,
-                Err(_) => return Some("the trusted planner rejects the own two-stage stage list"),
-            };
-            if own[0].positions != planned.stage_zero_positions
-                || own[0].work_bits != planned.stage_zero_work_bits
-                || own[1].positions != planned.last_positions
-                || own[1].main.r != planned.last_main_r
-                || own[1].mask.r != planned.last_mask_r
-                || self.own_base_positions != planned.last_positions
-            {
-                return Some("the own stage list differs from the trusted planner");
+            if let Some(reason) = self.planner_fault(send, closure, norm) {
+                return Some(reason);
             }
         }
         // The shared group is a join over table-derived rows that the table
@@ -4687,26 +4631,7 @@ impl HiddenProximityPlan {
         // work are a fixed join count, not a proximity parameter: the
         // proximity guarantee comes from the table column draws. Any other
         // count changes the plan semantics and is rejected here.
-        let shared = &self.shared_stages;
-        if self.planner_checked
-            && !shared.is_empty()
-            && (shared.len() != 2
-            || self.shared_base_positions != 2
-            || shared[0].main != self.code
-            || shared[0].mask != self.mask_code
-            || shared[0].k != 2
-            || shared[0].h != 0
-            || shared[0].samples != 1
-            || shared[0].positions != 2
-            || shared[0].work_bits != 0
-            || shared[1].k != 0
-            || shared[1].h != 0
-            || shared[1].samples != 1
-            || shared[1].positions != 2
-                || shared[1].work_bits != 0)
-        {
-            return Some("the shared join stage list differs from the trusted plan");
-        }
+
         if self.shared_mask_tree.fault().is_some() || self.own_mask_tree.fault().is_some() {
             return Some("a fresh mask tree is not valid");
         }
@@ -4917,6 +4842,211 @@ impl HiddenProximityPlan {
         }
         None
     }
+
+    /// The verifier's independent check of a planner-checked plan. Both sides
+    /// hold the same trusted plan and the same real member shapes; this
+    /// function rebuilds the assembly input from the plan's shapes and runs
+    /// the trusted derivation on the plan's public choices, without searching
+    /// for another configuration. Every derived value must equal the plan's.
+    fn planner_fault(
+        &self,
+        send: &HiddenSendPlan,
+        closure: Option<&ClosurePlan>,
+        norm: Option<&NormPlan>,
+    ) -> Option<&'static str> {
+        use crate::proof::proximity_planner::{
+            validate_assembled, AssemblyCandidate, AssemblyInput, AssemblyMember, AssemblyOwnObject,
+            StageChoice,
+        };
+        if closure.is_some() || norm.is_some() {
+            return Some("the planner-checked assembly covers the projection consumer's members only");
+        }
+        if send.w.answers != 1 {
+            return Some("the planner-checked plan does not fix the sample count at one");
+        }
+        if send.positions() == 0 || send.columns == 0 {
+            return Some("the planner-checked plan has no request message");
+        }
+        if send.w.code != self.code || self.gu.u.code != self.code || self.omega.u.code != self.code {
+            return Some("a proximity member does not share the main code");
+        }
+        if !self.code.ell.is_power_of_two() || !self.mask_code.ell.is_power_of_two() {
+            return Some("a proximity code message is not a power of two");
+        }
+        let mut shared_members = vec![
+            AssemblyMember::Fixed {
+                main_rows: self.gu.u.main_rows,
+                mask_rows: self.gu.u.mask_rows,
+            },
+            AssemblyMember::Fixed {
+                main_rows: self.omega.u.main_rows,
+                mask_rows: self.omega.u.mask_rows,
+            },
+        ];
+        if shared_members.iter().any(|member| member == &AssemblyMember::Fixed { main_rows: 0, mask_rows: 0 }) {
+            return Some("a shared proximity member is empty");
+        }
+        let mut own_objects = Vec::new();
+        for _ in 0..send.positions() {
+            own_objects.push(AssemblyOwnObject {
+                member: AssemblyMember::Fixed {
+                    main_rows: send.w.main_rows,
+                    mask_rows: 0,
+                },
+                shared_too: false,
+                spent: send.openings_per_oracle as u64,
+            });
+        }
+        own_objects.push(AssemblyOwnObject {
+            member: AssemblyMember::Fixed {
+                main_rows: self.omega.u.main_rows,
+                mask_rows: self.omega.u.mask_rows,
+            },
+            shared_too: true,
+            spent: 0,
+        });
+        if let Some(index) = &send.index_mask {
+            if index.mask_code != self.mask_code {
+                return Some("the index-mask code differs from the proximity mask code");
+            }
+            own_objects.push(AssemblyOwnObject {
+                member: AssemblyMember::Fixed {
+                    main_rows: 0,
+                    mask_rows: index.mask_rows,
+                },
+                shared_too: false,
+                spent: index.openings as u64,
+            });
+        }
+        if let Some(dot) = &send.dot {
+            if dot.shape.code != self.code {
+                return Some("the shown-map code differs from the proximity main code");
+            }
+            own_objects.push(AssemblyOwnObject {
+                member: AssemblyMember::Fixed {
+                    main_rows: dot.shape.main_rows,
+                    mask_rows: 0,
+                },
+                shared_too: false,
+                spent: 0,
+            });
+        }
+        if self.shared_stages.len() < 2 || self.own_stages.len() < 2 {
+            return Some("the planner-checked plan has no complete stage list");
+        }
+        if self
+            .shared_stages
+            .iter()
+            .chain(self.own_stages.iter())
+            .any(|stage| stage.samples != 1 || stage.work_bits != 0)
+        {
+            return Some("a planner-checked stage changes the fixed samples or work");
+        }
+        let shared_choices: Vec<StageChoice> = self
+            .shared_stages
+            .iter()
+            .skip(1)
+            .map(|stage| StageChoice {
+                log_n: stage.main.log_n,
+                mask_log_n: stage.mask.log_n,
+                k: stage.k,
+                h: stage.h,
+            })
+            .collect();
+        let own_choices: Vec<StageChoice> = self
+            .own_stages
+            .iter()
+            .skip(1)
+            .map(|stage| StageChoice {
+                log_n: stage.main.log_n,
+                mask_log_n: stage.mask.log_n,
+                k: stage.k,
+                h: stage.h,
+            })
+            .collect();
+        let candidate = AssemblyCandidate {
+            first_log_n: self.code.log_n,
+            first_log_ell: self.code.ell.trailing_zeros(),
+            first_mask_log_n: self.mask_code.log_n,
+            first_mask_log_ell: self.mask_code.ell.trailing_zeros(),
+            shared_choices,
+            own_choices,
+        };
+        let input = AssemblyInput {
+            shared_members: std::mem::take(&mut shared_members),
+            own_objects,
+            shared_mask_spent: 0,
+            requests: 1,
+            samples: send.w.answers,
+            columns: send.columns,
+            circle: false,
+        };
+        let assembled = match validate_assembled(&input, &candidate) {
+            Ok(assembled) => assembled,
+            Err(_) => return Some("the trusted planner rejects the planner-checked stage lists"),
+        };
+        if assembled.first_main != self.code || assembled.first_mask != self.mask_code {
+            return Some("the planner-checked codes differ from the trusted derivation");
+        }
+        if !planner_stages_match(&assembled.shared, &self.shared_stages)
+            || !planner_stages_match(&assembled.own, &self.own_stages)
+        {
+            return Some("the planner-checked stage lists differ from the trusted derivation");
+        }
+        if self.shared_base_positions
+            != assembled
+                .shared
+                .last()
+                .map(|stage| stage.positions as usize)
+                .unwrap_or(0)
+            || self.own_base_positions
+                != assembled
+                    .own
+                    .last()
+                    .map(|stage| stage.positions as usize)
+                    .unwrap_or(0)
+        {
+            return Some("the BASE position count differs from the trusted derivation");
+        }
+        let shared_mask_rows = match 1u64.checked_shl(self.shared_stages[0].h) {
+            Some(rows) => rows,
+            None => return Some("the shared first stage's mask rows overflow"),
+        };
+        let own_mask_rows = match 1u64.checked_shl(self.own_stages[0].h) {
+            Some(rows) => rows,
+            None => return Some("the own first stage's mask rows overflow"),
+        };
+        if self.shared_mask_tree.mask_rows != shared_mask_rows
+            || self.own_mask_tree.mask_rows != own_mask_rows
+            || self.shared_mask_tree.log_n != self.mask_code.log_n
+            || self.own_mask_tree.log_n != self.mask_code.log_n
+        {
+            return Some("a fresh mask tree does not match its first stage");
+        }
+        None
+    }
+}
+
+/// Whether a solved stage list equals a plan's stage list in every derived
+/// and chosen field.
+fn planner_stages_match(
+    solved: &[crate::proof::proximity_planner::SolvedStage],
+    planned: &[IoppStagePlan],
+) -> bool {
+    if solved.len() != planned.len() {
+        return false;
+    }
+    solved.iter().zip(planned).all(|(solved, planned)| {
+        solved.log_n == planned.main.log_n
+            && solved.mask_log_n == planned.mask.log_n
+            && solved.k == planned.k
+            && solved.h == planned.h
+            && solved.main_ell == planned.main.ell
+            && solved.mask_ell == planned.mask.ell
+            && solved.positions == planned.positions as u64
+            && solved.main_r == planned.main.r
+            && solved.mask_r == planned.mask.r
+    })
 }
 
 /// The complete trusted plan of one merged three-stage run.
