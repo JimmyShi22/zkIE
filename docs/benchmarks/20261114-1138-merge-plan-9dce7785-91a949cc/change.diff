@@ -1,0 +1,286 @@
+commit 9dce778512c8a42230095fd46098bb691b5078b5
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 11:38:23 2026 +0800
+
+    Plan the weight-claim merge into one pending claim
+    
+    The merge registers the claims' end-value slots before any challenge, batches them with one challenge, takes the sumcheck point over the matrix column bits and records the masked end value, whose slot may not reuse a claim's slot. The pending claim consumes the point lowest column bit first and carries the mask factor as the index-mask coefficient. The runtime reduced-witness plan is built from settled plan tables with contiguous offsets, checked entry counts and every point set.
+    
+    This is partial progress: the first-chain message and the read binding are the next step.
+
+diff --git a/crates/zkie-ops/src/proof/hidden_member.rs b/crates/zkie-ops/src/proof/hidden_member.rs
+index 51faf86a..026d12fb 100644
+--- a/crates/zkie-ops/src/proof/hidden_member.rs
++++ b/crates/zkie-ops/src/proof/hidden_member.rs
+@@ -234,6 +234,156 @@ pub fn claim_of(pending: &[PendingRow], coefficients: &[Fp3]) -> Result<Combined
+     })
+ }
+ 
++/// The merge that batches a sub-proof's weight claims into one pending claim.
++/// The claims' end values are registered as slots first; one challenge batches
++/// them, a product-sumcheck over the matrix column bits gives the point, and
++/// the masked end value leaves one pending claim. The plan fixes the order and
++/// the relations; the transcript supplies the challenge values.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++enum MergePhase {
++    Empty,
++    Claims,
++    Batched,
++    Pointed,
++    Ended,
++}
++
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct MergePlan {
++    claims: u32,
++    column_bits: u32,
++    phase: MergePhase,
++    claim_slots: Vec<u64>,
++    batch: Vec<Fp3>,
++    point: Vec<Fp3>,
++    end_slot: u64,
++    beta: Fp3,
++    target: Fp3,
++}
++
++impl MergePlan {
++    pub fn new(claims: u32, column_bits: u32) -> Result<Self> {
++        if claims == 0 || column_bits == 0 || column_bits > 62 {
++            return Err(Error::InvalidConfig);
++        }
++        Ok(Self {
++            claims,
++            column_bits,
++            phase: MergePhase::Empty,
++            claim_slots: Vec::new(),
++            batch: Vec::new(),
++            point: Vec::new(),
++            end_slot: 0,
++            beta: Fp3::ZERO,
++            target: Fp3::ZERO,
++        })
++    }
++
++    pub fn claims(&self) -> u32 {
++        self.claims
++    }
++
++    pub fn column_bits(&self) -> u32 {
++        self.column_bits
++    }
++
++    pub fn batch(&self) -> &[Fp3] {
++        &self.batch
++    }
++
++    /// The merge's point, the highest column bit first, as the transcript
++    /// produced it.
++    pub fn point(&self) -> &[Fp3] {
++        &self.point
++    }
++
++    pub fn beta(&self) -> Fp3 {
++        self.beta
++    }
++
++    pub fn target(&self) -> Fp3 {
++        self.target
++    }
++
++    /// Registers the claims' end-value slots, once, before any challenge.
++    pub fn register_claims(&mut self, slots: &[u64]) -> Result<()> {
++        if self.phase != MergePhase::Empty || slots.len() != self.claims as usize {
++            return Err(Error::InvalidConfig);
++        }
++        let mut sorted = slots.to_vec();
++        sorted.sort_unstable();
++        sorted.dedup();
++        if sorted.len() != slots.len() {
++            return Err(Error::InvalidConfig);
++        }
++        self.claim_slots = slots.to_vec();
++        self.phase = MergePhase::Claims;
++        Ok(())
++    }
++
++    /// Draws the challenge whose powers batch the claims.
++    pub fn draw_batch(&mut self, batch: &[Fp3]) -> Result<()> {
++        if self.phase != MergePhase::Claims || batch.len() != self.claims as usize {
++            return Err(Error::InvalidConfig);
++        }
++        self.batch = batch.to_vec();
++        self.phase = MergePhase::Batched;
++        Ok(())
++    }
++
++    /// Fixes the sumcheck's point over the matrix's column bits.
++    pub fn set_point(&mut self, point: &[Fp3]) -> Result<()> {
++        if self.phase != MergePhase::Batched || point.len() != self.column_bits as usize {
++            return Err(Error::InvalidConfig);
++        }
++        self.point = point.to_vec();
++        self.phase = MergePhase::Pointed;
++        Ok(())
++    }
++
++    /// Records the masked end value and its mask factor. The end value's slot
++    /// is not one of the claims' slots: no claim of the sub-proof may name it.
++    pub fn end(&mut self, end_slot: u64, beta: Fp3, target: Fp3) -> Result<()> {
++        if self.phase != MergePhase::Pointed || beta.is_zero() {
++            return Err(Error::InvalidConfig);
++        }
++        if self.claim_slots.contains(&end_slot) {
++            return Err(Error::InvalidConfig);
++        }
++        self.end_slot = end_slot;
++        self.beta = beta;
++        self.target = target;
++        self.phase = MergePhase::Ended;
++        Ok(())
++    }
++
++    /// The pending claim the merge leaves, with the caller's row weights and
++    /// the index-mask slot the target is masked by.
++    pub fn pending_claim(
++        &self,
++        weights: Vec<WeightBlock>,
++        index_oracle: u64,
++        mask_slot: u64,
++    ) -> Result<PendingRow> {
++        if self.phase != MergePhase::Ended || weights.is_empty() {
++            return Err(Error::InvalidConfig);
++        }
++        // The point's coordinates are consumed lowest column bit first.
++        let mut psi = self.point.clone();
++        psi.reverse();
++        Ok(PendingRow {
++            weights,
++            psi,
++            target: self.target,
++            masks: vec![MaskTerm {
++                oracle: index_oracle,
++                slot: mask_slot,
++                coeff: self.beta,
++            }],
++        })
++    }
++}
++
+ /// One reduced-witness table: a matrix part whose entries are the run scalar
+ /// products. `phi` is the point of the run; it is empty until the point is
+ /// known, and every table's point must be set before the witness root.
+@@ -342,6 +492,46 @@ impl ReductionWitnessPlan {
+         }
+     }
+ 
++    /// Builds the runtime plan from settled tables: the offsets must follow
++    /// each other from zero, the entry counts must match the geometry, and
++    /// every point must be set.
++    pub fn from_tables(tables: Vec<ReductionTable>) -> Result<Self> {
++        let mut next_at = 0u64;
++        for table in &tables {
++            if table.phi.is_empty()
++                || table.phi.len() as u64 != table.run_length
++                || table.parts == 0
++                || table.run_length == 0
++                || table.columns == 0
++                || table.columns % table.run_length != 0
++                || table.rows_per_part == 0
++                || table.at != next_at
++            {
++                return Err(Error::InvalidConfig);
++            }
++            let expected = table
++                .rows_per_part
++                .checked_mul(table.columns / table.run_length)
++                .and_then(|value| value.checked_mul(table.parts))
++                .ok_or(Error::ResourceLimit)?;
++            if table.entries != expected {
++                return Err(Error::InvalidConfig);
++            }
++            next_at = next_at
++                .checked_add(table.entries)
++                .ok_or(Error::ResourceLimit)?;
++        }
++        let mut plan = Self {
++            tables,
++            next_at,
++            phase: WitnessPhase::Built,
++            root: None,
++            batch_challenge: None,
++        };
++        plan.points_known()?;
++        Ok(plan)
++    }
++
+     pub fn tables(&self) -> &[ReductionTable] {
+         &self.tables
+     }
+@@ -678,6 +868,67 @@ mod tests {
+         assert!(plan.set_point(0, vec![fp(3), fp(4)]).is_err());
+     }
+ 
++    #[test]
++    fn the_merge_orders_its_parts_and_builds_one_pending_claim() {
++        let mut merge = MergePlan::new(2, 3).unwrap();
++        assert!(merge.draw_batch(&[fp(1), fp(2)]).is_err());
++        merge.register_claims(&[10, 12]).unwrap();
++        // Distinct slots and the exact count.
++        assert!(MergePlan::new(2, 3).unwrap().register_claims(&[10]).is_err());
++        let mut dup = MergePlan::new(2, 3).unwrap();
++        assert!(dup.register_claims(&[10, 10]).is_err());
++        merge.draw_batch(&[fp(1), fp(2)]).unwrap();
++        assert!(merge.set_point(&[fp(1), fp(2)]).is_err());
++        merge.set_point(&[fp(7), fp(8), fp(9)]).unwrap();
++        // The merge's end value may not reuse a claim slot, and its factor is
++        // not zero.
++        assert!(merge.end(10, fp(5), fp(4)).is_err());
++        assert!(merge.end(20, Fp3::ZERO, fp(4)).is_err());
++        merge.end(20, fp(5), fp(4)).unwrap();
++        assert!(merge.end(20, fp(5), fp(4)).is_err());
++        let weights = vec![WeightBlock::Scalar { row: 1, value: fp(3) }];
++        let pending = merge.pending_claim(weights.clone(), 60, 9).unwrap();
++        // The point's coordinates are consumed lowest column bit first.
++        assert_eq!(pending.psi, vec![fp(9), fp(8), fp(7)]);
++        assert_eq!(pending.target, fp(4));
++        assert_eq!(
++            pending.masks,
++            vec![MaskTerm {
++                oracle: 60,
++                slot: 9,
++                coeff: fp(5)
++            }]
++        );
++        assert_eq!(pending.weights, weights);
++        assert!(merge.pending_claim(Vec::new(), 60, 9).is_err());
++    }
++
++    #[test]
++    fn settled_tables_build_the_runtime_plan_in_order() {
++        let table = |at: u64, entries: u64| ReductionTable {
++            matrix: 0,
++            parts: 1,
++            run_length: 2,
++            rows_per_part: 2,
++            columns: 4,
++            at,
++            entries,
++            phi: vec![fp(1), fp(2)],
++            later: false,
++        };
++        let plan = ReductionWitnessPlan::from_tables(vec![table(0, 4), table(4, 4)]).unwrap();
++        assert_eq!(plan.tables().len(), 2);
++        assert!(plan.read(0, 0).is_err());
++        // A gap, an overlap, a wrong entry count and an unset point are each
++        // refused.
++        assert!(ReductionWitnessPlan::from_tables(vec![table(0, 4), table(5, 4)]).is_err());
++        assert!(ReductionWitnessPlan::from_tables(vec![table(0, 4), table(3, 4)]).is_err());
++        assert!(ReductionWitnessPlan::from_tables(vec![table(0, 3)]).is_err());
++        let mut unset = table(0, 4);
++        unset.phi.clear();
++        assert!(ReductionWitnessPlan::from_tables(vec![unset]).is_err());
++    }
++
+     #[test]
+     fn table_entries_are_the_run_inner_products() {
+         // Two rows of eight cells, runs of four: four entries in row-major,
