@@ -19005,6 +19005,146 @@ mod tests {
             Err(Error::StatementMismatch)
         ));
     }
+    struct SectionSource(u64);
+
+    impl crate::proof::psc_general::GeneralChallenges for SectionSource {
+        fn draw(&mut self) -> Result<Fp3> {
+            self.0 = self.0.wrapping_mul(6364136223846793005).wrapping_add(1);
+            Ok(Fp3::from_u64(self.0))
+        }
+        fn draw_nonzero(&mut self) -> Result<Fp3> {
+            for _ in 0..64 {
+                let value = self.draw()?;
+                if value != Fp3::ZERO {
+                    return Ok(value);
+                }
+            }
+            Err(Error::EntropyUnavailable)
+        }
+        fn send_hiding_sum(&mut self, _value: Fp3) -> Result<()> {
+            Ok(())
+        }
+        fn send_round(
+            &mut self,
+            _index: usize,
+            _round: &crate::proof::psc::PscRound,
+        ) -> Result<()> {
+            Ok(())
+        }
+        fn send_end_values(&mut self, _values: &[Fp3]) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_request_chain_section_requires_the_plan_and_the_message() {
+        let fixture = fixture();
+        let reduction = crate::proof::request_stack::StackReduction::new(vec![
+            crate::proof::request_stack::StackPanel {
+                claim: 0,
+                ec: Fp3::ONE,
+                ni: 2,
+                ny: 1,
+                weight: vec![Fp3::ONE, Fp3::ONE],
+                first_claim: None,
+                w: 0,
+                off: 0,
+            },
+        ])
+        .unwrap();
+        let layout = crate::proof::request_weights::WeightLayout::new(1).unwrap();
+        let masks = crate::proof::psc_general::GeneralMaskEntries {
+            hiding: Vec::new(),
+            shown: Vec::new(),
+        };
+        let zero = |_slot: usize| -> Result<Fp3> { Ok(Fp3::ZERO) };
+        let om = [Fp3::ONE];
+        let no_terms: [crate::proof::psc_general::MaskTerm; 0] = [];
+        let no_slots: [usize; 0] = [];
+        let no_maps: [Vec<Fp3>; 0] = [];
+        let no_claims: [crate::proof::request_weights::WeightClaim; 0] = [];
+        let no_cells: [Vec<Fp3>; 0] = [];
+        let no_point: [Fp3; 0] = [];
+        let inputs = crate::proof::request_chain::ChainInputs {
+            token_point: &no_point,
+            token_shown: &no_point,
+            token_kept: &no_point,
+            token_claim_masks: &no_terms,
+            token_shown_claim: Fp3::ZERO,
+            token_claim_slot: 3,
+            token_masks: &masks,
+            reduction: &reduction,
+            stack_left: &no_cells,
+            stack_right: &no_cells,
+            om: &om,
+            stack_masks: &masks,
+            layout: &layout,
+            claims: &no_claims,
+            claim_maps: &no_maps,
+            end_slots: &no_slots,
+            merge_masks: &masks,
+            mask_value: &zero,
+            index_oracle: 60,
+            index_slot: 7,
+        };
+        let proof = |ends: usize| crate::proof::psc_general::GeneralProof {
+            hiding_sum: Fp3::ONE,
+            rounds: vec![crate::proof::psc::PscRound {
+                coefficients: vec![Fp3::ONE],
+            }],
+            y_round: crate::proof::psc::PscRound {
+                coefficients: vec![Fp3::ONE],
+            },
+            end_values: vec![Fp3::ONE; ends],
+        };
+        let section = crate::proof::request_chain::RequestChainMessages {
+            token: proof(1),
+            stack: proof(2),
+            merge: proof(1),
+        };
+        let shape = crate::proof::request_chain::RequestChainShape {
+            token_rounds: 1,
+            token_ends: 1,
+            stack_rounds: 1,
+            stack_ends: 2,
+            merge_rounds: 1,
+            merge_ends: 1,
+        };
+        // The plan does not carry the chain.
+        let mut plan = fixture.verifier_plan.clone();
+        plan.request_chain = None;
+        assert!(super::verify_request_chain_section(
+            &plan,
+            &fixture.messages,
+            &inputs,
+            &mut SectionSource(3)
+        )
+        .is_err());
+        // The plan carries it, the message does not.
+        let mut plan = fixture.verifier_plan.clone();
+        plan.request_chain = Some(shape);
+        assert!(super::verify_request_chain_section(
+            &plan,
+            &fixture.messages,
+            &inputs,
+            &mut SectionSource(3)
+        )
+        .is_err());
+        // The message carries proofs of another shape.
+        let mut messages = fixture.messages.clone();
+        messages.request = Some(section);
+        let mut wrong = shape;
+        wrong.stack_rounds = 2;
+        plan.request_chain = Some(wrong);
+        assert!(super::verify_request_chain_section(
+            &plan,
+            &messages,
+            &inputs,
+            &mut SectionSource(3)
+        )
+        .is_err());
+    }
+
 }
 
 
