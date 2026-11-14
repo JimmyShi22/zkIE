@@ -2246,6 +2246,7 @@ mod tests {
             expected_roots: None,
             member: None,
             request_chain: None,
+            chain_mask: None,
             request_reads: None,
             request_w: None,
         };

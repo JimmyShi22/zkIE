@@ -1816,6 +1816,11 @@ pub struct HiddenSendPlan {
     /// The request chain's proof shapes, when this session carries the
     /// request reduction's transcript section.
     pub request_chain: Option<crate::proof::request_chain::RequestChainShape>,
+    /// The sub-proof mask table of the request chain's segment, when the plan
+    /// carries the chain: its own committed object, sample form and opening
+    /// ledger. It is a different object from the request index-mask; a slot is
+    /// never read across the two.
+    pub chain_mask: Option<crate::proof::request_chain::ChainMaskPlan>,
     /// The request chain's planned table cells, when the chain reads the
     /// table on the witness stream.
     pub request_reads: Option<RequestReadPlan>,
@@ -2024,6 +2029,47 @@ impl HiddenSendPlan {
         // that carries the section without a member has nowhere to bind it.
         if self.request_chain.is_some() && self.member.is_none() {
             return Err(Error::InvalidConfig);
+        }
+        if let Some(chain_mask) = &self.chain_mask {
+            if chain_mask.fault().is_some() || chain_mask.group != self.group {
+                return Err(Error::InvalidConfig);
+            }
+            let per_position = self
+                .oracle_base
+                .saturating_add(self.activation.positions as u64);
+            let in_positions =
+                chain_mask.oracle >= self.oracle_base && chain_mask.oracle < per_position;
+            let clashes = self
+                .index_mask
+                .as_ref()
+                .map_or(false, |index| index.oracle == chain_mask.oracle)
+                || self
+                    .request_w
+                    .as_ref()
+                    .map_or(false, |rw| rw.oracle == chain_mask.oracle)
+                || self
+                    .dot
+                    .as_ref()
+                    .map_or(false, |dot| dot.oracle == chain_mask.oracle);
+            if in_positions || clashes {
+                return Err(Error::InvalidConfig);
+            }
+            let mut trees = vec![self.w.tree_number];
+            if let Some(dot) = &self.dot {
+                trees.push(dot.shape.tree_number);
+            }
+            if let Some(rw) = &self.request_w {
+                trees.push(rw.shape.tree_number);
+            }
+            if let Some(member) = &self.member {
+                trees.push(member.tree.tree_number);
+            }
+            if let Some(index) = &self.index_mask {
+                trees.push(index.tree.tree_number);
+            }
+            if trees.contains(&chain_mask.tree.tree_number) {
+                return Err(Error::InvalidConfig);
+            }
         }
         Ok(())
     }
@@ -2244,6 +2290,50 @@ pub struct HiddenSendWitness {
     /// The request-level W's committed value message with the private tail
     /// and salts the sampling needs, when the plan commits it.
     pub request_w: Option<RequestWWitness>,
+    /// The sub-proof mask table's private rows, tails and salts, when the
+    /// plan carries the chain mask.
+    pub chain_mask: Option<ChainMaskWitness>,
+}
+
+/// The private sub-proof mask table: its rows, encoding tails, salts and the
+/// built tree. The table is the segment's own committed object.
+#[derive(Clone, Debug)]
+pub struct ChainMaskWitness {
+    pub rows: Vec<Vec<Fp3>>,
+    pub tails: Vec<Vec<Fp3>>,
+    pub salts: Vec<Vec<u8>>,
+    pub root: Digest,
+    pub tree: Arc<RuntimeTree>,
+}
+
+impl PartialEq for ChainMaskWitness {
+    fn eq(&self, other: &Self) -> bool {
+        self.rows == other.rows
+            && self.tails == other.tails
+            && self.salts == other.salts
+            && self.root == other.root
+    }
+}
+
+impl Eq for ChainMaskWitness {}
+
+impl ChainMaskWitness {
+    fn check(&self, plan: &crate::proof::request_chain::ChainMaskPlan) -> Result<()> {
+        if plan.fault().is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        let rows = usize::try_from(plan.mask_rows).map_err(|_| Error::ResourceLimit)?;
+        let ell = usize::try_from(plan.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+        if self.rows.len() != rows
+            || self.rows.iter().any(|row| row.len() != ell)
+            || self.tails.len() != rows
+            || self.salts.len() != plan.tree.columns() as usize
+            || *self.tree.root() != self.root
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        Ok(())
+    }
 }
 
 impl HiddenSendWitness {
@@ -2720,6 +2810,7 @@ pub fn commit_w_rows(
     };
     let witness = HiddenSendWitness {
         request_w: None,
+        chain_mask: None,
         group: plan.group,
         w: plan.w,
         positions: plan.activation.positions,
@@ -2955,6 +3046,18 @@ pub struct RequestWWitness {
     pub salts: Vec<Vec<u8>>,
 }
 
+/// The sub-proof mask table's committed message: its tree, root, one sampled
+/// answer and the drawn opening. The table is the segment's own object; the
+/// request index-mask is a different message with its own ledger.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainMaskMessage {
+    pub tree: RuntimeTreePlan,
+    pub root: Digest,
+    pub sample: SendSamples,
+    pub positions: Vec<u64>,
+    pub opening: RuntimeTreeOpening,
+}
+
 /// The complete public message of one hidden SEND-sample run.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HiddenSendMessages {
@@ -2988,6 +3091,9 @@ pub struct HiddenSendMessages {
     pub norm: Option<NormFirstMessages>,
     /// The request chain's proofs, when the plan carries the chain.
     pub request: Option<crate::proof::request_chain::RequestChainMessages>,
+    /// The sub-proof mask table's committed message, when the plan carries
+    /// it: its root, sample, drawn positions and opening.
+    pub chain_mask: Option<ChainMaskMessage>,
     pub chain_value: Digest,
 }
 
@@ -3019,6 +3125,18 @@ impl HiddenSendMessages {
             }
             writer.put_digest(&request_w.root);
             writer.put_bytes(&request_w.sample.encode());
+        }
+        if let Some(message) = &self.chain_mask {
+            // Plan-gated like the other optional sections: no presence byte
+            // when the plan carries no segment mask table.
+            put_tree_plan(&mut writer, &message.tree);
+            writer.put_digest(&message.root);
+            writer.put_bytes(&message.sample.encode());
+            writer.put_u64(message.positions.len() as u64);
+            for position in &message.positions {
+                writer.put_u64(*position);
+            }
+            writer.put_bytes(&encode_runtime_opening(&message.tree, &message.opening)?);
         }
         writer.put_bytes(&self.samples.encode());
         writer.put_u64(self.positions.len() as u64);
@@ -3112,6 +3230,44 @@ impl HiddenSendMessages {
                 }
                 let sample = SendSamples::decode(reader.get_bytes()?)?;
                 Some(RequestWMessage { root, sample })
+            }
+            None => None,
+        };
+        let chain_mask = match &plan.chain_mask {
+            Some(chain_plan) => {
+                if reader.get_u64()? != 1 {
+                    return Err(Error::InvalidEncoding);
+                }
+                let tree = get_tree_plan(&mut reader)?;
+                if tree != chain_plan.tree {
+                    return Err(Error::StatementMismatch);
+                }
+                let root = reader.get_digest()?;
+                if root == Digest::ZERO {
+                    return Err(Error::InvalidEncoding);
+                }
+                let sample = SendSamples::decode(reader.get_bytes()?)?;
+                if sample.seed.len() != 1 || sample.answers.len() != 1 {
+                    return Err(Error::ShapeMismatch);
+                }
+                let position_count =
+                    usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+                if position_count != chain_plan.openings {
+                    return Err(Error::ShapeMismatch);
+                }
+                let mut positions = Vec::with_capacity(position_count);
+                for _ in 0..position_count {
+                    positions.push(reader.get_u64()?);
+                }
+                let opening =
+                    decode_runtime_opening(&chain_plan.tree, &positions, reader.get_bytes()?)?;
+                Some(ChainMaskMessage {
+                    tree,
+                    root,
+                    sample,
+                    positions,
+                    opening,
+                })
             }
             None => None,
         };
@@ -3275,6 +3431,7 @@ impl HiddenSendMessages {
             closure,
             norm,
             request,
+            chain_mask,
             chain_value,
         })
     }
@@ -3684,6 +3841,7 @@ pub fn prove_hidden_send(
         closure: None,
         norm: None,
         request: None,
+        chain_mask: None,
     };
     Ok((messages, witness))
 }
@@ -4377,18 +4535,53 @@ fn prove_first_chain_segment(
     chain: &mut Chain,
     plan: &HiddenSendPlan,
     inputs: &crate::proof::request_chain::ChainInputs,
+    seed: &Digest,
 ) -> Result<(
     crate::proof::request_chain::RequestChainMessages,
     crate::proof::request_chain::ChainOutputs,
+    Option<ChainMaskMessage>,
+    Option<ChainMaskWitness>,
+    Vec<BatRow>,
 )> {
     let shape = plan.request_chain.ok_or(Error::InvalidConfig)?;
     let (messages, outputs) = {
         let mut challenges = ChainSegmentChallenges { chain };
         prove_request_chain_section(plan, inputs, &mut challenges)?
     };
+    // The segment's own mask table is committed after the segment runs and
+    // before the section is fixed: its entries are the masks the segment used
+    // and its data region carries the source cells. The request index-mask is
+    // a different object.
+    let (chain_mask_message, chain_mask_witness) = match &plan.chain_mask {
+        Some(chain_plan) => {
+            let witness = commit_chain_mask(chain_plan, inputs, seed)?;
+            absorb_chain_mask_root(chain, chain_plan, &witness.root)?;
+            let seeds = draw_seed_set(chain, chain_plan.sample_bits()?, 1)?;
+            let answer = chain_plan.answer(&witness.rows, &seeds[0])?;
+            absorb_chain_mask_answer(chain, answer)?;
+            let positions = draw_chain_mask_positions(chain, chain_plan)?;
+            let opening = witness.tree.open(&positions)?;
+            let message = ChainMaskMessage {
+                tree: chain_plan.tree.clone(),
+                root: witness.root,
+                sample: SendSamples {
+                    seed: seeds,
+                    answers: vec![answer],
+                },
+                positions,
+                opening,
+            };
+            (Some(message), Some(witness))
+        }
+        None => (None, None),
+    };
+    let rows = match &plan.chain_mask {
+        Some(_) => chain_relation_rows(plan, inputs, &outputs)?,
+        None => Vec::new(),
+    };
     messages.check_shape(shape)?;
     absorb_request_chain_section(chain, shape, &messages)?;
-    Ok((messages, outputs))
+    Ok((messages, outputs, chain_mask_message, chain_mask_witness, rows))
 }
 
 /// Binds the segment's pending claim to the request member the plan declares:
@@ -4413,7 +4606,8 @@ fn verify_first_chain_segment(
     plan: &HiddenSendPlan,
     messages: &crate::proof::request_chain::RequestChainMessages,
     inputs: &crate::proof::request_chain::ChainInputs,
-) -> Result<crate::proof::request_chain::ChainOutputs> {
+    chain_mask: Option<&ChainMaskMessage>,
+) -> Result<(crate::proof::request_chain::ChainOutputs, Vec<BatRow>)> {
     use crate::proof::request_chain::{verify_request_chain, ChainProof};
     let shape = plan.request_chain.ok_or(Error::InvalidConfig)?;
     messages.check_shape(shape)?;
@@ -4426,8 +4620,44 @@ fn verify_first_chain_segment(
         let mut challenges = ChainSegmentChallenges { chain };
         verify_request_chain(inputs, &proof, &mut challenges)
     }?;
+    // The segment's own mask table: the root, sample, positions and opening
+    // are checked before the section is fixed. The verifier never recovers a
+    // private mask value; the rows read the committed member.
+    match (&plan.chain_mask, chain_mask) {
+        (Some(chain_plan), Some(message)) => {
+            if message.tree != chain_plan.tree
+                || message.root == Digest::ZERO
+                || message.sample.seed.len() != 1
+                || message.sample.answers.len() != 1
+            {
+                return Err(Error::StatementMismatch);
+            }
+            absorb_chain_mask_root(chain, chain_plan, &message.root)?;
+            let seeds = draw_seed_set(chain, chain_plan.sample_bits()?, 1)?;
+            if message.sample.seed != seeds {
+                return Err(Error::InvalidProof);
+            }
+            absorb_chain_mask_answer(chain, message.sample.answers[0])?;
+            let positions = draw_chain_mask_positions(chain, chain_plan)?;
+            if message.positions != positions {
+                return Err(Error::InvalidProof);
+            }
+            crate::proof::request_chain::verify_chain_mask_opening(
+                chain_plan,
+                &message.root,
+                &positions,
+                &message.opening,
+            )?;
+        }
+        (None, None) => {}
+        _ => return Err(Error::InvalidProof),
+    }
+    let rows = match &plan.chain_mask {
+        Some(_) => chain_relation_rows(plan, inputs, &outputs)?,
+        None => Vec::new(),
+    };
     absorb_request_chain_section(chain, shape, messages)?;
-    Ok(outputs)
+    Ok((outputs, rows))
 }
 
 /// Absorbs the whole section message under the plan shape, fixing it in the
@@ -4489,6 +4719,178 @@ fn absorb_chain_mask_answer(chain: &mut Chain, answer: Fp3) -> Result<()> {
         return Err(Error::InvalidProof);
     }
     Ok(())
+}
+
+/// Draws the sub-proof mask table's opening positions after its root and
+/// sampled answer are fixed.
+fn draw_chain_mask_positions(
+    chain: &mut Chain,
+    plan: &crate::proof::request_chain::ChainMaskPlan,
+) -> Result<Vec<u64>> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(2);
+    message.push_u64(plan.openings as u64);
+    let prefix = message.prefix(KIND_POSITIONS, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    let mut positions = Vec::with_capacity(plan.openings);
+    for _ in 0..plan.openings {
+        positions.push(chain.draw_position(plan.mask_code.log_n)?);
+    }
+    Ok(unique_sorted(&positions))
+}
+
+/// The sub-proof mask table's entries at the segment fixture's trusted linear
+/// slots: the token and merge hiding forms in their own regions, the stack end
+/// slots and the token claim slot at their input slots, and the stack source
+/// cells plus the kept owner entry in the data region.
+fn segment_mask_rows(
+    plan: &crate::proof::request_chain::ChainMaskPlan,
+    inputs: &crate::proof::request_chain::ChainInputs,
+) -> Result<Vec<Vec<Fp3>>> {
+    if plan.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let rows = usize::try_from(plan.mask_rows).map_err(|_| Error::ResourceLimit)?;
+    let ell = usize::try_from(plan.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+    let mut table = vec![vec![Fp3::ZERO; ell]; rows];
+    let mut put = |slot: usize, value: Fp3| -> Result<()> {
+        let row = slot / ell;
+        let place = slot % ell;
+        let entry = table
+            .get_mut(row)
+            .and_then(|row| row.get_mut(place))
+            .ok_or(Error::ResourceLimit)?;
+        *entry = value;
+        Ok(())
+    };
+    if inputs.token_masks.hiding.len() > 20
+        || inputs.merge_masks.hiding.len() > 28
+        || inputs.stack_masks.shown.len() != 3
+    {
+        return Err(Error::InvalidConfig);
+    }
+    for (index, value) in inputs.token_masks.hiding.iter().enumerate() {
+        put(index, *value)?;
+    }
+    for (index, value) in inputs.merge_masks.hiding.iter().enumerate() {
+        put(32 + index, *value)?;
+    }
+    for (index, value) in inputs.stack_masks.shown.iter().enumerate() {
+        put(20 + index, *value)?;
+    }
+    put(96, (inputs.mask_value)(3)?)?;
+    if inputs.stack_left.len() != 2
+        || inputs.stack_right.len() != 2
+        || inputs.stack_left.iter().any(|cells| cells.len() != 1)
+        || inputs.stack_right.iter().any(|cells| cells.len() != 1)
+    {
+        return Err(Error::InvalidConfig);
+    }
+    put(64, inputs.stack_left[0][0])?;
+    put(65, inputs.stack_left[1][0])?;
+    put(66, inputs.stack_right[0][0])?;
+    put(67, Fp3::ZERO)?;
+    Ok(table)
+}
+
+/// Commits the sub-proof mask table from the segment's trusted entries. The
+/// table is the segment's own committed object; the request index-mask is a
+/// different object with its own ledger.
+fn commit_chain_mask(
+    plan: &crate::proof::request_chain::ChainMaskPlan,
+    inputs: &crate::proof::request_chain::ChainInputs,
+    seed: &Digest,
+) -> Result<ChainMaskWitness> {
+    let table = segment_mask_rows(plan, inputs)?;
+    let mut coins = ByteMaskCoins::new(derive_run_seed(seed, 2, 0)?)?;
+    let tail_len = usize::try_from(plan.mask_code.r).map_err(|_| Error::ResourceLimit)?;
+    let mut tails = Vec::with_capacity(table.len());
+    for _ in 0..table.len() {
+        let mut tail = Vec::with_capacity(tail_len);
+        for _ in 0..tail_len {
+            tail.push(coins.draw()?.0);
+        }
+        tails.push(tail);
+    }
+    let columns = usize::try_from(plan.mask_code.n()).map_err(|_| Error::ResourceLimit)?;
+    let salts = draw_salt_bytes(&mut coins, columns, plan.tree.salt_bytes)?;
+    let mut codewords = Vec::with_capacity(table.len());
+    for (row, tail) in table.iter().zip(&tails) {
+        codewords.push(encode_row_fp3(&plan.mask_code, row, tail)?);
+    }
+    let tree = RuntimeTree::commit(
+        plan.tree.clone(),
+        &[RuntimePartRows {
+            main: Vec::new(),
+            mask: codewords,
+            main_deg: 1,
+        }],
+        &salts,
+    )?;
+    Ok(ChainMaskWitness {
+        rows: table,
+        tails,
+        salts,
+        root: *tree.root(),
+        tree: Arc::new(tree),
+    })
+}
+
+/// The SEND sample row of the sub-proof mask table: the seed's cube
+/// coefficients over the table's compact row-major mask order plus the seed
+/// factor on the pad.
+fn chain_mask_sample_row(
+    plan: &crate::proof::request_chain::ChainMaskPlan,
+    message: &ChainMaskMessage,
+    target: Fp3,
+) -> Result<GuRelationRow> {
+    // The answer form matches the plan's own sample answer: its equality table
+    // pairs the first coordinate with the highest index bit.
+    if plan.fault().is_some()
+        || message.sample.answers.len() != 1
+        || message.sample.seed.len() != 1
+    {
+        return Err(Error::InvalidConfig);
+    }
+    let seed = &message.sample.seed[0];
+    let bits = plan.sample_bits()?;
+    if seed.z.len() < bits as usize || seed.beta == Fp3::ZERO {
+        return Err(Error::ShapeMismatch);
+    }
+    let ell = usize::try_from(plan.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+    let mask_rows = usize::try_from(plan.mask_rows).map_err(|_| Error::ResourceLimit)?;
+    let mut mask = vec![Fp3::ZERO; mask_rows * ell];
+    let row_bits = ceil_log2_u64(plan.mask_rows);
+    let stride = 1usize
+        .checked_shl(row_bits)
+        .ok_or(Error::ResourceLimit)?;
+    let point = &seed.z[..bits as usize];
+    let eq = crate::proof::output_closure::eq_vector(point)?;
+    let count = 1u64.checked_shl(bits).ok_or(Error::ResourceLimit)?;
+    for index in 0..count {
+        let row = (index & (stride as u64 - 1)) as usize;
+        let place = (index >> row_bits) as usize;
+        if row >= mask_rows || place >= ell {
+            continue;
+        }
+        let coefficient = if row + 1 == mask_rows && place + 1 == ell {
+            seed.beta
+        } else {
+            *eq.get(index as usize).ok_or(Error::InvalidIndex)?
+        };
+        mask[row * ell + place] = coefficient;
+    }
+    Ok(GuRelationRow {
+        oracle: plan.oracle,
+        group: plan.group,
+        kind: GuRelationKind::Sample,
+        main: Vec::new(),
+        mask,
+        target,
+    })
 }
 
 fn absorb_index_mask_root(chain: &mut Chain, plan: &IndexMaskPlan, root: &Digest) -> Result<()> {
@@ -4648,6 +5050,123 @@ fn index_mask_sample_row(
         mask,
         target,
     })
+}
+
+/// The four remaining relations of the request chain's segment, landed on the
+/// segment's committed mask table: the token kept row, the two stack source
+/// rows (A0 against the read cells, B0 against the second side) and the merge's
+/// remaining row. Every unit names the segment's own member; the request
+/// index-mask is a different object.
+fn chain_relation_rows(
+    plan: &HiddenSendPlan,
+    inputs: &crate::proof::request_chain::ChainInputs,
+    outputs: &crate::proof::request_chain::ChainOutputs,
+) -> Result<Vec<BatRow>> {
+    use crate::proof::request_stack::stack_affines;
+    use crate::proof::row_claim::RowForm;
+    use zkie_engine::pcs::request::bat::{BatPart, BatRow, BatRowKind};
+
+    let mask = plan.chain_mask.as_ref().ok_or(Error::InvalidConfig)?;
+    if mask.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let entry = |slot: usize| -> Result<u64> { mask.entry_virtual_index(slot) };
+    let slot_entry = |slot: usize| -> Result<usize> {
+        match slot {
+            3 => Ok(96),
+            20 => Ok(20),
+            21 => Ok(21),
+            22 => Ok(22),
+            _ => Err(Error::InvalidIndex),
+        }
+    };
+    let token = RowForm::from_output(&outputs.token);
+    let mut token_row = BatRow::new(BatRowKind::Plain);
+    for (index, coefficient) in token.hiding.iter().enumerate() {
+        token_row.add_unit(mask.oracle, BatPart::Mask, entry(index)?, *coefficient);
+    }
+    for term in &token.slots {
+        token_row.add_unit(
+            mask.oracle,
+            BatPart::Mask,
+            entry(slot_entry(term.slot)?)?,
+            term.coefficient,
+        );
+    }
+    for (index, coefficient) in &token.kept {
+        if *index != 0 {
+            return Err(Error::ShapeMismatch);
+        }
+        token_row.add_unit(mask.oracle, BatPart::Mask, entry(67)?, *coefficient);
+    }
+    token_row.target = token.constant;
+
+    let affines = stack_affines(
+        &inputs.reduction.panels,
+        &outputs.stack.point,
+        inputs.reduction.lam,
+        inputs.om,
+    )?;
+    if inputs.stack_left.len() != 2
+        || inputs.stack_right.len() != 2
+        || inputs.stack_left.iter().any(|cells| cells.len() != 1)
+        || inputs.stack_right.iter().any(|cells| cells.len() != 1)
+        || inputs.end_slots.len() != 3
+        || outputs.stack.ends.len() != 3
+    {
+        return Err(Error::InvalidConfig);
+    }
+    let mut a_row = BatRow::new(BatRowKind::Plain);
+    for term in &affines.alin {
+        a_row.add_unit(
+            mask.oracle,
+            BatPart::Mask,
+            entry(64 + term.panel)?,
+            term.coefficient,
+        );
+    }
+    a_row.add_unit(
+        mask.oracle,
+        BatPart::Mask,
+        entry(inputs.end_slots[0])?,
+        outputs.stack.ends[0].mask_scale,
+    );
+    a_row.target = outputs.stack.ends[0].value;
+    let mut b_row = BatRow::new(BatRowKind::Plain);
+    for term in &affines.blin {
+        b_row.add_unit(
+            mask.oracle,
+            BatPart::Mask,
+            entry(66 + term.panel)?,
+            term.coefficient,
+        );
+    }
+    b_row.add_unit(
+        mask.oracle,
+        BatPart::Mask,
+        entry(inputs.end_slots[1])?,
+        outputs.stack.ends[1].mask_scale,
+    );
+    b_row.target = outputs.stack.ends[1].value;
+
+    let merge = RowForm::from_output(&outputs.merge);
+    let mut merge_row = BatRow::new(BatRowKind::Plain);
+    for (index, coefficient) in merge.hiding.iter().enumerate() {
+        merge_row.add_unit(mask.oracle, BatPart::Mask, entry(32 + index)?, *coefficient);
+    }
+    for term in &merge.slots {
+        merge_row.add_unit(
+            mask.oracle,
+            BatPart::Mask,
+            entry(slot_entry(term.slot)?)?,
+            term.coefficient,
+        );
+    }
+    if !merge.kept.is_empty() {
+        return Err(Error::InvalidConfig);
+    }
+    merge_row.target = merge.constant;
+    Ok(vec![token_row, a_row, b_row, merge_row])
 }
 
 // ---------------------------------------------------------------------------
@@ -5474,6 +5993,12 @@ return Some("a fresh mask tree is not valid");
             },
             None => 0,
         };
+        if let Some(chain_mask) = &send.chain_mask {
+            own_mask_rows = match own_mask_rows.checked_add(chain_mask.mask_rows) {
+                Some(rows) => rows,
+                None => return Some("the chain-mask row count overflows"),
+            };
+        }
         if let Some(closure) = closure {
             own_mask_rows = match own_mask_rows.checked_add(match closure.mask.tree_rows() {
                 Ok(rows) => rows,
@@ -6035,6 +6560,9 @@ impl HiddenLinPlan {
             most = most.max(self.proximity.shared_mask_tree.leaf_class);
             most = most.max(self.proximity.own_mask_tree.leaf_class);
             most = most.max(member.tree.leaf_class);
+            if let Some(chain_mask) = &self.send.chain_mask {
+                most = most.max(chain_mask.tree.leaf_class);
+            }
             if let Some(closure) = &self.closure {
                 most = most.max(closure.slack.leaf_class);
                 most = most.max(closure.bits.leaf_class);
@@ -7862,7 +8390,7 @@ fn prove_first(
     seed: &Digest,
     param_tables: Option<&mut dyn NormParamTableProver>,
     chain_inputs: Option<&crate::proof::request_chain::ChainInputs>,
-) -> Result<(HiddenSendMessages, Digest, HiddenSendWitness)> {
+) -> Result<(HiddenSendMessages, Digest, HiddenSendWitness, Vec<BatRow>)> {
     let _profile_first = zkie_engine::profile::Scope::new("first.prove_first");
     plan.validate()?;
     take_mask_slots(plan)?;
@@ -8019,13 +8547,20 @@ fn prove_first(
     // The request chain's sub-proof segment runs before the LIN first W root:
     // its messages and challenges are fixed in the first chain, and the pending
     // claim the plan carries is the segment's output.
+    let mut chain_mask_message = None;
+    let mut chain_mask_witness = None;
+    let mut chain_rows = Vec::new();
     let request_section = match (&plan.send.request_chain, chain_inputs) {
         (Some(_), Some(inputs)) => {
             // The pending claim the segment leaves is the request member's
             // claim; the plan carries the same row and a difference is refused
             // before the LIN first commit and the seal.
-            let (section, outputs) = prove_first_chain_segment(&mut chain, &plan.send, inputs)?;
+            let (section, outputs, mask_message, mask_witness, rows) =
+                prove_first_chain_segment(&mut chain, &plan.send, inputs, seed)?;
             bind_chain_pending(&plan.send, &outputs.pending)?;
+            chain_mask_message = mask_message;
+            chain_mask_witness = mask_witness;
+            chain_rows = rows;
             Some(section)
         }
         (None, None) => None,
@@ -8482,9 +9017,11 @@ fn prove_first(
         closure,
         norm: norm_first,
         request: request_section,
+        chain_mask: chain_mask_message,
     };
     witness.request_w = request_w_commit;
-    Ok((messages, first_seal, witness))
+    witness.chain_mask = chain_mask_witness;
+    Ok((messages, first_seal, witness, chain_rows))
 }
 
 fn verify_first(
@@ -8493,7 +9030,7 @@ fn verify_first(
     output: Option<&[Vec<Fp3>]>,
     messages: &HiddenSendMessages,
     chain_inputs: Option<&crate::proof::request_chain::ChainInputs>,
-) -> Result<(Vec<EvalSampleRow>, Digest, Option<Vec<Fp3>>)> {
+) -> Result<(Vec<EvalSampleRow>, Digest, Option<Vec<Fp3>>, Vec<BatRow>)> {
     let _profile = zkie_engine::profile::Scope::new("verify.first");
     plan.validate()?;
     take_mask_slots(plan)?;
@@ -8548,12 +9085,20 @@ fn verify_first(
         (None, None) => {}
         _ => return Err(Error::InvalidProof),
     }
+    let mut chain_rows = Vec::new();
     match (&plan.send.request_chain, &messages.request, chain_inputs) {
         (Some(_), Some(section), Some(inputs)) => {
             // The verifier derives the pending from the received section and
             // binds it to the plan's member row before the seal.
-            let outputs = verify_first_chain_segment(&mut chain, &plan.send, section, inputs)?;
+            let (outputs, rows) = verify_first_chain_segment(
+                &mut chain,
+                &plan.send,
+                section,
+                inputs,
+                messages.chain_mask.as_ref(),
+            )?;
             bind_chain_pending(&plan.send, &outputs.pending)?;
+            chain_rows = rows;
         }
         (None, None, None) => {}
         _ => return Err(Error::InvalidProof),
@@ -8959,7 +9504,7 @@ fn verify_first(
             messages.eval_targets[position],
         )?);
     }
-    Ok((eval_rows, messages.chain_value, closure_r))
+    Ok((eval_rows, messages.chain_value, closure_r, chain_rows))
 }
 
 /// Folds the committed table by the shared point's high column coordinates.
@@ -10365,6 +10910,31 @@ fn own_members(
             mask_tails,
         });
     }
+    if let (Some(chain_plan), Some(message)) = (&plan.send.chain_mask, &first.chain_mask) {
+        let (mask_message, mask_tails) = match witness {
+            Some(witness) => {
+                let chain_mask = witness.chain_mask.as_ref().ok_or(Error::ShapeMismatch)?;
+                chain_mask.check(chain_plan)?;
+                (chain_mask.rows.clone(), chain_mask.tails.clone())
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        members.push(ProximityMember {
+            bat_oracle: 0,
+            source_oracle: chain_plan.oracle,
+            main_code: plan.proximity.code,
+            mask_code: chain_plan.mask_code,
+            main_rows: 0,
+            mask_rows: chain_plan.mask_rows,
+            answers: 1,
+            root: message.root,
+            tree_plan: chain_plan.tree.clone(),
+            message: Vec::new(),
+            tails: Vec::new(),
+            mask_message,
+            mask_tails,
+        });
+    }
     if let (Some(closure_plan), Some(closure_first)) = (&plan.closure, &first.closure) {
         let positions = plan.send.positions();
         for position in 0..positions {
@@ -11218,6 +11788,17 @@ fn own_sample_rows(
                     &closure_first.mask,
                     target,
                 )?]);
+            }
+        }
+        if let Some(chain_plan) = &plan.send.chain_mask {
+            if member.source_oracle == chain_plan.oracle {
+                let message = first.chain_mask.as_ref().ok_or(Error::ShapeMismatch)?;
+                let target = *message
+                    .sample
+                    .answers
+                    .first()
+                    .ok_or(Error::ShapeMismatch)?;
+                return Ok(vec![chain_mask_sample_row(chain_plan, message, target)?]);
             }
         }
         if let Some(index) = &plan.send.index_mask {
@@ -16638,6 +17219,7 @@ fn own_plain_rows(
     closure: Option<&ClosureRowBinding>,
     norm: Option<&NormRowBinding>,
     request: Option<&RequestRows>,
+    chain_rows: &[BatRow],
 ) -> Result<Vec<BatRow>> {
     let mut bat_of = std::collections::HashMap::new();
     for member in members {
@@ -16791,6 +17373,19 @@ fn own_plain_rows(
             )?);
         }
     }
+    // The request chain segment's remaining relations ride the same own group,
+    // on the segment's committed mask table. Their units name the plan's
+    // source oracle; the group's BAT registration id is the member's.
+    let mut rebound = chain_rows.to_vec();
+    for row in &mut rebound {
+        for unit in &mut row.units {
+            let member = bat_of
+                .get(&unit.oracle)
+                .ok_or(Error::StatementMismatch)?;
+            unit.oracle = member.bat_oracle;
+        }
+    }
+    rows.extend_from_slice(&rebound);
     Ok(rows)
 }
 
@@ -17461,6 +18056,7 @@ fn prove_second(
     seed: &Digest,
     bind_residual: bool,
     rstd_table: Option<&dyn crate::proof::lookup::LookupTable>,
+    chain_rows: &[BatRow],
 ) -> Result<OwnProveResult> {
     let _profile_second = zkie_engine::profile::Scope::new("second.prove_second");
     let _profile_own_members = zkie_engine::profile::Scope::new("second.own_members");
@@ -17549,6 +18145,7 @@ fn prove_second(
         closure_binding.as_ref(),
         norm_binding.as_ref(),
         request_bundle.as_ref(),
+        chain_rows,
     )?;
     drop(_profile_plain_rows);
     let fold = member_fold_shape(
@@ -17614,6 +18211,18 @@ fn witness_tree_for(
     first: &HiddenSendMessages,
     plan: &HiddenLinPlan,
 ) -> Result<Arc<RuntimeTree>> {
+    if let Some(chain_plan) = &plan.send.chain_mask {
+        if member.source_oracle == chain_plan.oracle {
+            let chain_mask = witness.chain_mask.as_ref().ok_or(Error::ShapeMismatch)?;
+            chain_mask.check(chain_plan)?;
+            if chain_mask.tree.plan() != &member.tree_plan
+                || *chain_mask.tree.root() != member.root
+            {
+                return Err(Error::StatementMismatch);
+            }
+            return Ok(chain_mask.tree.clone());
+        }
+    }
     if let Some(norm_plan) = &plan.norm {
         let norm_witness = witness.norm.as_ref().ok_or(Error::ShapeMismatch)?;
         let groups = norm_group_plans(norm_plan);
@@ -17842,6 +18451,7 @@ fn verify_second(
     messages: &HiddenSecondMessages,
     closure_r: Option<&[Fp3]>,
     rstd_table: Option<&dyn crate::proof::lookup::LookupTable>,
+    chain_rows: &[BatRow],
 ) -> Result<(
     Digest,
     Vec<GuRelationRow>,
@@ -17946,6 +18556,7 @@ fn verify_second(
         closure_binding.as_ref(),
         norm_binding.as_ref(),
         request_bundle.as_ref(),
+        chain_rows,
     )?;
     drop(_profile_plain_rows);
     let fold = member_fold_shape(
@@ -18026,7 +18637,7 @@ fn prove_hidden_lin_inner(
         plan.closure.as_ref(),
     )?;
     drop(_profile_randomness);
-    let (first, first_seal, send_witness) =
+    let (first, first_seal, send_witness, chain_rows) =
         prove_first(
             plan,
             activation,
@@ -18060,6 +18671,7 @@ fn prove_hidden_lin_inner(
         &seed,
         bind_residual,
         rstd_table,
+        &chain_rows,
     )?;
     let messages = HiddenLinMessages {
         first: first.clone(),
@@ -18179,7 +18791,7 @@ fn verify_hidden_lin_inner(
         return Err(Error::InvalidConfig);
     }
     let _profile_first = zkie_engine::profile::Scope::new("verify.hidden_lin.first");
-    let (eval_rows, first_seal, closure_r) =
+    let (eval_rows, first_seal, closure_r, chain_rows) =
         verify_first(plan, reader, output, &messages.first, chain_inputs)?;
     drop(_profile_first);
     if first_seal != messages.first_seal || messages.first.chain_value != first_seal {
@@ -18206,6 +18818,7 @@ fn verify_hidden_lin_inner(
         &messages.second,
         closure_r.as_deref(),
         rstd_table,
+        &chain_rows,
     )?;
     drop(_profile_second);
     Ok(HiddenLinOutcome {
@@ -19468,6 +20081,7 @@ mod tests {
             expected_roots: None,
             member: None,
             request_chain: None,
+            chain_mask: None,
             request_reads: None,
             request_w: None,
         };
@@ -20933,6 +21547,7 @@ mod merged_tests {
             expected_roots: None,
             member: None,
             request_chain: None,
+            chain_mask: None,
             request_reads: None,
             request_w: None,
         };
@@ -24240,6 +24855,12 @@ mod merged_tests {
         let f = |value: u64| Fp3::from_base(fp_from_u64(value));
         let activation = activation();
         let (mut plan, seed) = member_plan_for(&activation);
+        // The segment's own mask table: its own oracle, tree, sample form and
+        // opening ledger, separate from the request index-mask.
+        plan.send.chain_mask = Some(chain_mask_plan());
+        // The fresh mask tree carries the sum of the padded mask-row blocks:
+        // the request index-mask's four rows plus the segment mask's four.
+        plan.proximity.own_mask_tree.mask_rows = 8;
         {
             let table = zero_table();
             plan.send.table_identity = reader_table_identity(&table.reader).unwrap();
@@ -24253,7 +24874,7 @@ mod merged_tests {
             ByteMaskCoins::new(derive_run_seed(&seed, 1, 0).unwrap()).unwrap();
         let setup_randomness =
             WCommitRandomness::from_coins(&mut setup_coins, &setup_plan.send, None).unwrap();
-        let (setup_messages, _, _) = super::prove_first(
+        let (setup_messages, _, _, _) = super::prove_first(
             &setup_plan,
             Some(&activation),
             &mut setup_table,
@@ -24271,7 +24892,9 @@ mod merged_tests {
         // the read panel's cell carries that constant into the stack.
         let point = [f(2), f(3)];
         let token_shown = [f(1), f(2), f(3), f(4)];
-        let token_kept = [f(5), f(6), f(7), f(8)];
+        // The kept map is zero: its point value is zero, and the kept row's
+        // owner entry in the segment table is zero.
+        let token_kept = [Fp3::ZERO; 4];
         let hidden_claim = crate::proof::request_reduction::token_kept_claim(
             &point,
             &token_shown,
@@ -24576,6 +25199,125 @@ mod merged_tests {
             &inputs,
         )
         .is_err());
+        // The segment's mask table is its own committed object: a message
+        // without its plan, a plan whose oracle is the request index-mask and a
+        // changed root or sample answer are refused.
+        let mut without_plan = plan.clone();
+        without_plan.send.chain_mask = None;
+        assert!(super::verify_hidden_lin_hidden_with_chain_segment(
+            &without_plan,
+            &verifier_table.reader,
+            &messages,
+            &inputs,
+        )
+        .is_err());
+        let mut mixed = plan.clone();
+        mixed.send.chain_mask.as_mut().unwrap().oracle = INDEX_MASK_ORACLE;
+        let mut mixed_table = zero_table();
+        assert!(super::prove_hidden_lin_hidden_with_chain_segment(
+            &mixed,
+            &activation,
+            &mut mixed_table,
+            seed,
+            &inputs,
+        )
+        .is_err());
+        let mut changed_root = messages.clone();
+        changed_root.first.chain_mask.as_mut().unwrap().root = Digest([0x5C; 32]);
+        assert!(super::verify_hidden_lin_hidden_with_chain_segment(
+            &plan,
+            &verifier_table.reader,
+            &changed_root,
+            &inputs,
+        )
+        .is_err());
+        let mut changed_answer = messages.clone();
+        let answer = changed_answer
+            .first
+            .chain_mask
+            .as_ref()
+            .unwrap()
+            .sample
+            .answers[0]
+            .add(&Fp3::ONE);
+        changed_answer.first.chain_mask.as_mut().unwrap().sample.answers[0] = answer;
+        assert!(super::verify_hidden_lin_hidden_with_chain_segment(
+            &plan,
+            &verifier_table.reader,
+            &changed_answer,
+            &inputs,
+        )
+        .is_err());
+        // The terminal values ride the Y/rowS relations: a changed stack end
+        // value or a changed source cell is refused.
+        let mut changed_terminal = messages.clone();
+        changed_terminal.first.request.as_mut().unwrap().stack.end_values[0] =
+            changed_terminal.first.request.as_ref().unwrap().stack.end_values[0].add(&Fp3::ONE);
+        assert!(super::verify_hidden_lin_hidden_with_chain_segment(
+            &plan,
+            &verifier_table.reader,
+            &changed_terminal,
+            &inputs,
+        )
+        .is_err());
+        let mut changed_cell = stack_right.clone();
+        changed_cell[0][0] = changed_cell[0][0].add(&Fp3::ONE);
+        let changed_cell_inputs = ChainInputs {
+            stack_right: &changed_cell,
+            ..inputs
+        };
+        let mut chain = segment_chain(&plan, &table.reader, &setup_messages).unwrap();
+        let changed_cell_result = {
+            let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
+            crate::proof::request_chain::verify_request_chain(
+                &changed_cell_inputs,
+                &proof,
+                &mut challenges,
+            )
+        };
+        assert!(changed_cell_result.is_err());
+        // A missing or repeated weight slot is refused.
+        let short = [20usize, 21];
+        let short_inputs = ChainInputs {
+            end_slots: &short,
+            ..inputs
+        };
+        let mut chain = segment_chain(&plan, &table.reader, &setup_messages).unwrap();
+        let short_result = {
+            let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
+            crate::proof::request_chain::verify_request_chain(
+                &short_inputs,
+                &proof,
+                &mut challenges,
+            )
+        };
+        assert!(short_result.is_err());
+        let repeated = [20usize, 21, 22, 22];
+        let repeated_inputs = ChainInputs {
+            end_slots: &repeated,
+            ..inputs
+        };
+        let mut chain = segment_chain(&plan, &table.reader, &setup_messages).unwrap();
+        let repeated_result = {
+            let mut challenges = super::ChainSegmentChallenges { chain: &mut chain };
+            crate::proof::request_chain::verify_request_chain(
+                &repeated_inputs,
+                &proof,
+                &mut challenges,
+            )
+        };
+        assert!(repeated_result.is_err());
+        // The section and its mask message travel together: a plan with the
+        // mask but no message, and a message without the mask, are refused.
+        let mut missing_mask = messages.clone();
+        missing_mask.first.chain_mask = None;
+        assert!(super::verify_hidden_lin_hidden_with_chain_segment(
+            &plan,
+            &verifier_table.reader,
+            &missing_mask,
+            &inputs,
+        )
+        .is_err());
         // An end value's slot must carry the mask the stack used: swapping
         // two weight slots breaks the group's source tie.
         let swapped = [20usize, 22, 21];
@@ -24841,6 +25583,7 @@ mod merged_tests {
             None,
             None,
             None,
+            &[],
         )
         .unwrap();
         let index = plan.send.index_mask.as_ref().unwrap();
@@ -25127,6 +25870,7 @@ mod merged_tests {
             None,
             None,
             None,
+            &[],
         )
         .unwrap();
         assert_eq!(rows.len(), 2 * positions + 4);

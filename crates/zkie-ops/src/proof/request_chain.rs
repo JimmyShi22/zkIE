@@ -519,6 +519,7 @@ pub const START_HIDING_SLOT: usize = 1 << 24;
 /// Everything the chain proves and checks, in one place. The witnesses are the
 /// maps of the three sumchecks; the verifier supplies the same values except
 /// the kept map of the token sumcheck.
+#[derive(Clone, Copy)]
 pub struct ChainInputs<'a> {
     pub token_point: &'a [Fp3],
     pub token_shown: &'a [Fp3],
