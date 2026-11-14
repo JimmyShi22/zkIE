@@ -55,6 +55,8 @@ pub enum Summand {
     Leaves { alpha: Fp3, mu: usize },
     /// `y_0`: one shown map, degree one. The map is summed over the cube.
     Map,
+    /// `sum_t coeff_t * prod_{j in t} y_j`: a sum of products of shown maps.
+    ProductSum { terms: Vec<(Fp3, Vec<usize>)> },
 }
 
 impl Summand {
@@ -66,6 +68,11 @@ impl Summand {
             Self::Bits => 1,
             Self::Leaves { .. } => 0,
             Self::Map => 1,
+            Self::ProductSum { terms } => terms
+                .iter()
+                .flat_map(|(_, indices)| indices.iter())
+                .max()
+                .map_or(0, |index| index + 1),
         }
     }
 
@@ -83,6 +90,11 @@ impl Summand {
             Self::Bits => 2,
             Self::Leaves { .. } => 0,
             Self::Map => 1,
+            Self::ProductSum { terms } => terms
+                .iter()
+                .map(|(_, indices)| indices.len())
+                .max()
+                .unwrap_or(0),
         }
     }
 
@@ -114,6 +126,18 @@ impl Summand {
                 Ok(vec![Fp3::ONE, alpha.sub(&Fp3::ONE).sub(&table_at)])
             }
             Self::Map => Ok(vec![shown[0]]),
+            Self::ProductSum { terms } => {
+                let mut sum = Fp3::ZERO;
+                for (coefficient, indices) in terms {
+                    let mut term = *coefficient;
+                    for index in indices {
+                        let value = shown.get(*index).ok_or(Error::ShapeMismatch)?;
+                        term = term.mul(value);
+                    }
+                    sum = sum.add(&term);
+                }
+                Ok(vec![sum])
+            }
         }
     }
 }
@@ -567,6 +591,79 @@ impl InnerSumcheck for MapInner {
             high = high.add(&pair[1]);
         }
         Ok(vec![low, high.sub(&low)])
+    }
+
+    fn bind(&mut self, challenge: Fp3) -> Result<()> {
+        if self.bound >= self.variables || self.values.len() % 2 != 0 {
+            return Err(Error::InvalidSessionState);
+        }
+        let mut next = Vec::with_capacity(self.values.len() / 2);
+        for pair in self.values.chunks_exact(2) {
+            next.push(pair[0].add(&challenge.mul(&pair[1].sub(&pair[0]))));
+        }
+        self.values = next;
+        self.bound += 1;
+        Ok(())
+    }
+
+    fn end_values(&self) -> Result<Vec<Fp3>> {
+        if self.bound != self.variables || self.values.len() != 1 {
+            return Err(Error::InvalidSessionState);
+        }
+        Ok(vec![self.values[0]])
+    }
+}
+
+/// A single map's inner sumcheck under equality weights on the X variables.
+/// The current round's polynomial carries the equality factors of the
+/// variables after it; the variable being bound is weighted by the verifier.
+pub struct WeightedMapInner {
+    values: Vec<Fp3>,
+    z: Vec<Fp3>,
+    variables: usize,
+    bound: usize,
+}
+
+impl WeightedMapInner {
+    pub fn new(values: &[Fp3], z: &[Fp3]) -> Result<Self> {
+        if values.len() < 2 || !values.len().is_power_of_two() {
+            return Err(Error::InvalidConfig);
+        }
+        let variables = values.len().trailing_zeros() as usize;
+        if z.len() != variables {
+            return Err(Error::ShapeMismatch);
+        }
+        Ok(Self {
+            values: values.to_vec(),
+            z: z.to_vec(),
+            variables,
+            bound: 0,
+        })
+    }
+}
+
+impl InnerSumcheck for WeightedMapInner {
+    fn round(&self) -> Result<Vec<Fp3>> {
+        if self.bound >= self.variables || self.values.len() % 2 != 0 {
+            return Err(Error::InvalidSessionState);
+        }
+        let future = self.variables - self.bound - 1;
+        let mut low = Fp3::ZERO;
+        let mut delta = Fp3::ZERO;
+        for (index, pair) in self.values.chunks_exact(2).enumerate() {
+            let mut weight = Fp3::ONE;
+            for bit in 0..future {
+                let value = if (index >> bit) & 1 == 1 {
+                    self.z[self.bound + 1 + bit]
+                } else {
+                    Fp3::ONE.sub(&self.z[self.bound + 1 + bit])
+                };
+                weight = weight.mul(&value);
+            }
+            low = low.add(&weight.mul(&pair[0]));
+            delta = delta.add(&weight.mul(&pair[1].sub(&pair[0])));
+        }
+        Ok(vec![low, delta])
     }
 
     fn bind(&mut self, challenge: Fp3) -> Result<()> {
@@ -1155,6 +1252,25 @@ mod tests {
         )
         .unwrap();
         assert_ne!(tampered, verified);
+    }
+
+    #[test]
+    fn the_product_sum_form_combines_shown_maps() {
+        let summand = Summand::ProductSum {
+            terms: vec![(f(2), vec![0, 1]), (f(3), vec![1])],
+        };
+        assert_eq!(summand.shown(), 2);
+        assert_eq!(summand.degree(), 2);
+        let shown = [f(5), f(7)];
+        assert_eq!(
+            summand.at(&[], &shown, &[], None).unwrap(),
+            vec![f(2).mul(&f(5)).mul(&f(7)).add(&f(3).mul(&f(7)))]
+        );
+        // An index outside the shown maps is refused.
+        let bad = Summand::ProductSum {
+            terms: vec![(f(1), vec![2])],
+        };
+        assert!(bad.at(&[], &shown, &[], None).is_err());
     }
 
     #[test]
