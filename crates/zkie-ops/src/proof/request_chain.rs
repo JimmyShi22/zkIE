@@ -164,6 +164,122 @@ impl RequestChainMessages {
     }
 }
 
+/// The committed mask table of one request chain's sub-proof segment: one
+/// oracle owns the masks of the token, stack and merge sumchecks, with its own
+/// tree and opening ledger. The index-mask oracle of the request's pending
+/// claim is a different object; a slot number is never read across the two.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ChainMaskPlan {
+    pub oracle: u64,
+    pub group: u64,
+    pub mask_code: zkie_engine::pcs::request::code::CodeParams,
+    pub mask_rows: u64,
+    pub entries: usize,
+    pub tree: zkie_engine::pcs::request::runtime_tree::RuntimeTreePlan,
+}
+
+impl ChainMaskPlan {
+    /// The structural checks of the sub-proof mask table.
+    pub fn fault(&self) -> Option<&'static str> {
+        if self.oracle == 0 || self.group == 0 {
+            return Some("the sub-proof mask table has no identity");
+        }
+        if zkie_engine::pcs::request::code::build_code_plan(
+            self.mask_code.log_n,
+            self.mask_code.ell,
+            self.mask_code.r,
+        )
+        .is_err()
+        {
+            return Some("the sub-proof mask code is not a code");
+        }
+        if self.mask_rows == 0 || !self.mask_rows.is_power_of_two() {
+            return Some("the sub-proof mask table has no power-of-two rows");
+        }
+        if self.entries == 0 {
+            return Some("the sub-proof mask table has no entries");
+        }
+        if self.tree.fault().is_some() {
+            return Some("the sub-proof mask tree is not a tree");
+        }
+        if self.tree.log_n != self.mask_code.log_n
+            || self.tree.log_n_zk != self.mask_code.log_n
+            || self.tree.parts.len() != 1
+        {
+            return Some("the sub-proof mask tree does not match its code");
+        }
+        let mask_symbols = match self.mask_rows.checked_mul(3) {
+            Some(value) => value,
+            None => return Some("the sub-proof mask row width overflows"),
+        };
+        if self.tree.parts[0].main_symbols != 0
+            || self.tree.parts[0].mask_symbols != mask_symbols
+        {
+            return Some("the sub-proof mask tree does not carry its mask rows");
+        }
+        let free = match self.free_entries() {
+            Ok(free) => free,
+            Err(_) => return Some("the sub-proof mask rows are shorter than the entries"),
+        };
+        if free < self.entries {
+            return Some("the sub-proof mask rows are shorter than the entries");
+        }
+        None
+    }
+
+    /// The free mask entries, excluding the SEND pad of the last row.
+    pub fn free_entries(&self) -> Result<usize> {
+        let rows = usize::try_from(self.mask_rows).map_err(|_| Error::ResourceLimit)?;
+        let ell = usize::try_from(self.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+        if ell == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        rows.checked_mul(ell.checked_sub(1).ok_or(Error::InvalidConfig)?)
+            .and_then(|value| value.checked_add(rows.saturating_sub(1)))
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The BAT virtual table index of an entry: `row + place * 2^row_bits`,
+    /// the layout the mask group uses.
+    pub fn entry_virtual_index(&self, slot: usize) -> Result<u64> {
+        let rows = usize::try_from(self.mask_rows).map_err(|_| Error::ResourceLimit)?;
+        let ell = usize::try_from(self.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+        let length = rows.checked_mul(ell).ok_or(Error::ResourceLimit)?;
+        if slot >= length || slot >= self.free_entries()? {
+            return Err(Error::InvalidIndex);
+        }
+        let row = slot / ell;
+        let place = slot % ell;
+        let row_bits = if self.mask_rows <= 1 {
+            0
+        } else {
+            64 - (self.mask_rows - 1).leading_zeros()
+        };
+        (row as u64)
+            .checked_add((place as u64) << row_bits)
+            .ok_or(Error::ResourceLimit)
+    }
+}
+
+/// The owner binding of the sub-proof segment's mask slots: the committed
+/// member is the plan oracle and every slot maps through the chain mask
+/// layout. Duplicate slots are refused; the slots are the sub-proof's, never
+/// the request index-mask's.
+pub fn chain_mask_entries(plan: &ChainMaskPlan, slots: &[usize]) -> Result<Vec<(u64, u64)>> {
+    if plan.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    let mut entries = Vec::with_capacity(slots.len());
+    for slot in slots {
+        if !seen.insert(*slot) {
+            return Err(Error::InvalidConfig);
+        }
+        entries.push((plan.oracle, plan.entry_virtual_index(*slot)?));
+    }
+    Ok(entries)
+}
+
 /// Mask slots at and above this one name the start form's hiding entries.
 pub const START_HIDING_SLOT: usize = 1 << 24;
 
@@ -935,5 +1051,59 @@ mod tests {
         tampered.merge.rounds[0].coefficients[0] =
             tampered.merge.rounds[0].coefficients[0].add(&Fp3::ONE);
         assert!(verify_request_chain(&inputs, &tampered, &mut Source(61)).is_err());
+    }
+}
+
+#[cfg(test)]
+mod chain_mask_tests {
+    use super::*;
+    use zkie_engine::pcs::request::code::build_code_plan;
+    use zkie_engine::pcs::request::runtime_tree::{RuntimeTreePart, RuntimeTreePlan};
+
+    fn plan() -> ChainMaskPlan {
+        ChainMaskPlan {
+            oracle: 41,
+            group: 7,
+            mask_code: build_code_plan(8, 16, 4).unwrap(),
+            mask_rows: 4,
+            entries: 8,
+            tree: RuntimeTreePlan {
+                tree_number: 700,
+                leaf_class: 9,
+                log_n: 8,
+                log_n_zk: 8,
+                parts: vec![RuntimeTreePart {
+                    main_symbols: 0,
+                    mask_symbols: 12,
+                }],
+                salt_bytes: 40,
+                run: zkie_core::types::Digest([0x11; 32]),
+                configuration: zkie_core::types::Digest([0x22; 32]),
+            },
+        }
+    }
+
+    #[test]
+    fn the_chain_mask_layout_maps_slots_to_virtual_entries() {
+        let plan = plan();
+        assert!(plan.fault().is_none());
+        // Four rows of sixteen places: the pad is the last place of the last
+        // row, so the free entries are 4*15 + 3.
+        assert_eq!(plan.free_entries().unwrap(), 63);
+        assert_eq!(plan.entry_virtual_index(0).unwrap(), 0);
+        assert_eq!(plan.entry_virtual_index(16).unwrap(), 1);
+        assert_eq!(plan.entry_virtual_index(1).unwrap(), 4);
+        let entries = chain_mask_entries(&plan, &[0, 16, 1]).unwrap();
+        assert_eq!(entries[0], (41, 0));
+        assert_eq!(entries[1], (41, 1));
+        assert_eq!(entries[2], (41, 4));
+        // A duplicate slot, a slot past the free entries and a broken plan are
+        // refused.
+        assert!(chain_mask_entries(&plan, &[2, 2]).is_err());
+        assert!(chain_mask_entries(&plan, &[63]).is_err());
+        let mut broken = plan.clone();
+        broken.entries = 64;
+        assert!(broken.fault().is_some());
+        assert!(chain_mask_entries(&broken, &[0]).is_err());
     }
 }
