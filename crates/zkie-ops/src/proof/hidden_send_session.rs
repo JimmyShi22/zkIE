@@ -2071,6 +2071,17 @@ pub struct DotMapRandomness {
     pub pad: Fp3,
 }
 
+/// The private randomness of the request-level W message: one value message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RequestWRandomness {
+    /// One non-zero pad per sample answer.
+    pub pads: Vec<Fp3>,
+    /// `tail[row * r + i]`, one entry per message row and tail coefficient.
+    pub tail: Vec<Fp3>,
+    /// One salt per tree column.
+    pub salts: Vec<Vec<u8>>,
+}
+
 /// The private random values of one `W` commitment: one tail per message row,
 /// one salt per tree column and one pad per answer. Every pad must be non-zero.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2089,6 +2100,9 @@ pub struct WCommitRandomness {
     /// carries one. It is drawn from the same private source after the `W`
     /// values, so all masks of one run are independent of the challenges.
     pub index_mask: Option<IndexMaskRandomness>,
+    /// The private randomness of the request-level W message, when the plan
+    /// carries it: one value message under its own tree.
+    pub request_w: Option<RequestWRandomness>,
     /// The private randomness of the shown-map message, when the plan carries
     /// one. It is drawn from the same private source after the mask values.
     pub dot: Option<DotMapRandomness>,
@@ -2193,6 +2207,7 @@ impl HiddenSendWitness {
             return Err(Error::ShapeMismatch);
         }
         let randomness = WCommitRandomness {
+            request_w: None,
             tails: self.tails.clone(),
             salts: self.salts.clone(),
             pads: self.pads.clone(),
@@ -2349,6 +2364,36 @@ pub fn derive_w_rows(
 /// Derives the `W` rows from explicit private row-weight vectors. The caller
 /// owns the source of the rows: the committed activation, or the committed
 /// norm hidden-output messages.
+/// Derives the request-level W = g^T M: one entry per column, from the same
+/// table stream the witness uses. The row weights are public.
+fn derive_request_w(
+    plan: &HiddenSendPlan,
+    weights: &[Fp3],
+    source: &mut dyn TableRowSource,
+) -> Result<Vec<Fp3>> {
+    let matrix_rows = usize::try_from(plan.matrix_rows).map_err(|_| Error::ResourceLimit)?;
+    let columns = usize::try_from(plan.columns).map_err(|_| Error::ResourceLimit)?;
+    if weights.len() != matrix_rows {
+        return Err(Error::ShapeMismatch);
+    }
+    let ell = usize::try_from(plan.table_shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let tail_len = usize::try_from(plan.table_shape.code.r).map_err(|_| Error::ResourceLimit)?;
+    let mut message = vec![Fp::ZERO; ell];
+    let mut tail = vec![Fp::ZERO; tail_len];
+    let mut w = vec![Fp3::ZERO; columns];
+    for row in 0..matrix_rows {
+        source.row(row as u64, &mut message, &mut tail)?;
+        let weight = weights[row];
+        if weight.is_zero() {
+            continue;
+        }
+        for (slot, cell) in w.iter_mut().zip(&message[..columns]) {
+            *slot = slot.add(&weight.mul(&Fp3::from_base(*cell)));
+        }
+    }
+    Ok(w)
+}
+
 fn derive_w_rows_from_weights(
     plan: &HiddenSendPlan,
     weights: &[Vec<Fp3>],
@@ -7252,6 +7297,36 @@ impl WCommitRandomness {
             )?),
             None => None,
         };
+        let request_w = match &plan.request_w {
+            Some(rw) => {
+                let answers = plan.w.answers as usize;
+                let rows = usize::try_from(plan.w.main_rows).map_err(|_| Error::ResourceLimit)?;
+                let tail_len = usize::try_from(plan.w.code.r).map_err(|_| Error::ResourceLimit)?;
+                let mut pads = Vec::with_capacity(answers);
+                for _ in 0..answers {
+                    let mut pad = Fp3::ZERO;
+                    for _ in 0..64 {
+                        pad = coins.draw()?.0;
+                        if pad != Fp3::ZERO {
+                            break;
+                        }
+                    }
+                    if pad == Fp3::ZERO {
+                        return Err(Error::InvalidConfig);
+                    }
+                    pads.push(pad);
+                }
+                let mut tail = Vec::with_capacity(rows * tail_len);
+                for _ in 0..rows * tail_len {
+                    tail.push(coins.draw()?.0);
+                }
+                let columns =
+                    usize::try_from(rw.columns).map_err(|_| Error::ResourceLimit)?;
+                let salts = draw_salt_bytes(coins, columns, rw.shape.salt_bytes)?;
+                Some(RequestWRandomness { pads, tail, salts })
+            }
+            None => None,
+        };
         let randomness = Self {
             tails,
             salts,
@@ -7259,6 +7334,7 @@ impl WCommitRandomness {
             index_mask,
             dot,
             closure,
+            request_w,
         };
         randomness.check(plan)?;
         Ok(randomness)
@@ -18543,6 +18619,7 @@ mod tests {
                 })
                 .collect(),
             index_mask: None,
+            request_w: None,
             dot: None,
             pads: (0..POSITIONS as usize)
                 .map(|position| vec![Fp3::from_u64(0x900 + position as u64)])
@@ -19352,6 +19429,27 @@ mod tests {
         );
         // A point wider than the vector is refused.
         assert!(super::request_eval_row(&shape, 1, 123, &psi, &[], Fp3::ONE).is_err());
+    }
+
+    #[test]
+    fn the_request_w_is_the_weighted_table_rows() {
+        let fixture = fixture();
+        let messages = table_messages();
+        let matrix_rows = usize::try_from(fixture.plan.matrix_rows).unwrap();
+        let columns = usize::try_from(fixture.plan.columns).unwrap();
+        let mut g = vec![Fp3::ZERO; matrix_rows];
+        g[0] = Fp3::ONE;
+        g[1] = Fp3::from_u64(2);
+        let mut source = VecTableSource::new(messages.clone(), table_tails()).unwrap();
+        let w = super::derive_request_w(&fixture.plan, &g, &mut source).unwrap();
+        assert_eq!(w.len(), columns);
+        for column in [0usize, 1, columns - 1] {
+            let expected = Fp3::from_base(messages[0][column])
+                .add(&Fp3::from_u64(2).mul(&Fp3::from_base(messages[1][column])));
+            assert_eq!(w[column], expected);
+        }
+        // A row-weight vector of another length is refused.
+        assert!(super::derive_request_w(&fixture.plan, &g[..3], &mut source).is_err());
     }
 
     #[test]
