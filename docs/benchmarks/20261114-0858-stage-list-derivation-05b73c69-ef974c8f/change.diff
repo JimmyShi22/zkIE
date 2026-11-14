@@ -1,0 +1,265 @@
+commit 05b73c69593d18c00b8c89f2a49df81f62eceed6
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 08:58:08 2026 +0800
+
+    Derive a configured stage list with its failing point
+    
+    The trusted planner now derives a complete stage list from the public
+    configuration: the first stage plus one choice per further stage, where the
+    last choice must be the single-row stage and every other choice is a middle
+    stage with one or more folded rows and at most as many mask bits. Each stage's
+    capacities and random tail follow the stage rules, and every stage's code
+    lengths must hold the message and its tail. A configuration the rules reject
+    reports its stage and the failing point instead of a generic error. Unit tests
+    cover a valid chain, both stage-shape rules, an indivisible cut and a code
+    length that does not fit.
+    
+    The shared and own groups are still solved separately, the capacity mapping
+    and the whole-chain round budget remain the next steps.
+
+diff --git a/crates/zkie-ops/src/proof/proximity_planner.rs b/crates/zkie-ops/src/proof/proximity_planner.rs
+index c5a3cf2b..c3fd0169 100644
+--- a/crates/zkie-ops/src/proof/proximity_planner.rs
++++ b/crates/zkie-ops/src/proof/proximity_planner.rs
+@@ -668,6 +668,188 @@ pub fn solve_last_stage(
+     })
+ }
+ 
++/// One public choice of a middle or last stage: the two code lengths and the
++/// fold bits. It is plan data; no proof value enters it.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct StageChoice {
++    pub log_n: u32,
++    pub mask_log_n: u32,
++    pub k: u32,
++    pub h: u32,
++}
++
++/// The first stage of a chain, as chosen by the public configuration.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct FirstStage {
++    pub k: u32,
++    pub h: u32,
++    pub main_ell: u64,
++    pub mask_ell: u64,
++    pub slots: u64,
++    pub main_r: u64,
++    pub mask_r: u64,
++}
++
++/// One derived stage of a chain, with its code lengths and capacities.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct DerivedStage {
++    pub log_n: u32,
++    pub mask_log_n: u32,
++    pub k: u32,
++    pub h: u32,
++    pub main_ell: u64,
++    pub mask_ell: u64,
++    pub r_ood: u64,
++    pub tail: u64,
++}
++
++/// Why one public configuration is not a valid chain. The stage index is the
++/// position in the choice list plus one (the first stage is zero), and the
++/// point names the rule that failed: the stage shape rule, the divisibility
++/// of the folded row, or the code's capacity.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct StageFailure {
++    pub stage: usize,
++    pub point: &'static str,
++}
++
++fn code_fits(log_n: u32, ell: u64, tail: u64) -> bool {
++    if log_n > 32 {
++        return false;
++    }
++    let n = 1u64 << log_n;
++    ell.checked_add(tail).map_or(false, |used| used <= n)
++}
++
++/// Derives the complete stage list of one chain from the public
++/// configuration: the first stage and the per-stage choices. The last choice
++/// must be the single-row last stage (k = h = 0), every other choice is a
++/// middle stage with 1 <= k and h <= k. Each stage's capacities and random
++/// tail follow the stage rules; the code lengths must fit the message and the
++/// tail. A configuration the rules reject is reported with its stage and the
++/// failing point instead of a generic error.
++pub fn derive_stage_list(
++    first: FirstStage,
++    samples: u32,
++    positions: u64,
++    circle: bool,
++    choices: &[StageChoice],
++) -> std::result::Result<Vec<DerivedStage>, StageFailure> {
++    if choices.is_empty() {
++        return Err(StageFailure {
++            stage: 0,
++            point: "a chain folds at its first stage and has a last stage",
++        });
++    }
++    let first_tail = stage_tail(positions, circle);
++    if !code_fits(choices[0].log_n, first.main_ell, first_tail)
++        || !code_fits(choices[0].mask_log_n, first.mask_ell, first_tail)
++    {
++        return Err(StageFailure {
++            stage: 0,
++            point: "the first stage's message and tail do not fit its code length",
++        });
++    }
++    let mut stages = Vec::with_capacity(choices.len());
++    stages.push(DerivedStage {
++        log_n: choices[0].log_n,
++        mask_log_n: choices[0].mask_log_n,
++        k: first.k,
++        h: first.h,
++        main_ell: first.main_ell,
++        mask_ell: first.mask_ell,
++        r_ood: 0,
++        tail: first_tail,
++    });
++    let mut prev = first;
++    let mut prev_tail = first_tail;
++    for (index, choice) in choices.iter().enumerate() {
++        if index == 0 {
++            continue;
++        }
++        let last = index + 1 == choices.len();
++        if choice.k > 32 || choice.h > choice.k || (last && (choice.k != 0 || choice.h != 0)) || (!last && choice.k == 0) {
++            return Err(StageFailure {
++                stage: index,
++                point: if last {
++                    "the last stage has k = h = 0"
++                } else {
++                    "a middle stage has 1 <= k and h <= k"
++                },
++            });
++        }
++        let sizes = if last {
++            solve_last_stage(
++                prev.main_ell,
++                prev.mask_ell,
++                prev.slots,
++                prev_tail,
++                prev_tail,
++                samples,
++                positions,
++                circle,
++            )
++        } else {
++            solve_next_stage(
++                prev.main_ell,
++                prev.mask_ell,
++                prev.slots,
++                prev_tail,
++                prev_tail,
++                choice.k,
++                choice.h,
++                samples,
++                positions,
++                circle,
++            )
++        };
++        let sizes = match sizes {
++            Ok(sizes) => sizes,
++            Err(Error::InvalidConfig) => {
++                return Err(StageFailure {
++                    stage: index,
++                    point: "the folded row cannot be cut into the chosen rows",
++                })
++            }
++            Err(_) => {
++                return Err(StageFailure {
++                    stage: index,
++                    point: "the stage's capacities overflow",
++                })
++            }
++        };
++        if !code_fits(choice.log_n, sizes.main_ell, sizes.tail)
++            || !code_fits(choice.mask_log_n, sizes.mask_ell, sizes.tail)
++        {
++            return Err(StageFailure {
++                stage: index,
++                point: "the stage's message and tail do not fit its code length",
++            });
++        }
++        prev = FirstStage {
++            k: sizes.k,
++            h: sizes.h,
++            main_ell: sizes.main_ell,
++            mask_ell: sizes.mask_ell,
++            slots: 1,
++            main_r: sizes.tail,
++            mask_r: sizes.tail,
++        };
++        prev_tail = sizes.tail;
++        stages.push(DerivedStage {
++            log_n: choice.log_n,
++            mask_log_n: choice.mask_log_n,
++            k: sizes.k,
++            h: sizes.h,
++            main_ell: sizes.main_ell,
++            mask_ell: sizes.mask_ell,
++            r_ood: sizes.r_ood,
++            tail: sizes.tail,
++        });
++    }
++    Ok(stages)
++}
++
+ fn ceil_log2(value: u64) -> u32 {
+     if value <= 1 {
+         return 0;
+@@ -1069,3 +1251,52 @@ mod stage_sizes_tests {
+         assert_eq!(stage_tail(0, true), 0);
+     }
+ }
++
++#[cfg(test)]
++mod stage_list_tests {
++    use super::*;
++
++    fn choice(log_n: u32, mask_log_n: u32, k: u32, h: u32) -> StageChoice {
++        StageChoice { log_n, mask_log_n, k, h }
++    }
++
++    fn first() -> FirstStage {
++        FirstStage { k: 1, h: 0, main_ell: 2048, mask_ell: 64, slots: 2, main_r: 5, mask_r: 5 }
++    }
++
++    #[test]
++    fn a_configured_chain_derives_and_reports_the_failing_point() {
++        let choices = vec![choice(14, 13, 0, 1), choice(14, 13, 1, 1), choice(14, 14, 0, 0)];
++        let stages = derive_stage_list(first(), 1, 7, false, &choices).unwrap();
++        assert_eq!(stages.len(), 3);
++        assert_eq!(stages[1].k, 1);
++        assert_eq!(stages[2].k, 0);
++        assert_eq!(stages[2].h, 0);
++        assert!(stages.windows(2).all(|pair| pair[1].tail == 7));
++
++        // A middle stage cannot be the single-row stage.
++        let bad = vec![choice(14, 13, 0, 1), choice(14, 14, 0, 0), choice(14, 14, 0, 0)];
++        let failure = derive_stage_list(first(), 1, 7, false, &bad).unwrap_err();
++        assert_eq!(failure.stage, 1);
++        assert_eq!(failure.point, "a middle stage has 1 <= k and h <= k");
++
++        // The last stage must be the single-row stage.
++        let bad = vec![choice(14, 13, 0, 1), choice(14, 14, 1, 0)];
++        let failure = derive_stage_list(first(), 1, 7, false, &bad).unwrap_err();
++        assert_eq!(failure.stage, 1);
++        assert_eq!(failure.point, "the last stage has k = h = 0");
++
++        // An indivisible cut is a configuration failure at its stage.
++        let odd = FirstStage { k: 1, h: 0, main_ell: 2046, mask_ell: 64, slots: 1, main_r: 5, mask_r: 5 };
++        let bad = vec![choice(14, 13, 0, 1), choice(14, 14, 3, 0), choice(14, 14, 0, 0)];
++        let failure = derive_stage_list(odd, 1, 7, false, &bad).unwrap_err();
++        assert_eq!(failure.stage, 1);
++        assert!(failure.point.contains("cut"));
++
++        // A code length that does not hold the message and its tail fails.
++        let bad = vec![choice(10, 13, 0, 1)];
++        let failure = derive_stage_list(first(), 1, 7, false, &bad).unwrap_err();
++        assert_eq!(failure.stage, 0);
++        assert!(failure.point.contains("fit its code length"));
++    }
++}
