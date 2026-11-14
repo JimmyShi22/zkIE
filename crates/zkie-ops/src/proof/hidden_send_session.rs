@@ -18195,6 +18195,36 @@ pub fn verify_hidden_lin(
 /// own table reader and member roots. Neither the activation rows nor any
 /// output rows enter this entry; the Eval targets are message values bound to
 /// the committed reduced rows by the BAT rows.
+/// Prover entry that will take the request chain segment inputs once the
+/// first-chain order is wired. Until then it refuses a plan that carries the
+/// section instead of silently proving without it.
+pub fn prove_hidden_lin_hidden_with_chain_segment(
+    plan: &HiddenLinPlan,
+    activation: &CommittedActivation,
+    table: &mut dyn HiddenTableProver,
+    seed: Digest,
+    _inputs: &crate::proof::request_chain::ChainInputs,
+) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
+    if plan.send.request_chain.is_some() {
+        return Err(Error::UnsupportedPrimitive);
+    }
+    prove_hidden_lin_hidden(plan, activation, table, seed)
+}
+
+/// Verifier counterpart of the chain segment entry: the same refusal until the
+/// first-chain order and the caller inputs are wired.
+pub fn verify_hidden_lin_hidden_with_chain_segment(
+    plan: &HiddenLinPlan,
+    reader: &IndexReader,
+    messages: &HiddenLinMessages,
+    _inputs: &crate::proof::request_chain::ChainInputs,
+) -> Result<HiddenLinOutcome> {
+    if plan.send.request_chain.is_some() {
+        return Err(Error::UnsupportedPrimitive);
+    }
+    verify_hidden_lin_hidden(plan, reader, messages)
+}
+
 pub fn verify_hidden_lin_hidden(
     plan: &HiddenLinPlan,
     reader: &IndexReader,
@@ -23940,6 +23970,77 @@ mod merged_tests {
         super::absorb_chain_mask_answer(&mut other, Fp3::from_u64(9)).unwrap();
         assert_ne!(*rooted.value(), *other.value());
 
+    }
+
+    #[test]
+    fn the_chain_segment_entry_refuses_until_the_order_is_wired() {
+        let (plan, _, _) = member_run();
+        let mut plan = plan;
+        plan.send.request_chain = Some(crate::proof::request_chain::RequestChainShape {
+            token_rounds: 1,
+            token_ends: 1,
+            stack_rounds: 1,
+            stack_ends: 1,
+            merge_rounds: 1,
+            merge_ends: 1,
+        });
+        let reduction = crate::proof::request_stack::StackReduction::new(vec![
+            crate::proof::request_stack::StackPanel {
+                claim: 0,
+                ec: Fp3::ONE,
+                ni: 2,
+                ny: 1,
+                weight: vec![Fp3::ONE, Fp3::ONE],
+                first_claim: None,
+                w: 0,
+                off: 0,
+            },
+        ])
+        .unwrap();
+        let layout = crate::proof::request_weights::WeightLayout::new(1).unwrap();
+        let masks = crate::proof::psc_general::GeneralMaskEntries {
+            hiding: Vec::new(),
+            shown: Vec::new(),
+        };
+        let zero = |_slot: usize| -> Result<Fp3> { Ok(Fp3::ZERO) };
+        let om = [Fp3::ONE];
+        let no_terms: [crate::proof::psc_general::MaskTerm; 0] = [];
+        let no_slots: [usize; 0] = [];
+        let no_maps: [Vec<Fp3>; 0] = [];
+        let no_claims: [crate::proof::request_weights::WeightClaim; 0] = [];
+        let no_cells: [Vec<Fp3>; 0] = [];
+        let no_point: [Fp3; 0] = [];
+        let inputs = crate::proof::request_chain::ChainInputs {
+            token_point: &no_point,
+            token_shown: &no_point,
+            token_kept: &no_point,
+            token_claim_masks: &no_terms,
+            token_shown_claim: Fp3::ZERO,
+            token_claim_slot: 3,
+            token_masks: &masks,
+            reduction: &reduction,
+            stack_left: &no_cells,
+            stack_right: &no_cells,
+            om: &om,
+            stack_masks: &masks,
+            layout: &layout,
+            claims: &no_claims,
+            claim_maps: &no_maps,
+            end_slots: &no_slots,
+            merge_masks: &masks,
+            mask_value: &zero,
+            index_oracle: 60,
+            index_slot: 7,
+        };
+        let mut table = table();
+        assert!(super::prove_hidden_lin_hidden_with_chain_segment(
+            &plan,
+            &activation(),
+            &mut table,
+            Digest([0x31; 32]),
+            &inputs,
+        )
+        .is_err());
     }
 
     #[test]
