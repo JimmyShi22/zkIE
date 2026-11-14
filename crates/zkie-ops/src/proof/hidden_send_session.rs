@@ -3116,6 +3116,60 @@ pub fn source_reads(
     Ok(values)
 }
 
+/// Fetches planned cells on the witness stream in row order and restores them
+/// to the caller's order.
+fn fetch_cells(
+    plan: &HiddenSendPlan,
+    cells: &[(u64, u64)],
+    source: &mut dyn TableRowSource,
+) -> Result<Vec<Fp3>> {
+    let mut order: Vec<usize> = (0..cells.len()).collect();
+    order.sort_by_key(|index| cells[*index].0);
+    let sorted: Vec<(u64, u64)> = order.iter().map(|index| cells[*index]).collect();
+    let values = source_reads(plan, &sorted, source)?;
+    let mut restored = vec![Fp3::ZERO; cells.len()];
+    for (slot, value) in order.iter().zip(values) {
+        restored[*slot] = value;
+    }
+    Ok(restored)
+}
+
+/// The stack's two sides from planned table cells. The reduction's panels fix
+/// how many cells each side takes, in panel and cell order; the cells are
+/// fetched on the witness stream in row order and restored to panel order. The
+/// weight panels' second side holds their weight cells.
+pub fn stack_reads(
+    plan: &HiddenSendPlan,
+    reduction: &crate::proof::request_stack::StackReduction,
+    left_cells: &[(u64, u64)],
+    right_cells: &[(u64, u64)],
+    source: &mut dyn TableRowSource,
+) -> Result<(Vec<Vec<Fp3>>, Vec<Vec<Fp3>>)> {
+    let mut counts = Vec::with_capacity(reduction.panels.len());
+    let mut total = 0usize;
+    for panel in &reduction.panels {
+        let cells = (panel.ni as usize)
+            .checked_mul(panel.ny as usize)
+            .ok_or(Error::ResourceLimit)?;
+        counts.push(cells);
+        total = total.checked_add(cells).ok_or(Error::ResourceLimit)?;
+    }
+    if left_cells.len() != total || right_cells.len() != total {
+        return Err(Error::ShapeMismatch);
+    }
+    let left = fetch_cells(plan, left_cells, source)?;
+    let right = fetch_cells(plan, right_cells, source)?;
+    let mut left_rows = Vec::with_capacity(counts.len());
+    let mut right_rows = Vec::with_capacity(counts.len());
+    let mut at = 0usize;
+    for cells in counts {
+        left_rows.push(left[at..at + cells].to_vec());
+        right_rows.push(right[at..at + cells].to_vec());
+        at += cells;
+    }
+    Ok((left_rows, right_rows))
+}
+
 /// The salt-derivation purpose of the reduced-witness tree.
 const REDUCTION_SALT_PURPOSE: u64 = 16;
 
@@ -19174,6 +19228,56 @@ mod tests {
             &messages,
             &inputs,
             &mut SectionSource(3)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn the_stack_reads_follow_the_panels_and_the_stream() {
+        let fixture = fixture();
+        let messages = table_messages();
+        let reduction = crate::proof::request_stack::StackReduction::new(vec![
+            crate::proof::request_stack::StackPanel {
+                claim: 0,
+                ec: Fp3::ONE,
+                ni: 2,
+                ny: 1,
+                weight: vec![Fp3::ONE, Fp3::ONE],
+                first_claim: None,
+                w: 0,
+                off: 0,
+            },
+        ])
+        .unwrap();
+        // The cells need not be in row order; the values keep panel order.
+        let left_cells = [(3u64, 1u64), (1, 0)];
+        let right_cells = [(2u64, 2u64), (0, 1)];
+        let mut source = VecTableSource::new(messages.clone(), table_tails()).unwrap();
+        let (left, right) =
+            super::stack_reads(&fixture.plan, &reduction, &left_cells, &right_cells, &mut source)
+                .unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0][0], Fp3::from_base(messages[3][1]));
+        assert_eq!(left[0][1], Fp3::from_base(messages[1][0]));
+        assert_eq!(right[0][0], Fp3::from_base(messages[2][2]));
+        assert_eq!(right[0][1], Fp3::from_base(messages[0][1]));
+        // A short side or an out-of-range cell is refused.
+        let mut source = VecTableSource::new(messages.clone(), table_tails()).unwrap();
+        assert!(super::stack_reads(
+            &fixture.plan,
+            &reduction,
+            &left_cells[..1],
+            &right_cells,
+            &mut source
+        )
+        .is_err());
+        let mut source = VecTableSource::new(messages.clone(), table_tails()).unwrap();
+        assert!(super::stack_reads(
+            &fixture.plan,
+            &reduction,
+            &left_cells,
+            &[(0, COLUMNS as u64), (0, 0)],
+            &mut source
         )
         .is_err());
     }
