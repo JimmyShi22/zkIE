@@ -3037,6 +3037,38 @@ impl HiddenSendMessages {
     }
 }
 
+/// Commits the request-level W vector as its own SEND oracle. One logical
+/// vector is one value message (the layout may split it into several encoded
+/// rows; this entry commits the caller's layout as given), with its own oracle
+/// range and tree, through the generic value-message committer. The
+/// per-position rows of the send path are a different object and are not
+/// touched.
+#[allow(clippy::too_many_arguments)]
+pub fn commit_request_w(
+    shape: &WShape,
+    oracle_base: u64,
+    group: u64,
+    w: &[Fp3],
+    pads: &[Fp3],
+    tails: &[Vec<Fp3>],
+    salts: &[Vec<Vec<u8>>],
+) -> Result<crate::proof::output_closure::CommittedValueGroup> {
+    if w.is_empty() || !w.len().is_power_of_two() {
+        return Err(Error::InvalidConfig);
+    }
+    crate::proof::output_closure::commit_value_group(
+        shape,
+        w.len() as u64,
+        oracle_base,
+        group,
+        &[w.to_vec()],
+        pads,
+        tails,
+        salts,
+        1,
+    )
+}
+
 /// Proves the request chain's transcript section and returns the message it
 /// carries. The plan must carry the chain's shapes; the proofs must match them.
 pub fn prove_request_chain_section(
@@ -19134,6 +19166,45 @@ mod tests {
         fn send_end_values(&mut self, _values: &[Fp3]) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn the_request_w_commits_as_its_own_oracle() {
+        let fixture = fixture();
+        let plan = &fixture.plan;
+        let columns = usize::try_from(plan.columns).unwrap();
+        let w: Vec<Fp3> = (0..columns).map(|index| Fp3::from_u64(1 + index as u64)).collect();
+        let answers = plan.w.answers as usize;
+        let pads = fixture.randomness.pads[0][..answers].to_vec();
+        let tails = vec![fixture.randomness.tails[0].clone()];
+        let salts = vec![fixture.randomness.salts[0].clone()];
+        let committed = super::commit_request_w(
+            &plan.w,
+            plan.oracle_base + 1_000,
+            plan.group,
+            &w,
+            &pads,
+            &tails,
+            &salts,
+        )
+        .unwrap();
+        assert_eq!(committed.roots.len(), 1);
+        assert_ne!(committed.roots[0], Digest::ZERO);
+        // The per-position group is untouched.
+        assert_eq!(plan.positions(), POSITIONS);
+        // Another vector is another root.
+        let other: Vec<Fp3> = (0..columns).map(|index| Fp3::from_u64(2 + index as u64)).collect();
+        let other_committed = super::commit_request_w(
+            &plan.w,
+            plan.oracle_base + 1_000,
+            plan.group,
+            &other,
+            &pads,
+            &tails,
+            &salts,
+        )
+        .unwrap();
+        assert_ne!(other_committed.roots[0], committed.roots[0]);
     }
 
     #[test]
