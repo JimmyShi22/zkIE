@@ -1,0 +1,165 @@
+commit 21cc0e961e315b4013b8902b440763511179cdb8
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 10:20:24 2026 +0800
+
+    Count the chain rounds and recheck the object capacities
+    
+    The trusted planner now counts the rounds of a proximity-test chain from its
+    stage list: one batch round, for every stage but the last one epsilon round,
+    its fold rounds and one code-switch round, and the last stage's masked-target
+    and base rounds; roots and scalars stay message parts. A chain that does not
+    fit the reserved rounds is named with its overage, never silently extended.
+    The capacity recheck composes the opened-list derivation with the per-object
+    account, so the position capacity is checked once over the whole chain.
+    Unit tests cover the round counts, the named budget overage and the composed
+    recheck.
+    
+    The production session assembly with the derived parameters is the next step.
+
+diff --git a/crates/zkie-ops/src/proof/proximity_planner.rs b/crates/zkie-ops/src/proof/proximity_planner.rs
+index e4ba807b..330006d1 100644
+--- a/crates/zkie-ops/src/proof/proximity_planner.rs
++++ b/crates/zkie-ops/src/proof/proximity_planner.rs
+@@ -1348,6 +1348,90 @@ pub fn iopp_sized_fault(run: &[RunStage], solved: &[DerivedStage]) -> std::resul
+     Ok(())
+ }
+ 
++/// The rounds of one proximity-test chain, counted from the stage list: one
++/// BAT round, for every stage but the last one epsilon round and its fold
++/// rounds and one code-switch round, and the last stage's masked-target round
++/// and base round. Roots and scalars are message parts, not rounds.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct RoundBudget {
++    pub bat: u64,
++    pub fold_epsilon: u64,
++    pub fold_rounds: u64,
++    pub code_switch: u64,
++    pub base_lambda: u64,
++    pub base_positions: u64,
++    pub total: u64,
++}
++
++/// Counts the chain's rounds. A chain with fewer than two stages is refused
++/// with its failing point.
++pub fn chain_round_budget(stages: &[DerivedStage]) -> std::result::Result<RoundBudget, StageFailure> {
++    if stages.len() < 2 {
++        return Err(StageFailure {
++            stage: 0,
++            point: "a proximity test has at least two stages",
++        });
++    }
++    let mut budget = RoundBudget {
++        bat: 1,
++        fold_epsilon: 0,
++        fold_rounds: 0,
++        code_switch: 0,
++        base_lambda: 1,
++        base_positions: 1,
++        total: 0,
++    };
++    for (index, stage) in stages.iter().enumerate() {
++        if index + 1 == stages.len() {
++            break;
++        }
++        budget.fold_epsilon += 1;
++        budget.fold_rounds = budget
++            .fold_rounds
++            .checked_add(stage.k as u64)
++            .ok_or(StageFailure { stage: index, point: "the fold round count overflows" })?;
++        budget.code_switch += 1;
++    }
++    budget.total = budget
++        .bat
++        .checked_add(budget.fold_epsilon)
++        .and_then(|value| value.checked_add(budget.fold_rounds))
++        .and_then(|value| value.checked_add(budget.code_switch))
++        .and_then(|value| value.checked_add(budget.base_lambda))
++        .and_then(|value| value.checked_add(budget.base_positions))
++        .ok_or(StageFailure { stage: 0, point: "the chain round count overflows" })?;
++    Ok(budget)
++}
++
++/// The chain's rounds must fit the reserved budget. A chain that does not fit
++/// is named with its overage; the reserved number is never raised here.
++pub fn budget_within(budget: RoundBudget, reserved: u64) -> std::result::Result<(), String> {
++    if budget.total > reserved {
++        return Err(format!(
++            "the chain needs {} rounds but only {reserved} are reserved",
++            budget.total
++        ));
++    }
++    Ok(())
++}
++
++/// The capacity recheck over a whole chain: the opened lists derived from the
++/// stage positions must fit each object's account. Positions only; the table,
++/// range and link conditions stay outside this check.
++#[allow(clippy::too_many_arguments)]
++pub fn capacity_recheck(
++    positions: &[StagePositions],
++    requests: u64,
++    split: bool,
++    folded: HidingAccount,
++    omega: HidingAccount,
++    own: HidingAccount,
++) -> std::result::Result<(), String> {
++    let opened = opened_lists(positions, requests, split)
++        .map_err(|_| "capacity recheck: the opened lists overflow".to_string())?;
++    opened_capacity(&opened, folded, omega, own)
++}
++
+ fn ceil_log2(value: u64) -> u32 {
+     if value <= 1 {
+         return 0;
+@@ -2018,3 +2102,51 @@ mod plan_iopp_tests {
+         assert!(iopp_sized_fault(&matching[..1], &solved).is_err());
+     }
+ }
++
++#[cfg(test)]
++mod round_budget_tests {
++    use super::*;
++
++    fn stage(k: u32) -> DerivedStage {
++        DerivedStage {
++            log_n: 14,
++            mask_log_n: 14,
++            k,
++            h: 0,
++            main_ell: 512,
++            mask_ell: 64,
++            r_ood: 0,
++            tail: 7,
++        }
++    }
++
++    #[test]
++    fn rounds_follow_the_stage_list() {
++        let stages = [stage(1), stage(1), stage(0)];
++        let budget = chain_round_budget(&stages).unwrap();
++        assert_eq!(budget.bat, 1);
++        assert_eq!(budget.fold_epsilon, 2);
++        assert_eq!(budget.fold_rounds, 2);
++        assert_eq!(budget.code_switch, 2);
++        assert_eq!(budget.base_lambda, 1);
++        assert_eq!(budget.base_positions, 1);
++        assert_eq!(budget.total, 9);
++        assert!(budget_within(budget, 9).is_ok());
++        let error = budget_within(budget, 8).unwrap_err();
++        assert!(error.contains("9"));
++        assert!(error.contains("8"));
++        assert!(chain_round_budget(&stages[..1]).is_err());
++    }
++
++    #[test]
++    fn the_capacity_recheck_composes_the_object_checks() {
++        let stages = [StagePositions { shared: 11, own: 7 }];
++        let folded = HidingAccount { tail: 20, spent: 0 };
++        let omega = HidingAccount { tail: 18, spent: 0 };
++        let own = HidingAccount { tail: 7, spent: 0 };
++        assert!(capacity_recheck(&stages, 1, false, folded, omega, own).is_ok());
++        let own = HidingAccount { tail: 6, spent: 0 };
++        let error = capacity_recheck(&stages, 1, false, folded, omega, own).unwrap_err();
++        assert!(error.contains("request"));
++    }
++}
