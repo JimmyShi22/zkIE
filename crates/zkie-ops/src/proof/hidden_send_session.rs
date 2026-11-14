@@ -9904,6 +9904,61 @@ fn own_members(
         mask_message: Vec::new(),
         mask_tails: Vec::new(),
     });
+    if let (Some(rw), Some(first_message)) = (&plan.send.request_w, &first.request_w) {
+        let witness = witness.and_then(|witness| witness.request_w.as_ref());
+        let (message, tails) = match witness {
+            Some(witness) => {
+                let entry = witness
+                    .committed
+                    .group
+                    .entries
+                    .first()
+                    .ok_or(Error::ShapeMismatch)?;
+                if entry.oracle != rw.oracle
+                    || entry.root != first_message.root
+                    || entry.tree != rw.shape.tree_plan(0)?
+                {
+                    return Err(Error::StatementMismatch);
+                }
+                let tail_len =
+                    usize::try_from(rw.shape.code.r).map_err(|_| Error::ResourceLimit)?;
+                let rows =
+                    usize::try_from(rw.shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+                if witness.tails.len() != rows.checked_mul(tail_len).ok_or(Error::ResourceLimit)? {
+                    return Err(Error::ShapeMismatch);
+                }
+                let mut tails = Vec::with_capacity(rows);
+                for row in 0..rows {
+                    tails.push(witness.tails[row * tail_len..(row + 1) * tail_len].to_vec());
+                }
+                (
+                    witness
+                        .committed
+                        .messages
+                        .first()
+                        .ok_or(Error::ShapeMismatch)?
+                        .clone(),
+                    tails,
+                )
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        members.push(ProximityMember {
+            bat_oracle: 0,
+            source_oracle: rw.oracle,
+            main_code: rw.shape.code,
+            mask_code: plan.proximity.mask_code,
+            main_rows: rw.shape.main_rows,
+            mask_rows: 0,
+            answers: rw.shape.answers,
+            root: first_message.root,
+            tree_plan: rw.shape.tree_plan(0)?,
+            message,
+            tails,
+            mask_message: Vec::new(),
+            mask_tails: Vec::new(),
+        });
+    }
     if let Some(dot) = plan.send.dot.as_ref().filter(|_| !plan.send.activation_source.is_norm_hd()) {
         let message = first.dot.as_ref().ok_or(Error::ShapeMismatch)?;
         if message.tree != dot.tree_plan()? {
@@ -10520,6 +10575,27 @@ fn own_sample_rows(
         members,
         zkie_engine::scheduling::DEFAULT_UNITS_IN_FLIGHT,
         |member| -> Result<Vec<GuRelationRow>> {
+        if let (Some(rw), Some(message)) = (&plan.send.request_w, &first.request_w) {
+            if member.source_oracle == rw.oracle {
+                if message.sample.seed.len() != message.sample.answers.len()
+                    || message.sample.seed.len() != member.answers as usize
+                {
+                    return Err(Error::ShapeMismatch);
+                }
+                let mut rows = Vec::with_capacity(message.sample.seed.len());
+                for (seed, answer) in message.sample.seed.iter().zip(&message.sample.answers) {
+                    rows.push(oracle_sample_row(
+                        rw.oracle,
+                        rw.group,
+                        &rw.shape.oracle_shape(),
+                        std::slice::from_ref(seed),
+                        0,
+                        *answer,
+                    )?);
+                }
+                return Ok(rows);
+            }
+        }
         if let Some(norm_plan) = &plan.norm {
             if let Some(params_plan) = &norm_plan.params {
                 let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
