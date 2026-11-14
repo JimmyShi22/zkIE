@@ -291,6 +291,37 @@ impl ChainMaskReads {
     }
 }
 
+impl ChainMaskPlan {
+    /// Checks one test's opening list of the table and records it in the
+    /// table's read ledger: the count is the plan's openings, every position
+    /// lies in the tree's columns, no position repeats, and the accumulated
+    /// reads stay inside the code tail. The opening itself is checked against
+    /// the root, which this function never reads.
+    pub fn check_positions(
+        &self,
+        positions: &[u64],
+        reads: &mut ChainMaskReads,
+    ) -> Result<()> {
+        if self.fault().is_some() {
+            return Err(Error::InvalidConfig);
+        }
+        if positions.len() != self.openings {
+            return Err(Error::ShapeMismatch);
+        }
+        let columns = self.tree.columns();
+        let mut seen = std::collections::BTreeSet::new();
+        for position in positions {
+            if *position >= columns {
+                return Err(Error::InvalidIndex);
+            }
+            if !seen.insert(*position) {
+                return Err(Error::InvalidConfig);
+            }
+        }
+        reads.open(self, positions.len())
+    }
+}
+
 /// The owner binding of the sub-proof segment's mask slots: the committed
 /// member is the plan oracle and every slot maps through the chain mask
 /// layout. Duplicate slots are refused; the slots are the sub-proof's, never
@@ -1144,5 +1175,15 @@ mod chain_mask_tests {
         assert!(reads.open(&plan, 1).is_err());
         let mut zero = reads;
         assert!(zero.open(&plan, 0).is_err());
+        // One test's opening list: the plan count, positions inside the tree,
+        // no repeats, and the table's own read ledger.
+        let mut fresh = ChainMaskReads::default();
+        plan.check_positions(&[0, 1, 2, 3], &mut fresh).unwrap();
+        assert_eq!(fresh.used, 4);
+        assert!(plan.check_positions(&[0, 1, 2], &mut fresh).is_err());
+        assert!(plan.check_positions(&[0, 1, 2, 2], &mut fresh).is_err());
+        assert!(plan
+            .check_positions(&[0, 1, 2, plan.tree.columns()], &mut fresh)
+            .is_err());
     }
 }
