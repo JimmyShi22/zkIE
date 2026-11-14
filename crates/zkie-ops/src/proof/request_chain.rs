@@ -831,6 +831,14 @@ mod tests {
             ..inputs
         };
         assert!(verify_request_chain(&changed_read_inputs, &proof, &mut Source(61)).is_err());
+        // Another batch coefficient or a swapped weight slot is refused: the
+        // batch is public plan data and each slot names its own entry.
+        let changed_om = [batch.add(&Fp3::ONE)];
+        let changed_om_inputs = ChainInputs { om: &changed_om, ..inputs };
+        assert!(verify_request_chain(&changed_om_inputs, &proof, &mut Source(61)).is_err());
+        let swapped_slots = [20usize, 21, 23, 22];
+        let swapped_slot_inputs = ChainInputs { end_slots: &swapped_slots, ..inputs };
+        assert!(verify_request_chain(&swapped_slot_inputs, &proof, &mut Source(61)).is_err());
         // A changed token proof breaks the stack's start.
         let mut tampered = proof.clone();
         tampered.token.rounds[0].coefficients[0] =
