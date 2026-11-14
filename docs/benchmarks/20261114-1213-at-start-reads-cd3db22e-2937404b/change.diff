@@ -1,0 +1,230 @@
+diff --git a/crates/zkie-ops/src/proof/hidden_member.rs b/crates/zkie-ops/src/proof/hidden_member.rs
+index 78641f07..7b0330d7 100644
+--- a/crates/zkie-ops/src/proof/hidden_member.rs
++++ b/crates/zkie-ops/src/proof/hidden_member.rs
+@@ -458,6 +458,58 @@ pub struct ReductionRead {
+     pub weights: Vec<Fp3>,
+ }
+ 
++/// The reads of the reduced witness as one plan object: the caller fixes the
++/// per-entry weights, and the set is checked against the tables' geometry and
++/// coverage before any read is used.
++#[derive(Clone, Debug, PartialEq, Eq)]
++pub struct ReductionReadSet {
++    reads: Vec<ReductionRead>,
++}
++
++impl ReductionReadSet {
++    pub fn new(reads: Vec<ReductionRead>) -> Self {
++        Self { reads }
++    }
++
++    pub fn reads(&self) -> &[ReductionRead] {
++        &self.reads
++    }
++
++    /// One table's reads, cut into segments of `segment` entries: `weights[i]`
++    /// is the coefficient of entry `first_entry + i`. The caller supplies the
++    /// coefficients in entry order.
++    pub fn segmented(
++        table: usize,
++        first_entry: u64,
++        segment: u64,
++        weights: &[Fp3],
++    ) -> Result<Self> {
++        if segment == 0 || weights.is_empty() || weights.len() as u64 % segment != 0 {
++            return Err(Error::InvalidConfig);
++        }
++        let mut reads = Vec::with_capacity(weights.len() / segment as usize);
++        for (index, chunk) in weights.chunks(segment as usize).enumerate() {
++            let offset = (index as u64)
++                .checked_mul(segment)
++                .ok_or(Error::ResourceLimit)?;
++            reads.push(ReductionRead {
++                table,
++                first_entry: first_entry
++                    .checked_add(offset)
++                    .ok_or(Error::ResourceLimit)?,
++                weights: chunk.to_vec(),
++            });
++        }
++        Ok(Self { reads })
++    }
++
++    /// Checks the set against the witness plan: every entry of every table is
++    /// covered exactly once with a non-zero weight, and no read leaves a table.
++    pub fn cover(&self, plan: &ReductionWitnessPlan) -> Result<()> {
++        plan.check_reads(&self.reads)
++    }
++}
++
+ /// Where the reduced witness is in its order: built, points set, root
+ /// committed, batching challenge drawn.
+ #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+@@ -955,6 +1007,29 @@ mod tests {
+         assert!(entry_value(&[fp(1)], &[fp(1), fp(2)]).is_err());
+     }
+ 
++    #[test]
++    fn a_read_set_is_checked_against_the_witness() {
++        let mut plan = witness();
++        plan.commit_root(Digest([0x41; 32])).unwrap();
++        let weights: Vec<Fp3> = (0..8).map(|_| fp(2)).collect();
++        let reads = ReductionReadSet::segmented(0, 0, 4, &weights).unwrap();
++        assert_eq!(reads.reads().len(), 2);
++        reads.cover(&plan).unwrap();
++        // A set that stops short of the table's last entry, a read outside the
++        // table and a zero coefficient are each refused.
++        let short = ReductionReadSet::segmented(0, 0, 4, &weights[..4]).unwrap();
++        assert!(short.cover(&plan).is_err());
++        let outside = ReductionReadSet::segmented(0, 4, 4, &weights).unwrap();
++        assert!(outside.cover(&plan).is_err());
++        let mut zero = weights.clone();
++        zero[2] = Fp3::ZERO;
++        let zero = ReductionReadSet::segmented(0, 0, 4, &zero).unwrap();
++        assert!(zero.cover(&plan).is_err());
++        // A segment that does not divide the weight list is not a read set.
++        assert!(ReductionReadSet::segmented(0, 0, 3, &weights).is_err());
++        assert!(ReductionReadSet::segmented(0, 0, 0, &weights).is_err());
++    }
++
+     #[test]
+     fn reads_must_cover_each_entry_once_with_a_weight() {
+         let mut plan = witness();
+diff --git a/crates/zkie-ops/src/proof/hidden_send_session.rs b/crates/zkie-ops/src/proof/hidden_send_session.rs
+index 08afc03c..f240bc3c 100644
+--- a/crates/zkie-ops/src/proof/hidden_send_session.rs
++++ b/crates/zkie-ops/src/proof/hidden_send_session.rs
+@@ -5349,6 +5349,64 @@ impl HiddenLinPlan {
+             let _ = reason;
+             return Err(Error::InvalidConfig);
+         }
++        // When the chain carries the consumer's member relation, the index-mask
++        // message is the at_start message: it is sent in the first prover
++        // message, rides in no group of the frame, and shares no leaf with any
++        // other message or stage tree. Its mask entries must cover the pending
++        // claims' slots besides the allocation that the Eval masks use.
++        if let Some(member) = &self.send.member {
++            let index = self.send.index_mask.as_ref().ok_or(Error::InvalidConfig)?;
++            if self.norm.is_some() {
++                return Err(Error::UnsupportedPrimitive);
++            }
++            if index.mask_code != self.proximity.mask_code {
++                return Err(Error::InvalidConfig);
++            }
++            let total = index.entries.total().map_err(|_| Error::InvalidConfig)?;
++            let free = index.free_entries().map_err(|_| Error::InvalidConfig)?;
++            let needed = member.pending.masks.len();
++            if total
++                .checked_add(needed)
++                .map(|used| used > free)
++                .unwrap_or(true)
++            {
++                return Err(Error::InvalidConfig);
++            }
++            for term in &member.pending.masks {
++                let slot = usize::try_from(term.slot).map_err(|_| Error::ResourceLimit)?;
++                if slot < total || slot >= free {
++                    return Err(Error::InvalidConfig);
++                }
++            }
++            let mut most = self.send.w.leaf_class;
++            most = most.max(
++                self.send
++                    .dot
++                    .as_ref()
++                    .map_or(0, |dot| dot.shape.leaf_class),
++            );
++            most = most.max(self.proximity.gu.tree.leaf_class);
++            most = most.max(self.proximity.omega.tree.leaf_class);
++            most = most.max(self.proximity.shared_mask_tree.leaf_class);
++            most = most.max(self.proximity.own_mask_tree.leaf_class);
++            most = most.max(member.tree.leaf_class);
++            if let Some(closure) = &self.closure {
++                most = most.max(closure.slack.leaf_class);
++                most = most.max(closure.bits.leaf_class);
++                most = most.max(closure.map.leaf_class);
++                most = most.max(closure.mask.tree.leaf_class);
++            }
++            if !self.proximity.shared_stages.is_empty()
++                || !self.proximity.own_stages.is_empty()
++            {
++                most = most.max(crate::proof::multi_stage_iopp::IOPP_SWITCH_LEAF_CLASS);
++                most = most.max(crate::proof::multi_stage_iopp::IOPP_MASK_LEAF_CLASS);
++                most = most.max(crate::proof::proximity_iopp::PROXIMITY_BASE_STAR_LEAF_CLASS);
++            }
++            if index.tree.leaf_class <= most {
++                return Err(Error::InvalidConfig);
++            }
++        }
+         if self.output_relation == Some(Digest::ZERO) {
+             return Err(Error::InvalidConfig);
+         }
+diff --git a/zkie/tests/projection_consumer_diagnostic.rs b/zkie/tests/projection_consumer_diagnostic.rs
+index d639a518..f79a1bb2 100644
+--- a/zkie/tests/projection_consumer_diagnostic.rs
++++ b/zkie/tests/projection_consumer_diagnostic.rs
+@@ -568,7 +568,7 @@ fn index_mask_plan(positions: u32, mask_code: CodeParams) -> IndexMaskPlan {
+         openings: 1,
+         tree: RuntimeTreePlan {
+             tree_number: INDEX_MASK_TREE,
+-            leaf_class: 1,
++            leaf_class: 8,
+             log_n: mask_code.log_n,
+             log_n_zk: mask_code.log_n,
+             parts: vec![RuntimeTreePart {
+@@ -755,7 +755,9 @@ fn hidden_plan_for(
+         output_relation: None,
+         closure: None,
+     };
+-    plan.send.index_mask = Some(index_mask_plan(positions, mask_code));
++    let index_plan = index_mask_plan(positions, mask_code);
++    let pending_mask_slot = index_plan.entries.total().expect("mask allocation") as u64;
++    plan.send.index_mask = Some(index_plan);
+     plan.send.dot = Some(dot_plan(positions, code));
+     // The consumer's pending claim and reduced witness. The claim's weights are
+     // the first position's activation row over the matrix rows; the tables cut
+@@ -771,7 +773,7 @@ fn hidden_plan_for(
+         target: Fp3::from_u64(7),
+         masks: vec![MaskTerm {
+             oracle: INDEX_MASK_ORACLE,
+-            slot: 0,
++            slot: pending_mask_slot,
+             coeff: Fp3::from_u64(5),
+         }],
+     };
+@@ -928,6 +930,34 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
+         verify_hidden_lin_hidden(&changed_tree, session_table.reader(), &messages).is_err()
+     );
+ 
++    // The at_start mask message shares no leaf class with any other tree, its
++    // mask code is the own group's, and its entries cover the pending slots
++    // besides the Eval allocation.
++    let mut shared_class = hidden_plan.clone();
++    if let Some(index) = shared_class.send.index_mask.as_mut() {
++        index.tree.leaf_class = 7;
++    }
++    assert!(shared_class.validate().is_err());
++    let mut wrong_code = hidden_plan.clone();
++    if let Some(index) = wrong_code.send.index_mask.as_mut() {
++        index.mask_code.r = index.mask_code.r.saturating_add(1);
++    }
++    assert!(wrong_code.validate().is_err());
++    let mut low_slot = hidden_plan.clone();
++    if let Some(member) = low_slot.send.member.as_mut() {
++        for term in &mut member.pending.masks {
++            term.slot = 0;
++        }
++    }
++    assert!(low_slot.validate().is_err());
++    let mut high_slot = hidden_plan.clone();
++    if let Some(member) = high_slot.send.member.as_mut() {
++        for term in &mut member.pending.masks {
++            term.slot = 1_000_000;
++        }
++    }
++    assert!(high_slot.validate().is_err());
++
+     // The session slot after the trusted table: the canonical session
+     // encoding enters the verification package as session.bin, and the
+     // verifier consumes it from the package, not from the in-memory proof.
