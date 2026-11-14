@@ -1,0 +1,178 @@
+commit c3c8dd74688a1b37e24c8e82d5743bb6d8d0975e
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 12:22:08 2026 +0800
+
+    Add a single-map summand to the general sumcheck
+    
+    The general masked sumcheck gains a one-map summand of degree one and an inner sumcheck over a dense Boolean cube: every variable is summed plainly, so a round polynomial is linear and its two coefficients are the round's sums at the variable's two points. A focused test proves a map's cube sum, verifies it, and shows that a changed round leaves another output claim that the caller binds to committed messages.
+    
+    This is partial progress: the merge that batches weight claims uses this summand, and its transcript wiring is the next step.
+
+diff --git a/crates/zkie-ops/src/proof/psc_general.rs b/crates/zkie-ops/src/proof/psc_general.rs
+index dabc4b5b..4ea917b5 100644
+--- a/crates/zkie-ops/src/proof/psc_general.rs
++++ b/crates/zkie-ops/src/proof/psc_general.rs
+@@ -53,6 +53,8 @@ pub enum Summand {
+     Bits,
+     /// `1 + b_i (alpha - 1 - tau(point))`: no shown map, one kept map.
+     Leaves { alpha: Fp3, mu: usize },
++    /// `y_0`: one shown map, degree one. The map is summed over the cube.
++    Map,
+ }
+ 
+ impl Summand {
+@@ -63,6 +65,7 @@ impl Summand {
+             Self::TieNext => 2,
+             Self::Bits => 1,
+             Self::Leaves { .. } => 0,
++            Self::Map => 1,
+         }
+     }
+ 
+@@ -79,6 +82,7 @@ impl Summand {
+             Self::TieFirst { .. } | Self::TieNext => 3,
+             Self::Bits => 2,
+             Self::Leaves { .. } => 0,
++            Self::Map => 1,
+         }
+     }
+ 
+@@ -109,6 +113,7 @@ impl Summand {
+                     .at(table_point)?;
+                 Ok(vec![Fp3::ONE, alpha.sub(&Fp3::ONE).sub(&table_at)])
+             }
++            Self::Map => Ok(vec![shown[0]]),
+         }
+     }
+ }
+@@ -528,6 +533,63 @@ impl InnerSumcheck for ScalarInner {
+     }
+ }
+ 
++/// A single map's inner sumcheck over the Boolean cube: every variable is
++/// summed plainly, so a round polynomial is linear and its two coefficients
++/// are the round's sum at the two points of the variable.
++pub struct MapInner {
++    values: Vec<Fp3>,
++    variables: usize,
++    bound: usize,
++}
++
++impl MapInner {
++    pub fn new(values: &[Fp3]) -> Result<Self> {
++        if values.len() < 2 || !values.len().is_power_of_two() {
++            return Err(Error::InvalidConfig);
++        }
++        Ok(Self {
++            values: values.to_vec(),
++            variables: values.len().trailing_zeros() as usize,
++            bound: 0,
++        })
++    }
++}
++
++impl InnerSumcheck for MapInner {
++    fn round(&self) -> Result<Vec<Fp3>> {
++        if self.bound >= self.variables || self.values.len() % 2 != 0 {
++            return Err(Error::InvalidSessionState);
++        }
++        let mut low = Fp3::ZERO;
++        let mut high = Fp3::ZERO;
++        for pair in self.values.chunks_exact(2) {
++            low = low.add(&pair[0]);
++            high = high.add(&pair[1]);
++        }
++        Ok(vec![low, high.sub(&low)])
++    }
++
++    fn bind(&mut self, challenge: Fp3) -> Result<()> {
++        if self.bound >= self.variables || self.values.len() % 2 != 0 {
++            return Err(Error::InvalidSessionState);
++        }
++        let mut next = Vec::with_capacity(self.values.len() / 2);
++        for pair in self.values.chunks_exact(2) {
++            next.push(pair[0].add(&challenge.mul(&pair[1].sub(&pair[0]))));
++        }
++        self.values = next;
++        self.bound += 1;
++        Ok(())
++    }
++
++    fn end_values(&self) -> Result<Vec<Fp3>> {
++        if self.bound != self.variables || self.values.len() != 1 {
++            return Err(Error::InvalidSessionState);
++        }
++        Ok(vec![self.values[0]])
++    }
++}
++
+ /// The mask entries of one general sumcheck: hiding coefficients first, then
+ /// one entry for each shown map.
+ #[derive(Clone, Debug, PartialEq, Eq)]
+@@ -1035,6 +1097,66 @@ mod tests {
+         assert_eq!(proven.ends.len(), 2);
+     }
+ 
++    #[test]
++    fn a_single_map_proves_its_cube_sum() {
++        let variables = [Weight::plain(2).unwrap(), Weight::plain(2).unwrap()];
++        let values = [f(1), f(2), f(3), f(4)];
++        let target = values.iter().fold(Fp3::ZERO, |sum, value| sum.add(value));
++        let count = general_masks(&Summand::Map, &variables).unwrap();
++        let hiding = (0..hp_entries(&general_variables(&variables, &Summand::Map).unwrap()).unwrap())
++            .map(|index| f(300 + index as u64))
++            .collect::<Vec<_>>();
++        let masks = GeneralMaskEntries {
++            hiding,
++            shown: vec![f(400)],
++        };
++        assert_eq!(masks.hiding.len() + masks.shown.len(), count);
++        let mut inner = MapInner::new(&values).unwrap();
++        let (proof, proven) = prove_general(
++            &variables,
++            &[],
++            &|_| Ok(Fp3::ZERO),
++            target,
++            &Summand::Map,
++            None,
++            &mut inner,
++            &masks,
++            &mut Source(13),
++        )
++        .unwrap();
++        let verified = verify_general(
++            &variables,
++            &[],
++            target,
++            &Summand::Map,
++            None,
++            &proof,
++            masks.hiding.len(),
++            &mut Source(13),
++        )
++        .unwrap();
++        assert_eq!(proven, verified);
++        assert_eq!(proven.ends.len(), 1);
++        // A changed round is rejected.
++        // A changed round leaves another output claim; the caller binds the
++        // claim to committed messages, so the check rejects it there.
++        let mut changed = proof.clone();
++        changed.rounds[0].coefficients[0] =
++            changed.rounds[0].coefficients[0].add(&Fp3::ONE);
++        let tampered = verify_general(
++            &variables,
++            &[],
++            target,
++            &Summand::Map,
++            None,
++            &changed,
++            masks.hiding.len(),
++            &mut Source(13),
++        )
++        .unwrap();
++        assert_ne!(tampered, verified);
++    }
++
+     #[test]
+     fn bits_proves_booleanity_and_rejects_a_non_boolean_map() {
+         let variables = [Weight::plain(3).unwrap(), Weight::plain(3).unwrap()];
