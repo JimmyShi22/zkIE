@@ -14419,6 +14419,33 @@ fn request_rows(request: &RequestRows) -> Result<Vec<BatRow>> {
     Ok(rows)
 }
 
+/// The trusted-layout binding of the pending claim's mask terms: for each term,
+/// the committed member that owns the index-mask row (found by the plan's
+/// member index oracle) and the virtual entry the allocation layout gives the
+/// slot. A term on another oracle is refused, so a bare slot number is never
+/// read against a different object.
+fn pending_mask_entries(
+    plan: &HiddenLinPlan,
+    members: &[ProximityMember],
+) -> Result<Vec<(u64, u64)>> {
+    let member = plan.send.member.as_ref().ok_or(Error::InvalidConfig)?;
+    let index = plan.send.index_mask.as_ref().ok_or(Error::InvalidConfig)?;
+    let owner = members
+        .iter()
+        .find(|candidate| candidate.source_oracle == member.index_oracle)
+        .map(|candidate| candidate.bat_oracle)
+        .ok_or(Error::StatementMismatch)?;
+    let mut entries = Vec::with_capacity(member.pending.masks.len());
+    for term in &member.pending.masks {
+        if term.oracle != member.index_oracle {
+            return Err(Error::StatementMismatch);
+        }
+        let slot = usize::try_from(term.slot).map_err(|_| Error::ResourceLimit)?;
+        entries.push((owner, index.entry_virtual_index(slot)?));
+    }
+    Ok(entries)
+}
+
 /// Builds the request rows bundle from the plan's member claim and the own
 /// group's members: the request W's and Omega's member indices, the claim's
 /// point, mask entries and target, the flattened row weights and the shared
@@ -14448,18 +14475,15 @@ fn request_rows_bundle(
     let w_oracle = bat_oracle(rw.oracle)?;
     let omega = &plan.proximity.omega;
     let omega_oracle = bat_oracle(omega.oracle)?;
-    let index = plan.send.index_mask.as_ref().ok_or(Error::InvalidConfig)?;
-    let mut masks = Vec::with_capacity(pending.masks.len());
-    for term in &pending.masks {
-        if term.oracle != member.index_oracle {
-            return Err(Error::StatementMismatch);
-        }
-        masks.push((
-            bat_oracle(term.oracle)?,
-            index.entry_virtual_index(usize::try_from(term.slot).map_err(|_| Error::ResourceLimit)?)?,
-            term.coeff,
-        ));
+    let entries = pending_mask_entries(plan, members)?;
+    if entries.len() != pending.masks.len() {
+        return Err(Error::ShapeMismatch);
     }
+    let masks = entries
+        .into_iter()
+        .zip(&pending.masks)
+        .map(|((owner, entry), term)| (owner, entry, term.coeff))
+        .collect::<Vec<_>>();
     let weights = pending_row_weights(pending, plan.send.matrix_rows)?;
     let psi_star = shared_point
         .get(..k_col)
@@ -23643,6 +23667,33 @@ mod merged_tests {
         assert!(parameters
             .check(changed.send.member.as_ref().unwrap())
             .is_err());
+    }
+
+    #[test]
+    fn the_pending_slots_bind_to_the_index_mask_owner() {
+        let (plan, messages, _) = member_run();
+        let (members, _) =
+            own_members(&plan, &messages.first, &messages.shared, None, None).unwrap();
+        let entries = super::pending_mask_entries(&plan, &members).unwrap();
+        let member = plan.send.member.as_ref().unwrap();
+        let index = plan.send.index_mask.as_ref().unwrap();
+        assert_eq!(entries.len(), member.pending.masks.len());
+        let owner = members
+            .iter()
+            .find(|candidate| candidate.source_oracle == member.index_oracle)
+            .unwrap();
+        for (entry, term) in entries.iter().zip(&member.pending.masks) {
+            assert_eq!(entry.0, owner.bat_oracle);
+            assert_eq!(
+                entry.1,
+                index.entry_virtual_index(term.slot as usize).unwrap()
+            );
+        }
+        // A term on another oracle is refused: a slot never crosses objects.
+        let mut changed = plan.clone();
+        changed.send.member.as_mut().unwrap().pending.masks[0].oracle =
+            INDEX_MASK_ORACLE + 1;
+        assert!(super::pending_mask_entries(&changed, &members).is_err());
     }
 
     #[test]
