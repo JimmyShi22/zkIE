@@ -93,6 +93,37 @@ pub fn signed_cell(value: Fp) -> Result<i128> {
     Ok(cell)
 }
 
+/// The balanced base-256 limbs of one integer: `b = ((v + 128) mod 256) - 128`
+/// and `v = (v - b) / 256` per limb, so each limb is a signed byte and the
+/// integer is `sum_l 256^l b_l`. A value that does not fit the declared limb
+/// count is refused, never reduced.
+pub fn balanced_limbs(value: i128, limbs: u32) -> Result<Vec<i128>> {
+    if limbs == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let mut rest = value;
+    let mut out = Vec::with_capacity(limbs as usize);
+    for _ in 0..limbs {
+        let digit = (rest + 128).rem_euclid(256) - 128;
+        out.push(digit);
+        rest = (rest - digit) / 256;
+    }
+    if rest != 0 {
+        return Err(Error::BoundViolation);
+    }
+    Ok(out)
+}
+
+/// The smallest number of balanced base-256 limbs that reproduces `value`.
+pub fn balanced_limb_count(value: i128) -> Result<u32> {
+    for limbs in 1..=16u32 {
+        if balanced_limbs(value, limbs).is_ok() {
+            return Ok(limbs);
+        }
+    }
+    Err(Error::BoundViolation)
+}
+
 /// Packs the row-major signed integer cells of the matrix into the symbol
 /// array, row-major over `(group, column)`. Each cell must be in
 /// `(-2^18, 2^18)`; the last group holds only the valid rows. No field
@@ -594,6 +625,40 @@ mod tests {
         let mut negative = cells.clone();
         negative[0] = -1;
         assert!(combination_values(&plan, &negative, &coefficients, 0).is_err());
+    }
+
+    #[test]
+    fn the_balanced_limbs_recompose_signed_values() {
+        for value in [
+            0i128,
+            1,
+            -1,
+            127,
+            128,
+            -128,
+            -129,
+            300,
+            -300,
+            32_767,
+            -32_768,
+            1 << 40,
+            -(1 << 40),
+        ] {
+            let limbs = balanced_limb_count(value).unwrap();
+            let digits = balanced_limbs(value, limbs).unwrap();
+            assert!(digits.iter().all(|digit| (-128..=127).contains(digit)));
+            let mut recomposed = 0i128;
+            for (position, digit) in digits.iter().enumerate() {
+                recomposed += digit * 256i128.pow(position as u32);
+            }
+            assert_eq!(recomposed, value);
+        }
+        assert!(balanced_limbs(128, 1).is_err());
+        assert!(balanced_limbs(-129, 1).is_err());
+        assert!(balanced_limbs(0, 0).is_err());
+        assert_eq!(balanced_limb_count(127).unwrap(), 1);
+        assert_eq!(balanced_limb_count(128).unwrap(), 2);
+        assert_eq!(balanced_limb_count(-300).unwrap(), 2);
     }
 
     #[test]

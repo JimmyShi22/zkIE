@@ -268,34 +268,34 @@ impl ChainMaskPlan {
     }
 }
 
-/// The range-check objects of one request chain's segment: the original
-/// compute matrix in the functional's read orientation, its packed symbol
-/// array, the reduced read table and the low/high digit object of the random
-/// column combinations.
-///
-/// The matrix `matrix` is the functional's matrix: a cell row of it is a
-/// column of the table the functional reads, and a cell column of it is a
-/// table row. A functional's run over a table row is therefore a run over a
-/// cell column here, which is the orientation the reduced read table keeps.
-///
-/// The three messages are SEND value messages of the segment frame: the packed
-/// array at commit point 0, the reduced read table at commit point 1 and the
-/// digit object at commit point 2. Their roots and sample answers are proof
-/// values; every one of the three has its own oracle and tree.
+/// One limb matrix of the original computation matrix, with its packed symbol
+/// array's SEND message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeObject {
+    /// The limb matrix in the functional's read orientation: its cell rows are
+    /// the activation tensor's hidden features, its cell columns the positions.
+    pub matrix: PackedMatrixPlan,
+    pub array_oracle: u64,
+    pub array_shape: crate::proof::hidden_send_session::WShape,
+}
+
+/// The smallness objects of the original computation matrix: one packed
+/// symbol array per balanced base-256 limb, one reduced read table (U3)
+/// covering every limb's functionals, and one digit object (ZZ) whose planes
+/// cover all limb matrices at their offsets. The carrier is drawn once for the
+/// tensor's geometry. BZ and the digit lookup are not part of this object set.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RangePlan {
-    /// The original computation matrix in the functional's read orientation:
-    /// its cell rows are the activation tensor's hidden features, its cell
-    /// columns the positions. The range objects are derived from the
-    /// activation, not from the weight table.
-    pub matrix: PackedMatrixPlan,
-    /// The number of balanced base-256 limbs of the activation cells. This
-    /// step lays one range object per limb and carries a single limb; a larger
-    /// count is refused until the per-limb messages land.
-    pub limbs: u32,
-    /// The digit object's addresses: two planes over the matrix's cell rows.
+    /// One object per limb; every limb matrix has the same geometry.
+    pub objects: Vec<RangeObject>,
+    /// The digit object's addresses: two planes over the summed cell rows of
+    /// all limb matrices, each matrix at its offset.
     pub combination: RangeCombinationPlan,
-    /// The number of random column combinations, a power of two.
+    /// The number of random column combinations. The supported set is the
+    /// powers of two in `2..=256`; the carrier is drawn from the segment's
+    /// chain once, before the digit object and after every symbol array and
+    /// the reduced read table. The batching element is drawn nonzero from the
+    /// same chain after the digit object's sample answers.
     pub combinations: u32,
     /// The high digit's width. The low digit's width is the combination plan's.
     pub high_bits: u32,
@@ -303,45 +303,84 @@ pub struct RangePlan {
     /// split into the two digits.
     pub window: i128,
     pub group: u64,
-    /// The packed symbol array's SEND message.
-    pub array_oracle: u64,
-    pub array_shape: crate::proof::hidden_send_session::WShape,
     /// The reduced read table's SEND message.
     pub unit_oracle: u64,
     pub unit_shape: crate::proof::hidden_send_session::WShape,
     /// The digit object's SEND message: `combinations` rows over
-    /// `2 * matrix.rows` columns.
+    /// `2 * cell_rows()` columns.
     pub digit_oracle: u64,
     pub digit_shape: crate::proof::hidden_send_session::WShape,
 }
 
 impl RangePlan {
-    /// The number of entries of the packed symbol array before padding.
-    pub fn array_entries(&self) -> Result<u64> {
-        self.matrix
-            .groups
-            .checked_mul(self.matrix.columns)
+    /// The number of limb matrices.
+    pub fn limbs(&self) -> u64 {
+        self.objects.len() as u64
+    }
+
+    /// The cell rows of one limb matrix.
+    pub fn rows_cell(&self) -> Result<u64> {
+        self.objects
+            .first()
+            .map(|object| object.matrix.rows)
+            .ok_or(Error::InvalidConfig)
+    }
+
+    /// The cell columns of one limb matrix.
+    pub fn columns_cell(&self) -> Result<u64> {
+        self.objects
+            .first()
+            .map(|object| object.matrix.columns)
+            .ok_or(Error::InvalidConfig)
+    }
+
+    /// The summed cell rows of every limb matrix: the digit object's
+    /// per-plane column count.
+    pub fn cell_rows(&self) -> Result<u64> {
+        self.rows_cell()?
+            .checked_mul(self.limbs())
             .ok_or(Error::ResourceLimit)
     }
 
-    /// The length of the packed array's value vector: its entries padded to a
-    /// power of two.
-    pub fn array_columns(&self) -> Result<u64> {
-        self.array_entries()?
+    /// The first cell row of one limb matrix within the digit object.
+    pub fn offset(&self, limb: usize) -> Result<u64> {
+        if limb >= self.objects.len() {
+            return Err(Error::InvalidIndex);
+        }
+        (limb as u64)
+            .checked_mul(self.rows_cell()?)
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The entries of one limb's packed symbol array before padding.
+    pub fn array_entries(&self, limb: usize) -> Result<u64> {
+        let object = self.objects.get(limb).ok_or(Error::InvalidIndex)?;
+        object
+            .matrix
+            .groups
+            .checked_mul(object.matrix.columns)
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// The value-vector length of one limb's packed array: its entries padded
+    /// to a power of two.
+    pub fn array_columns(&self, limb: usize) -> Result<u64> {
+        self.array_entries(limb)?
             .checked_next_power_of_two()
             .ok_or(Error::ResourceLimit)
     }
 
     /// The number of columns of the digit object: `combinations` rows over
-    /// `2 * matrix.rows` columns.
+    /// `2 * cell_rows()` columns.
     pub fn digit_columns(&self) -> Result<u64> {
         (self.combinations as u64)
             .checked_mul(2)
-            .and_then(|value| value.checked_mul(self.matrix.rows))
+            .and_then(|value| value.checked_mul(self.cell_rows().ok()?))
             .ok_or(Error::ResourceLimit)
     }
 
-    /// The digit object's stored column of a plane and a cell row.
+    /// The digit object's stored column of a plane and a cell row. The index
+    /// is the limb matrix's offset plus its cell row.
     pub fn digit_place(&self, plane: u32, index: u64) -> Result<u64> {
         if plane >= 2 {
             return Err(Error::InvalidIndex);
@@ -388,29 +427,49 @@ impl RangePlan {
             .ok_or(Error::ResourceLimit)
     }
 
-    /// The structural checks of the three range objects. The message capacities
-    /// that depend on the member's read table are checked by the session plan.
+    /// The structural checks of the range objects. The message capacities
+    /// that depend on the member's read tables are checked by the session
+    /// plan.
     pub fn fault(&self) -> Option<&'static str> {
-        if self.group == 0
-            || self.array_oracle == 0
-            || self.unit_oracle == 0
-            || self.digit_oracle == 0
-        {
-            return Some("the range objects have no identity");
-        }
-        if self.array_oracle == self.unit_oracle
-            || self.array_oracle == self.digit_oracle
-            || self.unit_oracle == self.digit_oracle
-        {
-            return Some("two range objects share an oracle");
-        }
-        if self.matrix.rows == 0 || self.matrix.columns == 0 || self.matrix.groups == 0 {
+        let Some(first) = self.objects.first() else {
+            return Some("the range objects are empty");
+        };
+        let matrix = first.matrix;
+        if matrix.rows == 0 || matrix.columns == 0 || matrix.groups == 0 {
             return Some("the range matrix has no geometry");
         }
-        if self.limbs == 0 {
-            return Some("the range matrix has no limb");
+        if self.group == 0 || self.unit_oracle == 0 || self.digit_oracle == 0 {
+            return Some("the range objects have no identity");
         }
-        if self.combination.columns != self.matrix.rows
+        if self.unit_oracle == self.digit_oracle {
+            return Some("two range objects share an oracle");
+        }
+        let mut oracles = vec![self.unit_oracle, self.digit_oracle];
+        let mut trees = vec![self.unit_shape.tree_number, self.digit_shape.tree_number];
+        if self.unit_shape.tree_number == self.digit_shape.tree_number {
+            return Some("two range objects share a tree number");
+        }
+        for object in &self.objects {
+            if object.array_oracle == 0 {
+                return Some("a range message has no identity");
+            }
+            if object.matrix != matrix {
+                return Some("the limb matrices have different geometries");
+            }
+            if oracles.contains(&object.array_oracle) {
+                return Some("two range objects share an oracle");
+            }
+            if trees.contains(&object.array_shape.tree_number) {
+                return Some("two range objects share a tree number");
+            }
+            oracles.push(object.array_oracle);
+            trees.push(object.array_shape.tree_number);
+        }
+        let mz = match matrix.rows.checked_mul(self.limbs()) {
+            Some(value) => value,
+            None => return Some("the range matrix sizes overflow"),
+        };
+        if self.combination.columns != mz
             || self.combination.planes != 2
             || self.combination.low_bits != 10
             || self.high_bits != 8
@@ -424,18 +483,22 @@ impl RangePlan {
         {
             return Some("the combination count is not a power of two in range");
         }
-        if !self.array_shape.code.ell.is_power_of_two()
-            || !self.unit_shape.code.ell.is_power_of_two()
+        if !self.unit_shape.code.ell.is_power_of_two()
             || !self.digit_shape.code.ell.is_power_of_two()
         {
             return Some("a range message code has no power-of-two message length");
         }
-        let array_columns = match self.array_columns() {
-            Ok(columns) => columns,
-            Err(_) => return Some("the packed array size overflows"),
-        };
-        if self.array_shape.fault(array_columns, 1).is_some() {
-            return Some("the packed array message shape is not a message");
+        for (limb, object) in self.objects.iter().enumerate() {
+            if !object.array_shape.code.ell.is_power_of_two() {
+                return Some("a range message code has no power-of-two message length");
+            }
+            let array_columns = match self.array_columns(limb) {
+                Ok(columns) => columns,
+                Err(_) => return Some("the packed array size overflows"),
+            };
+            if object.array_shape.fault(array_columns, 1).is_some() {
+                return Some("the packed array message shape is not a message");
+            }
         }
         let digit_columns = match self.digit_columns() {
             Ok(columns) => columns,
@@ -448,12 +511,6 @@ impl RangePlan {
         }
         if self.digit_shape.fault(digit_columns, 1).is_some() {
             return Some("the digit message shape is not a message");
-        }
-        if self.array_shape.tree_number == self.unit_shape.tree_number
-            || self.array_shape.tree_number == self.digit_shape.tree_number
-            || self.unit_shape.tree_number == self.digit_shape.tree_number
-        {
-            return Some("two range messages share a tree number");
         }
         None
     }
@@ -1232,27 +1289,33 @@ mod tests {
             )
             .unwrap()
         };
-        let plan = RangePlan {
+        let object = |tree_number: u64, oracle: u64| RangeObject {
             matrix: PackedMatrixPlan::new(4, 2).unwrap(),
-            limbs: 1,
-            combination: RangeCombinationPlan::new(4, 2, 10, 0).unwrap(),
+            array_oracle: oracle,
+            array_shape: shape(4, 3, 4, 2, tree_number),
+        };
+        let plan = RangePlan {
+            objects: vec![object(910, 71), object(913, 74)],
+            combination: RangeCombinationPlan::new(8, 2, 10, 0).unwrap(),
             combinations: 2,
             high_bits: 8,
             window: 1i128 << 17,
             group: 7,
-            array_oracle: 71,
-            array_shape: shape(4, 3, 4, 2, 910),
             unit_oracle: 72,
             unit_shape: shape(4, 2, 4, 0, 911),
             digit_oracle: 73,
-            digit_shape: shape(16, 4, 16, 0, 912),
+            digit_shape: shape(32, 5, 32, 0, 912),
         };
         assert!(plan.fault().is_none());
+        assert_eq!(plan.limbs(), 2);
+        assert_eq!(plan.offset(1).unwrap(), 4);
+        assert_eq!(plan.cell_rows().unwrap(), 8);
         // A shared oracle or tree, another window, a combination count that is
         // not a power of two, a message that cannot carry its entries and a
-        // digit message with another row count are refused.
+        // digit message with another row count are refused. Two limb matrices
+        // must share one geometry and the digit object must cover every row.
         let mut broken = plan.clone();
-        broken.array_oracle = broken.unit_oracle;
+        broken.objects[1].array_oracle = broken.unit_oracle;
         assert!(broken.fault().is_some());
         let mut broken = plan.clone();
         broken.window = 1i128 << 16;
@@ -1261,10 +1324,16 @@ mod tests {
         broken.combinations = 3;
         assert!(broken.fault().is_some());
         let mut broken = plan.clone();
-        broken.array_shape.main_rows = 0;
+        broken.objects[0].array_shape.main_rows = 0;
         assert!(broken.fault().is_some());
         let mut broken = plan.clone();
         broken.digit_shape.main_rows = 1;
+        assert!(broken.fault().is_some());
+        let mut broken = plan.clone();
+        broken.objects[1].matrix = PackedMatrixPlan::new(4, 4).unwrap();
+        assert!(broken.fault().is_some());
+        let mut broken = plan.clone();
+        broken.combination = RangeCombinationPlan::new(4, 2, 10, 0).unwrap();
         assert!(broken.fault().is_some());
         let mut broken = plan;
         broken.unit_shape = shape(4, 2, 4, 0, 910);
