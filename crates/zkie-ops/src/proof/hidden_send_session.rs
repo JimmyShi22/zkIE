@@ -1720,6 +1720,55 @@ pub struct MemberPlan {
     pub tree: RuntimeTreePlan,
 }
 
+/// The request-level parameters re-derived from the trusted plan shapes: row
+/// and column bits, the request W's sample form, the opening and tree budget
+/// and the mask slots the pending claim consumes. The layout stays unfrozen:
+/// this is the derivation the final numbers follow, not a frozen constant set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RequestParameters {
+    pub row_bits: u32,
+    pub column_bits: u32,
+    pub sample_bits: u32,
+    pub sample_answers: u32,
+    pub openings: usize,
+    pub tree_columns: u64,
+    pub tree_number: u64,
+    pub mask_slots: usize,
+    pub mask_rows: u64,
+}
+
+impl RequestParameters {
+    /// Re-derives the request-level parameters from the plan. No value is a
+    /// frozen constant: every field follows a trusted shape.
+    pub fn derive(plan: &HiddenSendPlan) -> Result<Option<Self>> {
+        let (member, rw) = match (&plan.member, &plan.request_w) {
+            (Some(member), Some(rw)) => (member, rw),
+            (None, None) => return Ok(None),
+            _ => return Err(Error::InvalidConfig),
+        };
+        let index = plan.index_mask.as_ref().ok_or(Error::InvalidConfig)?;
+        Ok(Some(Self {
+            row_bits: plan.matrix_rows.trailing_zeros(),
+            column_bits: plan.columns.trailing_zeros(),
+            sample_bits: rw.shape.sample_bits()?,
+            sample_answers: rw.shape.answers,
+            openings: plan.openings_per_oracle,
+            tree_columns: rw.shape.tree_plan(0)?.columns(),
+            tree_number: rw.shape.tree_number,
+            mask_slots: member.pending.masks.len(),
+            mask_rows: index.mask_rows,
+        }))
+    }
+
+    /// The declared member bits must be the derived cube sizes.
+    pub fn check(&self, member: &MemberPlan) -> Result<()> {
+        if self.row_bits != member.row_bits || self.column_bits != member.column_bits {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(())
+    }
+}
+
 /// The request chain's planned table cells: one (row, column) pair per cell of
 /// each side, in panel and cell order. Trusted plan data; the cells are read on
 /// the witness stream by the same path as the reduced witness.
@@ -1817,6 +1866,9 @@ impl HiddenSendPlan {
             return Err(Error::InvalidConfig);
         }
         if let Some(member) = &self.member {
+            if let Some(parameters) = RequestParameters::derive(self)? {
+                parameters.check(member)?;
+            }
             if member.pending.psi.len() != member.column_bits as usize
                 || member.pending.weights.is_empty()
                 || member.pending.masks.is_empty()
@@ -5512,6 +5564,21 @@ impl HiddenProximityPlan {
                 spent: 0,
             });
         }
+        // The request-level W is an own object of its own: it is sampled
+        // through its own SEND oracle and opened only by the own tests.
+        if let Some(rw) = &send.request_w {
+            if rw.shape.code != self.code {
+                return Some("the request W code differs from the proximity main code");
+            }
+            own_objects.push(AssemblyOwnObject {
+                member: AssemblyMember::Fixed {
+                    main_rows: rw.shape.main_rows,
+                    mask_rows: 0,
+                },
+                shared_too: false,
+                spent: 0,
+            });
+        }
         if self.shared_stages.len() < 2 || self.own_stages.len() < 2 {
             return Some("the planner-checked plan has no complete stage list");
         }
@@ -5745,10 +5812,16 @@ impl HiddenLinPlan {
             {
                 return Err(Error::InvalidConfig);
             }
+            let mut taken = std::collections::BTreeSet::new();
             for term in &member.pending.masks {
                 let slot = usize::try_from(term.slot).map_err(|_| Error::ResourceLimit)?;
                 if slot < total || slot >= free {
                     return Err(Error::InvalidConfig);
+                }
+                // The at_start ledger takes each mask slot once: a claim that
+                // names the same slot twice would reuse one mask value.
+                if !taken.insert(slot) {
+                    return Err(Error::StatementMismatch);
                 }
             }
             let mut most = self.send.w.leaf_class;
@@ -7549,6 +7622,37 @@ fn eval_targets(
 /// the committed `W` oracles, the SEND samples, the drawn points and the Eval
 /// targets. Returns the public messages, the first seal and the private
 /// witness.
+/// The runtime take of the at_start ledger: the Eval and tilde allocation
+/// slots and the pending claim's mask slots are each taken once per run.
+fn take_mask_slots(plan: &HiddenLinPlan) -> Result<()> {
+    let Some(index) = plan.send.index_mask.as_ref() else {
+        return Ok(());
+    };
+    let mut taken = std::collections::BTreeSet::new();
+    let mut take = |slot: usize| -> Result<()> {
+        if !taken.insert(slot) {
+            return Err(Error::StatementMismatch);
+        }
+        Ok(())
+    };
+    for position in 0..plan.send.positions() {
+        take(index.entries.eval_slot(position)?)?;
+        take(index.entries.tilde_slot(position)?)?;
+    }
+    if let Some(member) = &plan.send.member {
+        let total = index.entries.total().map_err(|_| Error::InvalidConfig)?;
+        let free = index.free_entries().map_err(|_| Error::InvalidConfig)?;
+        for term in &member.pending.masks {
+            let slot = usize::try_from(term.slot).map_err(|_| Error::ResourceLimit)?;
+            if slot < total || slot >= free {
+                return Err(Error::StatementMismatch);
+            }
+            take(slot)?;
+        }
+    }
+    Ok(())
+}
+
 fn prove_first(
     plan: &HiddenLinPlan,
     activation: Option<&CommittedActivation>,
@@ -7561,6 +7665,7 @@ fn prove_first(
 ) -> Result<(HiddenSendMessages, Digest, HiddenSendWitness)> {
     let _profile_first = zkie_engine::profile::Scope::new("first.prove_first");
     plan.validate()?;
+    take_mask_slots(plan)?;
     let reader = table.reader().clone();
     check_table(&plan.send, &reader)?;
     let (reduction_root, _reduction_tree) = match &plan.send.member {
@@ -8175,6 +8280,7 @@ fn verify_first(
 ) -> Result<(Vec<EvalSampleRow>, Digest, Option<Vec<Fp3>>)> {
     let _profile = zkie_engine::profile::Scope::new("verify.first");
     plan.validate()?;
+    take_mask_slots(plan)?;
     // A fixture may pin the reduced roots as a negative-test expectation. The
     // hidden-input entry leaves them unpinned: the roots are proof values
     // absorbed into the first chain and checked through the openings below.
@@ -23339,6 +23445,42 @@ mod merged_tests {
     }
 
     #[test]
+    fn the_request_parameters_are_derived_from_the_shapes() {
+        let (plan, _, _) = member_run();
+        let parameters = super::RequestParameters::derive(&plan.send)
+            .unwrap()
+            .expect("the member plan derives request parameters");
+        let rw = plan.send.request_w.as_ref().unwrap();
+        assert_eq!(parameters.row_bits, plan.send.matrix_rows.trailing_zeros());
+        assert_eq!(parameters.column_bits, plan.send.columns.trailing_zeros());
+        assert_eq!(parameters.sample_bits, rw.shape.sample_bits().unwrap());
+        assert_eq!(parameters.sample_answers, rw.shape.answers);
+        assert_eq!(parameters.openings, plan.send.openings_per_oracle);
+        assert_eq!(parameters.tree_columns, 1u64 << rw.shape.code.log_n);
+        assert_eq!(parameters.tree_number, rw.shape.tree_number);
+        assert_eq!(
+            parameters.mask_slots,
+            plan.send.member.as_ref().unwrap().pending.masks.len()
+        );
+        assert_eq!(
+            parameters.mask_rows,
+            plan.send.index_mask.as_ref().unwrap().mask_rows
+        );
+        parameters
+            .check(plan.send.member.as_ref().unwrap())
+            .unwrap();
+        // A member whose declared bits differ from the cube sizes is refused.
+        let mut changed = plan.clone();
+        changed.send.member.as_mut().unwrap().row_bits += 1;
+        let parameters = super::RequestParameters::derive(&changed.send)
+            .unwrap()
+            .unwrap();
+        assert!(parameters
+            .check(changed.send.member.as_ref().unwrap())
+            .is_err());
+    }
+
+    #[test]
     fn the_member_and_the_request_rows_join_the_second_session() {
         let (plan, messages, witness) = member_run();
         let table = table();
@@ -23416,6 +23558,57 @@ mod merged_tests {
         let mut changed = plan.clone();
         changed.send.member.as_mut().unwrap().pending.masks[0].oracle =
             INDEX_MASK_ORACLE + 1;
+        assert!(verify_hidden_lin_hidden(&changed, &table.reader, &messages).is_err());
+        // The same mask slot twice is refused: the at_start ledger takes each
+        // slot once.
+        let mut changed = plan.clone();
+        let repeated = changed.send.member.as_ref().unwrap().pending.masks[0];
+        changed
+            .send
+            .member
+            .as_mut()
+            .unwrap()
+            .pending
+            .masks
+            .push(crate::proof::hidden_member::MaskTerm {
+                coeff: repeated.coeff.add(&Fp3::ONE),
+                ..repeated
+            });
+        assert!(verify_hidden_lin_hidden(&changed, &table.reader, &messages).is_err());
+        // A slot past the free mask entries is refused.
+        let mut changed = plan.clone();
+        let free = changed
+            .send
+            .index_mask
+            .as_ref()
+            .unwrap()
+            .free_entries()
+            .unwrap();
+        changed.send.member.as_mut().unwrap().pending.masks[0].slot = free as u64;
+        assert!(verify_hidden_lin_hidden(&changed, &table.reader, &messages).is_err());
+        // A changed fold round is rejected by the own proximity test.
+        let mut tampered = messages.clone();
+        tampered.second.fold_rounds[0].0 =
+            tampered.second.fold_rounds[0].0.add(&Fp3::ONE);
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &tampered).is_err());
+        // Another table identity (activation root) is refused by the first
+        // chain's statement.
+        let mut changed = plan.clone();
+        changed.send.activation_root = Digest([0x3C; 32]);
+        assert!(verify_hidden_lin_hidden(&changed, &table.reader, &messages).is_err());
+        // A changed reduction coefficient moves the claim's target and the Dot
+        // row away from the committed members.
+        let mut changed = plan.clone();
+        let pending = &mut changed.send.member.as_mut().unwrap().pending;
+        match pending.weights.first_mut() {
+            Some(crate::proof::hidden_member::WeightBlock::Scalar { value, .. }) => {
+                *value = value.add(&Fp3::ONE);
+            }
+            Some(crate::proof::hidden_member::WeightBlock::Dense { values, .. }) => {
+                values[0] = values[0].add(&Fp3::ONE);
+            }
+            None => panic!("the fixture has weights"),
+        }
         assert!(verify_hidden_lin_hidden(&changed, &table.reader, &messages).is_err());
         // The request W root travels in the first transcript.
         let mut tampered = messages.clone();
