@@ -1307,16 +1307,29 @@ mod chain_mask_tests {
         // The sample form reads the mask table row bits and the mask code
         // message bits.
         assert_eq!(plan.sample_bits().unwrap(), 2 + 4);
+        // A committed mask-only tree opening verifies against its root; another
+        // root is refused.
+        use zkie_engine::pcs::request::runtime_tree::{RuntimePartRows, RuntimeTree};
+        let short = 1usize << plan.tree.log_n_zk;
+        let rows = vec![vec![Fp3::from_u64(7); short]; 4];
+        let salts = vec![vec![9u8; plan.tree.salt_bytes]; plan.tree.columns() as usize];
+        let parts = [RuntimePartRows {
+            main: Vec::new(),
+            mask: rows,
+            main_deg: 3,
+        }];
+        let tree = RuntimeTree::commit(plan.tree.clone(), &parts, &salts).unwrap();
+        assert!(tree.plan().fault().is_none());
+        let opening = tree.open(&[0, 2]).unwrap();
+        verify_chain_mask_opening(&plan, tree.root(), &[0, 2], &opening).unwrap();
+        let mut wrong = *tree.root();
+        wrong.0[0] ^= 1;
+        assert!(verify_chain_mask_opening(&plan, &wrong, &[0, 2], &opening).is_err());
         // A broken table plan is refused before any opening is checked.
         let mut broken_plan = plan.clone();
         broken_plan.openings = 0;
         assert!(broken_plan.fault().is_some());
-        let opening = zkie_engine::pcs::request::runtime_tree::RuntimeTreeOpening {
-            positions: vec![0, 2],
-            columns: Vec::new(),
-            given: Vec::new(),
-        };
-        assert!(verify_chain_mask_opening(&broken_plan, &plan.tree.run, &[0, 2], &opening).is_err());
+        assert!(verify_chain_mask_opening(&broken_plan, tree.root(), &[0, 2], &opening).is_err());
         let mut fresh = ChainMaskReads::default();
         plan.check_positions(&[0, 1, 2, 3], &mut fresh).unwrap();
         assert_eq!(fresh.used, 4);
