@@ -131,6 +131,16 @@ pub struct StackAffines {
     pub shown: Vec<(usize, u64, Fp3)>,
 }
 
+/// The equality factors of a range that may be empty: an empty range has the
+/// single empty product, one.
+fn eq_range(point: &[Fp3], lo: usize, hi: usize) -> Result<Vec<Fp3>> {
+    if lo == hi {
+        Ok(vec![Fp3::ONE])
+    } else {
+        eq_low(point, lo, hi)
+    }
+}
+
 /// Builds the stack's affine recombination. `rs` holds the stack's challenge
 /// coordinates, `lam` its width in bits, `om` the batch coefficients of the
 /// panels' claims.
@@ -155,8 +165,8 @@ pub fn stack_affines(
         if w < wy {
             return Err(Error::InvalidConfig);
         }
-        let ey = eq_low(rs, 0, wy)?;
-        let ei = eq_low(rs, wy, w)?;
+        let ey = eq_range(rs, 0, wy)?;
+        let ei = eq_range(rs, wy, w)?;
         if ei.len() as u64 != panel.ni {
             return Err(Error::InvalidConfig);
         }
@@ -614,7 +624,7 @@ impl GroupInner {
                 panel.off >> panel.w,
             )?
         };
-        let ei = eq_low(&self.challenges, wy, w)?;
+        let ei = eq_range(&self.challenges, wy, w)?;
         ei.get(row).copied().ok_or(Error::ShapeMismatch).map(|value| sb.mul(&value))
     }
 }

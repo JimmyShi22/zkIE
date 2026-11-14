@@ -205,7 +205,9 @@ impl Summand {
             Self::Map => Ok(vec![shown[0]]),
             Self::ShownKept => Ok(vec![Fp3::ZERO, shown[0]]),
             Self::PanelProduct { lam, panels } => {
-                if point.len() != *lam as usize {
+                // The last round passes the point with the further variable
+                // appended; the geometry uses the X coordinates only.
+                if point.len() < *lam as usize {
                     return Err(Error::ShapeMismatch);
                 }
                 let mut bs = shown[1];

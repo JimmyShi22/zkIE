@@ -17,7 +17,9 @@ use crate::proof::psc_general::{
     GeneralChallenges, GeneralMaskEntries, GeneralOutput, GeneralProof, MaskTerm,
 };
 use crate::proof::request_reduction::{prove_token_kept, verify_token_kept};
-use crate::proof::request_stack::{prove_stack, verify_stack, StackReduction};
+use crate::proof::request_stack::{
+    prove_stack_group, verify_stack_group, GroupValues, StackReduction,
+};
 use crate::proof::request_start::{token_start, StartForm};
 use crate::proof::request_weights::{
     prove_merge, verify_merge, MergeValue, WeightClaim, WeightLayout,
@@ -108,7 +110,8 @@ pub struct ChainInputs<'a> {
     pub layout: &'a WeightLayout,
     pub claims: &'a [WeightClaim],
     pub claim_maps: &'a [Vec<Fp3>],
-    pub values: &'a [MergeValue],
+    /// One mask-row slot per sent end value, in the group's order.
+    pub end_slots: &'a [usize],
     pub merge_masks: &'a GeneralMaskEntries,
     pub mask_value: &'a dyn Fn(usize) -> Result<Fp3>,
     pub index_oracle: u64,
@@ -219,6 +222,51 @@ fn start_form(token: &GeneralOutput, epsilon: Fp3, inputs: &ChainInputs) -> Resu
     )
 }
 
+/// Derives the hidden end group from the received end values. Every end value
+/// carries the same factor, each slot's entry must be the mask the stack used,
+/// and a hidden value is the sent one minus the factor times its entry. The
+/// merge's input values are the sent weight values with their slots and the
+/// stack's factor.
+fn group_from_ends(
+    output: &GeneralOutput,
+    masks: &GeneralMaskEntries,
+    end_slots: &[usize],
+    mask_value: &dyn Fn(usize) -> Result<Fp3>,
+) -> Result<(GroupValues, Vec<MergeValue>, Fp3)> {
+    if output.ends.len() < 2
+        || output.ends.len() != end_slots.len()
+        || masks.shown.len() != output.ends.len()
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let beta = output.ends[0].mask_scale;
+    let mut hidden = Vec::with_capacity(output.ends.len());
+    for (index, (end, slot)) in output.ends.iter().zip(end_slots).enumerate() {
+        if end.mask_scale != beta {
+            return Err(Error::StatementMismatch);
+        }
+        let entry = mask_value(*slot)?;
+        if entry != masks.shown[index] {
+            return Err(Error::StatementMismatch);
+        }
+        hidden.push(end.value.sub(&beta.mul(&entry)));
+    }
+    let values = output.ends[2..]
+        .iter()
+        .zip(&end_slots[2..])
+        .map(|(end, slot)| MergeValue::from_stack_end(end.value, *slot, beta))
+        .collect();
+    Ok((
+        GroupValues {
+            a0: hidden[0],
+            b0: hidden[1],
+            v: hidden[2..].to_vec(),
+        },
+        values,
+        beta,
+    ))
+}
+
 /// Proves one request chain in the order the transcript carries it: the kept
 /// token sumcheck, the batched stack whose start absorbs the token claim, and
 /// the weight merge. The prover checks its own row claims before handing them
@@ -247,7 +295,7 @@ pub fn prove_request_chain(
     };
     let start = start_form(&token_output, epsilon, inputs)?;
     let terms = start_terms(&start);
-    let (stack, stack_output) = prove_stack(
+    let (stack, stack_output) = prove_stack_group(
         inputs.reduction,
         inputs.stack_left,
         inputs.stack_right,
@@ -258,11 +306,24 @@ pub fn prove_request_chain(
         inputs.stack_masks,
         challenges,
     )?;
+    let (group, values, _beta) = group_from_ends(
+        &stack_output,
+        inputs.stack_masks,
+        inputs.end_slots,
+        inputs.mask_value,
+    )?;
+    inputs.reduction.group_bases(
+        inputs.stack_left,
+        inputs.stack_right,
+        inputs.om,
+        &stack_output.point,
+        &group,
+    )?;
     let outcome = prove_merge(
         inputs.layout,
         inputs.claims,
         inputs.claim_maps,
-        inputs.values,
+        &values,
         inputs.mask_value,
         inputs.merge_masks,
         challenges,
@@ -310,7 +371,7 @@ pub fn verify_request_chain(
     };
     let start = start_form(&token, epsilon, inputs)?;
     let terms = start_terms(&start);
-    let stack = verify_stack(
+    let stack = verify_stack_group(
         inputs.reduction,
         &terms,
         start.constant,
@@ -318,10 +379,23 @@ pub fn verify_request_chain(
         inputs.stack_masks.hiding.len(),
         challenges,
     )?;
+    let (group, values, _beta) = group_from_ends(
+        &stack,
+        inputs.stack_masks,
+        inputs.end_slots,
+        inputs.mask_value,
+    )?;
+    inputs.reduction.group_bases(
+        inputs.stack_left,
+        inputs.stack_right,
+        inputs.om,
+        &stack.point,
+        &group,
+    )?;
     let (merge, _rows, gamma) = verify_merge(
         inputs.layout,
         inputs.claims,
-        inputs.values,
+        &values,
         &proof.merge,
         inputs.merge_masks.hiding.len(),
         challenges,
@@ -466,10 +540,10 @@ mod tests {
     }
 
     fn chain_mask(slot: usize) -> Result<Fp3> {
-        if slot == 3 {
+        if (20..24).contains(&slot) {
+            Ok(f(800 + (slot - 20) as u64))
+        } else if slot == 3 {
             Ok(f(953))
-        } else if slot == 0 || slot == 1 {
-            Ok(Fp3::ZERO)
         } else if slot >= START_HIDING_SLOT {
             Ok(f(700 + (slot - START_HIDING_SLOT) as u64))
         } else {
@@ -535,31 +609,56 @@ mod tests {
             hidden_cstart =
                 hidden_cstart.sub(&term.coefficient.mul(&chain_mask(term.slot).unwrap()));
         }
-        let panel_value = hidden_cstart.mul(&batch.inverse().unwrap());
-        let reduction = StackReduction::new(vec![StackPanel {
-            claim: 0,
-            ec: Fp3::ONE,
-            ni: 2,
-            ny: 1,
-            weight: vec![Fp3::ONE, Fp3::ONE],
-            first_claim: None,
-            w: 0,
-            off: 0,
-        }])
+        let reduction = StackReduction::new(vec![
+            StackPanel {
+                claim: 0,
+                ec: Fp3::ONE,
+                ni: 2,
+                ny: 1,
+                weight: vec![Fp3::ONE, Fp3::ONE],
+                first_claim: None,
+                w: 0,
+                off: 0,
+            },
+            StackPanel {
+                claim: 0,
+                ec: Fp3::ONE,
+                ni: 2,
+                ny: 1,
+                weight: vec![Fp3::ONE, Fp3::ONE],
+                first_claim: Some(0),
+                w: 0,
+                off: 0,
+            },
+        ])
         .unwrap();
-        let stack_left = vec![vec![panel_value, Fp3::ZERO]];
-        let stack_right = vec![vec![Fp3::ONE, Fp3::ONE]];
+        // The weight panel's rows are the merge's hidden values.
+        let stack_right = vec![vec![Fp3::ONE, Fp3::ONE], vec![f(10), f(20)]];
+        // The packed product equals the hidden start: the read panel carries
+        // the balance after the weight rows' contribution.
+        let panel_value = hidden_cstart
+            .sub(&batch.mul(&f(30)))
+            .mul(&batch.inverse().unwrap());
+        let stack_left = vec![
+            vec![panel_value, Fp3::ZERO],
+            vec![Fp3::ONE, Fp3::ONE],
+        ];
         let om = vec![batch];
         let stack_variables = (0..reduction.lam)
             .map(|_| crate::proof::psc::Weight::plain(3))
             .collect::<Result<Vec<_>>>()
             .unwrap();
+        let stack_summand = Summand::PanelProduct {
+            lam: reduction.lam,
+            panels: reduction.panel_ends(),
+        };
         let stack_masks = GeneralMaskEntries {
-            hiding: (0..hiding_count(&stack_variables, &Summand::Product))
+            hiding: (0..hiding_count(&stack_variables, &stack_summand))
                 .map(|i| f(600 + i as u64))
                 .collect(),
-            shown: vec![f(810), f(811)],
+            shown: vec![f(800), f(801), f(802), f(803)],
         };
+        let end_slots = [20usize, 21, 22, 23];
         // The weight merge: two claims over a two-bit column cube.
         let mut layout = WeightLayout::new(2).unwrap();
         layout
@@ -617,7 +716,7 @@ mod tests {
             layout: &layout,
             claims: &claims,
             claim_maps: &maps,
-            values: &values,
+            end_slots: &end_slots,
             merge_masks: &merge_masks,
             mask_value: &chain_mask,
             index_oracle: 60,
