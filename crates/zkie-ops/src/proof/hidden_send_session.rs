@@ -3083,6 +3083,39 @@ pub struct HiddenSendOutcome {
     pub chain_value: Digest,
 }
 
+/// The planned table cells of the consumer's reads, from the same stream and
+/// the same row/cell layout as the reduced witness: one pass over the rows,
+/// each cell taken from the message before the run reductions. The reads are
+/// (row, column) pairs in nondecreasing row order; every column must be inside
+/// the plan's columns and every row inside the matrix.
+pub fn source_reads(
+    plan: &HiddenSendPlan,
+    reads: &[(u64, u64)],
+    source: &mut dyn TableRowSource,
+) -> Result<Vec<Fp3>> {
+    let ell = usize::try_from(plan.table_shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let tail_len = usize::try_from(plan.table_shape.code.r).map_err(|_| Error::ResourceLimit)?;
+    let columns = usize::try_from(plan.columns).map_err(|_| Error::ResourceLimit)?;
+    if reads.windows(2).any(|pair| pair[0].0 > pair[1].0) {
+        return Err(Error::InvalidConfig);
+    }
+    let mut message = vec![Fp::ZERO; ell];
+    let mut tail = vec![Fp::ZERO; tail_len];
+    let mut values = Vec::with_capacity(reads.len());
+    let mut row = 0u64;
+    for &(want_row, want_column) in reads {
+        if want_row >= plan.matrix_rows || want_column as usize >= columns {
+            return Err(Error::BoundViolation);
+        }
+        while row <= want_row {
+            source.row(row, &mut message, &mut tail)?;
+            row += 1;
+        }
+        values.push(Fp3::from_base(message[want_column as usize]));
+    }
+    Ok(values)
+}
+
 /// The salt-derivation purpose of the reduced-witness tree.
 const REDUCTION_SALT_PURPOSE: u64 = 16;
 
@@ -19143,6 +19176,24 @@ mod tests {
             &mut SectionSource(3)
         )
         .is_err());
+    }
+
+    #[test]
+    fn the_source_reads_follow_the_witness_stream() {
+        let fixture = fixture();
+        let messages = table_messages();
+        let tails = table_tails();
+        let mut source = VecTableSource::new(messages.clone(), tails).unwrap();
+        let reads = [(0u64, 0u64), (0, 1), (1, 2)];
+        let values = super::source_reads(&fixture.plan, &reads, &mut source).unwrap();
+        assert_eq!(values[0], Fp3::from_base(messages[0][0]));
+        assert_eq!(values[1], Fp3::from_base(messages[0][1]));
+        assert_eq!(values[2], Fp3::from_base(messages[1][2]));
+        // Out-of-range cells and unsorted rows are refused.
+        let mut source = VecTableSource::new(messages.clone(), table_tails()).unwrap();
+        assert!(super::source_reads(&fixture.plan, &[(0, COLUMNS as u64)], &mut source).is_err());
+        let mut source = VecTableSource::new(messages.clone(), table_tails()).unwrap();
+        assert!(super::source_reads(&fixture.plan, &[(1, 0), (0, 0)], &mut source).is_err());
     }
 
 }
