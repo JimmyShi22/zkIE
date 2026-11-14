@@ -23,6 +23,7 @@ pub mod output_head_lin;
 pub mod output_closure;
 pub mod plan;
 pub mod proximity_session;
+pub mod digit_lookup;
 pub mod packed_matrix;
 pub mod psc;
 pub mod psc_general;
