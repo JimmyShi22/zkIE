@@ -234,6 +234,88 @@ pub fn claim_of(pending: &[PendingRow], coefficients: &[Fp3]) -> Result<Combined
     })
 }
 
+/// The multilinear extension of one matrix row at the column point: bit `j`
+/// of the column index pairs with `psi[j]`, the lowest column bit first.
+pub fn row_at(row: &[Fp3], psi: &[Fp3]) -> Result<Fp3> {
+    if psi.is_empty() || psi.len() >= 32 || row.len() != (1usize << psi.len()) {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut value = Fp3::ZERO;
+    for (index, entry) in row.iter().enumerate() {
+        let mut factor = Fp3::ONE;
+        for (bit, coordinate) in psi.iter().enumerate() {
+            let chosen = if (index >> bit) & 1 == 1 {
+                *coordinate
+            } else {
+                Fp3::ONE.sub(coordinate)
+            };
+            factor = factor.mul(&chosen);
+        }
+        value = value.add(&factor.mul(entry));
+    }
+    Ok(value)
+}
+
+/// The pending claim's left side: the row weights against the matrix rows at
+/// the column point, plus the index-mask entries.
+pub fn pending_value(
+    pending: &PendingRow,
+    matrix: &[Vec<Fp3>],
+    mask_value: &dyn Fn(u64, u64) -> Result<Fp3>,
+) -> Result<Fp3> {
+    if pending.weights.is_empty() {
+        return Err(Error::InvalidConfig);
+    }
+    let cube = 1u64 << pending.row_bits()?;
+    let mut value = Fp3::ZERO;
+    for block in &pending.weights {
+        match block {
+            WeightBlock::Scalar { row, value: weight } => {
+                if *row >= cube {
+                    return Err(Error::BoundViolation);
+                }
+                let row_values = matrix.get(*row as usize).ok_or(Error::ShapeMismatch)?;
+                value = value.add(&weight.mul(&row_at(row_values, &pending.psi)?));
+            }
+            WeightBlock::Dense {
+                first_row,
+                log_rows,
+                values,
+            } => {
+                if values.len() as u64 != 1u64 << log_rows {
+                    return Err(Error::ShapeMismatch);
+                }
+                for (offset, weight) in values.iter().enumerate() {
+                    let row = first_row
+                        .checked_add(offset as u64)
+                        .ok_or(Error::ResourceLimit)?;
+                    if row >= cube {
+                        return Err(Error::BoundViolation);
+                    }
+                    let row_values = matrix.get(row as usize).ok_or(Error::ShapeMismatch)?;
+                    value = value.add(&weight.mul(&row_at(row_values, &pending.psi)?));
+                }
+            }
+        }
+    }
+    for term in &pending.masks {
+        value = value.add(&term.coeff.mul(&mask_value(term.oracle, term.slot)?));
+    }
+    Ok(value)
+}
+
+/// Checks the pending claim: the left side must equal the target.
+pub fn check_pending(
+    pending: &PendingRow,
+    matrix: &[Vec<Fp3>],
+    mask_value: &dyn Fn(u64, u64) -> Result<Fp3>,
+) -> Result<()> {
+    if pending_value(pending, matrix, mask_value)? != pending.target {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
 /// The merge that batches a sub-proof's weight claims into one pending claim.
 /// The claims' end values are registered as slots first; one challenge batches
 /// them, a product-sumcheck over the matrix column bits gives the point, and
@@ -1070,5 +1152,74 @@ mod tests {
                 weights: vec![fp(1)],
             }])
             .is_err());
+    }
+
+    #[test]
+    fn the_column_point_pairs_bits_low_first() {
+        let row = [fp(10), fp(20), fp(30), fp(40)];
+        let zero = fp(0);
+        let one = fp(1);
+        assert_eq!(row_at(&row, &[zero, zero]).unwrap(), fp(10));
+        assert_eq!(row_at(&row, &[one, zero]).unwrap(), fp(20));
+        assert_eq!(row_at(&row, &[zero, one]).unwrap(), fp(30));
+        assert_eq!(row_at(&row, &[one, one]).unwrap(), fp(40));
+        assert!(row_at(&row, &[]).is_err());
+        assert!(row_at(&row[..3], &[zero, zero]).is_err());
+    }
+
+    #[test]
+    fn the_pending_claim_holds_on_the_matrix_and_masks() {
+        // Four rows of four columns; the column point is zero, so each row's
+        // value is its first column.
+        let matrix: Vec<Vec<Fp3>> = (0..4)
+            .map(|row| {
+                (0..4)
+                    .map(|column| fp(1 + 4 * row as u64 + column as u64))
+                    .collect()
+            })
+            .collect();
+        let weights = stretch_weights(2, 0, &[fp(2), fp(3), fp(5), fp(7)]).unwrap();
+        let zero = fp(0);
+        let mask_value = |oracle: u64, slot: u64| Ok(fp(oracle + slot + 100));
+        let pending = PendingRow {
+            weights,
+            psi: vec![zero, zero],
+            target: fp(2 * 1 + 3 * 5 + 5 * 9 + 7 * 13 + 7 * (60 + 3 + 100)),
+            masks: vec![MaskTerm {
+                oracle: 60,
+                slot: 3,
+                coeff: fp(7),
+            }],
+        };
+        check_pending(&pending, &matrix, &mask_value).unwrap();
+        // Another matrix value or mask value breaks the claim.
+        let mut changed = matrix.clone();
+        changed[1][0] = changed[1][0].add(&fp(1));
+        assert!(check_pending(&pending, &changed, &mask_value).is_err());
+        let other_mask = |oracle: u64, slot: u64| Ok(fp(oracle + slot + 101));
+        assert!(check_pending(&pending, &matrix, &other_mask).is_err());
+        // A scalar block with a gap and a block outside the row cube.
+        let scalar = PendingRow {
+            weights: vec![WeightBlock::Scalar {
+                row: 1,
+                value: fp(3),
+            }],
+            psi: vec![zero, zero],
+            target: fp(3 * 5 + 7 * (60 + 3 + 100)),
+            masks: vec![MaskTerm {
+                oracle: 60,
+                slot: 3,
+                coeff: fp(7),
+            }],
+        };
+        check_pending(&scalar, &matrix, &mask_value).unwrap();
+        let outside = PendingRow {
+            weights: vec![WeightBlock::Scalar {
+                row: 4,
+                value: fp(3),
+            }],
+            ..scalar.clone()
+        };
+        assert!(check_pending(&outside, &matrix, &mask_value).is_err());
     }
 }
