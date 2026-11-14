@@ -14163,11 +14163,52 @@ fn eq_vector(point: &[Fp3]) -> Result<Vec<Fp3>> {
     Ok(values)
 }
 
+/// The flat layout of one table message: `main_rows` rows of the code's `ell`
+/// places, entry `j` at row `j mod main_rows`, place `j div main_rows`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TableLayout {
+    main_rows: u64,
+    ell: u64,
+}
+
+impl TableLayout {
+    fn of(shape: &WShape) -> Self {
+        Self {
+            main_rows: shape.main_rows,
+            ell: shape.code.ell,
+        }
+    }
+
+    /// The table of a coefficient vector on this layout: `column` carries the
+    /// coefficient of entry `column`.
+    fn scatter(self, columns: u64, coefficients: &[Fp3]) -> Result<Vec<Fp3>> {
+        let rows = usize::try_from(self.main_rows).map_err(|_| Error::ResourceLimit)?;
+        let ell = usize::try_from(self.ell).map_err(|_| Error::ResourceLimit)?;
+        let mut values = vec![Fp3::ZERO; rows.checked_mul(ell).ok_or(Error::ResourceLimit)?];
+        for (column, coefficient) in coefficients
+            .iter()
+            .enumerate()
+            .take(usize::try_from(columns).map_err(|_| Error::ResourceLimit)?)
+        {
+            if coefficient.is_zero() {
+                continue;
+            }
+            let row = column % rows;
+            let place = column / rows;
+            let slot = values
+                .get_mut(row * ell + place)
+                .ok_or(Error::ShapeMismatch)?;
+            *slot = *coefficient;
+        }
+        to_bat_table(&values, self.main_rows, self.ell)
+    }
+}
+
 /// The request's (Eval) row: the request-level W at the claim's column point,
 /// on the W message's own layout, plus the claim's mask slots, against the
 /// claim's target.
 fn request_eval_row(
-    shape: &WShape,
+    layout: TableLayout,
     columns: u64,
     w_oracle: u64,
     psi: &[Fp3],
@@ -14179,11 +14220,7 @@ fn request_eval_row(
         return Err(Error::ShapeMismatch);
     }
     let mut row = BatRow::new(BatRowKind::Plain);
-    row.add_term(
-        w_oracle,
-        BatPart::Main,
-        scatter_message_coefficients(shape, columns, &eq)?,
-    );
+    row.add_term(w_oracle, BatPart::Main, layout.scatter(columns, &eq)?);
     for (oracle, index, coefficient) in masks {
         row.add_unit(*oracle, BatPart::Mask, *index, *coefficient);
     }
@@ -14195,11 +14232,11 @@ fn request_eval_row(
 /// shared point, against zero.
 #[allow(clippy::too_many_arguments)]
 fn request_dot_row(
-    omega_shape: &WShape,
+    omega: TableLayout,
     omega_columns: u64,
     omega_oracle: u64,
     weights: &[Fp3],
-    w_shape: &WShape,
+    w: TableLayout,
     w_columns: u64,
     w_oracle: u64,
     psi_star: &[Fp3],
@@ -14208,57 +14245,119 @@ fn request_dot_row(
     if eq.len() as u64 > w_columns {
         return Err(Error::ShapeMismatch);
     }
+    // The W side enters negated: `<g, Omega> - W(psi*) = 0` is the LIN Dot row.
+    let negated: Vec<Fp3> = eq.iter().map(|value| Fp3::ZERO.sub(value)).collect();
     let mut row = BatRow::new(BatRowKind::Plain);
     row.add_term(
         omega_oracle,
         BatPart::Main,
-        scatter_message_coefficients(omega_shape, omega_columns, weights)?,
+        omega.scatter(omega_columns, weights)?,
     );
-    row.add_term(
-        w_oracle,
-        BatPart::Main,
-        scatter_message_coefficients(w_shape, w_columns, &eq)?,
-    );
+    row.add_term(w_oracle, BatPart::Main, w.scatter(w_columns, &negated)?);
     Ok(row)
 }
 
 /// The inputs of the request's two LIN rows: the request W member and its
 /// claim, and the Omega member with the row weights and the shared point.
-struct RequestRows<'a> {
+struct RequestRows {
     w_oracle: u64,
-    w_shape: &'a WShape,
+    w_layout: TableLayout,
     w_columns: u64,
-    psi: &'a [Fp3],
-    masks: &'a [(u64, u64, Fp3)],
+    psi: Vec<Fp3>,
+    masks: Vec<(u64, u64, Fp3)>,
     target: Fp3,
     omega_oracle: u64,
-    omega_shape: &'a WShape,
+    omega_layout: TableLayout,
     omega_columns: u64,
-    weights: &'a [Fp3],
-    psi_star: &'a [Fp3],
+    weights: Vec<Fp3>,
+    psi_star: Vec<Fp3>,
 }
 
 fn request_rows(request: &RequestRows) -> Result<Vec<BatRow>> {
     let mut rows = Vec::with_capacity(2);
     rows.push(request_eval_row(
-        request.w_shape,
+        request.w_layout,
         request.w_columns,
         request.w_oracle,
-        request.psi,
-        request.masks,
+        &request.psi,
+        &request.masks,
         request.target,
     )?);
     rows.push(request_dot_row(
-        request.omega_shape,
+        request.omega_layout,
         request.omega_columns,
         request.omega_oracle,
-        request.weights,
-        request.w_shape,
+        &request.weights,
+        request.w_layout,
         request.w_columns,
         request.w_oracle,
-        request.psi_star,
+        &request.psi_star,
     )?);
     Ok(rows)
+}
+
+/// Builds the request rows bundle from the plan's member claim and the own
+/// group's members: the request W's and Omega's member indices, the claim's
+/// point, mask entries and target, the flattened row weights and the shared
+/// point.
+fn request_rows_bundle(
+    plan: &HiddenLinPlan,
+    members: &[ProximityMember],
+    shared_point: &[Fp3],
+) -> Result<Option<RequestRows>> {
+    let rw = match &plan.send.request_w {
+        Some(rw) => *rw,
+        None => return Ok(None),
+    };
+    let member = plan.send.member.as_ref().ok_or(Error::InvalidConfig)?;
+    let pending = &member.pending;
+    let k_col = plan.send.columns.trailing_zeros() as usize;
+    if pending.psi.len() != k_col {
+        return Err(Error::ShapeMismatch);
+    }
+    let bat_oracle = |oracle: u64| -> Result<u64> {
+        members
+            .iter()
+            .find(|m| m.source_oracle == oracle)
+            .map(|m| m.bat_oracle)
+            .ok_or(Error::StatementMismatch)
+    };
+    let w_oracle = bat_oracle(rw.oracle)?;
+    let omega = &plan.proximity.omega;
+    let omega_oracle = bat_oracle(omega.oracle)?;
+    let index = plan.send.index_mask.as_ref().ok_or(Error::InvalidConfig)?;
+    let mut masks = Vec::with_capacity(pending.masks.len());
+    for term in &pending.masks {
+        if term.oracle != member.index_oracle {
+            return Err(Error::StatementMismatch);
+        }
+        masks.push((
+            bat_oracle(term.oracle)?,
+            index.entry_virtual_index(usize::try_from(term.slot).map_err(|_| Error::ResourceLimit)?)?,
+            term.coeff,
+        ));
+    }
+    let weights = pending_row_weights(pending, plan.send.matrix_rows)?;
+    let psi_star = shared_point
+        .get(..k_col)
+        .ok_or(Error::ShapeMismatch)?
+        .to_vec();
+    Ok(Some(RequestRows {
+        w_oracle,
+        w_layout: TableLayout::of(&rw.shape),
+        w_columns: rw.columns,
+        psi: pending.psi.clone(),
+        masks,
+        target: pending.target,
+        omega_oracle,
+        omega_layout: TableLayout {
+            main_rows: omega.u.main_rows,
+            ell: omega.u.code.ell,
+        },
+        omega_columns: plan.send.matrix_rows,
+        weights,
+        psi_star,
+    }))
 }
 
 fn scatter_message_coefficients(
@@ -17066,6 +17165,7 @@ fn prove_second(
     let sample_rows = own_sample_rows(plan, &members, first, shared)?;
     drop(_profile_sample_rows);
     let _profile_plain_rows = zkie_engine::profile::Scope::new("second.plain_rows");
+    let request_bundle = request_rows_bundle(plan, &members, shared_point)?;
     let plain_rows = own_plain_rows(
         plan,
         &members,
@@ -17075,7 +17175,7 @@ fn prove_second(
         dot_binding.as_ref(),
         closure_binding.as_ref(),
         norm_binding.as_ref(),
-        None,
+        request_bundle.as_ref(),
     )?;
     drop(_profile_plain_rows);
     let fold = member_fold_shape(
@@ -17455,6 +17555,7 @@ fn verify_second(
         _ => return Err(Error::ShapeMismatch),
     };
     let _profile_plain_rows = zkie_engine::profile::Scope::new("verify.second.plain_rows");
+    let request_bundle = request_rows_bundle(plan, &members, shared_point)?;
     let plain_rows = own_plain_rows(
         plan,
         &members,
@@ -17464,7 +17565,7 @@ fn verify_second(
         dot_binding.as_ref(),
         closure_binding.as_ref(),
         norm_binding.as_ref(),
-        None,
+        request_bundle.as_ref(),
     )?;
     drop(_profile_plain_rows);
     let fold = member_fold_shape(
@@ -19663,16 +19764,16 @@ mod tests {
         let weights = [Fp3::from_u64(1), Fp3::from_u64(2)];
         let request = super::RequestRows {
             w_oracle: 123,
-            w_shape: &shape,
+            w_layout: super::TableLayout::of(&shape),
             w_columns: 4,
-            psi: &psi,
-            masks: &masks,
+            psi: psi.to_vec(),
+            masks: masks.to_vec(),
             target: Fp3::from_u64(99),
             omega_oracle: 124,
-            omega_shape: &shape,
+            omega_layout: super::TableLayout::of(&shape),
             omega_columns: 4,
-            weights: &weights,
-            psi_star: &psi_star,
+            weights: weights.to_vec(),
+            psi_star: psi_star.to_vec(),
         };
         let rows = super::request_rows(&request).unwrap();
         assert_eq!(rows.len(), 2);
@@ -19690,7 +19791,7 @@ mod tests {
         let psi = [Fp3::from_u64(2), Fp3::from_u64(3)];
         let eq = super::eq_vector(&psi).unwrap();
         let row = super::request_eval_row(
-            &shape,
+            super::TableLayout::of(&shape),
             4,
             123,
             &psi,
@@ -19707,11 +19808,11 @@ mod tests {
         );
         let psi_star = [Fp3::from_u64(4), Fp3::from_u64(5)];
         let dot = super::request_dot_row(
-            &shape,
+            super::TableLayout::of(&shape),
             4,
             124,
             &[Fp3::from_u64(1), Fp3::from_u64(2)],
-            &shape,
+            super::TableLayout::of(&shape),
             4,
             123,
             &psi_star,
@@ -19719,13 +19820,20 @@ mod tests {
         .unwrap();
         assert_eq!(dot.terms.len(), 2);
         assert_eq!(dot.target, Fp3::ZERO);
+        let negated: Vec<Fp3> = super::eq_vector(&psi_star)
+            .unwrap()
+            .iter()
+            .map(|value| Fp3::ZERO.sub(value))
+            .collect();
         assert_eq!(
             dot.terms[1].values,
-            super::scatter_message_coefficients(&shape, 4, &super::eq_vector(&psi_star).unwrap())
-                .unwrap()
+            super::scatter_message_coefficients(&shape, 4, &negated).unwrap()
         );
         // A point wider than the vector is refused.
-        assert!(super::request_eval_row(&shape, 1, 123, &psi, &[], Fp3::ONE).is_err());
+        assert!(
+            super::request_eval_row(super::TableLayout::of(&shape), 1, 123, &psi, &[], Fp3::ONE)
+                .is_err()
+        );
     }
 
     #[test]
