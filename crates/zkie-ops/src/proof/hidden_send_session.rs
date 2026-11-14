@@ -4292,6 +4292,141 @@ fn absorb_eval(chain: &mut Chain, plan: &HiddenSendPlan, targets: &[Fp3]) -> Res
     Ok(())
 }
 
+/// The chain-backed challenge source of the first-chain sub-proof segment:
+/// every segment message is absorbed before the challenge that tests it is
+/// drawn. The tags are the segment's own, distinct from the product sumcheck
+/// and the mask table entries.
+struct ChainSegmentChallenges<'a> {
+    chain: &'a mut Chain,
+}
+
+impl crate::proof::psc_general::GeneralChallenges for ChainSegmentChallenges<'_> {
+    fn draw(&mut self) -> Result<Fp3> {
+        self.chain.draw_e()
+    }
+
+    fn draw_nonzero(&mut self) -> Result<Fp3> {
+        self.chain.draw_e_nonzero()
+    }
+
+    fn send_hiding_sum(&mut self, value: Fp3) -> Result<()> {
+        absorb_segment_tagged_fp3(self.chain, 24, KIND_ALGEBRAIC, &value)
+    }
+
+    fn send_round(&mut self, index: usize, round: &crate::proof::psc::PscRound) -> Result<()> {
+        let mut message = self.chain.message();
+        message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+        message.push_u64(25);
+        message.push_u64(index as u64);
+        message.push_u64(round.coefficients.len() as u64);
+        for coefficient in &round.coefficients {
+            message.push_fp3(coefficient);
+        }
+        let prefix = message.prefix(KIND_ALGEBRAIC, 0)?;
+        if !self.chain.step(&prefix, 0)? {
+            return Err(Error::InvalidProof);
+        }
+        Ok(())
+    }
+
+    fn send_end_values(&mut self, values: &[Fp3]) -> Result<()> {
+        let mut message = self.chain.message();
+        message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+        message.push_u64(26);
+        message.push_u64(values.len() as u64);
+        for value in values {
+            message.push_fp3(value);
+        }
+        let prefix = message.prefix(KIND_EMPTY, 0)?;
+        if !self.chain.step(&prefix, 0)? {
+            return Err(Error::InvalidProof);
+        }
+        Ok(())
+    }
+}
+
+fn absorb_segment_tagged_fp3(
+    chain: &mut Chain,
+    tag: u64,
+    kind: u32,
+    value: &Fp3,
+) -> Result<()> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(tag);
+    message.push_fp3(value);
+    let prefix = message.prefix(kind, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+/// Runs the request chain's sub-proof segment on the request first chain: the
+/// three sumchecks in order, each message absorbed before its challenge, and
+/// the section message fixed under the plan shape before the seal.
+fn prove_first_chain_segment(
+    chain: &mut Chain,
+    plan: &HiddenSendPlan,
+    inputs: &crate::proof::request_chain::ChainInputs,
+) -> Result<crate::proof::request_chain::RequestChainMessages> {
+    use crate::proof::request_chain::RequestChainMessages;
+    let shape = plan.request_chain.ok_or(Error::InvalidConfig)?;
+    let messages = {
+        let mut challenges = ChainSegmentChallenges { chain };
+        prove_request_chain_section(plan, inputs, &mut challenges)?
+    };
+    messages.check_shape(shape)?;
+    absorb_request_chain_section(chain, shape, &messages)?;
+    Ok(messages)
+}
+
+/// Verifies the request chain's sub-proof segment on the first chain with the
+/// same transcript position and challenge order as the prover.
+fn verify_first_chain_segment(
+    chain: &mut Chain,
+    plan: &HiddenSendPlan,
+    messages: &crate::proof::request_chain::RequestChainMessages,
+    inputs: &crate::proof::request_chain::ChainInputs,
+) -> Result<crate::proof::request_chain::ChainOutputs> {
+    use crate::proof::request_chain::{verify_request_chain, ChainProof};
+    let shape = plan.request_chain.ok_or(Error::InvalidConfig)?;
+    messages.check_shape(shape)?;
+    let proof = ChainProof {
+        token: messages.token.clone(),
+        stack: messages.stack.clone(),
+        merge: messages.merge.clone(),
+    };
+    let outputs = {
+        let mut challenges = ChainSegmentChallenges { chain };
+        verify_request_chain(inputs, &proof, &mut challenges)
+    }?;
+    absorb_request_chain_section(chain, shape, messages)?;
+    Ok(outputs)
+}
+
+/// Absorbs the whole section message under the plan shape, fixing it in the
+/// first chain before the request seal.
+fn absorb_request_chain_section(
+    chain: &mut Chain,
+    shape: crate::proof::request_chain::RequestChainShape,
+    messages: &crate::proof::request_chain::RequestChainMessages,
+) -> Result<()> {
+    let bytes = messages.encode(shape)?;
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(27);
+    message.push_u64(bytes.len() as u64);
+    for byte in &bytes {
+        message.push_u64(*byte as u64);
+    }
+    let prefix = message.prefix(KIND_SEED, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
 /// Absorbs the sub-proof mask table's root before the segment's challenges:
 /// the table is its own committed object, with its own identity and layout.
 fn absorb_chain_mask_root(
@@ -23735,6 +23870,52 @@ mod merged_tests {
                 configuration: W_CONFIGURATION,
             },
         }
+    }
+
+    #[test]
+    fn the_chain_section_is_fixed_before_the_seal() {
+        let (plan, _, _) = member_run();
+        let table = table();
+        let shape = crate::proof::request_chain::RequestChainShape {
+            token_rounds: 1,
+            token_ends: 1,
+            stack_rounds: 1,
+            stack_ends: 1,
+            merge_rounds: 1,
+            merge_ends: 1,
+        };
+        let proof = |base: u64| crate::proof::psc_general::GeneralProof {
+            hiding_sum: Fp3::from_u64(base),
+            rounds: vec![crate::proof::psc::PscRound {
+                coefficients: vec![Fp3::from_u64(base + 1)],
+            }],
+            y_round: crate::proof::psc::PscRound {
+                coefficients: vec![Fp3::from_u64(base + 2)],
+            },
+            end_values: vec![Fp3::from_u64(base + 3)],
+        };
+        let messages = crate::proof::request_chain::RequestChainMessages {
+            token: proof(10),
+            stack: proof(20),
+            merge: proof(30),
+        };
+        let mut first = first_chain(&plan, &table.reader).unwrap();
+        super::absorb_request_chain_section(&mut first, shape, &messages).unwrap();
+        let mut same = first_chain(&plan, &table.reader).unwrap();
+        super::absorb_request_chain_section(&mut same, shape, &messages).unwrap();
+        assert_eq!(*first.value(), *same.value());
+        let mut other = crate::proof::request_chain::RequestChainMessages {
+            token: proof(10),
+            stack: proof(21),
+            merge: proof(30),
+        };
+        let mut changed = first_chain(&plan, &table.reader).unwrap();
+        super::absorb_request_chain_section(&mut changed, shape, &other).unwrap();
+        assert_ne!(*first.value(), *changed.value());
+        other.stack = proof(20);
+        let mut back = first_chain(&plan, &table.reader).unwrap();
+        super::absorb_request_chain_section(&mut back, shape, &other).unwrap();
+        assert_eq!(*first.value(), *back.value());
     }
 
     #[test]
