@@ -1,0 +1,153 @@
+commit a43cbffc42e53ceb5304a4bb68b80afd08a61750
+Author: JimmyShi22 <417711026@qq.com>
+Date:   Sat Nov 14 10:07:57 2026 +0800
+
+    Check the stage lists against the sized stages and the runs
+    
+    The trusted planner now checks two relations between the solved stages and a
+    run: a planned list longer than the stage's sized random coordinates is
+    rejected with its stage, and the run's stage sizes must match the solved ones
+    in the stage count, the fold bits, the main and mask lengths and the code
+    lengths, each mismatch naming the stage and the field. Unit tests cover both
+    checks and their named failures.
+    
+    This is the structural part of the whole-chain budget check; the per-round
+    round counts and the total budget remain the next step.
+
+diff --git a/crates/zkie-ops/src/proof/proximity_planner.rs b/crates/zkie-ops/src/proof/proximity_planner.rs
+index 815675d1..e4ba807b 100644
+--- a/crates/zkie-ops/src/proof/proximity_planner.rs
++++ b/crates/zkie-ops/src/proof/proximity_planner.rs
+@@ -1283,6 +1283,71 @@ pub fn opened_capacity(
+     Ok(())
+ }
+ 
++/// One stage as the run sizes it: the two codes' lengths and the fold bits.
++#[derive(Clone, Copy, Debug, PartialEq, Eq)]
++pub struct RunStage {
++    pub log_n: u32,
++    pub mask_log_n: u32,
++    pub main_ell: u64,
++    pub mask_ell: u64,
++    pub k: u32,
++    pub h: u32,
++}
++
++/// A measurement or message list longer than the stage was sized for opens a
++/// row at more positions than its random tail hides. The stage is named.
++pub fn stage_list_within(
++    list_lengths: &[u64],
++    sized_positions: &[u64],
++) -> std::result::Result<(), StageFailure> {
++    if list_lengths.len() != sized_positions.len() || list_lengths.is_empty() {
++        return Err(StageFailure {
++            stage: 0,
++            point: "the planned lists and the stages differ",
++        });
++    }
++    for (stage, (list, sized)) in list_lengths.iter().zip(sized_positions).enumerate() {
++        if list > sized {
++            return Err(StageFailure {
++                stage,
++                point: "a list is longer than the stage's random coordinates were sized for",
++            });
++        }
++    }
++    Ok(())
++}
++
++/// Compares the run's stage sizes with the solved stages: the same count, and
++/// each stage's fold bits, main and mask lengths and code lengths must match.
++/// A mismatch names the stage and the field instead of being accepted.
++pub fn iopp_sized_fault(run: &[RunStage], solved: &[DerivedStage]) -> std::result::Result<(), StageFailure> {
++    if run.len() != solved.len() {
++        return Err(StageFailure {
++            stage: 0,
++            point: "the proximity test is sized for another number of stages than it has",
++        });
++    }
++    for (stage, (actual, solved)) in run.iter().zip(solved).enumerate() {
++        if actual.k != solved.k || actual.h != solved.h {
++            return Err(StageFailure {
++                stage,
++                point: "a stage of the proximity test is sized for another number of rows than it has",
++            });
++        }
++        if actual.log_n != solved.log_n
++            || actual.mask_log_n != solved.mask_log_n
++            || actual.main_ell != solved.main_ell
++            || actual.mask_ell != solved.mask_ell
++        {
++            return Err(StageFailure {
++                stage,
++                point: "a stage of the proximity test names another code than the solved one",
++            });
++        }
++    }
++    Ok(())
++}
++
+ fn ceil_log2(value: u64) -> u32 {
+     if value <= 1 {
+         return 0;
+@@ -1896,3 +1961,60 @@ mod opened_list_tests {
+         assert!(error.contains("request"));
+     }
+ }
++
++#[cfg(test)]
++mod plan_iopp_tests {
++    use super::*;
++
++    fn solved(k: u32, h: u32, main_ell: u64, mask_ell: u64) -> DerivedStage {
++        DerivedStage {
++            log_n: 14,
++            mask_log_n: 14,
++            k,
++            h,
++            main_ell,
++            mask_ell,
++            r_ood: 0,
++            tail: 7,
++        }
++    }
++
++    fn run(k: u32, h: u32, main_ell: u64, mask_ell: u64) -> RunStage {
++        RunStage {
++            log_n: 14,
++            mask_log_n: 14,
++            main_ell,
++            mask_ell,
++            k,
++            h,
++        }
++    }
++
++    #[test]
++    fn lists_longer_than_the_stage_are_rejected_and_named() {
++        let sized = [4u64, 6];
++        assert!(stage_list_within(&[4, 6], &sized).is_ok());
++        let failure = stage_list_within(&[5, 6], &sized).unwrap_err();
++        assert_eq!(failure.stage, 0);
++        assert!(failure.point.contains("longer than the stage"));
++        let failure = stage_list_within(&[4, 7], &sized).unwrap_err();
++        assert_eq!(failure.stage, 1);
++        assert!(stage_list_within(&[4], &sized).is_err());
++    }
++
++    #[test]
++    fn sized_fault_names_the_mismatching_stage_and_field() {
++        let solved = [solved(1, 0, 512, 64), solved(0, 0, 512, 128)];
++        let matching = [run(1, 0, 512, 64), run(0, 0, 512, 128)];
++        assert!(iopp_sized_fault(&matching, &solved).is_ok());
++        let rows = [run(2, 0, 512, 64), run(0, 0, 512, 128)];
++        let failure = iopp_sized_fault(&rows, &solved).unwrap_err();
++        assert_eq!(failure.stage, 0);
++        assert!(failure.point.contains("number of rows"));
++        let codes = [run(1, 0, 512, 64), run(0, 0, 256, 128)];
++        let failure = iopp_sized_fault(&codes, &solved).unwrap_err();
++        assert_eq!(failure.stage, 1);
++        assert!(failure.point.contains("another code"));
++        assert!(iopp_sized_fault(&matching[..1], &solved).is_err());
++    }
++}
