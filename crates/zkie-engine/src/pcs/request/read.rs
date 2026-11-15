@@ -13,6 +13,7 @@
 //! the plan/priced_table that fixes the budget is still open.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -21,6 +22,7 @@ use zkie_core::types::Digest;
 
 use crate::pcs::request::chain::Chain;
 use crate::pcs::request::field::Fp;
+use crate::pcs::request::persistent_count::{CountPlan, CountReceipt, CountSet};
 use crate::pcs::request::table::{
     verify_columns, ColumnOpening, IndexReader,
 };
@@ -310,6 +312,64 @@ impl HidingCharge {
         }
         state.units = candidate;
         Ok(fresh.len())
+    }
+}
+
+/// A durable per-table column budget: one count file under the provider's
+/// trusted directory, appended under the count lock and synced before the
+/// reservation is returned. The file length is the table-life count; a new
+/// process over the same file continues from it. There is no refund: a proof
+/// that fails after the reservation keeps its count.
+pub struct DurableColumnBudget {
+    set: CountSet,
+    leaf: usize,
+    columns: u64,
+}
+
+impl DurableColumnBudget {
+    /// The count file must live under `root`; it is created empty when absent.
+    /// `columns` is the fixed batch size and `max_columns` the table-life
+    /// limit. Both are trusted plan values.
+    pub fn new(
+        root: impl Into<PathBuf>,
+        count: PathBuf,
+        columns: u64,
+        max_columns: u64,
+    ) -> Result<Self> {
+        let root = root.into();
+        if !root.is_dir() {
+            return Err(Error::InvalidConfig);
+        }
+        if !count.exists() {
+            std::fs::File::create(&count).map_err(|_| Error::Io)?;
+        }
+        let plan = CountPlan::new(columns, max_columns)?;
+        let set = CountSet::new(root, vec![count], plan)?;
+        Ok(Self {
+            set,
+            leaf: 0,
+            columns,
+        })
+    }
+
+    pub fn columns(&self) -> u64 {
+        self.columns
+    }
+
+    /// Reserve one batch durably. The count is appended and synced before the
+    /// receipt is returned; a rejected or failed call returns no receipt and
+    /// no refund.
+    pub fn reserve(&self) -> Result<CountReceipt> {
+        self.set.begin_batch(self.leaf)
+    }
+
+    /// The persisted table-life count.
+    pub fn count(&self) -> Result<u64> {
+        self.set
+            .counts()?
+            .first()
+            .copied()
+            .ok_or(Error::InvalidConfig)
     }
 }
 

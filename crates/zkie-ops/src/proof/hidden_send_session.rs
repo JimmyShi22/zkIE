@@ -235,7 +235,7 @@ use zkie_engine::pcs::request::params::{
 use zkie_engine::pcs::request::pow::{search_nonce_for_plan, verify_nonce};
 use zkie_engine::pcs::request::proximity::SingleRows;
 use zkie_engine::pcs::request::read::{
-    unique_sorted, HidingCharge, HidingState, ReadLedger, VerifierReads,
+    unique_sorted, DurableColumnBudget, HidingCharge, HidingState, ReadLedger, VerifierReads,
 };
 use zkie_engine::pcs::request::relation::{
     column_row, foldeq_weights, gu_sample_pad_offsets, gu_table, oracle_sample_row, record_row,
@@ -9710,6 +9710,13 @@ pub trait HiddenTableProver: TableRowSource {
     fn hiding_state(&mut self) -> Option<&mut HidingState> {
         None
     }
+
+    /// The durable table-life count, when the keeper owns one. A reservation
+    /// is written and synced before use, survives a restart and has no
+    /// refund; an in-memory state alone is not a production budget.
+    fn durable_column_budget(&mut self) -> Option<&mut DurableColumnBudget> {
+        None
+    }
 }
 
 /// The prover-side handle of the norm gain/bias parameter tables. Each table
@@ -11314,6 +11321,16 @@ fn prove_first(
     // state before the first part commits anything. The reservation is not
     // refunded, and repeated proofs on the same keeper consume the same state.
     let fold_charge = {
+        // A durable table-life budget, when the keeper owns one, is the
+        // authority: one batch is appended and synced before any use. The
+        // in-memory state below still checks the unique positions of this
+        // batch against the same reserved count.
+        if let Some(budget) = table.durable_column_budget() {
+            if budget.columns() != plan.proximity.column_draws as u64 {
+                return Err(Error::StatementMismatch);
+            }
+            let _receipt = budget.reserve()?;
+        }
         let state = table.hiding_state().ok_or(Error::InvalidConfig)?;
         let table_id = state.table();
         let lifecycle = state.lifecycle();
@@ -25070,6 +25087,7 @@ mod merged_tests {
         source: RefCell<VecTableSource>,
         reader: IndexReader,
         hiding: zkie_engine::pcs::request::read::HidingState,
+        budget: Option<zkie_engine::pcs::request::read::DurableColumnBudget>,
     }
 
     impl TableRowSource for Table {
@@ -25096,6 +25114,12 @@ mod merged_tests {
             &mut self,
         ) -> Option<&mut zkie_engine::pcs::request::read::HidingState> {
             Some(&mut self.hiding)
+        }
+
+        fn durable_column_budget(
+            &mut self,
+        ) -> Option<&mut zkie_engine::pcs::request::read::DurableColumnBudget> {
+            self.budget.as_mut()
         }
     }
 
@@ -25124,6 +25148,7 @@ mod merged_tests {
                 1,
                 reader.shape.code.r as u64,
             ),
+            budget: None,
             reader,
         }
     }
@@ -29059,6 +29084,7 @@ mod merged_tests {
                 1,
                 reader.shape.code.r as u64,
             ),
+            budget: None,
             reader,
         }
     }
@@ -29482,6 +29508,62 @@ mod merged_tests {
         let mut changed = messages.clone();
         changed.shared.omega_answers.clear();
         assert!(verify_hidden_lin_hidden(&plan, &table.reader, &changed).is_err());
+    }
+
+    /// The asset-table budget is durable: one batch is counted and synced
+    /// before use, a failed proof keeps its reservation, and a new owner over
+    /// the same files (a restart) continues from the count and refuses an
+    /// exhausted budget.
+    #[test]
+    fn the_asset_budget_survives_a_restart_and_is_not_refunded() {
+        let dir = std::env::temp_dir().join(format!(
+            "zkie-asset-budget-{}-{}",
+            std::process::id(),
+            17
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let count = dir.join("count.bin");
+        let activation = activation();
+        let (mut plan, seed) = member_plan_for(&activation);
+        let columns = plan.proximity.column_draws as u64;
+        let max = 2 * columns;
+        let open = || {
+            zkie_engine::pcs::request::read::DurableColumnBudget::new(
+                dir.clone(),
+                count.clone(),
+                columns,
+                max,
+            )
+            .unwrap()
+        };
+        let mut keeper = table();
+        keeper.budget = Some(open());
+        let _ = prove_hidden_lin_hidden(&plan, &activation, &mut keeper, seed).unwrap();
+        assert_eq!(keeper.budget.as_ref().unwrap().count().unwrap(), columns);
+
+        // A proof that fails after the reservation does not get it back.
+        let positions = plan.send.activation.positions as usize;
+        plan.send.expected_roots = Some(vec![Digest([0xEE; 32]); positions]);
+        assert!(prove_hidden_lin_hidden(&plan, &activation, &mut keeper, seed).is_err());
+        assert_eq!(
+            keeper.budget.as_ref().unwrap().count().unwrap(),
+            2 * columns
+        );
+
+        // A new owner over the same files continues from the count.
+        let mut restarted = table();
+        restarted.budget = Some(open());
+        assert_eq!(
+            restarted.budget.as_ref().unwrap().count().unwrap(),
+            2 * columns
+        );
+        plan.send.expected_roots = None;
+        assert!(prove_hidden_lin_hidden(&plan, &activation, &mut restarted, seed).is_err());
+        assert_eq!(
+            restarted.budget.as_ref().unwrap().count().unwrap(),
+            2 * columns
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
