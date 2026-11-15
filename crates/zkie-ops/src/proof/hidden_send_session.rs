@@ -10524,6 +10524,11 @@ pub(crate) struct KeyFirstPlan {
     pub mask_bat: u64,
     /// The BAT id of the index-mask member of the key group.
     pub index_bat: u64,
+    /// The LIN shared group's own codes, as the public key plan fixes them.
+    /// They are checked against the shared result by role, not inferred from
+    /// the lookup messages' codes.
+    pub shared_code: CodeParams,
+    pub shared_mask_code: CodeParams,
     /// The shape of the one-leaf binding tree over the first chain's seal.
     pub binding: crate::proof::lin_binding::LinBindingShape,
     /// The public parameters of the key group's derived chain.
@@ -10629,6 +10634,8 @@ impl KeyFirstPlan {
         w.put_u64(self.bits_bat);
         w.put_u64(self.mask_bat);
         w.put_u64(self.index_bat);
+        key_first_put_code(&mut w, &self.shared_code);
+        key_first_put_code(&mut w, &self.shared_mask_code);
         w.put_bytes(&self.binding.encode());
         w.put_u64(self.group_config.fresh);
         w.put_u64(self.group_config.mask_tree_number);
@@ -10757,8 +10764,8 @@ pub(crate) fn key_second_chain(
 ) -> Result<Chain> {
     if plan.table_identity != shared.shared_table
         || plan.table_configuration != shared.shared_configuration
-        || plan.commit.bits_shape.code != shared.shared_code
-        || plan.commit.mask_code != shared.shared_mask_code
+        || plan.shared_code != shared.shared_code
+        || plan.shared_mask_code != shared.shared_mask_code
         || shared.shared_seal == Digest::ZERO
         || shared.omega_root == Digest::ZERO
         || shared.shared_point.is_empty()
@@ -37064,6 +37071,8 @@ mod key_first_plan_tests {
             bits_bat: 10,
             mask_bat: 11,
             index_bat: 12,
+            shared_code: code,
+            shared_mask_code: code,
             binding: crate::proof::lin_binding::LinBindingShape {
                 log_leaves: 0,
                 salt_bytes: 40,
@@ -37253,6 +37262,8 @@ mod key_first_flow_tests {
             bits_bat: 0,
             mask_bat: 1,
             index_bat: 2,
+            shared_code: group_plan.first_main,
+            shared_mask_code: group_plan.first_mask,
             binding: crate::proof::lin_binding::LinBindingShape {
                 log_leaves: 0,
                 salt_bytes: 40,
@@ -37354,8 +37365,8 @@ mod key_first_flow_tests {
             .expect("the key first part verifies");
         let shared = KeySecondInputs {
             shared_seal: Digest([0x61; 32]),
-            shared_code: plan.commit.bits_shape.code,
-            shared_mask_code: plan.commit.mask_code,
+            shared_code: plan.shared_code,
+            shared_mask_code: plan.shared_mask_code,
             shared_table: plan.table_identity,
             shared_configuration: plan.table_configuration,
             omega_root: Digest([0x62; 32]),
