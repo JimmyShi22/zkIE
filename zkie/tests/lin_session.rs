@@ -532,6 +532,7 @@ fn selected_gpt2_output_head_request_session() {
     struct CommittedOutputHeadTable {
         table: StreamingTable,
         source: LmHeadAssetSource,
+        hiding: zkie_engine::pcs::request::read::HidingState,
     }
 
     impl TableRowSource for CommittedOutputHeadTable {
@@ -553,6 +554,11 @@ fn selected_gpt2_output_head_request_session() {
             self.table.open_columns(&mut self.source, positions)
         }
 
+        fn hiding_state(
+            &mut self,
+        ) -> Option<&mut zkie_engine::pcs::request::read::HidingState> {
+            Some(&mut self.hiding)
+        }
     }
 
     let fixture = env::var("ZKIE_SESSION_FIXTURE").expect("set ZKIE_SESSION_FIXTURE");
@@ -675,6 +681,11 @@ fn selected_gpt2_output_head_request_session() {
     let mut table = CommittedOutputHeadTable {
         table: committed,
         source,
+        hiding: zkie_engine::pcs::request::read::HidingState::new(
+            reader.root,
+            1,
+            reader.shape.code.r as u64,
+        ),
     };
     let table_commit_ms = started.elapsed().as_millis();
     println!("table_root={:?}", reader.root);
@@ -767,6 +778,7 @@ fn selected_gpt2_output_head_request_session() {
         own_fresh: OWN_FRESH,
         column_draws: COLUMN_DRAWS,
         column_budget: COLUMN_DRAWS,
+        ledger: zkie_ops::proof::hidden_send_session::ReadLedgerCell::new(COLUMN_DRAWS as u64),
         column_work_bits: COLUMN_WORK_BITS,
         shared_base_positions: 2,
         own_base_positions: 259,

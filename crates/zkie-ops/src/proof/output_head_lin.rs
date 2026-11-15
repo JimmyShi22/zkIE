@@ -2033,6 +2033,7 @@ mod tests {
             own_fresh: 1000,
             column_draws: 1,
             column_budget: 1,
+            ledger: crate::proof::hidden_send_session::ReadLedgerCell::new(1 as u64),
             column_work_bits: 0,
             shared_base_positions: 2,
             own_base_positions: 2,
@@ -2074,6 +2075,7 @@ mod tests {
         table: StreamingTable,
         source: RefCell<VecTableSource>,
         reader: IndexReader,
+        hiding: zkie_engine::pcs::request::read::HidingState,
     }
 
     impl zkie_engine::pcs::request::table::TableRowSource for Table {
@@ -2098,6 +2100,12 @@ mod tests {
             let mut source = self.source.borrow_mut();
             self.table.open_columns(&mut *source, positions)
         }
+
+        fn hiding_state(
+            &mut self,
+        ) -> Option<&mut zkie_engine::pcs::request::read::HidingState> {
+            Some(&mut self.hiding)
+        }
     }
 
     fn encoded_table(values: &[i32]) -> Table {
@@ -2120,8 +2128,20 @@ mod tests {
         Table {
             table,
             source: RefCell::new(source),
+            hiding: zkie_engine::pcs::request::read::HidingState::new(
+                reader.root,
+                1,
+                reader.shape.code.r as u64,
+            ),
             reader,
         }
+    }
+
+    /// A fresh keeper over the same committed table: the toy fixture reuses
+    /// one table commitment for several proofs, and the in-memory hiding state
+    /// belongs to the keeper, so each proof gets its own table copy object.
+    fn fresh_table() -> Table {
+        encoded_table(&table_values())
     }
 
     struct Fixture {
@@ -2725,7 +2745,7 @@ mod tests {
             fixture.shape,
             &setup,
             &output,
-            &mut fixture.table,
+            &mut fresh_table(),
             &rows,
             &fixture.activation_salts,
         )
@@ -2758,9 +2778,12 @@ mod tests {
         assert_eq!(outcome.outcome.eval_rows.len(), TOY_POSITIONS);
 
         let bytes = proof.encode().unwrap();
+        // A second verification of the same proof is a fresh statement plan
+        // with the same read-ledger maximum; the original plan keeps its own
+        // ledger for the first verification.
         let decoded = verify_output_head_lin_hidden_bytes(
             fixture.shape,
-            &plan,
+            &plan.clone(),
             &trusted,
             &fixture.table.reader,
             &bytes,
@@ -3019,7 +3042,7 @@ mod tests {
         )
         .unwrap();
         let (session, _) =
-            prove_hidden_lin_hidden(&prover_plan, &arbitrary, &mut fixture.table, setup.seed)
+            prove_hidden_lin_hidden(&prover_plan, &arbitrary, &mut fresh_table(), setup.seed)
                 .unwrap();
         let proof = OutputHeadLinProof { session };
         assert_ne!(proof.session.first.activation, activation);
@@ -3143,7 +3166,7 @@ mod tests {
             fixture.shape,
             &setup,
             &output,
-            &mut fixture.table,
+            &mut fresh_table(),
             &rows,
             &fixture.activation_salts,
         )

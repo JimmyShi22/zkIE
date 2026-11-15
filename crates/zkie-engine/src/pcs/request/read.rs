@@ -255,6 +255,16 @@ struct ChargeState {
     units: usize,
 }
 
+impl PartialEq for HidingCharge {
+    fn eq(&self, other: &Self) -> bool {
+        self.table == other.table
+            && self.lifecycle == other.lifecycle
+            && self.total == other.total
+    }
+}
+
+impl Eq for HidingCharge {}
+
 impl HidingCharge {
     pub fn table(&self) -> Digest {
         self.table

@@ -234,7 +234,9 @@ use zkie_engine::pcs::request::params::{
 };
 use zkie_engine::pcs::request::pow::{search_nonce_for_plan, verify_nonce};
 use zkie_engine::pcs::request::proximity::SingleRows;
-use zkie_engine::pcs::request::read::{unique_sorted, HidingState, ReadLedger, VerifierReads};
+use zkie_engine::pcs::request::read::{
+    unique_sorted, HidingCharge, HidingState, ReadLedger, VerifierReads,
+};
 use zkie_engine::pcs::request::relation::{
     column_row, foldeq_weights, gu_sample_pad_offsets, gu_table, oracle_sample_row, record_row,
     sample_cube_of, sample_row, GuRelationKind, GuRelationRow, GuWitness,
@@ -2725,6 +2727,9 @@ pub struct HiddenSendWitness {
     /// The sub-proof mask table's private rows, tails and salts, when the
     /// plan carries the chain mask.
     pub chain_mask: Option<ChainMaskWitness>,
+    /// The batch's column reservation, taken before the first part and
+    /// consumed by the shared stage.
+    pub fold_charge: Option<HidingCharge>,
 }
 
 /// The private sub-proof mask table: its rows, encoding tails, salts and the
@@ -3259,6 +3264,7 @@ pub fn commit_w_rows(
         dot: None,
         closure: None,
         norm: None,
+        fold_charge: None,
     };
     Ok((group, witness))
 }
@@ -8577,6 +8583,43 @@ pub(crate) fn iopp_stage_fault(
 /// message. All members of both groups share one main code and one mask code so
 /// that the split path is not needed; a shape that names other codes
 /// is rejected instead of silently changing the relation.
+/// The plan-owned verifier read ledger. Cloning a plan yields a fresh ledger
+/// with the same maximum; the same plan object keeps one ledger across calls,
+/// so a repeated verification cannot regain a full budget.
+#[derive(Debug)]
+pub struct ReadLedgerCell(Arc<Mutex<ReadLedger>>);
+
+impl ReadLedgerCell {
+    pub fn new(max_reads: u64) -> Self {
+        Self(Arc::new(Mutex::new(ReadLedger::new(max_reads))))
+    }
+
+    pub fn arc(&self) -> Arc<Mutex<ReadLedger>> {
+        Arc::clone(&self.0)
+    }
+
+    pub fn max_reads(&self) -> Result<u64> {
+        self.0
+            .lock()
+            .map(|ledger| ledger.max_reads())
+            .map_err(|_| Error::InvalidSessionState)
+    }
+}
+
+impl Clone for ReadLedgerCell {
+    fn clone(&self) -> Self {
+        Self::new(self.max_reads().unwrap_or(0))
+    }
+}
+
+impl PartialEq for ReadLedgerCell {
+    fn eq(&self, other: &Self) -> bool {
+        self.max_reads().ok() == other.max_reads().ok()
+    }
+}
+
+impl Eq for ReadLedgerCell {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HiddenProximityPlan {
     /// The folded table message of the shared stage.
@@ -8596,6 +8639,10 @@ pub struct HiddenProximityPlan {
     /// the same count it draws; a plan whose draw count exceeds the budget is
     /// rejected before any read.
     pub column_budget: usize,
+    /// The verifier's read ledger for the table columns, owned by the plan so
+    /// that repeated verifications share one budget. A plan clone starts a
+    /// fresh ledger with the same maximum.
+    pub ledger: ReadLedgerCell,
     pub column_work_bits: u8,
     pub shared_base_positions: usize,
     pub own_base_positions: usize,
@@ -8752,6 +8799,9 @@ return Some("the shared stage-0 switch openings exceed a group tail");
         }
         if self.column_budget as u64 > send.table_shape.code.r {
 return Some("the table column budget exceeds the table code tail");
+        }
+        if self.ledger.max_reads().ok() != Some(self.column_budget as u64) {
+return Some("the read ledger does not match the column budget");
         }
         if let Some(closure) = closure {
             let own_open = if self.own_stages.is_empty() {
@@ -9653,6 +9703,13 @@ pub struct HiddenLinWitness {
 pub trait HiddenTableProver: TableRowSource {
     fn reader(&self) -> &IndexReader;
     fn open_columns(&mut self, positions: &[u64]) -> Result<Vec<ColumnOpening>>;
+
+    /// The keeper's hiding state for the table's column reads. It persists
+    /// across the calls that share the keeper; a fresh state per proof would
+    /// hand out a fresh budget. The shared fold requires it.
+    fn hiding_state(&mut self) -> Option<&mut HidingState> {
+        None
+    }
 }
 
 /// The prover-side handle of the norm gain/bias parameter tables. Each table
@@ -11253,6 +11310,15 @@ fn prove_first(
     take_mask_slots(plan)?;
     let reader = table.reader().clone();
     check_table(&plan.send, &reader)?;
+    // The batch's table columns are reserved against the keeper's hiding
+    // state before the first part commits anything. The reservation is not
+    // refunded, and repeated proofs on the same keeper consume the same state.
+    let fold_charge = {
+        let state = table.hiding_state().ok_or(Error::InvalidConfig)?;
+        let table_id = state.table();
+        let lifecycle = state.lifecycle();
+        Some(state.begin_charge(table_id, lifecycle, plan.proximity.column_draws)?)
+    };
     let (reduction_root, _reduction_tree) = if plan.send.range.is_some() {
         // The reduced read table is the range segment's unit message.
         (None, None)
@@ -11314,6 +11380,7 @@ fn prove_first(
     drop(_profile_derive);
     let _profile_commit_w = zkie_engine::profile::Scope::new("first.commit_w_rows");
     let (group, mut witness) = commit_w_rows(&plan.send, &rows, randomness)?;
+    witness.fold_charge = fold_charge;
     drop(_profile_commit_w);
     let dot_root = match (&plan.send.dot, plan.send.activation_source) {
         (Some(_), ActivationSource::Commitment) => {
@@ -12872,6 +12939,7 @@ fn prove_shared(
     first_seal: &Digest,
     seed: &Digest,
     norm_witness: Option<&NormWitness>,
+    fold_charge: Option<&HidingCharge>,
 ) -> Result<SharedProveResult> {
     let _profile_shared = zkie_engine::profile::Scope::new("shared.prove_shared");
     let k_col = shared_point_bits(plan)?;
@@ -12973,11 +13041,10 @@ fn prove_shared(
     {
         return Err(Error::ShapeMismatch);
     }
-    // The provider hides the columns it exposes: the batch's columns are
-    // charged against the table's random tail before any opening, a repeated
-    // position is free, and the reservation is never refunded.
-    let mut hiding = HidingState::new(reader.root, 1, reader.shape.code.r as u64);
-    let charge = hiding.begin_charge(reader.root, 1, unique.len())?;
+    // The provider hides the columns it exposes: the batch's columns were
+    // charged against the keeper's hiding state before the first part, a
+    // repeated position is free, and the reservation is never refunded.
+    let charge = fold_charge.ok_or(Error::InvalidConfig)?;
     let _fresh = charge.consume(&unique)?;
     let _profile_open_columns = zkie_engine::profile::Scope::new("shared.table_open_columns");
     let gu_openings = table.open_columns(&unique)?;
@@ -13408,11 +13475,11 @@ fn verify_shared(
         return Err(Error::ShapeMismatch);
     }
     let _profile_columns = zkie_engine::profile::Scope::new("verify.shared.columns");
-    // The reads are reserved and committed against one ledger before the
-    // columns are used; a repeated position must return the same column.
-    let mut reads = VerifierReads::new(Arc::new(Mutex::new(ReadLedger::new(
-        plan.proximity.column_budget as u64,
-    ))));
+    // The reads are reserved and committed against the plan's ledger before
+    // the columns are used; a repeated position must return the same column.
+    // The plan keeps the ledger across calls, and a plan clone starts a fresh
+    // ledger with the same maximum.
+    let mut reads = VerifierReads::new(plan.proximity.ledger.arc());
     let columns = reads.read(reader, &unique, &messages.column_openings)?;
     let column_map = column_map_from_reads(&unique, &columns)?;
     drop(_profile_columns);
@@ -22115,6 +22182,7 @@ fn prove_hidden_lin_inner(
         &first_seal,
         &seed,
         send_witness.norm.as_ref(),
+        send_witness.fold_charge.as_ref(),
     )
     ?;
     let own = prove_second(
@@ -25001,6 +25069,7 @@ mod merged_tests {
         table: StreamingTable,
         source: RefCell<VecTableSource>,
         reader: IndexReader,
+        hiding: zkie_engine::pcs::request::read::HidingState,
     }
 
     impl TableRowSource for Table {
@@ -25021,6 +25090,12 @@ mod merged_tests {
         fn open_columns(&mut self, positions: &[u64]) -> Result<Vec<ColumnOpening>> {
             let mut source = self.source.borrow_mut();
             self.table.open_columns(&mut *source, positions)
+        }
+
+        fn hiding_state(
+            &mut self,
+        ) -> Option<&mut zkie_engine::pcs::request::read::HidingState> {
+            Some(&mut self.hiding)
         }
     }
 
@@ -25044,6 +25119,11 @@ mod merged_tests {
         Table {
             table,
             source: RefCell::new(source),
+            hiding: zkie_engine::pcs::request::read::HidingState::new(
+                reader.root,
+                1,
+                reader.shape.code.r as u64,
+            ),
             reader,
         }
     }
@@ -25124,6 +25204,7 @@ mod merged_tests {
                 own_fresh: 51,
                 column_draws: 2,
                 column_budget: 4,
+                ledger: crate::proof::hidden_send_session::ReadLedgerCell::new(4 as u64),
                 column_work_bits: 0,
                 shared_base_positions: 2,
                 own_base_positions: 2,
@@ -28973,6 +29054,11 @@ mod merged_tests {
         Table {
             table,
             source: RefCell::new(source),
+            hiding: zkie_engine::pcs::request::read::HidingState::new(
+                reader.root,
+                1,
+                reader.shape.code.r as u64,
+            ),
             reader,
         }
     }
@@ -29259,6 +29345,37 @@ mod merged_tests {
             k_lo
         )
         .is_err());
+    }
+
+    /// The batch column reservation lives in the keeper: a proof charges the
+    /// plan column count before the first part, a second proof on the same
+    /// keeper charges again, and the state is not reset between calls.
+    #[test]
+    fn the_column_reservation_lives_in_the_keeper() {
+        let activation = activation();
+        let (plan, seed) = member_plan_for(&activation);
+        let columns = plan.proximity.column_draws as u64;
+        assert!(columns > 0);
+        let mut table = table();
+        assert_eq!(table.hiding_state().unwrap().used(), 0);
+        let _ = prove_hidden_lin_hidden(&plan, &activation, &mut table, seed).unwrap();
+        assert_eq!(table.hiding_state().unwrap().used(), columns);
+        let _ = prove_hidden_lin_hidden(&plan, &activation, &mut table, seed).unwrap();
+        assert_eq!(table.hiding_state().unwrap().used(), 2 * columns);
+    }
+
+    /// The verifier read ledger belongs to the plan: one verification charges
+    /// it, and a plan clone starts a fresh ledger with the same maximum.
+    #[test]
+    fn the_read_ledger_belongs_to_the_plan() {
+        let (plan, messages, _) = member_run();
+        let table = table();
+        assert_eq!(plan.proximity.ledger.arc().lock().unwrap().used(), 0);
+        verify_hidden_lin_hidden(&plan, &table.reader, &messages).unwrap();
+        let used = plan.proximity.ledger.arc().lock().unwrap().used();
+        assert!(used > 0);
+        let clone = plan.clone();
+        assert_eq!(clone.proximity.ledger.arc().lock().unwrap().used(), 0);
     }
 
     #[test]

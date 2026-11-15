@@ -261,6 +261,7 @@ struct Table {
     table: StreamingTable,
     source: RefCell<VecTableSource>,
     reader: IndexReader,
+    hiding: zkie_engine::pcs::request::read::HidingState,
 }
 
 impl TableRowSource for Table {
@@ -286,6 +287,12 @@ impl HiddenTableProver for Table {
     fn open_columns(&mut self, positions: &[u64]) -> zkie_core::error::Result<Vec<ColumnOpening>> {
         let mut source = self.source.borrow_mut();
         self.table.open_columns(&mut *source, positions)
+    }
+
+    fn hiding_state(
+        &mut self,
+    ) -> Option<&mut zkie_engine::pcs::request::read::HidingState> {
+        Some(&mut self.hiding)
     }
 }
 
@@ -322,6 +329,11 @@ fn diagnostic_table(weights: &[i64]) -> Table {
     Table {
         table,
         source: RefCell::new(source),
+        hiding: zkie_engine::pcs::request::read::HidingState::new(
+            reader.root,
+            1,
+            reader.shape.code.r as u64,
+        ),
         reader,
     }
 }
@@ -704,6 +716,7 @@ fn plan_for(
             own_fresh: 91,
             column_draws: 2,
             column_budget: 4,
+            ledger: zkie_ops::proof::hidden_send_session::ReadLedgerCell::new(4 as u64),
             column_work_bits: 0,
             shared_base_positions: 2,
             own_base_positions: 2,
@@ -993,6 +1006,7 @@ fn hidden_plan_for(
             own_fresh: 91,
             column_draws: 2,
             column_budget: 4,
+            ledger: zkie_ops::proof::hidden_send_session::ReadLedgerCell::new(4 as u64),
             column_work_bits: 0,
             shared_base_positions: assembled.shared.last().unwrap().positions as usize,
             own_base_positions: assembled.own.last().unwrap().positions as usize,
