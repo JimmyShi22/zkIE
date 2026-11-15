@@ -70,6 +70,9 @@ const MATRIX_ROWS: u64 = 1024;
 const K_LO: u32 = 0;
 const COLUMNS: u64 = 1024;
 const TABLE_LOG_N: u32 = 12;
+/// The hidden plan's shared column draws; the table budget counts one batch of
+/// exactly this many columns per proof.
+const DIAGNOSTIC_COLUMN_DRAWS: u64 = 2;
 const TABLE_ELL: u64 = 2048;
 const TABLE_R: u64 = 8;
 const CODE_LOG_N: u32 = 14;
@@ -262,6 +265,9 @@ struct Table {
     source: RefCell<VecTableSource>,
     reader: IndexReader,
     hiding: zkie_engine::pcs::request::read::HidingState,
+    /// The table's durable column budget. The real entry always carries one,
+    /// so the first part cannot silently run without a persistent count.
+    budget: zkie_engine::pcs::request::read::DurableColumnBudget,
 }
 
 impl TableRowSource for Table {
@@ -293,6 +299,12 @@ impl HiddenTableProver for Table {
         &mut self,
     ) -> Option<&mut zkie_engine::pcs::request::read::HidingState> {
         Some(&mut self.hiding)
+    }
+
+    fn durable_column_budget(
+        &mut self,
+    ) -> Option<&mut zkie_engine::pcs::request::read::DurableColumnBudget> {
+        Some(&mut self.budget)
     }
 }
 
@@ -326,6 +338,29 @@ fn diagnostic_table(weights: &[i64]) -> Table {
     )
     .unwrap();
     let reader = table.reader.clone();
+    let ledger_dir = std::env::temp_dir().join(format!(
+        "zkie-diagnostic-ledger-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = fs::remove_dir_all(&ledger_dir);
+    fs::create_dir_all(&ledger_dir).unwrap();
+    let count = ledger_dir.join("columns.count");
+    zkie_engine::pcs::request::read::DurableColumnBudget::initialize(
+        ledger_dir.clone(),
+        count.clone(),
+    )
+    .unwrap();
+    let budget = zkie_engine::pcs::request::read::DurableColumnBudget::open(
+        ledger_dir,
+        count,
+        DIAGNOSTIC_COLUMN_DRAWS,
+        64,
+    )
+    .unwrap();
     Table {
         table,
         source: RefCell::new(source),
@@ -334,6 +369,7 @@ fn diagnostic_table(weights: &[i64]) -> Table {
             1,
             reader.shape.code.r as u64,
         ),
+        budget,
         reader,
     }
 }

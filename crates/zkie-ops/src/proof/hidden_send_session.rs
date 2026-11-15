@@ -22334,6 +22334,33 @@ pub fn prove_hidden_lin_hidden(
     prove_hidden_lin_inner(plan, Some(activation), table, None, seed, true, None, None, None, None)
 }
 
+/// Prover entry of the hidden-input mode over the production asset table
+/// keeper. The concrete keeper type makes the table's durable column budget
+/// part of the entry: a keeper without one cannot be passed here. The
+/// fixture-oriented entry above remains for isolated component runs.
+pub fn prove_hidden_lin_hidden_with_asset_table(
+    plan: &HiddenLinPlan,
+    activation: &CommittedActivation,
+    keeper: &mut crate::proof::column_session::AssetTableKeeper,
+    seed: Digest,
+) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
+    if !plan.weights.is_empty() || plan.norm.is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    prove_hidden_lin_inner(
+        plan,
+        Some(activation),
+        keeper,
+        None,
+        seed,
+        true,
+        None,
+        None,
+        None,
+        None,
+    )
+}
+
 /// Prover entry of the hidden-input mode with the private norm witness. The
 /// norm groups are committed and sampled before the second stage draws its
 /// challenges; the witness never enters the proof bytes.
@@ -29659,6 +29686,148 @@ mod merged_tests {
         assert!(prove_hidden_lin_hidden(&plan, &activation, &mut restarted, seed).is_err());
         assert_eq!(restarted.count().unwrap(), 2 * columns);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// One authenticated asset table over a temporary committed asset: the
+    /// same builder, configuration and shape as the fixture table, so the
+    /// hidden plan can consume it.
+    struct AuthenticatedTable {
+        root: std::path::PathBuf,
+        public: crate::proof::model_commitment::ModelCommitmentPublic,
+        opening: crate::proof::model_commitment::AssetOpening,
+        specs: Vec<crate::proof::model_commitment::ModelAssetSpec>,
+        table_root: Digest,
+    }
+
+    impl AuthenticatedTable {
+        fn new() -> Self {
+            let root = std::env::temp_dir().join(format!(
+                "zkie-authenticated-table-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let values: Vec<i32> = (0..16).map(|index| index - 8).collect();
+            let bytes: Vec<u8> = values
+                .iter()
+                .flat_map(|value| value.to_le_bytes())
+                .collect();
+            std::fs::write(root.join("asset.bin"), bytes).unwrap();
+            let specs = vec![crate::proof::model_commitment::ModelAssetSpec {
+                asset_id: 0,
+                path: "asset.bin".into(),
+                element_count: 16,
+                row_width: 8,
+                encoding: "i32-le".into(),
+            }];
+            let commitment = crate::proof::model_commitment::commit_assets(
+                &root,
+                Digest([0xE1; 32]),
+                Digest([0xE2; 32]),
+                &specs,
+            )
+            .unwrap();
+            let public =
+                crate::proof::model_commitment::ModelCommitmentPublic::from_commitment(
+                    &commitment,
+                );
+            let opening = crate::proof::model_commitment::AssetStore::open(&commitment)
+                .unwrap()
+                .open_all()
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            let mut built = Self {
+                root,
+                public,
+                opening,
+                specs,
+                table_root: Digest::ZERO,
+            };
+            built.table_root = built.build().reader.root;
+            built
+        }
+
+        fn build(&self) -> crate::proof::column_session::AssetEncodingTable {
+            let trusted = crate::proof::session_baseline::TrustedModel {
+                anchor_id: self.public.anchor.anchor_id,
+                model_id: Digest([0xE1; 32]),
+                parameters_digest: Digest([0xE2; 32]),
+                asset_specs: &self.specs,
+            };
+            crate::proof::column_session::build_authenticated_encoding_table_on_shape(
+                &self.public,
+                &trusted,
+                "asset.bin",
+                &self.opening,
+                TABLE_CONFIGURATION,
+                table_shape(),
+            )
+            .unwrap()
+        }
+
+        fn ledger(&self) -> std::path::PathBuf {
+            crate::proof::column_session::column_ledger_dir(&self.root, self.table_root)
+        }
+    }
+
+    /// The authenticated asset table feeds the hidden chain through the
+    /// production keeper: the first part reserves one durable batch before any
+    /// use, the full run verifies against the same reader, a restarted keeper
+    /// continues the count and an exhausted ledger refuses the next proof.
+    #[test]
+    fn the_authenticated_table_feeds_the_hidden_chain_through_the_keeper() {
+        let built = AuthenticatedTable::new();
+        crate::proof::column_session::initialize_asset_table_ledger(
+            &built.root,
+            built.table_root,
+        )
+        .unwrap();
+        let ledger = built.ledger();
+        let activation = activation();
+        let mut plan = hidden_plan(&activation);
+        plan.send.table_identity = reader_table_identity(&built.build().reader).unwrap();
+        let seed = Digest([0x71; 32]);
+        let columns = plan.proximity.column_draws as u64;
+        let max = 2 * columns;
+        let open = || {
+            crate::proof::column_session::AssetTableKeeper::open(
+                built.build(),
+                ledger.clone(),
+                columns,
+                max,
+            )
+            .unwrap()
+        };
+        let mut keeper = open();
+        let (messages, _) =
+            prove_hidden_lin_hidden_with_asset_table(&plan, &activation, &mut keeper, seed)
+                .unwrap();
+        assert_eq!(keeper.count().unwrap(), columns);
+        verify_hidden_lin_hidden(&plan, keeper.reader(), &messages).unwrap();
+
+        let mut restarted = open();
+        assert_eq!(restarted.count().unwrap(), columns);
+        let (messages, _) =
+            prove_hidden_lin_hidden_with_asset_table(&plan, &activation, &mut restarted, seed)
+                .unwrap();
+        assert_eq!(restarted.count().unwrap(), 2 * columns);
+        verify_hidden_lin_hidden(&plan, restarted.reader(), &messages).unwrap();
+
+        assert!(prove_hidden_lin_hidden_with_asset_table(
+            &plan,
+            &activation,
+            &mut restarted,
+            seed
+        )
+        .is_err());
+        assert_eq!(restarted.count().unwrap(), 2 * columns);
+        std::fs::remove_dir_all(&built.root).ok();
     }
 
     /// The Omega tree's runtime opening count is one accumulator owned by the

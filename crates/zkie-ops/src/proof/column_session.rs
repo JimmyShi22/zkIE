@@ -332,17 +332,17 @@ pub fn build_authenticated_encoding_table(
     )
 }
 
-/// The same table construction with the caller's table configuration. The
-/// independent candidate parameters digest is the configuration used by the
-/// session entry; the fixed demo configuration remains available for isolated
-/// component probes. The table root and record are produced after this
-/// configuration and are never part of it.
-pub fn build_authenticated_encoding_table_with_configuration(
+/// The same table construction over the caller's table configuration and
+/// shape. The independent candidate parameters digest is the configuration
+/// used by the session entry. The table root and record are produced after
+/// this configuration and are never part of it.
+pub fn build_authenticated_encoding_table_on_shape(
     public: &ModelCommitmentPublic,
     trusted: &TrustedModel<'_>,
     asset_path: &str,
     opening: &AssetOpening,
     configuration: Digest,
+    shape: IndexShape,
 ) -> Result<AssetEncodingTable> {
     verify_model_anchor(
         public,
@@ -371,7 +371,9 @@ pub fn build_authenticated_encoding_table_with_configuration(
     }
     public.verify_opening(opening)?;
 
-    let shape = demo_index_shape()?;
+    if index_shape_fault(&shape).is_some() {
+        return Err(Error::InvalidConfig);
+    }
     let rows = usize::try_from(shape.rows_checked()?).map_err(|_| Error::ResourceLimit)?;
     let plain = usize::try_from(shape.plain()).map_err(|_| Error::ResourceLimit)?;
     let code_len = usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?;
@@ -407,6 +409,25 @@ pub fn build_authenticated_encoding_table_with_configuration(
         messages,
         tails,
     })
+}
+
+/// The same table construction with the fixed demonstration shape. The shape
+/// validation runs before any asset row is read.
+pub fn build_authenticated_encoding_table_with_configuration(
+    public: &ModelCommitmentPublic,
+    trusted: &TrustedModel<'_>,
+    asset_path: &str,
+    opening: &AssetOpening,
+    configuration: Digest,
+) -> Result<AssetEncodingTable> {
+    build_authenticated_encoding_table_on_shape(
+        public,
+        trusted,
+        asset_path,
+        opening,
+        configuration,
+        demo_index_shape()?,
+    )
 }
 
 /// Opens one charged physical column per unique query position and returns one
