@@ -459,9 +459,11 @@ pub struct AssetTableKeeper {
 }
 
 impl AssetTableKeeper {
-    /// Wraps a built table with a durable budget over `ledger_dir`. The caller
-    /// owns the ledger location; the production constructor below derives it
-    /// from the asset directory and the table root.
+    /// Wraps a built table with a durable budget over `ledger_dir`. The ledger
+    /// must already have been initialized when the table was created; this
+    /// constructor opens it and never creates or resets it. The caller owns the
+    /// ledger location; the production constructor below derives it from the
+    /// asset directory and the table root.
     pub fn open(
         table: AssetEncodingTable,
         ledger_dir: impl Into<PathBuf>,
@@ -469,9 +471,8 @@ impl AssetTableKeeper {
         max_columns: u64,
     ) -> Result<Self> {
         let ledger_dir = ledger_dir.into();
-        std::fs::create_dir_all(&ledger_dir).map_err(|_| Error::Io)?;
         let root = table.reader.root;
-        let budget = DurableColumnBudget::new(
+        let budget = DurableColumnBudget::open(
             ledger_dir.clone(),
             ledger_dir.join("columns.count"),
             columns,
@@ -524,9 +525,21 @@ impl HiddenTableProver for AssetTableKeeper {
     }
 }
 
+/// Initializes the column ledger of one table identity below the real asset
+/// directory. It is called when the table is committed: a new table gets an
+/// empty count and its initialization marker; an existing ledger is left
+/// untouched, so a repeated commit never resets a consumed count. The
+/// prove-side keeper opens the ledger and never creates it.
+pub fn initialize_asset_table_ledger(asset_dir: &Path, table_root: Digest) -> Result<()> {
+    let ledger_dir = column_ledger_dir(asset_dir, table_root);
+    std::fs::create_dir_all(&ledger_dir).map_err(|_| Error::Io)?;
+    DurableColumnBudget::initialize(ledger_dir.clone(), ledger_dir.join("columns.count"))
+}
+
 /// Builds the authenticated table from the real asset opening and opens the
 /// production keeper. The ledger directory is derived from `asset_dir` and the
-/// built table root; the asset file itself is only read through the opening.
+/// built table root; the ledger must have been initialized when the table was
+/// committed. The asset file itself is only read through the opening.
 /// `configuration` is the session's candidate parameters digest.
 pub fn open_asset_table_keeper(
     public: &ModelCommitmentPublic,
@@ -1250,23 +1263,13 @@ mod tests {
         let max_columns = 4u64;
         let body = fixture.root.join("table_i32.bin");
         let before = fs::read(&body).unwrap();
-        let trusted = trusted(&fixture);
-        let open = || {
-            open_asset_table_keeper(
-                &fixture.public,
-                &trusted,
-                "table_i32.bin",
-                &fixture.opening,
-                fixture.input.parameters.digest().unwrap(),
-                &fixture.root,
-                columns,
-                max_columns,
-            )
-            .unwrap()
-        };
-        let mut keeper = open();
-        let ledger = column_ledger_dir(&fixture.root, keeper.table().reader.root);
-        assert!(ledger.is_dir(), "the ledger directory is derived and created");
+        let built = table(&fixture);
+        let root = built.reader.root;
+        initialize_asset_table_ledger(&fixture.root, root).unwrap();
+        let ledger = column_ledger_dir(&fixture.root, root);
+        assert!(ledger.is_dir(), "the ledger directory is derived");
+        let mut keeper =
+            AssetTableKeeper::open(built, ledger.clone(), columns, max_columns).unwrap();
         assert_eq!(keeper.count().unwrap(), 0);
         assert_eq!(keeper.rows(), keeper.table().shape.rows());
         let mut message = vec![Fp::ZERO; keeper.table().shape.code.ell as usize];
@@ -1278,7 +1281,8 @@ mod tests {
         assert_eq!(openings[0].position, 0);
         assert_eq!(openings[1].position, 1);
 
-        let mut second = open();
+        let mut second =
+            AssetTableKeeper::open(table(&fixture), ledger.clone(), columns, max_columns).unwrap();
         keeper.durable_column_budget().unwrap().reserve().unwrap();
         second.durable_column_budget().unwrap().reserve().unwrap();
         assert_eq!(second.count().unwrap(), 2 * columns);
@@ -1287,6 +1291,31 @@ mod tests {
 
         let after = fs::read(&body).unwrap();
         assert_eq!(before, after);
+    }
+
+    /// The keeper never creates the ledger, and a lost count is refused rather
+    /// than reset: initialization is the commit-time path only.
+    #[test]
+    fn the_keeper_never_creates_the_ledger() {
+        let fixture = fixture();
+        let built = table(&fixture);
+        let root = built.reader.root;
+        let ledger = column_ledger_dir(&fixture.root, root);
+        assert!(AssetTableKeeper::open(
+            built,
+            ledger.clone(),
+            1,
+            1,
+        )
+        .is_err());
+        assert!(!ledger.exists());
+
+        initialize_asset_table_ledger(&fixture.root, root).unwrap();
+        let mut keeper =
+            AssetTableKeeper::open(table(&fixture), ledger.clone(), 1, 1).unwrap();
+        keeper.durable_column_budget().unwrap().reserve().unwrap();
+        std::fs::remove_file(ledger.join("columns.count")).unwrap();
+        assert!(AssetTableKeeper::open(table(&fixture), ledger.clone(), 1, 1).is_err());
     }
 
     fn verify(fixture: &Fixture) -> Result<ColumnSessionOutcome> {

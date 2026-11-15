@@ -121,6 +121,41 @@ fn commit(name: &str, values: &[i32]) -> (ModelCommitmentPublic, Vec<AssetTableM
     )
 }
 
+/// The commit creates the table's column ledger, empty and initialized; a
+/// repeated commit of the same table never resets a consumed count.
+#[test]
+fn the_table_commit_creates_its_column_ledger_and_a_recommit_keeps_it() {
+    let root = temp_dir("ledger-init");
+    write_asset(&root.join("asset.bin"), &values());
+    let commitment =
+        commit_assets_with_tables(&root, MODEL, PARAMS_DIGEST, &[spec()], &[input()]).unwrap();
+    let meta = commitment.tables.first().unwrap();
+    let ledger = zkie_ops::proof::column_session::column_ledger_dir(&root, meta.root);
+    assert!(ledger.is_dir());
+    let budget = zkie_engine::pcs::request::read::DurableColumnBudget::open(
+        ledger.clone(),
+        ledger.join("columns.count"),
+        2,
+        4,
+    )
+    .unwrap();
+    assert_eq!(budget.count().unwrap(), 0);
+    budget.reserve().unwrap();
+    assert_eq!(budget.count().unwrap(), 2);
+
+    let again =
+        commit_assets_with_tables(&root, MODEL, PARAMS_DIGEST, &[spec()], &[input()]).unwrap();
+    assert_eq!(again.tables.first().unwrap().root, meta.root);
+    let reopened = zkie_engine::pcs::request::read::DurableColumnBudget::open(
+        ledger.clone(),
+        ledger.join("columns.count"),
+        2,
+        4,
+    )
+    .unwrap();
+    assert_eq!(reopened.count().unwrap(), 2);
+}
+
 #[test]
 fn table_commit_binds_the_anchor_and_verifies() {
     let (public, metas) = commit("positive", &values());

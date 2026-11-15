@@ -22,7 +22,9 @@ use zkie_core::types::Digest;
 
 use crate::pcs::request::chain::Chain;
 use crate::pcs::request::field::Fp;
-use crate::pcs::request::persistent_count::{CountPlan, CountReceipt, CountSet};
+use crate::pcs::request::persistent_count::{
+    check_initialized, initialize_count, CountPlan, CountReceipt, CountSet,
+};
 use crate::pcs::request::table::{
     verify_columns, ColumnOpening, IndexReader,
 };
@@ -327,10 +329,12 @@ pub struct DurableColumnBudget {
 }
 
 impl DurableColumnBudget {
-    /// The count file must live under `root`; it is created empty when absent.
+    /// Opens the existing count of one table. The count and its initialization
+    /// marker must both exist; opening never creates, truncates or resets
+    /// them, and a missing count is refused rather than read as zero.
     /// `columns` is the fixed batch size and `max_columns` the table-life
     /// limit. Both are trusted plan values.
-    pub fn new(
+    pub fn open(
         root: impl Into<PathBuf>,
         count: PathBuf,
         columns: u64,
@@ -340,9 +344,7 @@ impl DurableColumnBudget {
         if !root.is_dir() {
             return Err(Error::InvalidConfig);
         }
-        if !count.exists() {
-            std::fs::File::create(&count).map_err(|_| Error::Io)?;
-        }
+        check_initialized(&root, &count)?;
         let plan = CountPlan::new(columns, max_columns)?;
         let set = CountSet::new(root, vec![count], plan)?;
         Ok(Self {
@@ -350,6 +352,14 @@ impl DurableColumnBudget {
             leaf: 0,
             columns,
         })
+    }
+
+    /// Creates the empty count of a new table, together with its
+    /// initialization marker. An existing count is never truncated, a repeated
+    /// initialization leaves it untouched, and concurrent initializers
+    /// serialize on the count lock.
+    pub fn initialize(root: impl Into<PathBuf>, count: PathBuf) -> Result<()> {
+        initialize_count(root, count)
     }
 
     pub fn columns(&self) -> u64 {

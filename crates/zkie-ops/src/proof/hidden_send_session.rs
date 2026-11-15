@@ -29623,6 +29623,12 @@ mod merged_tests {
             17
         ));
         let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        zkie_engine::pcs::request::read::DurableColumnBudget::initialize(
+            dir.clone(),
+            dir.join("columns.count"),
+        )
+        .unwrap();
         let activation = activation();
         let (mut plan, seed) = member_plan_for(&activation);
         let columns = plan.proximity.column_draws as u64;

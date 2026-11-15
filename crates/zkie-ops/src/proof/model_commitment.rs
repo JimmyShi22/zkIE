@@ -424,6 +424,13 @@ fn commit_assets_inner(
     if !table_by_asset.is_empty() {
         return Err(Error::StatementMismatch);
     }
+    // Every committed asset table gets its column ledger at commit time: an
+    // empty count under the asset directory, keyed by the table root, with its
+    // initialization marker. A repeated commit of the same table leaves a
+    // consumed count untouched, and the prove side never creates one.
+    for meta in &table_metas {
+        crate::proof::column_session::initialize_asset_table_ledger(root, meta.root)?;
+    }
     let anchor = make_anchor(model_commitment, parameters_digest, &records)?;
     Ok((
         ModelCommitment {

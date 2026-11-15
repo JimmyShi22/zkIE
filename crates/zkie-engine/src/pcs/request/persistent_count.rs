@@ -9,6 +9,12 @@
 //! copied directory has an independent count. Those extensions have no
 //! counterpart here and are not claimed.
 //!
+//! The count file is created once, when the table is committed: the initializer
+//! below creates an empty count and an initialization marker under the table's
+//! lock, and never truncates an existing count. Opening a count never creates
+//! or resets it; a missing count, or a count without its marker, is an error
+//! and is never treated as zero. Those are the recovery rules of this store.
+//!
 //! A production caller must replace the test-only failure hooks and must decide
 //! which live tables are in the set. This module does not select a new leaf,
 //! shorten a batch, retry a failed sync, or silently downgrade hiding. The lock
@@ -28,6 +34,9 @@ use std::path::{Path, PathBuf};
 use std::os::unix::io::IntoRawFd;
 
 use zkie_core::error::{Error, Result};
+
+const LOCK_FILE: &str = "count.lock";
+const INITIALIZED_FILE: &str = "initialized";
 
 /// The fixed plan for one batch of count files. `columns` is the logical
 /// number of columns the plan reserves for every batch; `max_columns` is the
@@ -63,6 +72,115 @@ impl CountPlan {
         }
         Ok(())
     }
+}
+
+/// The initialization marker of one table's count: a regular file next to the
+/// count that records that the table has a ledger. The count is created only
+/// together with this marker; a marker with a missing count is a lost ledger
+/// and is refused, never reset to zero.
+pub fn initialization_marker(root: &Path) -> PathBuf {
+    root.join(INITIALIZED_FILE)
+}
+
+/// Checks that one table's count was initialized: both the marker and the
+/// count must exist as regular, non-symlink files.
+pub fn check_initialized(root: &Path, count: &Path) -> Result<()> {
+    let marker = initialization_marker(root);
+    let metadata = std::fs::symlink_metadata(&marker).map_err(|_| Error::Io)?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(Error::InvalidConfig);
+    }
+    let count_metadata = std::fs::symlink_metadata(count).map_err(|_| Error::Io)?;
+    if count_metadata.file_type().is_symlink() || !count_metadata.file_type().is_file() {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(())
+}
+
+/// Creates the count of a new table, empty, together with its initialization
+/// marker. An existing count is left untouched: a repeated initialization of
+/// one table never truncates a consumed count, and two concurrent
+/// initializers serialize on the count lock. A count without the marker that
+/// is not empty is refused, and an initialized table whose count is missing is
+/// refused; neither is reset to zero.
+pub fn initialize_count(root: impl Into<PathBuf>, count: PathBuf) -> Result<()> {
+    let root = root.into();
+    if !root.is_dir() {
+        return Err(Error::InvalidConfig);
+    }
+    let lock_path = root.join(LOCK_FILE);
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .open(&lock_path)
+        .map_err(|_| Error::Io)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+        .map_err(|_| Error::Io)?;
+    lock.lock().map_err(|_| Error::Io)?;
+    let result = initialize_count_locked(&root, &count);
+    let unlock = lock.unlock().map_err(|_| Error::Io);
+    match (result, unlock) {
+        (Err(error), _) => Err(error),
+        (Ok(()), Err(error)) => Err(error),
+        (Ok(()), Ok(())) => Ok(()),
+    }
+}
+
+fn initialize_count_locked(root: &Path, count: &Path) -> Result<()> {
+    let marker = initialization_marker(root);
+    match std::fs::symlink_metadata(&marker) {
+        Ok(metadata) => {
+            if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                return Err(Error::InvalidConfig);
+            }
+            check_initialized(root, count)
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            match std::fs::symlink_metadata(count) {
+                Ok(metadata) => {
+                    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+                        return Err(Error::InvalidConfig);
+                    }
+                    if metadata.len() != 0 {
+                        // A count without the marker is not a new table. It is
+                        // never adopted, shortened or reset here.
+                        return Err(Error::InvalidConfig);
+                    }
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    let file = OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(count)
+                        .map_err(|_| Error::Io)?;
+                    file.sync_all().map_err(|_| Error::Io)?;
+                    close_count_file(file)?;
+                }
+                Err(_) => return Err(Error::Io),
+            }
+            write_initialization_marker(&marker)
+        }
+        Err(_) => Err(Error::Io),
+    }
+}
+
+fn write_initialization_marker(marker: &Path) -> Result<()> {
+    let temporary = marker.with_extension("tmp");
+    std::fs::remove_file(&temporary).ok();
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temporary)
+        .map_err(|_| Error::Io)?;
+    file.write_all(b"1").map_err(|_| Error::Io)?;
+    file.sync_all().map_err(|_| Error::Io)?;
+    close_count_file(file)?;
+    std::fs::rename(&temporary, marker).map_err(|_| Error::Io)?;
+    Ok(())
 }
 
 /// A completed, durable count reservation. There is no cancel/refund method:
@@ -107,7 +225,7 @@ impl CountSet {
                 return Err(Error::InvalidConfig);
             }
         }
-        let lock_path = root.join("count.lock");
+        let lock_path = root.join(LOCK_FILE);
         OpenOptions::new()
             .read(true)
             .write(true)
@@ -408,6 +526,63 @@ mod tests {
 
     fn set_count(path: &Path, count: u64) {
         std::fs::write(path, vec![0u8; count as usize]).unwrap();
+    }
+
+    #[test]
+    fn initialization_never_truncates_a_consumed_count() {
+        let root = temp_root("init-no-truncate");
+        let count = root.join("count.bin");
+        initialize_count(&root, count.clone()).unwrap();
+        let plan = CountPlan::new(2, 4).unwrap();
+        let set = CountSet::new(&root, vec![count.clone()], plan).unwrap();
+        set.begin_batch(0).unwrap();
+        assert_eq!(read_count(&count).unwrap(), 2);
+        initialize_count(&root, count.clone()).unwrap();
+        assert_eq!(read_count(&count).unwrap(), 2);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn concurrent_initialization_creates_one_empty_count() {
+        let root = temp_root("init-concurrent");
+        let count = root.join("count.bin");
+        let (left, right) = std::thread::scope(|scope| {
+            let first_root = root.clone();
+            let first_count = count.clone();
+            let first = scope.spawn(move || initialize_count(&first_root, first_count));
+            let second_root = root.clone();
+            let second_count = count.clone();
+            let second = scope.spawn(move || initialize_count(&second_root, second_count));
+            (first.join().unwrap(), second.join().unwrap())
+        });
+        left.unwrap();
+        right.unwrap();
+        assert_eq!(read_count(&count).unwrap(), 0);
+        let set = CountSet::new(&root, vec![count.clone()], CountPlan::new(1, 1).unwrap()).unwrap();
+        set.begin_batch(0).unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_initialized_table_with_a_missing_count_is_refused() {
+        let root = temp_root("init-missing");
+        let count = root.join("count.bin");
+        initialize_count(&root, count.clone()).unwrap();
+        std::fs::remove_file(&count).unwrap();
+        assert!(initialize_count(&root, count.clone()).is_err());
+        assert!(check_initialized(&root, &count).is_err());
+        assert!(CountSet::new(&root, vec![count], CountPlan::new(1, 1).unwrap()).is_err());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_count_without_its_marker_is_not_reset() {
+        let root = temp_root("init-unmarked");
+        let count = root.join("count.bin");
+        set_count(&count, 3);
+        assert!(initialize_count(&root, count.clone()).is_err());
+        assert_eq!(read_count(&count).unwrap(), 3);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]
