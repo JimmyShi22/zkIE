@@ -126,6 +126,14 @@ fn shared_form_carries_no_input_openings() {
     assert!(proof.lengths.raw.is_empty());
     let values: Vec<Option<Vec<i64>>> = inputs.iter().cloned().map(Some).collect();
     verify_op_relation_shared_with_external(&public, &proof, &config, &values).unwrap();
+    // The ordinary entry keeps requiring raw; the empty shared form is not a
+    // second accepted form there.
+    assert_eq!(
+        verify_op_relation_with_external(&public, &proof, &config, &values)
+            .unwrap_err()
+            .code(),
+        "shape_mismatch"
+    );
 
     // A materialized value that differs from the prover's input is rejected by
     // the relation equation.
