@@ -475,13 +475,21 @@ impl PipelineProvider for ProductionProvider {
             return Err(Error::StatementMismatch);
         }
         let table_params = trusted_table_params(&trusted.model)?;
+        // The public case config fixes the asset root that locates the fixed
+        // public tables. It is public material from the bundle, not a weight
+        // path and never a proof value.
+        let config_bytes = fs::read(request.public_bundle_dir.join("provider-config.bin"))
+            .map_err(|_| Error::IncompleteArtifact)?;
+        let public_config: ProviderConfig =
+            bincode::deserialize(&config_bytes).map_err(|_| Error::InvalidEncoding)?;
+        let public_root = std::path::Path::new(&public_config.asset_root);
 
         let (bound, statement_matches) = match trusted.model.as_str() {
             "gpt2" => {
                 if trusted.model_version != zkie_models_gpt2::plan::MODEL_VERSION {
                     return Err(Error::InvalidConfig);
                 }
-                let plan = zkie_models_gpt2::plan::trace_plan(statement.tokens.len())?;
+                let plan = zkie_models_gpt2::plan::trace_plan_public(statement.tokens.len())?;
                 if zkie_models_gpt2::plan::model_commitment(&statement.tokens)? != model_id {
                     return Err(Error::StatementMismatch);
                 }
@@ -497,7 +505,7 @@ impl PipelineProvider for ProductionProvider {
                     &table_params,
                 )?;
                 let argmax =
-                    verify_shared_trace(&public, &trace, &statement.tokens, &plan, None)?;
+                    verify_shared_trace(&public, &trace, &statement.tokens, &plan, Some(public_root))?;
                 let computed: Vec<i64> = argmax.iter().map(|value| *value as i64).collect();
                 let bound = crate::output::bind(
                     &trusted.output,
@@ -516,7 +524,7 @@ impl PipelineProvider for ProductionProvider {
                 if trusted.model_version != zkie_models_gemma3::plan::MODEL_VERSION {
                     return Err(Error::InvalidConfig);
                 }
-                let plan = zkie_models_gemma3::plan::trace_plan(statement.tokens.len())?;
+                let plan = zkie_models_gemma3::plan::trace_plan_public(statement.tokens.len())?;
                 if zkie_models_gemma3::plan::model_commitment(&statement.tokens)? != model_id {
                     return Err(Error::StatementMismatch);
                 }
@@ -532,7 +540,7 @@ impl PipelineProvider for ProductionProvider {
                     &table_params,
                 )?;
                 let argmax =
-                    verify_shared_trace(&public, &trace, &statement.tokens, &plan, None)?;
+                    verify_shared_trace(&public, &trace, &statement.tokens, &plan, Some(public_root))?;
                 let computed: Vec<i64> = argmax.iter().map(|value| *value as i64).collect();
                 let bound = crate::output::bind(
                     &trusted.output,
@@ -554,7 +562,7 @@ impl PipelineProvider for ProductionProvider {
                 if trusted.model_version != zkie_models_timesfm::plan::MODEL_VERSION {
                     return Err(Error::InvalidConfig);
                 }
-                let plan = zkie_models_timesfm::plan::trace_plan(patches)?;
+                let plan = zkie_models_timesfm::plan::trace_plan_public(patches)?;
                 if zkie_models_timesfm::plan::model_commitment(&statement.tokens)? != model_id {
                     return Err(Error::StatementMismatch);
                 }
@@ -574,7 +582,7 @@ impl PipelineProvider for ProductionProvider {
                     &trace,
                     &statement.tokens,
                     &plan,
-                    None,
+                    Some(public_root),
                 )?;
                 if output.len() != zkie_models_timesfm::plan::output_elements(patches)? {
                     return Err(Error::ShapeMismatch);

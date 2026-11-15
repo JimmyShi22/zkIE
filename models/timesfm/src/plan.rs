@@ -556,6 +556,47 @@ pub fn model_commitment(tokens: &[u32]) -> Result<Digest> {
     transcript_digest(15, &bytes)
 }
 
+fn public_tables() -> Vec<(String, zkie_ops::proof::plan::PublicTable)> {
+    use zkie_core::artifact::digest_from_hex;
+    use zkie_ops::proof::plan::{PublicTable, PublicTableEncoding};
+    let table = |path: &str, digest: &str, entries: u64| {
+        (
+            path.to_owned(),
+            PublicTable {
+                locator: path.to_owned(),
+                digest: digest_from_hex(digest).expect("the fixed public table digest"),
+                entries,
+                encoding: PublicTableEncoding::I32LeSigned,
+            },
+        )
+    };
+    vec![
+        table(
+            EXP,
+            "c6a3e6fae423e86bc2598392e4055c938381616c738414fa8bad859da4004f55",
+            2_097_152,
+        ),
+        table(
+            RSQRT,
+            "7cba6a7c88053b99112c1271a2d593e1147a4b3b4a92fe1091c148e2e33573ed",
+            7_340_032,
+        ),
+        table(
+            "models/timesfm/weights/silu_table_i32.bin",
+            "107fba3ab21394f02ff1869ca8aaeda98f70f092a96e61bcf646cb53af19d6c7",
+            1_048_576,
+        ),
+    ]
+}
+
+/// The production plan: the shared exp/rsqrt and the silu table are trusted
+/// public files.
+pub fn trace_plan_public(m: usize) -> Result<TracePlan> {
+    let mut plan = trace_plan(m)?;
+    zkie_ops::proof::plan::promote_public_tables(&mut plan, &public_tables());
+    Ok(plan)
+}
+
 pub fn asset_specs() -> Vec<ModelAssetSpec> {
     crate::executor::asset_specs()
 }

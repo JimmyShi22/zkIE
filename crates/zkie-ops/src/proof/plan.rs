@@ -851,6 +851,46 @@ pub(crate) fn cache_keys(plan: &TracePlan) -> AssetCacheKeys {
         .collect()
 }
 
+/// Replaces every flat asset source that names one of `tables` with the same
+/// trusted public table source, keeping its layout. The trusted plan calls
+/// this with the fixed public identities; a proof value never selects a
+/// table.
+pub fn promote_public_tables(plan: &mut TracePlan, tables: &[(String, PublicTable)]) {
+    for step in &mut plan.steps {
+        for source in &mut step.inputs {
+            promote_source(source, tables);
+        }
+    }
+}
+
+fn promote_source(source: &mut PlanSource, tables: &[(String, PublicTable)]) {
+    match source {
+        PlanSource::Asset { path, layout } => {
+            if let Some((_, table)) = tables.iter().find(|(name, _)| name == path) {
+                let layout = layout.clone();
+                *source = PlanSource::PublicTable {
+                    table: table.clone(),
+                    layout,
+                };
+            }
+        }
+        PlanSource::Concat(parts) => {
+            for part in parts {
+                promote_source(part, tables);
+            }
+        }
+        PlanSource::HeadConcat { parts, .. } => {
+            for part in parts {
+                promote_source(part, tables);
+            }
+        }
+        PlanSource::Layout(inner, _) => promote_source(inner, tables),
+        PlanSource::Prev { .. }
+        | PlanSource::Constant(_)
+        | PlanSource::PublicTable { .. } => {}
+    }
+}
+
 fn count_source(source: &PlanSource, counts: &mut BTreeMap<(String, PlanLayout), usize>) {
     match source {
         PlanSource::Asset { path, layout } => {
