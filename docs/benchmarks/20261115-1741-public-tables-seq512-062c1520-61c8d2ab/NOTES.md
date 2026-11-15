@@ -34,23 +34,25 @@ policy.
 | | verify wall | 38,739 ms | 38,754 ms | +15 ms (noise) |
 | | verify VmHWM | 18,851,352 KiB | 18,649,416 KiB | -201,936 KiB (-1.1%) |
 | | proof.bin | 11,127,643,038 B | 10,917,923,358 B | -209,719,680 B |
-| gemma3-seq512 | commit | reused | GEMMA_COMMIT | created once, then reused |
-| | prove wall | GEMMA_PROVE_BEFORE | GEMMA_PROVE_AFTER | |
-| | prove VmHWM | GEMMA_PHWM_BEFORE | GEMMA_PHWM_AFTER | |
-| | verify wall | GEMMA_VERIFY_BEFORE | GEMMA_VERIFY_AFTER | |
-| | verify VmHWM | GEMMA_VHWM_BEFORE | GEMMA_VHWM_AFTER | |
-| | proof.bin | GEMMA_PROOF_BEFORE | GEMMA_PROOF_AFTER | |
+| gemma3-seq512 | commit | reused | 9,569 ms / 1,085,800 KiB | created once, then reused |
+| | prove wall | 113,560 ms | 114,070 ms | +510 ms (+0.5%) |
+| | prove VmHWM | 52,503,644 KiB | 52,094,200 KiB | -409,444 KiB (-0.8%) |
+| | verify wall | 75,470 ms | 74,430 ms | -1,040 ms (-1.4%) |
+| | verify VmHWM | 30,491,832 KiB | 30,293,608 KiB | -198,224 KiB (-0.7%) |
+| | proof.bin | 16,578,322,086 B | 16,368,601,254 B | -209,720,832 B |
 
-- Carried trace assets from the bincode header: gpt2-seq512 199 -> 196.
-- gpt2-seq512 removes the exp/rsqrt/gelu openings: their values are
+- Carried trace assets from the bincode header: gpt2-seq512 199 -> 196,
+  gemma3-seq512 245 -> 242.
+- Both cases remove the exp/rsqrt/gelu openings: their values are
   209,715,200 B (exp 16,777,216 + rsqrt 58,720,256 + gelu 134,217,728). The
   small remainder of the measured proof delta is the per-instance opening
   bookkeeping and the relation-proof bookkeeping for the table ports that no
   longer name an external pool; it is measured per case and not claimed as a
   fixed number.
-- Output correctness: both verifications PASS with `output_binding =
-  "expected"` and the expected 512-element argmax digest
-  `eac0949d6463927eb9a961d61d618fb703e4b02169e89db10dbada94a5f0dfdd`.
+- Output correctness: all four verifications PASS with `output_binding =
+  "expected"` and the expected 512-element argmax digest, gpt2
+  `eac0949d6463927eb9a961d61d618fb703e4b02169e89db10dbada94a5f0dfdd` and
+  gemma3 `6d1df6b50c20d02db715fd14b12b9134623739375c44a029dd15b6b30bd9344c`.
 - The expected table digests and entry counts are fixed constants in the
   model plan code; the case config's asset root only locates the files. The
   0.07 s warm-cache read+hash in the seq16 trace is not the full first
