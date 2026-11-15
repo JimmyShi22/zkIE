@@ -131,6 +131,9 @@ fn supported_source(source: &PlanSource) -> bool {
         } | PlanSource::Asset {
             layout: PlanLayout::Flat,
             ..
+        } | PlanSource::PublicTable {
+            layout: PlanLayout::Flat,
+            ..
         }
     )
 }
@@ -223,6 +226,19 @@ fn encode_plan_source(
             writer.put_u64(meta.leaf_record.generation);
             writer.put_digest(&meta.leaf_record.table_identity);
             writer.put_digest(&meta.leaf_record.leaf_root);
+            Ok(())
+        }
+        PlanSource::PublicTable {
+            table,
+            layout: PlanLayout::Flat,
+        } => {
+            writer.put_u64(3);
+            writer.put_bytes(table.locator.as_bytes());
+            writer.put_digest(&table.digest);
+            writer.put_u64(table.entries);
+            writer.put_u64(match table.encoding {
+                crate::proof::plan::PublicTableEncoding::I32LeSigned => 0,
+            });
             Ok(())
         }
         _ => Err(Error::UnsupportedPrimitive),

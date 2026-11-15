@@ -29,6 +29,9 @@ pub enum PlanSource {
     },
     /// A model asset, optionally sliced or transformed.
     Asset { path: String, layout: PlanLayout },
+    /// A trusted public table: the values are read from the fixed public file
+    /// under the trusted identity, never from the proof.
+    PublicTable { table: PublicTable, layout: PlanLayout },
     /// A trusted constant derived from public configuration.
     Constant(PlanConstant),
     /// Values concatenated from several sources.
@@ -70,8 +73,59 @@ impl PlanSource {
         }
     }
 
+    pub fn public_table(table: PublicTable) -> Self {
+        Self::PublicTable {
+            table,
+            layout: PlanLayout::Flat,
+        }
+    }
+
     pub fn with_layout(self, layout: PlanLayout) -> Self {
         Self::Layout(Box::new(self), layout)
+    }
+}
+
+/// The integer decoding of a trusted public table. The verifier reads the
+/// table's exact bytes; no proof value and no freshly discovered file can
+/// change the expected identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicTableEncoding {
+    I32LeSigned,
+}
+
+/// One trusted public table: the trusted plan fixes the content digest, the
+/// entry count and the integer decoding. The locator only finds the file; the
+/// values never come from the proof.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublicTable {
+    pub locator: String,
+    pub digest: Digest,
+    pub entries: u64,
+    pub encoding: PublicTableEncoding,
+}
+
+/// Reads one public table from its trusted locator and checks the full
+/// identity: the byte length equals the fixed entry count times four and the
+/// content digest equals the fixed one. A missing or different file is an
+/// error, never a silent fallback.
+pub fn read_public_table(table: &PublicTable) -> Result<Vec<i64>> {
+    let bytes = std::fs::read(&table.locator).map_err(|_| Error::Io)?;
+    let expected = table.entries.checked_mul(4).ok_or(Error::ResourceLimit)?;
+    if bytes.len() as u64 != expected {
+        return Err(Error::ShapeMismatch);
+    }
+    if digest_bytes(&bytes) != table.digest {
+        return Err(Error::AssetMismatch);
+    }
+    match table.encoding {
+        PublicTableEncoding::I32LeSigned => {
+            let entries = usize::try_from(table.entries).map_err(|_| Error::ResourceLimit)?;
+            let mut values = Vec::with_capacity(entries);
+            for chunk in bytes.chunks_exact(4) {
+                values.push(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as i64);
+            }
+            Ok(values)
+        }
     }
 }
 
@@ -614,6 +668,19 @@ fn put_source(bytes: &mut Vec<u8>, source: &PlanSource) {
             put_source(bytes, inner);
             put_layout(bytes, layout);
         }
+        PlanSource::PublicTable { table, layout } => {
+            put_word(bytes, 6);
+            put_text(bytes, &table.locator);
+            bytes.extend_from_slice(&table.digest.0);
+            put_word(bytes, table.entries);
+            put_word(
+                bytes,
+                match table.encoding {
+                    PublicTableEncoding::I32LeSigned => 0,
+                },
+            );
+            put_layout(bytes, layout);
+        }
     }
 }
 
@@ -799,7 +866,7 @@ fn count_source(source: &PlanSource, counts: &mut BTreeMap<(String, PlanLayout),
             }
         }
         PlanSource::Layout(inner, _) => count_source(inner, counts),
-        PlanSource::Prev { .. } | PlanSource::Constant(_) => {}
+        PlanSource::Prev { .. } | PlanSource::Constant(_) | PlanSource::PublicTable { .. } => {}
     }
 }
 
@@ -1002,6 +1069,14 @@ fn materialize<'a>(
         PlanSource::Asset { path, layout } => {
             Ok(Materialized::Owned(assets.source_values(path, layout)?))
         }
+        PlanSource::PublicTable { table, layout } => {
+            let values = read_public_table(table)?;
+            if matches!(layout, PlanLayout::Flat) {
+                Ok(Materialized::Owned(Rc::new(values)))
+            } else {
+                Ok(Materialized::Owned(Rc::new(layout.apply(&values)?)))
+            }
+        }
         PlanSource::Constant(constant) => Ok(Materialized::Owned(Rc::new(
             constant.materialize(tokens)?,
         ))),
@@ -1057,6 +1132,7 @@ enum SourceKind {
         flat: bool,
     },
     Asset,
+    Public,
     Other,
 }
 
@@ -1072,6 +1148,7 @@ fn source_kind(source: &PlanSource) -> SourceKind {
             flat: matches!(layout, PlanLayout::Flat),
         },
         PlanSource::Asset { .. } => SourceKind::Asset,
+        PlanSource::PublicTable { .. } => SourceKind::Public,
         PlanSource::Constant(_) => SourceKind::Other,
         PlanSource::Concat(_) => SourceKind::Other,
         PlanSource::HeadConcat { .. } => SourceKind::Other,
@@ -1131,6 +1208,11 @@ pub(crate) fn verify_step(
     for (port, source) in plan_step.inputs.iter().enumerate() {
         let external = step.external.get(port).copied().flatten();
         let edge = step.sources.get(port).copied().flatten();
+        if matches!(source_kind(source), SourceKind::Public)
+            && (external.is_some() || edge.is_some())
+        {
+            return Err(Error::StatementMismatch);
+        }
         if matches!(source_kind(source), SourceKind::Asset) && external.is_some() {
             if edge.is_some() {
                 return Err(Error::StatementMismatch);
@@ -1198,6 +1280,11 @@ pub(crate) fn verify_step(
                     if opening.asset_id != plan_asset {
                         return Err(Error::StatementMismatch);
                     }
+                }
+            }
+            SourceKind::Public => {
+                if external.is_some() || edge.is_some() {
+                    return Err(Error::StatementMismatch);
                 }
             }
             SourceKind::Other => {
@@ -1290,6 +1377,49 @@ pub(crate) fn verify_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The public table source reads only its trusted file: the fixed digest,
+    /// entry count and signed decoding must all match, and a different file or
+    /// a changed size is refused.
+    #[test]
+    fn the_public_table_source_reads_only_its_trusted_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "zkie-public-table-{}-{}",
+            std::process::id(),
+            19
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("table.bin");
+        let values: Vec<i32> = vec![0, 1, -1, i32::MIN, i32::MAX];
+        let bytes: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect();
+        std::fs::write(&path, &bytes).unwrap();
+        let table = PublicTable {
+            locator: path.to_string_lossy().into_owned(),
+            digest: digest_bytes(&bytes),
+            entries: values.len() as u64,
+            encoding: PublicTableEncoding::I32LeSigned,
+        };
+        assert_eq!(
+            read_public_table(&table).unwrap(),
+            values.iter().map(|value| *value as i64).collect::<Vec<_>>()
+        );
+        let mut wrong_digest = table.clone();
+        wrong_digest.digest = Digest([0xAB; 32]);
+        assert!(read_public_table(&wrong_digest).is_err());
+        let mut wrong_size = table.clone();
+        wrong_size.entries -= 1;
+        assert!(read_public_table(&wrong_size).is_err());
+        let missing = PublicTable {
+            locator: dir.join("absent.bin").to_string_lossy().into_owned(),
+            ..table.clone()
+        };
+        assert!(read_public_table(&missing).is_err());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn cache_keys_select_only_reused_sources() {
