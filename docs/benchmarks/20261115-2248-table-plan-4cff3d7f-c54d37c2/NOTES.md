@@ -35,12 +35,14 @@
   failure and the corrected rerun is `run2`.
 - `run2` with the candidate policy: prove PASS and verify PASS with the
   expected output binding.
-  - seq16: prove 1,887,840,915 B / 14,041 ms / 3,897,632 KiB; verify
+  - seq16: prove result.json `proof_bytes` 1,887,840,915; 14,041 ms;
+    VmHWM 3,897,632 KiB; verify
     `135c4d1c…a80` over 16 elements / 12,038 ms / 3,791,668 KiB.
-  - seq512: prove 6,798,965,242 B / 44,508 ms / 18,922,904 KiB; verify
+  - seq512: prove result.json `proof_bytes` 6,798,965,242; 44,508 ms;
+    VmHWM 18,922,904 KiB; verify
     `eac0949d…fdd` over 512 elements / 29,659 ms / 14,089,508 KiB.
-- Proof bytes are single-run values, not a stability claim. The protected
-  45,080 B object is untouched.
+- The `proof_bytes` values are `result.json` execution statistics; they are
+  not the `proof.bin` file size. The protected 45,080 B object is untouched.
 
 ## Why superseded
 
