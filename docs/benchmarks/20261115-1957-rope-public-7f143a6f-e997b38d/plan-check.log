@@ -1,0 +1,209 @@
+warning: unused variable: `number`
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1513:9
+     |
+1513 |         number: u32,
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_number`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:881:5
+    |
+881 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: field `target` is never read
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1118:5
+     |
+1112 | struct FoldOutputMeta {
+     |        -------------- field in this struct
+...
+1118 |     target: Fp3,
+     |     ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-engine` (lib) generated 4 warnings (run `cargo fix --lib -p zkie-engine` to apply 3 suggestions)
+warning: unused import: `MODULUS`
+   --> crates/zkie-ops/src/proof/bat_fold_session.rs:147:59
+    |
+147 | use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE, MODULUS};
+    |                                                           ^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `verify_last_base_proof_with_positions`
+  --> crates/zkie-ops/src/proof/multi_stage_iopp.rs:47:29
+   |
+47 |     encode_last_base_proof, verify_last_base_proof_with_positions, verify_last_base_proof_with_positions_and_chain, LastBaseProver,
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:603:13
+    |
+603 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reader`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:3052:5
+     |
+3052 |     reader: &IndexReader,
+     |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_reader`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `combinations`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:6664:17
+     |
+6664 |             let combinations = range_plan.combinations as usize;
+     |                 ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_combinations`
+
+warning: unused variable: `first`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:19884:5
+      |
+19884 |     first: &HiddenSendMessages,
+      |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_first`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:20690:9
+      |
+20690 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:20790:9
+      |
+20790 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: unused variable: `n`
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:218:9
+    |
+218 |     let n = word_n(word)?;
+    |         ^ help: if this is intentional, prefix it with an underscore: `_n`
+
+warning: value assigned to `serves_folded` is never read
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:2120:29
+     |
+2120 |     let mut serves_folded = false;
+     |                             ^^^^^ this value is reassigned later and never used
+...
+2159 |         serves_folded = folded_step.1;
+     |         ----------------------------- `serves_folded` is overwritten here before the previous value is read
+     |
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `serves_omega` is never read
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:2121:28
+     |
+2121 |     let mut serves_omega = false;
+     |                            ^^^^^ this value is reassigned later and never used
+...
+2160 |         serves_omega = omega_step.map_or(false, |step| step.1);
+     |         ------------------------------------------------------ `serves_omega` is overwritten here before the previous value is read
+
+warning: value assigned to `serves_own` is never read
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:2122:26
+     |
+2122 |     let mut serves_own = false;
+     |                          ^^^^^ this value is reassigned later and never used
+...
+2161 |         serves_own = own_step.1;
+     |         ----------------------- `serves_own` is overwritten here before the previous value is read
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:201:5
+    |
+195 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+201 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `stack_hiding` is never read
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:7384:5
+     |
+7382 | struct SegmentSlotLayout {
+     |        ----------------- field in this struct
+7383 |     token_hiding: usize,
+7384 |     stack_hiding: usize,
+     |     ^^^^^^^^^^^^
+
+warning: field `m` is never read
+  --> crates/zkie-ops/src/proof/proximity_planner.rs:57:5
+   |
+52 | struct Proximity {
+   |        --------- field in this struct
+...
+57 |     m: u64,
+   |     ^
+   |
+   = note: `Proximity` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `batched_rows` is never used
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:2614:4
+     |
+2614 | fn batched_rows(word: &Word) -> u64 {
+     |    ^^^^^^^^^^^^
+
+warning: `zkie-ops` (lib) generated 16 warnings (run `cargo fix --lib -p zkie-ops` to apply 9 suggestions)
+   Compiling zkie-ops v0.1.0 (/data/zkIE/crates/zkie-ops)
+warning: unused variable: `root`
+   --> crates/zkie-ops/tests/plan_check.rs:801:5
+    |
+801 |     root: &PathBuf,
+    |     ^^^^ help: if this is intentional, prefix it with an underscore: `_root`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-ops` (test "plan_check") generated 1 warning (run `cargo fix --test "plan_check" -p zkie-ops` to apply 1 suggestion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.38s
+     Running tests/plan_check.rs (target/debug/deps/plan_check-3943ead61eabf449)
+
+running 31 tests
+test old_form_input_openings_are_rejected ... ok
+test materialized_input_mismatch_is_rejected ... ok
+test public_table_missing_file_is_rejected ... ok
+test prover_supplied_table_opening_is_rejected ... ok
+test rope_public_port_injection_is_rejected ... ok
+test public_table_file_swap_is_rejected ... ok
+test public_table_short_table_rejects_index_past_the_end ... ok
+test public_table_without_a_trusted_root_is_rejected ... ok
+test rms_extension_prover_supplied_opening_is_rejected ... ok
+test public_table_value_mismatch_is_rejected ... ok
+test step_output_opening_tamper_is_rejected ... ok
+test rope_public_tables_are_read_from_the_trusted_files ... ok
+test public_table_wrong_output_is_rejected ... ok
+test negative_wrong_asset ... ok
+test public_table_wrong_fixed_identity_is_rejected ... ok
+test public_table_source_verifies_from_the_trusted_file ... ok
+test negative_final_output ... ok
+test negative_external_and_missing_ports ... ok
+test negative_slice ... ok
+test negative_cross_step_edge_with_equal_values ... ok
+test rms_extension_index_past_the_end_is_rejected ... ok
+test positive_and_missing_extra_reorder ... ok
+test rms_extension_wrong_identity_or_short_table_is_rejected ... ok
+test public_table_truncated_or_padded_file_is_rejected ... ok
+test negative_sources_and_argmax ... ok
+test rope_public_wrong_table_or_slice_is_rejected_by_the_rotation_relation ... ok
+test rms_extension_reads_the_trusted_public_file ... ok
+test negative_external_opening_must_cover_the_full_asset ... ok
+test rope_public_file_identity_is_checked ... ok
+test rms_extension_file_tamper_is_rejected ... ok
+test rms_extension_consumption_tamper_is_rejected ... ok
+
+test result: ok. 31 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

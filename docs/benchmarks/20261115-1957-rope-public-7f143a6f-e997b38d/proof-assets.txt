@@ -1,0 +1,10 @@
+docs/benchmarks/20261115-1957-rope-public-7f143a6f-e997b38d/before/gemma3-seq16/proof/proof.bin: tokens=16 assets=241
+docs/benchmarks/20261115-1957-rope-public-7f143a6f-e997b38d/before/gemma3-seq512/proof/proof.bin: tokens=512 assets=241
+docs/benchmarks/20261115-1957-rope-public-7f143a6f-e997b38d/before/gpt2-seq16/proof/proof.bin: tokens=16 assets=196
+docs/benchmarks/20261115-1957-rope-public-7f143a6f-e997b38d/before/gpt2-seq512/proof/proof.bin: tokens=512 assets=196
+docs/benchmarks/20261115-1957-rope-public-7f143a6f-e997b38d/before/timesfm-16patch/proof/proof.bin: tokens=512 assets=238
+docs/benchmarks/20261115-1957-rope-public-7f143a6f-e997b38d/after/gemma3-seq16/proof/proof.bin: tokens=16 assets=237
+docs/benchmarks/20261115-1957-rope-public-7f143a6f-e997b38d/after/gemma3-seq512/proof/proof.bin: tokens=512 assets=237
+docs/benchmarks/20261115-1957-rope-public-7f143a6f-e997b38d/after/gpt2-seq16/proof/proof.bin: tokens=16 assets=196
+docs/benchmarks/20261115-1957-rope-public-7f143a6f-e997b38d/after/gpt2-seq512/proof/proof.bin: tokens=512 assets=196
+docs/benchmarks/20261115-1957-rope-public-7f143a6f-e997b38d/after/timesfm-16patch/proof/proof.bin: tokens=512 assets=238
