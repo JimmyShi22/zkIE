@@ -10817,10 +10817,9 @@ pub(crate) fn key_first_verify(
     // lookup key claim the verifier checked.
     let member =
         crate::proof::table_range::range_pending_row_with(&plan.range, &claims.key, plan.commit.mask_oracle)?;
-    if member.psi != messages.psi {
+    if member.psi != messages.psi || member.target != messages.eval_target {
         return Err(Error::InvalidProof);
     }
-    let _ = member.target;
     absorb_key_fp3(&mut chain, KEY_EVAL_TARGET_TAG, messages.eval_target)?;
     let seal = *chain.value();
     if seal != messages.seal {
@@ -36638,7 +36637,9 @@ mod key_first_flow_tests {
         let mut message_rows = vec![vec![Fp::ZERO; 8]; 4];
         for row in 0..4 {
             for column in 0..4 {
-                message_rows[row][column] =
+                // The table row is the matrix column: place row holds entry
+                // (row, column).
+                message_rows[column][row] =
                     crate::proof::column_session::fp_from_signed_word((row as i64 * 4 + column as i64 - 8) as u64);
             }
         }
@@ -36679,6 +36680,9 @@ mod key_first_flow_tests {
         .unwrap();
         let verified = key_first_verify(&plan, &reader, &table, &messages).unwrap();
         assert_eq!(verified, seal);
+        let mut changed = messages.clone();
+        changed.eval_target = changed.eval_target.add(&Fp3::ONE);
+        assert!(key_first_verify(&plan, &reader, &table, &changed).is_err());
         let mut changed = messages;
         changed.w_root = Digest([0x77; 32]);
         assert!(key_first_verify(&plan, &reader, &table, &changed).is_err());
