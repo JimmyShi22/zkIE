@@ -207,3 +207,16 @@ path.
   `run-summary.txt`; `proof-assets.py` and `proof-assets.txt`. Per-stage
   `result.json` and `progress.jsonl` stay under each run directory; proof
   binaries stay on disk and are gitignored. Not pushed.
+
+## Round closure
+
+- Expert batch review: the whole round is accepted, no further rework.
+- Final commit list, in order: `95a236fb` (production change: the remaining
+  shared relations no longer carry the redundant raw declaration),
+  `0a00b5cd` (test assertions for the softmax auxiliary and table
+  declarations), `e13984d9` (evidence record), and this closing commit (round
+  flag, NOTES record only; no code change).
+- State at closure: hard gate 45,080 B untouched; no anchor, policy, asset,
+  ground truth or commitment registration changed; the workspace suite is
+  green (1175 passed / 0 failed / 20 ignored); source and evidence are on
+  the branch, not pushed.
