@@ -3843,8 +3843,9 @@ mod single_group_stage_tests {
     #[test]
     fn the_frozen_message_derives_a_group_chain() {
         // The frozen geometry's bit message: 2^23 entries, one mask row, and
-        // the four rows the lookup registers on its own group.
-        match derive_single_group_stages(1 << 23, 1, 4, 1, false) {
+        // every row the lookup registers on its own group (its 71 outcome
+        // rows, the multiplicity row and the mask sample row).
+        match derive_single_group_stages(1 << 23, 1, 73, 1, false) {
             Ok(group) => {
                 assert!(!group.stages.is_empty());
                 assert_eq!(group.stages[0].main_ell, group.first_main.ell);
