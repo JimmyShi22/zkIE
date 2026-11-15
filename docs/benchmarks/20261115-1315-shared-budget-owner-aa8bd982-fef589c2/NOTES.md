@@ -60,3 +60,13 @@
   The full diagnostic entry still fails with the placeholder claim and zero
   maps; request-source limits from the earlier batch keep their list. Local
   evidence only, not R5. Not pushed.
+
+## Correction (TURN 566)
+
+The "fresh keeper over the same commitment" wording in this scheme is a
+test-only isolated-world boundary, not a production reset path. A new hiding
+budget needs new random material and the established authentication source;
+the same table root and random source must follow the old ledger. The
+production asset-table budget is durable and is wired separately (persistent
+count under the table identity, serialized reservations, reserve before use,
+no refund on failure, no reset on restart).

@@ -2137,9 +2137,11 @@ mod tests {
         }
     }
 
-    /// A fresh keeper over the same committed table: the toy fixture reuses
-    /// one table commitment for several proofs, and the in-memory hiding state
-    /// belongs to the keeper, so each proof gets its own table copy object.
+    /// Test-only isolated world: the toy fixture reuses one committed table
+    /// for several proofs and gives each proof a fresh in-memory keeper so the
+    /// tests can run. This is not a production reset path: a new hiding budget
+    /// needs new random material and the established authentication source,
+    /// and the same table root and random source must follow the old ledger.
     fn fresh_table() -> Table {
         encoded_table(&table_values())
     }
