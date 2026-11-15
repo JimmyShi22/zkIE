@@ -72,7 +72,7 @@ const K_LO: u32 = 0;
 const COLUMNS: u64 = 1024;
 const TABLE_LOG_N: u32 = 12;
 const TABLE_ELL: u64 = 2048;
-const TABLE_R: u64 = 128;
+const TABLE_R: u64 = 1024;
 const CODE_LOG_N: u32 = 14;
 const CODE_ELL: u64 = 8192;
 const CODE_R: u64 = 4;
@@ -190,6 +190,10 @@ fn shared_lin_columns() -> u64 {
         0,
     )
     .expect("the shared column count")
+}
+
+fn hidden_plan_table_lifetime() -> u64 {
+    table_code().r
 }
 
 fn table_shape() -> IndexShape {
@@ -362,28 +366,30 @@ fn diagnostic_table(weights: &[i64]) -> Table {
     )
     .unwrap();
     let reader = table.reader.clone();
+    // The ledger is stable per table identity: the first run creates it (the
+    // table's initialization) and later runs open the same files. A missing
+    // count is refused rather than reset.
     let ledger_dir = std::env::temp_dir().join(format!(
-        "zkie-diagnostic-ledger-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        "zkie-table-ledger-{}",
+        zkie_core::artifact::digest_to_hex(&reader.root)
     ));
-    let _ = fs::remove_dir_all(&ledger_dir);
-    fs::create_dir_all(&ledger_dir).unwrap();
     let count = ledger_dir.join("columns.count");
-    zkie_engine::pcs::request::read::DurableColumnBudget::initialize(
-        ledger_dir.clone(),
-        count.clone(),
-    )
-    .unwrap();
+    if !ledger_dir.is_dir() {
+        fs::create_dir_all(&ledger_dir).unwrap();
+        zkie_engine::pcs::request::read::DurableColumnBudget::initialize(
+            ledger_dir.clone(),
+            count.clone(),
+        )
+        .unwrap();
+    }
     let columns = shared_lin_columns();
+    let lifetime = table_code().r;
+    assert!(columns <= lifetime);
     let budget = zkie_engine::pcs::request::read::DurableColumnBudget::open(
         ledger_dir,
         count,
         columns,
-        columns * 4,
+        lifetime,
     )
     .unwrap();
     Table {
@@ -392,7 +398,7 @@ fn diagnostic_table(weights: &[i64]) -> Table {
         hiding: zkie_engine::pcs::request::read::HidingState::new(
             reader.root,
             1,
-            columns * 4,
+            lifetime,
         ),
         budget,
         reader,
@@ -1556,6 +1562,19 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
         no_distance.send.table_shape.distances.m_once = 0;
         no_distance.proximity.gu.index.distances.m_once = 0;
         assert!(no_distance.validate().is_err(), "the plan without a distance is refused");
+        let mut no_check = hidden_plan.clone();
+        no_check.proximity.lin_check = None;
+        assert!(
+            prove_hidden_lin_hidden_shared_seal(
+                &no_check,
+                &activation,
+                &mut session_table,
+                SEED,
+                Some(&inputs),
+            )
+            .is_err(),
+            "the production entry refuses a plan without the check"
+        );
         // The first two chains (the first part and the shared stage) up to
         // their seals, on the real plan and table with the plan's derived
         // column draws and one-time distance. The second stage is outside
@@ -1588,8 +1607,11 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
         let mut check =
             |label: &str, first: HiddenSendMessages, shared: HiddenSharedMessages| {
                 attempted += 1;
+                // A repeated verification needs a fresh plan-owned read
+                // ledger, so the tamper checks do not drain one plan.
+                let check_plan = hidden_plan.clone();
                 match verify_hidden_lin_hidden_shared_seal(
-                    &hidden_plan,
+                    &check_plan,
                     session_table.reader(),
                     &first,
                     &shared,
@@ -1615,6 +1637,56 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
         changed.chain_value.0[0] ^= 1;
         check("changed first seal", changed, seal_shared.clone());
         assert_eq!(rejected, attempted, "every shared seal negative is rejected");
+
+        // The same table identity reopens the same stable ledger: a re-run
+        // continues the count, and the lifetime total is the table's tail
+        // capacity, so exhaustion is refused before any use.
+        let per_batch = hidden_plan.proximity.column_draws as u64;
+        let count_after_first = session_table
+            .durable_column_budget()
+            .unwrap()
+            .count()
+            .unwrap();
+        let mut rerun_table = diagnostic_table(&weights);
+        assert_eq!(
+            rerun_table.durable_column_budget().unwrap().count().unwrap(),
+            count_after_first
+        );
+        let (rerun_first, rerun_shared) = prove_hidden_lin_hidden_shared_seal(
+            &hidden_plan,
+            &activation,
+            &mut rerun_table,
+            SEED,
+            Some(&inputs),
+        )
+        .expect("rerun prove");
+        assert_eq!(
+            rerun_table.durable_column_budget().unwrap().count().unwrap(),
+            count_after_first + per_batch
+        );
+        let rerun_plan = hidden_plan.clone();
+        verify_hidden_lin_hidden_shared_seal(
+            &rerun_plan,
+            rerun_table.reader(),
+            &rerun_first,
+            &rerun_shared,
+            Some(&inputs),
+        )
+        .expect("rerun verify");
+        while rerun_table
+            .durable_column_budget()
+            .unwrap()
+            .reserve()
+            .is_ok()
+        {}
+        assert!(prove_hidden_lin_hidden_shared_seal(
+            &hidden_plan,
+            &activation,
+            &mut rerun_table,
+            SEED,
+            Some(&inputs)
+        )
+        .is_err());
         let hwm = fs::read_to_string("/proc/self/status")
             .ok()
             .and_then(|status| {
@@ -1625,7 +1697,7 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
             })
             .unwrap_or_else(|| "VmHWM unavailable".to_string());
         eprintln!(
-            "SHARED SEAL EVIDENCE (local first+shared chains, not R5): limbs={} discovery={:?} seal_bytes={} seal_prove={:?} seal_verify={:?} negatives={}/{} {}",
+            "SHARED SEAL EVIDENCE (local first+shared chains, not R5): limbs={} discovery={:?} seal_bytes={} seal_prove={:?} seal_verify={:?} negatives={}/{} count_before_rerun={} count_after_rerun={} lifetime={} {}",
             limbs,
             discovery,
             seal_bytes,
@@ -1633,6 +1705,9 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
             seal_verify_time,
             rejected,
             attempted,
+            count_after_first,
+            count_after_first + per_batch,
+            hidden_plan_table_lifetime(),
             hwm,
         );
         return;

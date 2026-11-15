@@ -9502,6 +9502,12 @@ impl HiddenLinPlan {
         let Some(check) = self.proximity.lin_check else {
             return Ok(());
         };
+        // The shared psi and zeta rounds spend no proof-of-work in this
+        // session: their fixed rounds use zero. Accept only zero until a
+        // nonzero value is bound to the actual round and its nonce.
+        if check.point_work_bits != 0 || check.zeta_work_bits != 0 {
+            return Err(Error::InvalidConfig);
+        }
         let fault = crate::proof::proximity_planner::SharedLinPlanFault {
             v: self.send.table_shape.v,
             k_lo: self.proximity.omega.k_lo,
@@ -22380,6 +22386,16 @@ pub fn prove_hidden_lin_hidden(
     prove_hidden_lin_inner(plan, Some(activation), table, None, seed, true, None, None, None, None)
 }
 
+/// The production asset and shared-seal boundaries require the checked shared
+/// linear plan. The fixture entry `prove_hidden_lin_hidden` remains for
+/// isolated component runs and does not require it.
+fn check_production_plan(plan: &HiddenLinPlan) -> Result<()> {
+    if plan.proximity.lin_check.is_none() {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(())
+}
+
 /// Prover prefix of the hidden-input mode: the first part and the shared
 /// stage up to their seals. The table is the caller's keeper; the second stage
 /// is outside this entry.
@@ -22390,6 +22406,10 @@ pub fn prove_hidden_lin_hidden_shared_seal(
     seed: Digest,
     chain_inputs: Option<&crate::proof::request_chain::ChainInputs>,
 ) -> Result<(HiddenSendMessages, HiddenSharedMessages)> {
+    check_production_plan(plan)?;
+    if table.durable_column_budget().is_none() {
+        return Err(Error::InvalidConfig);
+    }
     plan.validate()?;
     if plan.send.request_chain.is_some() != chain_inputs.is_some() || seed == Digest::ZERO {
         return Err(Error::InvalidConfig);
@@ -22432,6 +22452,7 @@ pub fn verify_hidden_lin_hidden_shared_seal(
     shared: &HiddenSharedMessages,
     chain_inputs: Option<&crate::proof::request_chain::ChainInputs>,
 ) -> Result<Digest> {
+    check_production_plan(plan)?;
     plan.validate()?;
     if plan.send.request_chain.is_some() != chain_inputs.is_some() {
         return Err(Error::InvalidConfig);
@@ -22459,6 +22480,7 @@ pub fn prove_hidden_lin_hidden_with_asset_table(
     keeper: &mut crate::proof::column_session::AssetTableKeeper,
     seed: Digest,
 ) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
+    check_production_plan(plan)?;
     if !plan.weights.is_empty() || plan.norm.is_some() {
         return Err(Error::InvalidConfig);
     }
@@ -29922,20 +29944,18 @@ mod merged_tests {
         };
         let mut keeper = open();
         let (messages, _) =
-            prove_hidden_lin_hidden_with_asset_table(&plan, &activation, &mut keeper, seed)
-                .unwrap();
+            prove_hidden_lin_hidden(&plan, &activation, &mut keeper, seed).unwrap();
         assert_eq!(keeper.count().unwrap(), columns);
         verify_hidden_lin_hidden(&plan, keeper.reader(), &messages).unwrap();
 
         let mut restarted = open();
         assert_eq!(restarted.count().unwrap(), columns);
         let (messages, _) =
-            prove_hidden_lin_hidden_with_asset_table(&plan, &activation, &mut restarted, seed)
-                .unwrap();
+            prove_hidden_lin_hidden(&plan, &activation, &mut restarted, seed).unwrap();
         assert_eq!(restarted.count().unwrap(), 2 * columns);
         verify_hidden_lin_hidden(&plan, restarted.reader(), &messages).unwrap();
 
-        assert!(prove_hidden_lin_hidden_with_asset_table(
+        assert!(prove_hidden_lin_hidden(
             &plan,
             &activation,
             &mut restarted,
@@ -29944,6 +29964,56 @@ mod merged_tests {
         .is_err());
         assert_eq!(restarted.count().unwrap(), 2 * columns);
         std::fs::remove_dir_all(&built.root).ok();
+    }
+
+    /// The production entry refuses a plan without the checked shared linear
+    /// parameters, before any table use.
+    #[test]
+    fn the_production_entry_requires_the_checked_plan() {
+        let built = AuthenticatedTable::new();
+        crate::proof::column_session::initialize_asset_table_ledger(
+            &built.root,
+            built.table_root,
+        )
+        .unwrap();
+        let ledger = built.ledger();
+        let activation = activation();
+        let plan = hidden_plan(&activation);
+        assert!(plan.proximity.lin_check.is_none());
+        let columns = plan.proximity.column_draws as u64;
+        let mut keeper = crate::proof::column_session::AssetTableKeeper::open(
+            built.build(),
+            ledger,
+            columns,
+            2 * columns,
+        )
+        .unwrap();
+        assert!(prove_hidden_lin_hidden_with_asset_table(
+            &plan,
+            &activation,
+            &mut keeper,
+            Digest([0x71; 32])
+        )
+        .is_err());
+        std::fs::remove_dir_all(&built.root).ok();
+    }
+
+    /// The shared psi and zeta rounds perform no proof-of-work: a check that
+    /// claims nonzero work in either field is refused.
+    #[test]
+    fn a_shared_lin_check_with_unperformed_work_is_refused() {
+        let activation = activation();
+        let (mut plan, _) = member_plan_for(&activation);
+        plan.proximity.lin_check = Some(SharedLinCheck {
+            point_work_bits: 1,
+            zeta_work_bits: 0,
+        });
+        assert!(plan.validate().is_err());
+        plan.proximity.lin_check = Some(SharedLinCheck {
+            point_work_bits: 0,
+            zeta_work_bits: 1,
+        });
+        assert!(plan.validate().is_err());
     }
 
     /// The Omega tree's runtime opening count is one accumulator owned by the

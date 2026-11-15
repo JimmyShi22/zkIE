@@ -493,6 +493,12 @@ impl AssetTableKeeper {
     ) -> Result<Self> {
         let ledger_dir = ledger_dir.into();
         let root = table.reader.root;
+        // The lifetime total is bounded by the table's own hiding capacity:
+        // the tail positions of its code. A total above it could never be
+        // spent and is refused before any use.
+        if max_columns == 0 || max_columns > table.reader.shape.code.hiding_positions() {
+            return Err(Error::InvalidConfig);
+        }
         let budget = DurableColumnBudget::open(
             ledger_dir.clone(),
             ledger_dir.join("columns.count"),
@@ -1280,8 +1286,8 @@ mod tests {
     #[test]
     fn the_production_keeper_counts_under_the_asset_directory() {
         let fixture = fixture();
-        let columns = 2u64;
-        let max_columns = 4u64;
+        let columns = 1u64;
+        let max_columns = 1u64;
         let body = fixture.root.join("table_i32.bin");
         let before = fs::read(&body).unwrap();
         let built = table(&fixture);
@@ -1305,13 +1311,29 @@ mod tests {
         let mut second =
             AssetTableKeeper::open(table(&fixture), ledger.clone(), columns, max_columns).unwrap();
         keeper.durable_column_budget().unwrap().reserve().unwrap();
-        second.durable_column_budget().unwrap().reserve().unwrap();
-        assert_eq!(second.count().unwrap(), 2 * columns);
+        // The table's tail capacity is the lifetime total: the second owner
+        // is refused before use, and the first owner cannot spend it again.
+        assert!(second.durable_column_budget().unwrap().reserve().is_err());
+        assert_eq!(second.count().unwrap(), columns);
         assert!(keeper.durable_column_budget().unwrap().reserve().is_err());
-        assert_eq!(keeper.count().unwrap(), 2 * columns);
+        assert_eq!(keeper.count().unwrap(), columns);
 
         let after = fs::read(&body).unwrap();
         assert_eq!(before, after);
+    }
+
+    /// A lifetime total above the table's own hiding capacity is refused when
+    /// the keeper opens, before any reservation.
+    #[test]
+    fn the_keeper_rejects_a_budget_above_the_table_capacity() {
+        let fixture = fixture();
+        let built = table(&fixture);
+        let root = built.reader.root;
+        initialize_asset_table_ledger(&fixture.root, root).unwrap();
+        let ledger = column_ledger_dir(&fixture.root, root);
+        let capacity = built.reader.shape.code.hiding_positions();
+        assert_eq!(capacity, 1);
+        assert!(AssetTableKeeper::open(built, ledger, 1, capacity + 1).is_err());
     }
 
     /// The keeper never creates the ledger, and a lost count is refused rather
