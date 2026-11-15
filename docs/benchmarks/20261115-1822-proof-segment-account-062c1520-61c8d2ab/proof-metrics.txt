@@ -1,3 +1,8 @@
+# Whole-artifact metric (result.json proof_bytes), listed separately from the
+# per-field segments in NOTES.md. The proof.bin lengths are unchanged file sizes.
+# The segment totals in NOTES (with the 16-byte outer Vec prefixes) reconcile to
+# each proof.bin: top_sum == file_len. The difference column is the statement,
+# public inputs and whole-product counting, not a segment.
 gpt2-seq16 result.proof_bytes 1980405259 proof.bin 1980401278 diff 3981
 gemma3-seq16 result.proof_bytes 6013559226 proof.bin 6013555254 diff 3972
 timesfm-16patch result.proof_bytes 3740935379 proof.bin 3740667388 diff 267991

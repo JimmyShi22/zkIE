@@ -16,15 +16,22 @@
 
 ## Top-level segments
 
-| case | proof.bin bytes | asset openings | share | relation receipts | share | other |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| gpt2 seq16 | 1,980,401,278 | 1,753,111,896 | 88.52% | 227,289,230 | 11.48% | 152 |
-| gemma3 seq16 | 6,013,555,254 | 5,710,016,064 | 94.95% | 303,539,038 | 5.05% | 152 |
-| timesfm 16-patch | 3,740,667,388 | 3,498,978,744 | 93.54% | 241,424,428 | 6.45% | 264,216 |
-| gpt2 seq512 | 10,917,923,358 | 1,753,111,896 | 16.06% | 9,164,807,342 | 83.94% | 4,120 |
-| gemma3 seq512 | 16,368,601,254 | 5,710,016,064 | 34.88% | 10,658,581,070 | 65.12% | 4,120 |
+| case | proof.bin bytes | outer Vec prefixes (asset + step) | asset openings | share | relation receipts | share | other |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| gpt2 seq16 | 1,980,401,278 | 16 | 1,753,111,896 | 88.52% | 227,289,230 | 11.48% | 152 |
+| gemma3 seq16 | 6,013,555,254 | 16 | 5,710,016,064 | 94.95% | 303,539,038 | 5.05% | 152 |
+| timesfm 16-patch | 3,740,667,388 | 16 | 3,498,978,744 | 93.54% | 241,424,428 | 6.45% | 264,216 |
+| gpt2 seq512 | 10,917,923,358 | 16 | 1,753,111,896 | 16.06% | 9,164,807,342 | 83.94% | 4,120 |
+| gemma3 seq512 | 16,368,601,254 | 16 | 5,710,016,064 | 34.88% | 10,658,581,070 | 65.12% | 4,120 |
 
-`other` is tokens, argmax and the recorded output together.
+The `outer Vec prefixes` column is the 8-byte length prefix of the asset
+list plus the 8-byte length prefix of the step list (16 B total); those
+bytes are included inside the asset-opening and relation-receipt figures,
+not added on top of them. `other` is tokens, argmax and the recorded output
+together. `tokens + assets + steps + argmax + output` equals `proof.bin` for
+every case; the raw segment files carry the check (`top_sum` == `file_len`).
+The sub-tables below exclude the 16-byte outer prefixes; their rows sum to
+the corresponding segment minus 8 bytes.
 
 ## Asset openings
 
@@ -34,7 +41,9 @@
 | gemma3 seq16/512 | 5,699,987,320 | 3,302,256 | 3,302,256 | 100,672 | 3,323,552 |
 | timesfm 16-patch | 3,494,722,576 | 1,378,736 | 1,378,736 | 99,008 | 1,399,680 |
 
-Asset classes (opening bytes per class):
+The per-opening parts above exclude the 8-byte outer asset-list prefix;
+the outer prefix is shown in the top-level table. Asset classes (opening
+bytes per class; each subtotal also excludes the outer asset-list prefix):
 
 | case | weights | embedding / output head | norm | RoPE | extension | structure / config |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -46,6 +55,11 @@ The four trusted public tables are absent from every number above: their
 openings were removed in the previous round and are not counted again.
 
 ## Relation receipts
+
+The content figures below exclude the 8-byte outer step-list prefix (shown
+in the top-level table). The relation `inputs` field length includes empty
+inner containers; it is a serialized field length, not input plaintext, and
+field lengths are not the same quantity as value payloads.
 
 | case | relation proofs | roots | config | external indices | port wiring | opcode tags |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
