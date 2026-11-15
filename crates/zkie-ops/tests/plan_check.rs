@@ -1547,8 +1547,7 @@ fn rope_public_file_identity_is_checked() {
     assert_eq!(code, "shape_mismatch");
 
     let padded = rope_public_fixture(&[3, 5, 7, 11], &[10, 20, 30, 40], &[5, 6, 7, 8]);
-    let bytes = fs::read(padded.root.join("cos_i32.bin")).unwrap();
-    let mut bytes = bytes;
+    let mut bytes = fs::read(padded.root.join("cos_i32.bin")).unwrap();
     bytes.push(0);
     fs::write(padded.root.join("cos_i32.bin"), bytes).unwrap();
     let code = verify_rope_public(&padded)
