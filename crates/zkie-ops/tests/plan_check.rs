@@ -1396,3 +1396,260 @@ fn rms_extension_consumption_tamper_is_rejected() {
         assert_eq!(code, "invalid_proof");
     }
 }
+
+// ---- trusted public rope coefficient tables ----
+
+#[derive(Clone)]
+struct RopePublicFixture {
+    public: ModelCommitmentPublic,
+    trace: SharedTrace,
+    tokens: Vec<u32>,
+    plan: TracePlan,
+    root: PathBuf,
+    opening: Vec<zkie_ops::proof::model_commitment::AssetOpening>,
+    cos: zkie_ops::proof::plan::PublicTable,
+    sin: zkie_ops::proof::plan::PublicTable,
+}
+
+fn rope_public_fixture(x: &[i64], cos_values: &[i32], sin_values: &[i32]) -> RopePublicFixture {
+    let root = temp_dir();
+    write_i32(&root.join("cos_i32.bin"), cos_values);
+    write_i32(&root.join("sin_i32.bin"), sin_values);
+    let cos = rms_public_table(&root, "cos_i32.bin", cos_values);
+    let sin = rms_public_table(&root, "sin_i32.bin", sin_values);
+    let specs = vec![ModelAssetSpec {
+        asset_id: 0,
+        path: "dummy_i32.bin".into(),
+        element_count: 4,
+        row_width: 4,
+        encoding: "i32-le".into(),
+    }];
+    write_i32(&root.join("dummy_i32.bin"), &[1, 2, 3, 4]);
+    let commitment = commit_assets(&root, Digest([21; 32]), Digest([22; 32]), &specs).unwrap();
+    let public = ModelCommitmentPublic::from_commitment(&commitment);
+    let opening = AssetStore::open(&commitment).unwrap().open_all().unwrap();
+
+    let head_dim = 4usize;
+    let half = head_dim / 2;
+    let op = zkie_ops::profile_rope::ProfileRopeOp {
+        head_dim,
+        shift: 0,
+    };
+    let rope_config = vec![head_dim as i64, 0];
+    let cos_input: Vec<i64> = cos_values[..half].iter().map(|value| *value as i64).collect();
+    let sin_input: Vec<i64> = sin_values[..half].iter().map(|value| *value as i64).collect();
+    let inputs = vec![x.to_vec(), cos_input, sin_input];
+    let (rope_step, rope_out) = make_step(
+        &op,
+        &inputs,
+        &rope_config,
+        &[],
+        vec![None, None, None],
+        vec![None, None, None],
+    );
+    let (argmax_step, argmax_out) = make_step(
+        &ArgmaxOp,
+        &[rope_out[0].clone()],
+        &[],
+        &[],
+        vec![None],
+        vec![Some((0, 0))],
+    );
+
+    let mut builder = PlanBuilder::new();
+    let rope = builder.step(
+        OpCode::ProfileRope,
+        config(rope_config.clone()),
+        vec![
+            PlanSource::Constant(PlanConstant::Literal(x.to_vec())),
+            PlanSource::PublicTable {
+                table: cos.clone(),
+                layout: PlanLayout::range(0, half),
+            },
+            PlanSource::PublicTable {
+                table: sin.clone(),
+                layout: PlanLayout::range(0, half),
+            },
+        ],
+        1,
+    );
+    let argmax = builder.step(
+        OpCode::Argmax,
+        config(Vec::new()),
+        vec![PlanSource::prev(rope, 0)],
+        1,
+    );
+    builder.argmax_step(argmax);
+    let plan = builder.finish();
+
+    let trace = SharedTrace {
+        tokens: vec![1],
+        assets: Vec::new(),
+        steps: vec![rope_step, argmax_step],
+        argmax: vec![argmax_out[0][0] as u32],
+        output: Vec::new(),
+    };
+    RopePublicFixture {
+        public,
+        trace,
+        tokens: vec![1],
+        plan,
+        root,
+        opening,
+        cos,
+        sin,
+    }
+}
+
+fn verify_rope_public(fixture: &RopePublicFixture) -> Result<Vec<u32>, zkie_core::error::Error> {
+    let bytes = bincode::serialize(&fixture.trace).unwrap();
+    let trace: SharedTrace = bincode::deserialize(&bytes).unwrap();
+    zkie_ops::proof::model_commitment::verify_shared_trace(
+        &fixture.public,
+        &trace,
+        &fixture.tokens,
+        &fixture.plan,
+        Some(&fixture.root),
+    )
+}
+
+fn set_plan_rope_source(plan: &mut TracePlan, port: usize, source: PlanSource) {
+    plan.steps[0].inputs[port] = source;
+}
+
+#[test]
+fn rope_public_tables_are_read_from_the_trusted_files() {
+    let fixture = rope_public_fixture(&[3, 5, 7, 11], &[10, 20, 30, 40], &[5, 6, 7, 8]);
+    assert!(fixture.trace.assets.is_empty());
+    let argmax = verify_rope_public(&fixture).unwrap();
+    assert_eq!(argmax, vec![3]);
+}
+
+#[test]
+fn rope_public_file_identity_is_checked() {
+    let missing = rope_public_fixture(&[3, 5, 7, 11], &[10, 20, 30, 40], &[5, 6, 7, 8]);
+    fs::remove_file(missing.root.join("cos_i32.bin")).unwrap();
+    let code = verify_rope_public(&missing)
+        .err()
+        .expect("expected rejection")
+        .code()
+        .to_owned();
+    assert_eq!(code, "io");
+
+    let truncated = rope_public_fixture(&[3, 5, 7, 11], &[10, 20, 30, 40], &[5, 6, 7, 8]);
+    let bytes = fs::read(truncated.root.join("cos_i32.bin")).unwrap();
+    fs::write(truncated.root.join("cos_i32.bin"), &bytes[..bytes.len() - 4]).unwrap();
+    let code = verify_rope_public(&truncated)
+        .err()
+        .expect("expected rejection")
+        .code()
+        .to_owned();
+    assert_eq!(code, "shape_mismatch");
+
+    let padded = rope_public_fixture(&[3, 5, 7, 11], &[10, 20, 30, 40], &[5, 6, 7, 8]);
+    let bytes = fs::read(padded.root.join("cos_i32.bin")).unwrap();
+    let mut bytes = bytes;
+    bytes.push(0);
+    fs::write(padded.root.join("cos_i32.bin"), bytes).unwrap();
+    let code = verify_rope_public(&padded)
+        .err()
+        .expect("expected rejection")
+        .code()
+        .to_owned();
+    assert_eq!(code, "shape_mismatch");
+
+    let mut wrong_digest =
+        rope_public_fixture(&[3, 5, 7, 11], &[10, 20, 30, 40], &[5, 6, 7, 8]);
+    let mut cos = wrong_digest.cos.clone();
+    cos.digest = Digest([9; 32]);
+    set_plan_rope_source(
+        &mut wrong_digest.plan,
+        1,
+        PlanSource::PublicTable {
+            table: cos,
+            layout: PlanLayout::range(0, 2),
+        },
+    );
+    let code = verify_rope_public(&wrong_digest)
+        .err()
+        .expect("expected rejection")
+        .code()
+        .to_owned();
+    assert_eq!(code, "asset_mismatch");
+
+    // The fixed entry count does not match the trusted file's byte length.
+    let mut short = rope_public_fixture(&[3, 5, 7, 11], &[10, 20, 30, 40], &[5, 6, 7, 8]);
+    let mut cos = short.cos.clone();
+    cos.entries = 3;
+    set_plan_rope_source(
+        &mut short.plan,
+        1,
+        PlanSource::PublicTable {
+            table: cos,
+            layout: PlanLayout::range(0, 2),
+        },
+    );
+    let code = verify_rope_public(&short)
+        .err()
+        .expect("expected rejection")
+        .code()
+        .to_owned();
+    assert_eq!(code, "shape_mismatch");
+}
+
+#[test]
+fn rope_public_wrong_table_or_slice_is_rejected_by_the_rotation_relation() {
+    // The proof is produced over the cos prefix [10, 20]; the trusted plan
+    // maps the cos port to the sin table, whose file identity is legal. The
+    // proof material stays valid and the rotation relation rejects the
+    // committed raw and output values.
+    let mut swapped = rope_public_fixture(&[3, 5, 7, 11], &[10, 20, 30, 40], &[5, 6, 7, 8]);
+    let sin = swapped.sin.clone();
+    set_plan_rope_source(
+        &mut swapped.plan,
+        1,
+        PlanSource::PublicTable {
+            table: sin,
+            layout: PlanLayout::range(0, 2),
+        },
+    );
+    let code = verify_rope_public(&swapped)
+        .err()
+        .expect("expected rejection")
+        .code()
+        .to_owned();
+    assert_eq!(code, "invalid_proof");
+
+    // The same table with a different prefix slice: [20, 30] instead of the
+    // proved [10, 20]. The lengths are unchanged, so the rejection is the
+    // rotation relation, not a shape check.
+    let mut sliced = rope_public_fixture(&[3, 5, 7, 11], &[10, 20, 30, 40], &[5, 6, 7, 8]);
+    let cos = sliced.cos.clone();
+    set_plan_rope_source(
+        &mut sliced.plan,
+        1,
+        PlanSource::PublicTable {
+            table: cos,
+            layout: PlanLayout::range(1, 2),
+        },
+    );
+    let code = verify_rope_public(&sliced)
+        .err()
+        .expect("expected rejection")
+        .code()
+        .to_owned();
+    assert_eq!(code, "invalid_proof");
+}
+
+#[test]
+fn rope_public_port_injection_is_rejected() {
+    let mut fixture = rope_public_fixture(&[3, 5, 7, 11], &[10, 20, 30, 40], &[5, 6, 7, 8]);
+    fixture.trace.assets = fixture.opening.clone();
+    fixture.trace.steps[0].external[1] = Some(0);
+    let code = verify_rope_public(&fixture)
+        .err()
+        .expect("expected rejection")
+        .code()
+        .to_owned();
+    assert_eq!(code, "statement_mismatch");
+}

@@ -443,13 +443,17 @@ pub fn model_commitment(tokens: &[u32]) -> Result<Digest> {
     transcript_digest(15, &bytes)
 }
 
-/// The migrated shared public table paths of this model.
+/// The trusted public table paths of this model.
 pub fn public_table_paths() -> &'static [&'static str] {
     &[
         "models/gpt2/weights/exp_table_i32.bin",
         "models/gpt2/weights/rsqrt_table_i32.bin",
         "models/gpt2/weights/gelu_table_i32.bin",
         EXTENSION_PATH,
+        "models/gemma3/weights/rope_cos_global_i32.bin",
+        "models/gemma3/weights/rope_cos_local_i32.bin",
+        "models/gemma3/weights/rope_sin_global_i32.bin",
+        "models/gemma3/weights/rope_sin_local_i32.bin",
     ]
 }
 
@@ -488,11 +492,31 @@ fn public_tables() -> Vec<(String, zkie_ops::proof::plan::PublicTable)> {
             "59fc2554a5d0f13abb265ed2eb5b56d5e75d82616561c60545013be7aa6dcf50",
             14_849_263,
         ),
+        table(
+            "models/gemma3/weights/rope_cos_global_i32.bin",
+            "f1274259717ea29f4377d1b3a9510f44104007708de3f3a8bb15f35afe772bd1",
+            65_536,
+        ),
+        table(
+            "models/gemma3/weights/rope_cos_local_i32.bin",
+            "59215ba7da66e69a9209ab0a39c068229aa974dd533752104e6075c4118b10c6",
+            65_536,
+        ),
+        table(
+            "models/gemma3/weights/rope_sin_global_i32.bin",
+            "47c3d75d9b4a0f66476a20252e73cc3a0de33a68c422b36561755ce7f5dd5730",
+            65_536,
+        ),
+        table(
+            "models/gemma3/weights/rope_sin_local_i32.bin",
+            "3096bad8797eed01cd733d508d726fff764630bce8fb3740b71746ad8e80f91d",
+            65_536,
+        ),
     ]
 }
 
-/// The production plan: the shared tables and the rsqrt extension are
-/// trusted public files; the RoPE tables keep their original sources.
+/// The production plan: the shared tables, the rsqrt extension and the four
+/// RoPE coefficient tables are trusted public files.
 pub fn trace_plan_public(m: usize) -> Result<TracePlan> {
     let mut plan = trace_plan(m)?;
     zkie_ops::proof::plan::promote_public_tables(&mut plan, &public_tables());
@@ -553,6 +577,71 @@ mod tests {
             }
         }
         assert!(extension_public, "the extension source is public");
+    }
+
+    #[test]
+    fn the_public_plan_promotes_the_rope_tables() {
+        const ROPE: [(&str, &str); 4] = [
+            (
+                "models/gemma3/weights/rope_cos_global_i32.bin",
+                "f1274259717ea29f4377d1b3a9510f44104007708de3f3a8bb15f35afe772bd1",
+            ),
+            (
+                "models/gemma3/weights/rope_cos_local_i32.bin",
+                "59215ba7da66e69a9209ab0a39c068229aa974dd533752104e6075c4118b10c6",
+            ),
+            (
+                "models/gemma3/weights/rope_sin_global_i32.bin",
+                "47c3d75d9b4a0f66476a20252e73cc3a0de33a68c422b36561755ce7f5dd5730",
+            ),
+            (
+                "models/gemma3/weights/rope_sin_local_i32.bin",
+                "3096bad8797eed01cd733d508d726fff764630bce8fb3740b71746ad8e80f91d",
+            ),
+        ];
+        for (path, _) in ROPE {
+            assert!(public_table_paths().contains(&path));
+        }
+        let m = 16;
+        let half = HEAD_DIM / 2;
+        let plan = trace_plan_public(m).unwrap();
+        let mut global = false;
+        let mut local = false;
+        for step in &plan.steps {
+            if step.opcode != OpCode::ProfileRope {
+                continue;
+            }
+            let mut locators = Vec::new();
+            for port in [1usize, 2] {
+                match &step.inputs[port] {
+                    PlanSource::PublicTable { table, layout } => {
+                        assert_eq!(*layout, PlanLayout::range(0, m * half));
+                        assert_eq!(table.entries, 65_536);
+                        let (_, digest) = ROPE
+                            .iter()
+                            .find(|(path, _)| *path == table.locator.as_str())
+                            .expect("the rope source is one of the fixed tables");
+                        assert_eq!(
+                            table.digest,
+                            zkie_core::artifact::digest_from_hex(digest).unwrap()
+                        );
+                        locators.push(table.locator.clone());
+                    }
+                    other => panic!("the rope input is a public table: {other:?}"),
+                }
+            }
+            let cos = &locators[0];
+            let sin = &locators[1];
+            assert_eq!(
+                cos.replace("cos", "sin").as_str(),
+                sin.as_str(),
+                "cos and sin stay paired"
+            );
+            global |= cos.ends_with("cos_global_i32.bin");
+            local |= cos.ends_with("cos_local_i32.bin");
+        }
+        assert!(global, "a global rope layer is promoted");
+        assert!(local, "a local rope layer is promoted");
     }
 
     #[test]

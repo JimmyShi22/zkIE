@@ -329,9 +329,9 @@ pub fn execute_shared_with_progress(
     execute_shared_inner(commitment, tokens, progress, false)
 }
 
-/// The production trace: the shared public tables are not carried as trace
-/// assets and their inputs take no external pool; the rsqrt extension keeps
-/// its own asset and pool.
+/// The production trace: the trusted public tables (the shared tables, the
+/// rsqrt extension and the four RoPE coefficient tables) are not carried as
+/// trace assets and their inputs take no external pool.
 pub fn execute_shared_with_progress_public(
     commitment: &ModelCommitment,
     tokens: &[i64],
