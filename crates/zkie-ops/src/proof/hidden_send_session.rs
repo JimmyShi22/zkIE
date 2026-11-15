@@ -29378,6 +29378,112 @@ mod merged_tests {
         assert_eq!(clone.proximity.ledger.arc().lock().unwrap().used(), 0);
     }
 
+    /// The column reservation is taken at the first part start: a proof that
+    /// fails after that point does not get the reservation back, and the next
+    /// proof on the same keeper charges again.
+    #[test]
+    fn the_reservation_is_taken_before_the_first_part_and_is_not_refunded() {
+        let activation = activation();
+        let (mut plan, seed) = member_plan_for(&activation);
+        let columns = plan.proximity.column_draws as u64;
+        let positions = plan.send.activation.positions as usize;
+        plan.send.expected_roots = Some(vec![Digest([0xEE; 32]); positions]);
+        let mut table = table();
+        assert!(prove_hidden_lin_hidden(&plan, &activation, &mut table, seed).is_err());
+        assert_eq!(table.hiding_state().unwrap().used(), columns);
+        plan.send.expected_roots = None;
+        let _ = prove_hidden_lin_hidden(&plan, &activation, &mut table, seed).unwrap();
+        assert_eq!(table.hiding_state().unwrap().used(), 2 * columns);
+    }
+
+    /// The shared order binds each message to the one before it: a changed
+    /// G_u answer, Omega root or answer, or a changed sampled seed no longer
+    /// matches the chain that drew the later points.
+    #[test]
+    fn the_shared_order_binds_each_message() {
+        let table = table();
+        let reject = |mutate: &dyn Fn(&mut HiddenLinMessages)| {
+            let (plan, mut messages, _) = member_run();
+            mutate(&mut messages);
+            assert!(verify_hidden_lin_hidden(&plan, &table.reader, &messages).is_err());
+        };
+        reject(&|messages| messages.shared.omega_root.0[0] ^= 1);
+        reject(&|messages| {
+            messages.shared.gu_seeds[0].beta =
+                messages.shared.gu_seeds[0].beta.add(&Fp3::ONE);
+        });
+        reject(&|messages| {
+            messages.shared.gu_answers[0] = messages.shared.gu_answers[0].add(&Fp3::ONE);
+        });
+        reject(&|messages| {
+            messages.shared.omega_seeds[0].z[0] =
+                messages.shared.omega_seeds[0].z[0].add(&Fp3::ONE);
+        });
+        reject(&|messages| messages.shared.column_nonce ^= 1);
+    }
+
+    /// The query budget cannot be regained by reuse: a keeper whose hiding
+    /// capacity is the batch column count refuses a second proof, and a plan
+    /// whose read ledger is the batch size refuses a second verification.
+    #[test]
+    fn the_shared_query_budget_cannot_be_exhausted_by_reuse() {
+        let activation = activation();
+        let (plan, seed) = member_plan_for(&activation);
+        let columns = plan.proximity.column_draws as u64;
+        let mut keeper = table();
+        keeper.hiding = zkie_engine::pcs::request::read::HidingState::new(
+            keeper.reader.root,
+            1,
+            columns,
+        );
+        let _ = prove_hidden_lin_hidden(&plan, &activation, &mut keeper, seed).unwrap();
+        assert!(prove_hidden_lin_hidden(&plan, &activation, &mut keeper, seed).is_err());
+
+        let (mut plan, seed) = member_plan_for(&activation);
+        plan.proximity.column_draws = 1;
+        plan.proximity.column_budget = 1;
+        plan.proximity.ledger = ReadLedgerCell::new(1);
+        plan.validate().unwrap();
+        let mut ledger_keeper = table();
+        let (messages, _) =
+            prove_hidden_lin_hidden(&plan, &activation, &mut ledger_keeper, seed).unwrap();
+        verify_hidden_lin_hidden(&plan, &ledger_keeper.reader, &messages).unwrap();
+        assert!(verify_hidden_lin_hidden(&plan, &ledger_keeper.reader, &messages).is_err());
+    }
+
+    /// The shared parameters are bound to the plan, and every relation the
+    /// verifier needs is required: another table identity, fewer base
+    /// positions, a budget that no longer matches the ledger, and a missing
+    /// opening or answer list are refused.
+    #[test]
+    fn the_shared_parameters_and_relations_are_required() {
+        let (plan, messages, _) = member_run();
+        let table = table();
+        let mut changed = plan.clone();
+        changed.send.table_identity = Digest([0xAB; 32]);
+        assert!(changed.validate().is_ok());
+        assert!(verify_hidden_lin_hidden(&changed, &table.reader, &messages).is_err());
+        let mut changed = plan.clone();
+        changed.proximity.shared_base_positions -= 1;
+        assert!(changed.validate().is_ok());
+        assert!(verify_hidden_lin_hidden(&changed, &table.reader, &messages).is_err());
+        let mut changed = plan.clone();
+        changed.proximity.column_budget -= 1;
+        assert!(changed.validate().is_err());
+        let mut changed = messages.clone();
+        changed.shared.column_openings.clear();
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &changed).is_err());
+        let mut changed = messages.clone();
+        changed.shared.fold_rounds.clear();
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &changed).is_err());
+        let mut changed = messages.clone();
+        changed.shared.gu_answers.clear();
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &changed).is_err());
+        let mut changed = messages.clone();
+        changed.shared.omega_answers.clear();
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &changed).is_err());
+    }
+
     #[test]
     fn the_chain_segment_runs_inside_the_first_chain() {
         use crate::proof::psc_general::{GeneralMaskEntries, MaskTerm, Summand};
