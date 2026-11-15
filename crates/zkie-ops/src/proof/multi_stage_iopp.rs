@@ -38,6 +38,7 @@ use zkie_engine::pcs::request::relation::foldeq_weights;
 use zkie_engine::pcs::request::runtime_tree::{
     MaskTree, MaskTreePlan, RuntimeTree, RuntimeTreeOpening, RuntimeTreePlan,
 };
+use zkie_engine::pcs::request::tree_book::TreeOpeningCount;
 use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
 use zkie_core::common::codec::DecodeLimits;
 
@@ -343,6 +344,7 @@ pub enum IoppSwitchMembers<'a> {
         members: &'a [IoppInitialMember<'a>],
         old_mask: Option<&'a MaskTree>,
         fresh: &'a MaskTree,
+        count: Option<&'a TreeOpeningCount>,
     },
     Stage {
         member: &'a CsMultiProver,
@@ -390,10 +392,26 @@ impl<'a> IoppSwitchMembers<'a> {
                 members,
                 old_mask,
                 fresh,
+                count,
             } => {
                 let mut openings = Vec::with_capacity(members.len());
+                let mut counted = false;
                 for member in members.iter() {
+                    // The count names its tree; the member it matches is
+                    // counted before its opening. A count that matches no
+                    // opened tree is refused.
+                    if let Some(count) = count {
+                        if count.tree() == member.tree.plan().tree_number
+                            && count.root() == *member.tree.root()
+                        {
+                            count.reserve(positions.len())?;
+                            counted = true;
+                        }
+                    }
                     openings.push(member.tree.open(positions)?);
+                }
+                if count.is_some() && !counted {
+                    return Err(Error::StatementMismatch);
                 }
                 let old = match old_mask {
                     Some(tree) => Some(tree.open(mask_positions)?),
@@ -420,6 +438,9 @@ pub struct IoppStageZero {
     pub member_trees: Vec<Arc<RuntimeTree>>,
     pub old_mask_tree: Option<MaskTree>,
     pub fresh_tree: MaskTree,
+    /// The owner-held per-tree opening count, when the session carries one.
+    /// The initial member whose oracle matches is counted before its opening.
+    pub member_opening: Option<TreeOpeningCount>,
 }
 
 /// The verifier's stage 0 input. Member roots and tree plans are the trusted
@@ -712,6 +733,7 @@ pub fn prove_multi_stage_iopp(
         member_trees,
         old_mask_tree,
         fresh_tree,
+        member_opening,
     } = stage_zero;
     validate_stage_zero(
         &plan.stages[0].plan,
@@ -762,6 +784,7 @@ pub fn prove_multi_stage_iopp(
                 members: &initial_members,
                 old_mask: old_mask_tree.as_ref(),
                 fresh: &fresh_tree,
+                count: member_opening.as_ref(),
             },
         };
         let mut session = CsMultiSession::new(
@@ -2029,6 +2052,7 @@ mod tests {
             member_trees: vec![Arc::new(tree)],
             old_mask_tree: Some(old_tree),
             fresh_tree,
+            member_opening: None,
         };
         let verifier = IoppVerifyStageZero {
             handoff,
@@ -2188,6 +2212,7 @@ mod tests {
             member_trees: vec![Arc::new(tree)],
             old_mask_tree: None,
             fresh_tree,
+            member_opening: None,
         };
         let verifier = IoppVerifyStageZero {
             handoff,

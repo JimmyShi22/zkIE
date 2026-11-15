@@ -15,6 +15,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 
 use zkie_core::error::{Error, Result};
+use zkie_core::types::Digest;
 
 /// A non-empty position list. The sorted set is the opening list; the draws
 /// preserve the original order and repeats.
@@ -102,6 +103,103 @@ pub struct TreeCounts {
     pub lists: u64,
     pub positions: u64,
 }
+
+/// One runtime tree's opening count, shared pointer-style by every chain that
+/// opens that tree. The count is raised before the actual opening and checked
+/// against the tree's tail hiding capacity; an error leaves the raised count in
+/// place, so a run whose runtime state is lost is abandoned rather than
+/// refunded. Mask trees are one-time objects and are never represented here or
+/// adopted across chains.
+#[derive(Clone, Debug)]
+pub struct TreeOpeningCount {
+    oracle: u64,
+    tree: u64,
+    root: Digest,
+    budget: u64,
+    counts: Arc<Mutex<TreeCounts>>,
+}
+
+impl TreeOpeningCount {
+    /// `budget` is the tree's tail hiding capacity, the code tail length.
+    pub fn new(oracle: u64, tree: u64, root: Digest, budget: u64) -> Result<Self> {
+        if budget == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(Self {
+            oracle,
+            tree,
+            root,
+            budget,
+            counts: Arc::new(Mutex::new(TreeCounts::default())),
+        })
+    }
+
+    pub fn oracle(&self) -> u64 {
+        self.oracle
+    }
+
+    pub fn tree(&self) -> u64 {
+        self.tree
+    }
+
+    pub fn root(&self) -> Digest {
+        self.root
+    }
+
+    pub fn budget(&self) -> u64 {
+        self.budget
+    }
+
+    /// The accumulated positions over every opening of this tree.
+    pub fn positions(&self) -> Result<u64> {
+        Ok(self
+            .counts
+            .lock()
+            .map_err(|_| Error::InvalidSessionState)?
+            .positions)
+    }
+
+    pub fn lists(&self) -> Result<u64> {
+        Ok(self
+            .counts
+            .lock()
+            .map_err(|_| Error::InvalidSessionState)?
+            .lists)
+    }
+
+    /// Raise the count for one opening before the actual opening and check the
+    /// tail budget. The count is raised before use; a failed or abandoned run
+    /// keeps it, and there is no refund.
+    pub fn reserve(&self, positions: usize) -> Result<u64> {
+        let added = u64::try_from(positions).map_err(|_| Error::ResourceLimit)?;
+        let mut counts = self.counts.lock().map_err(|_| Error::InvalidSessionState)?;
+        let next = counts
+            .positions
+            .checked_add(added)
+            .ok_or(Error::ResourceLimit)?;
+        if next > self.budget {
+            return Err(Error::ResourceLimit);
+        }
+        counts.positions = next;
+        counts.lists = counts.lists.checked_add(1).ok_or(Error::ResourceLimit)?;
+        Ok(next)
+    }
+}
+
+impl PartialEq for TreeOpeningCount {
+    /// Sharing is identity: two handles are equal when they name the same tree
+    /// and point at the same count. Accumulated values are runtime state, not
+    /// part of the handle's identity.
+    fn eq(&self, other: &Self) -> bool {
+        self.oracle == other.oracle
+            && self.tree == other.tree
+            && self.root == other.root
+            && self.budget == other.budget
+            && Arc::ptr_eq(&self.counts, &other.counts)
+    }
+}
+
+impl Eq for TreeOpeningCount {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct OpenedTree {
@@ -431,6 +529,24 @@ impl TreeBook {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The count is shared through its handle, raised before use, checked
+    /// against the tail budget and not refunded.
+    #[test]
+    fn the_tree_opening_count_is_shared_and_fails_closed() {
+        let count = TreeOpeningCount::new(7, 9, Digest([0x11; 32]), 3).unwrap();
+        let shared = count.clone();
+        assert_eq!(count, shared);
+        count.reserve(2).unwrap();
+        assert_eq!(shared.positions().unwrap(), 2);
+        assert_eq!(shared.lists().unwrap(), 1);
+        shared.reserve(1).unwrap();
+        assert_eq!(count.positions().unwrap(), 3);
+        assert!(count.reserve(1).is_err());
+        assert_eq!(count.positions().unwrap(), 3);
+        assert_eq!(count.lists().unwrap(), 2);
+        assert!(TreeOpeningCount::new(7, 9, Digest([0x11; 32]), 0).is_err());
+    }
 
     fn oracle(id: u64, groups: Vec<u32>) -> OracleSpec {
         OracleSpec {

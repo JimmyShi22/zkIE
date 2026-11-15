@@ -249,6 +249,7 @@ use zkie_engine::pcs::request::table::{
     record_seeds, validate_index_shape, verify_columns, ColumnOpening, IndexReader, IndexShape,
     SampleSeed, TableRowSource,
 };
+use zkie_engine::pcs::request::tree_book::TreeOpeningCount;
 use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
 use zkie_engine::primitives::transcript::{
     hash_labeled, tag_word, LEAF_MAIN, PARAMETERS,
@@ -6419,7 +6420,7 @@ fn segment_tree_source<'a>(
             ));
         }
     }
-    Ok(ProximityTreeSource::Ready(trees))
+    Ok(ProximityTreeSource::Ready { trees, omega: None })
 }
 
 fn prove_first_chain_segment(
@@ -9694,6 +9695,9 @@ pub struct HiddenLinWitness {
     pub gu_tail: Vec<Fp3>,
     pub omega_message: Vec<Fp3>,
     pub omega_tail: Vec<Fp3>,
+    /// The Omega tree's runtime opening count, shared by the shared and second
+    /// chains. It is private prover material and never enters the proof bytes.
+    pub omega_opening: TreeOpeningCount,
 }
 
 /// The prover-side table handle: the committed reader, the row source and the
@@ -9757,14 +9761,29 @@ struct ProximityMember {
 struct ProximityMemberProver {
     member: ProximityMember,
     tree: Arc<RuntimeTree>,
+    /// The owner-held opening count, when this member is the counted tree.
+    opening: Option<TreeOpeningCount>,
 }
 
 impl ProximityMemberProver {
-    fn sealed(member: ProximityMember, tree: Arc<RuntimeTree>) -> Result<Self> {
+    fn sealed(
+        member: ProximityMember,
+        tree: Arc<RuntimeTree>,
+        opening: Option<TreeOpeningCount>,
+    ) -> Result<Self> {
         if *tree.root() != member.root {
             return Err(Error::StatementMismatch);
         }
-        Ok(Self { member, tree })
+        if let Some(count) = &opening {
+            if count.tree() != member.tree_plan.tree_number || count.root() != member.root {
+                return Err(Error::StatementMismatch);
+            }
+        }
+        Ok(Self {
+            member,
+            tree,
+            opening,
+        })
     }
 }
 
@@ -10292,7 +10311,11 @@ fn mask_rows_of_draft(draft: &MaskDraft, shape: &FoldShape) -> Result<(Vec<Vec<F
 /// source returns a shared handle without rebuilding; the mask, index-mask and
 /// Dot trees are built from their witnesses when they are first needed.
 enum ProximityTreeSource<'a> {
-    Ready(Vec<(u64, Arc<RuntimeTree>)>),
+    Ready {
+        trees: Vec<(u64, Arc<RuntimeTree>)>,
+        /// The Omega tree's owner-held opening count, when this source has it.
+        omega: Option<TreeOpeningCount>,
+    },
     Retained {
         witness: &'a HiddenSendWitness,
         shared_witness: &'a SharedWitness,
@@ -10304,7 +10327,7 @@ enum ProximityTreeSource<'a> {
 impl ProximityTreeSource<'_> {
     fn tree_for(&self, member: &ProximityMember) -> Result<Arc<RuntimeTree>> {
         match self {
-            Self::Ready(trees) => trees
+            Self::Ready { trees, .. } => trees
                 .iter()
                 .find(|(oracle, _)| *oracle == member.source_oracle)
                 .map(|(_, tree)| Arc::clone(tree))
@@ -10315,6 +10338,19 @@ impl ProximityTreeSource<'_> {
                 first,
                 plan,
             } => witness_tree_for(member, witness, shared_witness, first, plan),
+        }
+    }
+
+    /// The Omega tree's count: created by the shared stage that commits the
+    /// tree, carried to every later consuming chain through the shared
+    /// witness. One-time mask trees are never represented and are never
+    /// adopted across chains.
+    fn omega_opening(&self) -> Option<TreeOpeningCount> {
+        match self {
+            Self::Ready { omega, .. } => omega.clone(),
+            Self::Retained { shared_witness, .. } => {
+                Some(shared_witness.omega_opening.clone())
+            }
         }
     }
 }
@@ -10341,6 +10377,7 @@ fn proximity_prove(
     if members.is_empty() || sample_rows.len() != members.len() {
         return Err(Error::ShapeMismatch);
     }
+    let omega_opening = trees.omega_opening();
     let _profile_bat = zkie_engine::profile::Scope::new("prox.bat");
     let mut statement = BatStatement::new();
     for member in &members {
@@ -10533,6 +10570,7 @@ fn proximity_prove(
                 member_trees,
                 old_mask_tree: None,
                 fresh_tree: stage_zero_tree,
+                member_opening: omega_opening.clone(),
             },
             &private.switches,
             &private.stage_folds,
@@ -10601,14 +10639,27 @@ fn proximity_prove(
         member.tails = Vec::new();
         member.mask_message = Vec::new();
         member.mask_tails = Vec::new();
-        let prover = ProximityMemberProver::sealed(member, tree)?;
+        let opening = omega_opening
+            .as_ref()
+            .filter(|count| {
+                count.tree() == member.tree_plan.tree_number && count.root() == member.root
+            })
+            .cloned();
+        let prover = ProximityMemberProver::sealed(member, tree, opening)?;
         provers.push(prover);
     }
     provers.sort_by_key(|member| member.member.bat_oracle);
     let member_openings = zkie_engine::scheduling::try_map_bounded(
         provers.as_slice(),
         zkie_engine::scheduling::DEFAULT_UNITS_IN_FLIGHT,
-        |member| member.tree.open(&unique),
+        |member| {
+            // The count is raised before the actual opening; a failure keeps
+            // the raised count and abandons the run.
+            if let Some(opening) = &member.opening {
+                opening.reserve(unique.len())?;
+            }
+            member.tree.open(&unique)
+        },
     )?;
     let mask_positions: Vec<u64> = positions
         .iter()
@@ -12824,6 +12875,8 @@ struct SharedWitness {
     omega_message: Vec<Fp3>,
     omega_tails: Vec<Vec<Fp3>>,
     omega_salts: Vec<Vec<u8>>,
+    /// The Omega tree's runtime opening count, shared with the second chain.
+    omega_opening: TreeOpeningCount,
 }
 
 struct SharedPoints {
@@ -13161,6 +13214,14 @@ fn prove_shared(
     )?;
     drop(_profile_omega_commit);
     let omega_root = *omega_tree.root();
+    // The Omega tree's runtime opening count is owned by this stage and shared
+    // pointer-style with every later chain that opens the same tree.
+    let omega_opening = TreeOpeningCount::new(
+        omega.oracle,
+        omega.tree.tree_number,
+        omega_root,
+        omega.u.code.r,
+    )?;
     absorb_root_round(&mut chain, &omega_root)?;
     let omega_bits = sample_cube_of(&omega.u)?.bits;
     let omega_seeds = draw_seed_set(&mut chain, omega_bits, omega.u.answers)?;
@@ -13332,7 +13393,10 @@ fn prove_shared(
         ),
     ];
     trees.extend(param_trees);
-    let trees = ProximityTreeSource::Ready(trees);
+    let trees = ProximityTreeSource::Ready {
+        trees,
+        omega: Some(omega_opening.clone()),
+    };
     let fold = member_fold_shape(
         plan.proximity.code,
         plan.proximity.mask_code,
@@ -13385,6 +13449,7 @@ fn prove_shared(
             omega_message: omega_message.concat(),
             omega_tails,
             omega_salts,
+            omega_opening,
         },
         points: SharedPoints { psi, zeta },
     })
@@ -22227,6 +22292,7 @@ fn prove_hidden_lin_inner(
         send: send_witness,
         gu_message: shared.witness.gu_message.concat(),
         gu_tail: shared.witness.gu_tails.concat(),
+        omega_opening: shared.witness.omega_opening.clone(),
         omega_message: shared.witness.omega_message,
         omega_tail: shared.witness.omega_tails.concat(),
     };
@@ -24314,7 +24380,8 @@ mod tests {
         assert!(retained_member_tree(&trees, 0, &member).is_ok());
         assert!(ProximityMemberProver::sealed(
             member.clone(),
-            Arc::clone(&trees.0[0])
+            Arc::clone(&trees.0[0]),
+            None,
         )
         .is_ok());
 
@@ -24360,7 +24427,7 @@ mod tests {
         let mut wrong_root = member.clone();
         wrong_root.root.0[0] ^= 1;
         assert!(matches!(
-            ProximityMemberProver::sealed(wrong_root, Arc::clone(&trees.0[0])),
+            ProximityMemberProver::sealed(wrong_root, Arc::clone(&trees.0[0]), None),
             Err(Error::StatementMismatch)
         ));
 
@@ -24375,7 +24442,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            ProximityMemberProver::sealed(wrong_message, Arc::new(other_tree)),
+            ProximityMemberProver::sealed(wrong_message, Arc::new(other_tree), None),
             Err(Error::StatementMismatch)
         ));
 
@@ -27749,6 +27816,9 @@ mod merged_tests {
         let (messages, witness) =
             prove_hidden_lin_hidden(&staged, &activation, &mut table, Digest([0x71; 32]))
                 .unwrap();
+        // The Omega count spans both chains in the staged path as well.
+        assert_eq!(witness.omega_opening.lists().unwrap(), 2);
+        assert!(witness.omega_opening.positions().unwrap() <= witness.omega_opening.budget());
         let mut verifier_plan = staged;
         verifier_plan.send.expected_roots = Some(witness.send.roots.clone());
         let outcome =
@@ -29583,6 +29653,30 @@ mod merged_tests {
         assert!(prove_hidden_lin_hidden(&plan, &activation, &mut restarted, seed).is_err());
         assert_eq!(restarted.count().unwrap(), 2 * columns);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The Omega tree's runtime opening count is one accumulator owned by the
+    /// shared stage and shared with the second chain: both BASE openings are
+    /// counted against the same tail budget before their trees are opened.
+    #[test]
+    fn the_omega_tree_counts_across_both_chains() {
+        let (plan, messages, witness) = member_run();
+        let opening = &witness.omega_opening;
+        assert_eq!(opening.oracle(), plan.proximity.omega.oracle);
+        assert_eq!(opening.root(), messages.shared.omega_root);
+        assert_eq!(opening.budget(), plan.proximity.code.r);
+        let unique = |tail: &ProximityTail| match tail {
+            ProximityTail::Single { base_openings, .. } => base_openings
+                .members
+                .first()
+                .map(|opening| opening.positions.len() as u64)
+                .unwrap_or(0),
+            ProximityTail::Stages(_) => panic!("the fixture ends in BASE"),
+        };
+        let expected = unique(&messages.shared.tail) + unique(&messages.second.tail);
+        assert_eq!(opening.positions().unwrap(), expected);
+        assert_eq!(opening.lists().unwrap(), 2);
+        assert!(opening.positions().unwrap() <= opening.budget());
     }
 
     #[test]
