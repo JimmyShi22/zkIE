@@ -11065,7 +11065,7 @@ fn table_key_sample_rows(
     for (seed, answer) in group.bits_samples {
         bits.push(oracle_sample_row(
             group.commit.bits_oracle,
-            group.group_id,
+            group.commit.group,
             &oracle_shape,
             std::slice::from_ref(seed),
             0,
@@ -11077,7 +11077,7 @@ fn table_key_sample_rows(
         mask.push(digit_lookup_mask_sample_row(
             group.commit,
             group.commit.mask_oracle,
-            group.group_id,
+            group.commit.group,
             seed,
             *answer,
         )?);
@@ -11128,6 +11128,125 @@ fn table_key_iopp(
         group.base_positions,
         group.bound,
     )
+}
+
+/// One solved stage as the group chain takes it.
+fn key_group_stage(
+    stage: &crate::proof::proximity_planner::SolvedStage,
+) -> IoppStagePlan {
+    IoppStagePlan {
+        main: CodeParams {
+            log_n: stage.log_n,
+            ell: stage.main_ell,
+            r: stage.main_r,
+        },
+        mask: CodeParams {
+            log_n: stage.mask_log_n,
+            ell: stage.mask_ell,
+            r: stage.mask_r,
+        },
+        k: stage.k,
+        h: stage.h,
+        positions: stage.positions as usize,
+        samples: 1,
+        work_bits: 0,
+    }
+}
+
+/// The key group's derived chain: the single-group solve's first codes and
+/// stage list, and the fresh mask tree its stage-zero fold hides in.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeyGroupPlan {
+    pub first_main: CodeParams,
+    pub first_mask: CodeParams,
+    pub mask_rows: u64,
+    pub stages: Vec<IoppStagePlan>,
+    pub base_positions: usize,
+    pub mask_tree: MaskTreePlan,
+    pub fresh: u64,
+}
+
+/// Derives the key group's chain from the multiplicity-bit message's entry
+/// count, the mask message's entry count and the group's BAT row count. The
+/// derived first codes are the codes the lookup messages are committed under,
+/// so the group's members and the FOLD share one pair of codes.
+pub(crate) fn derive_key_group_plan(
+    bit_entries: u64,
+    mask_entries: usize,
+    rows: u64,
+    salt_bytes: usize,
+    fresh: u64,
+    mask_tree_number: u64,
+    run: Digest,
+    configuration: Digest,
+) -> Result<KeyGroupPlan> {
+    if fresh == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let derived = crate::proof::proximity_planner::derive_single_group_plan(
+        bit_entries, mask_entries, rows, 1, false,
+    )
+    .map_err(|_| Error::InvalidConfig)?;
+    let stages: Vec<IoppStagePlan> = derived.stages.iter().map(key_group_stage).collect();
+    let base_positions = stages.last().ok_or(Error::InvalidConfig)?.positions;
+    let first_h = stages.first().ok_or(Error::InvalidConfig)?.h;
+    let tree_rows = 1u64.checked_shl(first_h).ok_or(Error::ResourceLimit)?;
+    let mask_tree = MaskTreePlan {
+        tree_number: mask_tree_number,
+        leaf_class: crate::proof::multi_stage_iopp::IOPP_MASK_LEAF_CLASS,
+        log_n: derived.first_mask.log_n,
+        mask_rows: tree_rows,
+        salt_bytes,
+        run,
+        configuration,
+    };
+    if mask_tree.fault().is_some()
+        || mask_tree.width()? > mask_tree.columns()
+        || iopp_stage_fault(
+            &stages,
+            derived.first_main,
+            derived.first_mask,
+            base_positions,
+        )
+        .is_some()
+    {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(KeyGroupPlan {
+        first_main: derived.first_main,
+        first_mask: derived.first_mask,
+        mask_rows: derived.mask_rows,
+        stages,
+        base_positions,
+        mask_tree,
+        fresh,
+    })
+}
+
+/// The identifiers the trusted key plan already binds: the BAT member oracles,
+/// the constant oracle and the group's own fresh identifier, plus every
+/// runtime tree number the plan commits. The derived stage chain allocates
+/// from this registry.
+pub(crate) fn key_group_bound(
+    plan: &KeyFirstPlan,
+    group: &KeyGroupPlan,
+) -> Result<crate::proof::proximity_iopp::IoppBoundIds> {
+    if plan.bits_bat == plan.mask_bat
+        || group.fresh == plan.bits_bat
+        || group.fresh == plan.mask_bat
+    {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(crate::proof::proximity_iopp::IoppBoundIds::new(
+        vec![0, plan.bits_bat, plan.mask_bat, group.fresh],
+        vec![
+            plan.commit.bits_shape.tree_number,
+            plan.commit.mask_tree.tree_number,
+            plan.index.tree.tree_number,
+            plan.w.tree_number,
+            group.mask_tree.tree_number,
+        ],
+    ))
 }
 
 /// Proves the key group's proximity test: the BAT rows on the lookup messages,
@@ -36506,14 +36625,12 @@ mod key_first_flow_tests {
     use super::*;
     use crate::proof::table_range::{
         derive_entry_range, derive_range_lookup_message, range_bit_values, range_key_values,
-        range_multiplicities, range_pending_row_with, EntryRange, EntryRangeLimits,
-        IntegerRangeTable,
+        range_multiplicities, EntryRange, EntryRangeLimits, IntegerRangeTable,
     };
 
-    fn flow_plan() -> (KeyFirstPlan, Vec<Fp3>, Vec<Fp3>) {
+    fn flow_plan() -> (KeyFirstPlan, Vec<Fp3>, Vec<Fp3>, KeyGroupPlan, u64) {
         let code = zkie_engine::pcs::request::code::build_code_plan(4, 8, 1).unwrap();
-        let bits_code = zkie_engine::pcs::request::code::build_code_plan(15, 2048, 128).unwrap();
-        let mask_code = zkie_engine::pcs::request::code::build_code_plan(15, 256, 66).unwrap();
+        let index_code = zkie_engine::pcs::request::code::build_code_plan(15, 256, 66).unwrap();
         let range = EntryRange::new(-8, 7).unwrap();
         let range_plan = derive_entry_range(
             4,
@@ -36525,10 +36642,32 @@ mod key_first_flow_tests {
             },
         )
         .unwrap();
+        let lookup_plan = crate::proof::table_range::range_lookup_plan(&range_plan).unwrap();
+        let bit_entries = range_plan.bit_entries;
+        let mask_entries = crate::proof::lookup::mask_count(&lookup_plan).unwrap();
+        let leaf_index = (lookup_plan.planes().unwrap() - 1)
+            + lookup_plan.key_bits as usize
+            + lookup_plan.table_log as usize;
+        // The group's BAT rows: one sample row per member and the lookup's
+        // plain rows, which are one per remaining relation plus four.
+        let planned = (leaf_index + 6) as u64;
+        let group_plan = derive_key_group_plan(
+            bit_entries,
+            mask_entries,
+            planned,
+            40,
+            95,
+            301,
+            Digest([0x71; 32]),
+            Digest([0x72; 32]),
+        )
+        .unwrap();
+        // The lookup messages are committed under the group's first codes, so
+        // the members and the FOLD share one pair of codes.
         let message = derive_range_lookup_message(
             &range_plan,
-            bits_code,
-            mask_code,
+            group_plan.first_main,
+            group_plan.first_mask,
             40,
             100,
             1,
@@ -36536,6 +36675,7 @@ mod key_first_flow_tests {
             Digest([0x51; 32]),
         )
         .unwrap();
+        assert_eq!(message.mask_rows, group_plan.mask_rows);
         let values: Vec<i64> = vec![-8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7];
         let entries: Vec<Fp3> = values
             .iter()
@@ -36547,8 +36687,8 @@ mod key_first_flow_tests {
         let mask_tree = RuntimeTreePlan {
             tree_number: 101,
             leaf_class: 3,
-            log_n: mask_code.log_n,
-            log_n_zk: mask_code.log_n,
+            log_n: group_plan.first_mask.log_n,
+            log_n_zk: group_plan.first_mask.log_n,
             parts: vec![RuntimeTreePart {
                 main_symbols: 0,
                 mask_symbols: message.mask_rows * E_DEGREE as u64,
@@ -36557,7 +36697,6 @@ mod key_first_flow_tests {
             run: Digest([0x42; 32]),
             configuration: Digest([0x52; 32]),
         };
-        let index_code = mask_code;
         let plan = KeyFirstPlan {
             table_identity: Digest([9; 32]),
             table_configuration: Digest([8; 32]),
@@ -36584,7 +36723,7 @@ mod key_first_flow_tests {
                 group: 7,
                 bits_openings: 1,
                 mask_oracle: 2,
-                mask_code,
+                mask_code: group_plan.first_mask,
                 mask_rows: message.mask_rows,
                 mask_openings: 1,
                 mask_tree,
@@ -36625,20 +36764,29 @@ mod key_first_flow_tests {
             .unwrap(),
             w_oracle: 5,
             group: 7,
-            bits_bat: 10,
-            mask_bat: 11,
+            bits_bat: 0,
+            mask_bat: 1,
         };
-        (plan, keys, bits)
+        (plan, keys, bits, group_plan, planned)
     }
 
-    #[test]
-    fn the_key_first_part_proves_and_verifies() {
-        let (plan, keys, bits) = flow_plan();
+    #[allow(clippy::type_complexity)]
+    fn flow_run() -> (
+        KeyFirstPlan,
+        IndexReader,
+        IntegerRangeTable,
+        KeyFirstMessages,
+        Digest,
+        KeyFirstWitness,
+        KeyGroupPlan,
+        u64,
+    ) {
+        let (plan, keys, bits, group_plan, planned) = flow_plan();
+        // The table row is the matrix column: place row holds entry
+        // (row, column).
         let mut message_rows = vec![vec![Fp::ZERO; 8]; 4];
         for row in 0..4 {
             for column in 0..4 {
-                // The table row is the matrix column: place row holds entry
-                // (row, column).
                 message_rows[column][row] =
                     crate::proof::column_session::fp_from_signed_word((row as i64 * 4 + column as i64 - 8) as u64);
             }
@@ -36664,10 +36812,9 @@ mod key_first_flow_tests {
         .unwrap();
         let table = IntegerRangeTable::new(&range_plan, 1 << 8).unwrap();
         let mut coins = ByteMaskCoins::new(Digest([5; 32])).unwrap();
-        let index_randomness =
-            IndexMaskRandomness::from_coins(&mut coins, &plan.index).unwrap();
+        let index_randomness = IndexMaskRandomness::from_coins(&mut coins, &plan.index).unwrap();
         let seed = Digest([7; 32]);
-        let (messages, seal, _witness) = key_first_prove(
+        let (messages, seal, witness) = key_first_prove(
             &plan,
             &reader,
             &mut source,
@@ -36678,6 +36825,12 @@ mod key_first_flow_tests {
             seed,
         )
         .unwrap();
+        (plan, reader, table, messages, seal, witness, group_plan, planned)
+    }
+
+    #[test]
+    fn the_key_first_part_proves_and_verifies() {
+        let (plan, reader, table, messages, seal, _witness, _group_plan, _planned) = flow_run();
         let verified = key_first_verify(&plan, &reader, &table, &messages).unwrap();
         assert_eq!(verified, seal);
         let mut changed = messages.clone();
@@ -36686,5 +36839,71 @@ mod key_first_flow_tests {
         let mut changed = messages;
         changed.w_root = Digest([0x77; 32]);
         assert!(key_first_verify(&plan, &reader, &table, &changed).is_err());
+    }
+
+    #[test]
+    fn the_key_group_proves_and_verifies() {
+        let (plan, reader, _table, _messages, _seal, witness, group_plan, planned) = flow_run();
+        let claims = &witness.lookup.claims;
+        let mut plain =
+            lookup_remaining_rows(&plan.lookup, &plan.commit, claims, plan.mask_bat).unwrap();
+        plain.extend(
+            lookup_group_rows(&plan.lookup, &plan.commit, claims, plan.bits_bat, plan.mask_bat)
+                .unwrap(),
+        );
+        assert_eq!(plain.len() as u64 + 2, planned);
+        let bound = key_group_bound(&plan, &group_plan).unwrap();
+        let group = TableKeyGroup {
+            lookup: &plan.lookup,
+            commit: &plan.commit,
+            claims,
+            messages: &witness.lookup.commit_messages,
+            first_main: group_plan.first_main,
+            first_mask: group_plan.first_mask,
+            stages: &group_plan.stages,
+            base_positions: group_plan.base_positions,
+            mask_tree: group_plan.mask_tree,
+            fresh: group_plan.fresh,
+            group_id: 0,
+            bits_bat: plan.bits_bat,
+            mask_bat: plan.mask_bat,
+            bits_samples: &witness.lookup.samples[0..1],
+            mask_samples: &witness.lookup.samples[1..2],
+            bound: &bound,
+        };
+        let members = table_key_members(&group, true).unwrap();
+        let trees = vec![
+            (
+                plan.commit.bits_oracle,
+                retained_member_tree(
+                    &witness.lookup.commit_messages.bits.trees,
+                    0,
+                    &members[0],
+                )
+                .unwrap(),
+            ),
+            (plan.commit.mask_oracle, witness.lookup.mask_tree.clone()),
+        ];
+        let label = 0x4B47_0001u64;
+        let begin = || {
+            Chain::begin(
+                label,
+                &plan.statement_digest(),
+                &plan.range.encode(),
+                &reader.name(),
+                None,
+            )
+            .unwrap()
+        };
+        let proof = table_key_group_prove(begin(), &group, trees, Digest([0x83; 32])).unwrap();
+        let verified = table_key_group_verify(begin(), &group, &proof.messages).unwrap();
+        assert_eq!(verified, proof.seal);
+        let mut changed = proof.messages.clone();
+        let first = changed
+            .fold_rounds
+            .first_mut()
+            .expect("the group has a fold round to tamper");
+        first.0 = first.0.add(&Fp3::ONE);
+        assert!(table_key_group_verify(begin(), &group, &changed).is_err());
     }
 }
