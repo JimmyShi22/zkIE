@@ -118,8 +118,10 @@ Negatives (rejected through the same path; there is no plaintext fallback):
 - The extension asset stays registered in the commitment; the anchor,
   policy, asset identities and ground truth are unchanged and no asset is
   regenerated.
-- The 45,080 B gate object is untouched. The workspace suite is green
-  (1156 passed / 0 failed / 20 ignored). Not pushed.
+- The 45,080 B gate object is untouched. The workspace suite is green at
+  the evidence commit (1156 passed / 0 failed / 20 ignored); the later
+  consumption-negative rework changes only the test file and was verified
+  with the targeted filter (6 passed / 0 failed). Not pushed.
 - Logs and scripts: the ten `before-*`/`after-*` run logs; the workspace
   suite log `workspace.log`; the release build log `release-build.log`; the
   run script `run-script.sh`; the targeted negative suite log
@@ -129,3 +131,15 @@ Negatives (rejected through the same path; there is no plaintext fallback):
   authentication-accepted/relation-rejected lines). Per-stage `result.json`
   and `progress.jsonl` stay under each run directory; proof binaries stay
   on disk and are gitignored.
+
+## Round closure
+
+- Expert batch review: the whole round is accepted, no further rework.
+- Final commit list, in order: `58db8cb1` (production change: the extension
+  read through the trusted public-file channel), `b5579ef4` (evidence
+  record), `45c4d6ed` (negative matrix completion), `0d00804e` (trace
+  archive), `ec41db34` (authentication-consistent consumption negatives),
+  and this closing commit (round flag, NOTES record only; no code change).
+- State at closure: hard gate 45,080 B untouched; no anchor, policy, asset,
+  ground truth or commitment registration changed; source and evidence are
+  on the branch, not pushed.
