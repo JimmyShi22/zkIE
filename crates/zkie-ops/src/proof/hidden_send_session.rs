@@ -1558,7 +1558,7 @@ pub struct IndexMaskRandomness {
 }
 
 impl IndexMaskRandomness {
-    fn from_coins(coins: &mut ByteMaskCoins, plan: &IndexMaskPlan) -> Result<Self> {
+    pub(crate) fn from_coins(coins: &mut ByteMaskCoins, plan: &IndexMaskPlan) -> Result<Self> {
         let rows = usize::try_from(plan.mask_rows).map_err(|_| Error::ResourceLimit)?;
         let ell = usize::try_from(plan.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
         let tail = usize::try_from(plan.mask_code.r).map_err(|_| Error::ResourceLimit)?;
@@ -3141,6 +3141,36 @@ fn derive_w_rows_from_weights(
 /// witness. Each message is placed in its main rows, encoded with the product
 /// form and committed under its runtime tree. The sample pads are reserved at
 /// the end of the last row and filled from the supplied private randomness.
+/// Commits the at_start index-mask message: its mask rows, their encoding
+/// tails and salts, under its runtime tree. The witness checks itself against
+/// the plan.
+pub(crate) fn commit_index_mask(
+    index: &IndexMaskPlan,
+    randomness: &IndexMaskRandomness,
+) -> Result<IndexMaskWitness> {
+    let mut codewords = Vec::with_capacity(randomness.rows.len());
+    for (row, tail) in randomness.rows.iter().zip(&randomness.tails) {
+        codewords.push(encode_row_fp3(&index.mask_code, row, tail)?);
+    }
+    let tree = RuntimeTree::commit(
+        index.tree.clone(),
+        &[RuntimePartRows {
+            main: Vec::new(),
+            mask: codewords,
+            main_deg: 1,
+        }],
+        &randomness.salts,
+    )?;
+    let witness = IndexMaskWitness {
+        rows: randomness.rows.clone(),
+        tails: randomness.tails.clone(),
+        salts: randomness.salts.clone(),
+        root: *tree.root(),
+    };
+    witness.check(index)?;
+    Ok(witness)
+}
+
 pub fn commit_w_rows(
     plan: &HiddenSendPlan,
     rows: &[Vec<Fp3>],
@@ -3241,29 +3271,7 @@ pub fn commit_w_rows(
         return Err(Error::InvalidConfig);
     }
     let index_mask = match (&plan.index_mask, &randomness.index_mask) {
-        (Some(index), Some(randomness)) => {
-            let mut codewords = Vec::with_capacity(randomness.rows.len());
-            for (row, tail) in randomness.rows.iter().zip(&randomness.tails) {
-                codewords.push(encode_row_fp3(&index.mask_code, row, tail)?);
-            }
-            let tree = RuntimeTree::commit(
-                index.tree.clone(),
-                &[RuntimePartRows {
-                    main: Vec::new(),
-                    mask: codewords,
-                    main_deg: 1,
-                }],
-                &randomness.salts,
-            )?;
-            let witness = IndexMaskWitness {
-                rows: randomness.rows.clone(),
-                tails: randomness.tails.clone(),
-                salts: randomness.salts.clone(),
-                root: *tree.root(),
-            };
-            witness.check(index)?;
-            Some(witness)
-        }
+        (Some(index), Some(randomness)) => Some(commit_index_mask(index, randomness)?),
         (None, None) => None,
         _ => return Err(Error::ShapeMismatch),
     };
