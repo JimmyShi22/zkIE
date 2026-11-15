@@ -1234,3 +1234,53 @@ fn rms_extension_prover_supplied_opening_is_rejected() {
         .to_owned();
     assert_eq!(code, "statement_mismatch");
 }
+
+fn set_plan_activation(plan: &mut TracePlan, value: i64) {
+    let step = &mut plan.steps[0];
+    match &mut step.inputs[0] {
+        PlanSource::Constant(PlanConstant::Literal(values)) => values[0] = value,
+        _ => panic!("the activation is a literal"),
+    }
+}
+
+#[test]
+fn rms_extension_index_past_the_end_is_rejected() {
+    // With the two-entry extension and the 1024 activation the derived index
+    // is exactly the base length and the first extension entry is consumed:
+    // this instance verifies. Raising the trusted activation to 1280 makes the
+    // derived index six, past the base-four plus extension-two end; the file
+    // identity and the input lengths stay legal.
+    let mut fixture = rms_public_fixture(1024, &[100, 200, 300, 400], &[500, 600], None, None);
+    verify_rms_public(&fixture).expect("the legal boundary instance verifies");
+    set_plan_activation(&mut fixture.plan, 1280);
+    let code = verify_rms_public(&fixture)
+        .err()
+        .expect("the past-end index is rejected")
+        .code()
+        .to_owned();
+    // The past-end index enters the consumption relation check and the
+    // verifier rejects the proof there (the file identity and the input
+    // lengths are legal, so the rejection is not a length check).
+    assert_eq!(code, "invalid_proof");
+}
+
+#[test]
+fn rms_extension_consumption_tamper_is_rejected() {
+    let base = || rms_public_fixture(1024, &[100, 200, 300, 400], &[500, 600, 700, 800], None, None);
+
+    let mut tampered = base();
+    tampered.trace.steps[0].message.proof.outputs[0][0].values[0] ^= 1;
+    assert!(verify_rms_public(&tampered).is_err(), "norm output tamper");
+
+    let mut tampered = base();
+    tampered.trace.steps[0].message.proof.raw[0][0].values[0] ^= 1;
+    assert!(verify_rms_public(&tampered).is_err(), "raw product tamper");
+
+    let mut tampered = base();
+    tampered.trace.steps[0].message.proof.aux[0][0].values[0] ^= 1;
+    assert!(verify_rms_public(&tampered).is_err(), "mean-square tamper");
+
+    let mut tampered = base();
+    tampered.trace.steps[0].message.proof.aux[1][0].values[0] ^= 1;
+    assert!(verify_rms_public(&tampered).is_err(), "rstd tamper");
+}
