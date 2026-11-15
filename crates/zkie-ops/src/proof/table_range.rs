@@ -500,6 +500,57 @@ pub fn range_bit_values(plan: &EntryRangePlan, counts: &[u64]) -> Result<Vec<Fp3
     Ok(bits)
 }
 
+/// The pending claim of the declared range configuration: the same
+/// derivation as , from the public declaration alone.
+pub fn range_pending_row_with(
+    config: &TableKeyRangeConfig,
+    claim: &GeneralClaim,
+    index_oracle: u64,
+) -> Result<PendingRow> {
+    if claim.point.len() != config.key_bits as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    let column_bits = config.column_bits as usize;
+    let place_point = &claim.point[column_bits..];
+    let weights = eq_weights(place_point);
+    if weights.len() != (1usize << config.place_bits) {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut covered = Fp3::ZERO;
+    for weight in &weights {
+        covered = covered.add(weight);
+    }
+    let blocks = if config.place_bits == 0 {
+        vec![WeightBlock::Scalar {
+            row: 0,
+            value: weights[0],
+        }]
+    } else {
+        vec![WeightBlock::Dense {
+            first_row: 0,
+            log_rows: config.place_bits,
+            values: weights,
+        }]
+    };
+    let ps: Vec<Fp3> = claim.point[..column_bits].to_vec();
+    let target = claim.value.sub(&covered.mul(&config.offset));
+    let masks = claim
+        .masks
+        .iter()
+        .map(|term| PendingMaskTerm {
+            oracle: index_oracle,
+            slot: term.slot as u64,
+            coeff: term.coefficient,
+        })
+        .collect();
+    Ok(PendingRow {
+        weights: blocks,
+        psi: ps,
+        target,
+        masks,
+    })
+}
+
 /// The pending claim the range lookup leaves on the matrix, from the lookup's
 /// key claim: the matrix is weighted by the equality weights of the key
 /// point's place coordinates, the column point is the key point's column

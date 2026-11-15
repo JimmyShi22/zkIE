@@ -10597,6 +10597,237 @@ impl KeyFirstPlan {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// The key chain's first part
+// ---------------------------------------------------------------------------
+
+pub(crate) const KEY_FIRST_CHAIN_LABEL: u64 = 0x4B45_5946_4952_5354;
+const KEY_W_ROOT_TAG: u64 = 81;
+const KEY_EVAL_TARGET_TAG: u64 = 82;
+
+/// The messages of the key first part: the index-mask root and answer, the
+/// lookup messages, the W root, the drawn point and the Eval target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeyFirstMessages {
+    pub index_root: Digest,
+    pub index_answer: Fp3,
+    pub lookup: KeyLookupMessages,
+    pub w_root: Digest,
+    pub psi: Vec<Fp3>,
+    pub eval_target: Fp3,
+}
+
+/// What the prover keeps of the key first part.
+pub(crate) struct KeyFirstWitness {
+    pub index: IndexMaskWitness,
+    pub lookup: KeyLookupProof,
+    pub w: crate::proof::output_closure::CommittedValueGroup,
+    pub member: crate::proof::hidden_member::PendingRow,
+    pub eval_row: BatRow,
+}
+
+fn absorb_key_fp3(chain: &mut Chain, tag: u64, value: Fp3) -> Result<()> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(tag);
+    message.push_fp3(&value);
+    let prefix = message.prefix(KIND_SEED, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+fn key_lookup_key_plan(plan: &KeyFirstPlan) -> crate::proof::lookup::LookupKeyPlan {
+    crate::proof::lookup::LookupKeyPlan {
+        sources: Vec::new(),
+        padding_values: vec![Fp3::ZERO; plan.lookup.columns as usize],
+        table_identity: plan.range.range_table,
+    }
+}
+
+fn key_mask_units(
+    plan: &KeyFirstPlan,
+    member: &crate::proof::hidden_member::PendingRow,
+) -> Result<Vec<(u64, u64, Fp3)>> {
+    let mut units = Vec::with_capacity(member.masks.len());
+    for term in &member.masks {
+        if term.oracle != plan.index.oracle {
+            return Err(Error::StatementMismatch);
+        }
+        let slot = usize::try_from(term.slot).map_err(|_| Error::ResourceLimit)?;
+        units.push((
+            plan.index.oracle,
+            plan.index.entry_virtual_index(slot)?,
+            term.coeff,
+        ));
+    }
+    Ok(units)
+}
+
+fn key_eval_target(
+    plan: &KeyFirstPlan,
+    index: &IndexMaskWitness,
+    member: &crate::proof::hidden_member::PendingRow,
+    w_values: &[Fp3],
+    psi: &[Fp3],
+) -> Result<Fp3> {
+    let mut target = eval_fp3_vector(w_values, psi)?;
+    let ell = usize::try_from(plan.index.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+    for term in &member.masks {
+        let slot = usize::try_from(term.slot).map_err(|_| Error::ResourceLimit)?;
+        let offset = plan.index.entry_offset(slot)?;
+        let row = index.rows.get(offset / ell).ok_or(Error::ShapeMismatch)?;
+        let value = *row.get(offset % ell).ok_or(Error::ShapeMismatch)?;
+        target = target.add(&term.coeff.mul(&value));
+    }
+    Ok(target)
+}
+
+/// The prover's key first part: the at_start index mask, the range lookup, the
+/// pending claim, the request-level W and the Eval target, sealed at the end.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn key_first_prove(
+    plan: &KeyFirstPlan,
+    reader: &IndexReader,
+    table: &mut dyn TableRowSource,
+    lookup_table: &dyn crate::proof::lookup::LookupTable,
+    lookup_key_values: &[Fp3],
+    bit_values: &[Fp3],
+    index_randomness: &IndexMaskRandomness,
+    seed: Digest,
+) -> Result<(KeyFirstMessages, Digest, KeyFirstWitness)> {
+    let mut chain = Chain::begin(
+        KEY_FIRST_CHAIN_LABEL,
+        &plan.statement_digest(),
+        &plan.range.encode(),
+        &reader.name(),
+        None,
+    )?;
+    let index = commit_index_mask(&plan.index, index_randomness)?;
+    absorb_index_mask_root(&mut chain, &plan.index, &index.root)?;
+    let index_seeds = draw_seed_set(&mut chain, plan.index.sample_bits()?, 1)?;
+    let index_answer = index_mask_answer(&plan.index, &index.rows, &index_seeds[0])?;
+    absorb_index_mask_answer(&mut chain, index_answer)?;
+    let _positions = draw_index_mask_positions(&mut chain, &plan.index)?;
+    let key_plan = key_lookup_key_plan(plan);
+    let lookup = table_key_lookup_prove(
+        &plan.lookup,
+        &plan.commit,
+        &key_plan,
+        lookup_key_values,
+        &crate::proof::lookup::LookupWitness {
+            bits: bit_values.to_vec(),
+        },
+        lookup_table,
+        plan.commit.bits_oracle ^ 0x4B45_594C,
+        &mut chain,
+    )?;
+    let member =
+        crate::proof::table_range::range_pending_row_with(&plan.range, &lookup.claims.key, plan.index.oracle)?;
+    let g = pending_row_weights(&member, plan.matrix_rows)?;
+    let w_values = derive_w_values(
+        &plan.table_shape,
+        plan.matrix_rows,
+        plan.k_lo,
+        plan.columns,
+        &g,
+        table,
+    )?;
+    let mut coins = ByteMaskCoins::new(derive_run_seed(&seed, 9, 0)?)?;
+    let (pads, tail, salts) = draw_w_message_randomness(&mut coins, &plan.w)?;
+    let w = commit_request_w(
+        &plan.w,
+        plan.w_oracle,
+        plan.group,
+        &w_values,
+        &pads,
+        std::slice::from_ref(&tail),
+        std::slice::from_ref(&salts),
+    )?;
+    let w_root = *w.roots.first().ok_or(Error::ShapeMismatch)?;
+    absorb_digest_round(&mut chain, KEY_W_ROOT_TAG, &[w_root], &[plan.w_oracle])?;
+    let psi = draw_point_round(
+        &mut chain,
+        KIND_ALGEBRAIC,
+        &[plan.columns],
+        plan.columns.trailing_zeros(),
+    )?;
+    let eval_target = key_eval_target(plan, &index, &member, &w_values, &psi)?;
+    absorb_key_fp3(&mut chain, KEY_EVAL_TARGET_TAG, eval_target)?;
+    let eval_row = request_eval_row(
+        TableLayout::of(&plan.w),
+        plan.columns,
+        plan.w_oracle,
+        &psi,
+        &key_mask_units(plan, &member)?,
+        eval_target,
+    )?;
+    let seal = *chain.value();
+    Ok((
+        KeyFirstMessages {
+            index_root: index.root,
+            index_answer,
+            lookup: lookup.messages.clone(),
+            w_root,
+            psi,
+            eval_target,
+        },
+        seal,
+        KeyFirstWitness {
+            index,
+            lookup,
+            w,
+            member,
+            eval_row,
+        },
+    ))
+}
+
+/// The verifier's key first part: the same transcript, no member or W rows.
+pub(crate) fn key_first_verify(
+    plan: &KeyFirstPlan,
+    reader: &IndexReader,
+    lookup_table: &dyn crate::proof::lookup::LookupTable,
+    messages: &KeyFirstMessages,
+) -> Result<Digest> {
+    let mut chain = Chain::begin(
+        KEY_FIRST_CHAIN_LABEL,
+        &plan.statement_digest(),
+        &plan.range.encode(),
+        &reader.name(),
+        None,
+    )?;
+    absorb_index_mask_root(&mut chain, &plan.index, &messages.index_root)?;
+    let index_seeds = draw_seed_set(&mut chain, plan.index.sample_bits()?, 1)?;
+    let _ = index_seeds;
+    absorb_index_mask_answer(&mut chain, messages.index_answer)?;
+    let _positions = draw_index_mask_positions(&mut chain, &plan.index)?;
+    let key_plan = key_lookup_key_plan(plan);
+    let (claims, _samples) = table_key_lookup_verify(
+        &plan.lookup,
+        &plan.commit,
+        &key_plan,
+        &messages.lookup,
+        lookup_table,
+        &mut chain,
+    )?;
+    let _ = claims;
+    absorb_digest_round(&mut chain, KEY_W_ROOT_TAG, &[messages.w_root], &[plan.w_oracle])?;
+    let psi = draw_point_round(
+        &mut chain,
+        KIND_ALGEBRAIC,
+        &[plan.columns],
+        plan.columns.trailing_zeros(),
+    )?;
+    if psi != messages.psi {
+        return Err(Error::InvalidProof);
+    }
+    absorb_key_fp3(&mut chain, KEY_EVAL_TARGET_TAG, messages.eval_target)?;
+    Ok(*chain.value())
+}
+
 // ---------------------------------------------------------------------------
 // The key chain's lookup
 // ---------------------------------------------------------------------------
