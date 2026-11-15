@@ -1,0 +1,25 @@
+TRACE docs/benchmarks/20261116-0012-table-plan-fbf98f2f-f91f0c1d
+commit gpt2-seq16 EXIT 0 WALL_MS 3851
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"commit","error_code":null,"last_completed_stage":"commit","last_event_seq":3,"outcome":"PASS","output_binding":null,"progress_path":"docs/benchmarks/20261116-0012-table-plan-fbf98f2f-f91f0c1d/instance/gpt2-seq16/commit-run/progress.jsonl","proof_bytes":null,"protocol_wall_ms":3848,"run_id":"commit","stage_wall_ms":3848,"vmhwm_kib":356744}
+anchor gpt2-seq16 EXIT 0
+commit gpt2-seq512 EXIT 0 WALL_MS 3854
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"commit","error_code":null,"last_completed_stage":"commit","last_event_seq":3,"outcome":"PASS","output_binding":null,"progress_path":"docs/benchmarks/20261116-0012-table-plan-fbf98f2f-f91f0c1d/instance/gpt2-seq512/commit-run/progress.jsonl","proof_bytes":null,"protocol_wall_ms":3850,"run_id":"commit","stage_wall_ms":3850,"vmhwm_kib":356672}
+anchor gpt2-seq512 EXIT 0
+baseline-policy run gpt2-seq16 EXIT 1
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"verify","error_code":"statement_mismatch","last_completed_stage":"verify","last_event_seq":2,"outcome":"FAIL","output_binding":null,"progress_path":"docs/benchmarks/20261116-0012-table-plan-fbf98f2f-f91f0c1d/instance/gpt2-seq16/run/verify/progress.jsonl","proof_bytes":null,"protocol_wall_ms":1213,"run_id":"verify","stage_wall_ms":1213,"vmhwm_kib":1884352}
+baseline-policy run gpt2-seq512 EXIT 1
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"verify","error_code":"statement_mismatch","last_completed_stage":"verify","last_event_seq":2,"outcome":"FAIL","output_binding":null,"progress_path":"docs/benchmarks/20261116-0012-table-plan-fbf98f2f-f91f0c1d/instance/gpt2-seq512/run/verify/progress.jsonl","proof_bytes":null,"protocol_wall_ms":4754,"run_id":"verify","stage_wall_ms":4754,"vmhwm_kib":7213652}
+run2 gpt2-seq16 EXIT 0 WALL_MS 26045
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"prove","error_code":null,"last_completed_stage":"prove","last_event_seq":75,"outcome":"PASS","output_binding":null,"progress_path":"docs/benchmarks/20261116-0012-table-plan-fbf98f2f-f91f0c1d/instance/gpt2-seq16/run2/prove/progress.jsonl","proof_bytes":1887840920,"protocol_wall_ms":13992,"run_id":"prove","stage_wall_ms":13992,"vmhwm_kib":3897948}
+{"authenticated_output_digest":"135c4d1c47aee4fd1985fa862afefbedde9d59beaf112bd2cf0dcfff03339280","authenticated_output_elements":16,"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":5,"outcome":"PASS","output_binding":"expected","progress_path":"docs/benchmarks/20261116-0012-table-plan-fbf98f2f-f91f0c1d/instance/gpt2-seq16/run2/verify/progress.jsonl","proof_bytes":null,"protocol_wall_ms":11884,"run_id":"verify","stage_wall_ms":11884,"vmhwm_kib":3794148}
+1887836942 docs/benchmarks/20261116-0012-table-plan-fbf98f2f-f91f0c1d/instance/gpt2-seq16/run2/proof/proof.bin
+run2 gpt2-seq512 EXIT 0 WALL_MS 73699
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"prove","error_code":null,"last_completed_stage":"prove","last_event_seq":55,"outcome":"PASS","output_binding":null,"progress_path":"docs/benchmarks/20261116-0012-table-plan-fbf98f2f-f91f0c1d/instance/gpt2-seq512/run2/prove/progress.jsonl","proof_bytes":6798965241,"protocol_wall_ms":43806,"run_id":"prove","stage_wall_ms":43806,"vmhwm_kib":18924808}
+{"authenticated_output_digest":"eac0949d6463927eb9a961d61d618fb703e4b02169e89db10dbada94a5f0dfdd","authenticated_output_elements":512,"command":"verify","error_code":null,"last_completed_stage":"verify","last_event_seq":8,"outcome":"PASS","output_binding":"expected","progress_path":"docs/benchmarks/20261116-0012-table-plan-fbf98f2f-f91f0c1d/instance/gpt2-seq512/run2/verify/progress.jsonl","proof_bytes":null,"protocol_wall_ms":29506,"run_id":"verify","stage_wall_ms":29506,"vmhwm_kib":14089736}
+6798955310 docs/benchmarks/20261116-0012-table-plan-fbf98f2f-f91f0c1d/instance/gpt2-seq512/run2/proof/proof.bin
+prefix gpt2-seq16 EXIT 0 WALL_MS 414140
+plan validate ok
+prefix geometry: matrix_rows=1024 columns=1024 hidden=1024 openings=2 index_rows=1 own_mask_rows=1 fresh=2/12 shared_base=66 own_base=53 shared_positions=[65, 71, 66] own_positions=[65, 66, 53]
+table-plan prefix seal=dd4b00eeeacb6b834a2585b397f815a07faa32e305ff886b449d57d56898ab17 reserved=52 total=52 first_bytes=5992 shared_bytes=713904 prove_ms=122881 verify_ms=77731
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 414.01s
+DONE docs/benchmarks/20261116-0012-table-plan-fbf98f2f-f91f0c1d

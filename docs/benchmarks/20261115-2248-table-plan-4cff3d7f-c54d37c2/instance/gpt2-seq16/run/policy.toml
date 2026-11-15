@@ -1,0 +1,81 @@
+policy_version = 1
+model = "gpt2"
+model_version = 2
+
+[[case]]
+case_id = "gpt2-seq16"
+sequence_length = 16
+anchor_id = "fe8a72cdc37d50fd72942daa1585401e67d22effb10eb417d145dafc2c4ffbed"
+model_id = "c2971c0179463bf12aecaefc3488417228008c1314e6905c49a55078242c1268"
+output_mode = "expected"
+expected_output_sha256 = "135c4d1c47aee4fd1985fa862afefbedde9d59beaf112bd2cf0dcfff03339280"
+output_digest_algorithm = "sha256"
+output_type = "argmax"
+output_encoding = "i32-le"
+output_elements = 16
+
+[case.limited_table_identity]
+version = 1
+model = "gpt2"
+model_version = 2
+case_id = "gpt2-seq16"
+anchor_id = "91397c7e3a02f7b35e2a49de44806391af55b7ef1c41a83552af2bfa910cc060"
+model_id = "c2971c0179463bf12aecaefc3488417228008c1314e6905c49a55078242c1268"
+asset_id = 192
+asset_table_identity = "e1c5430264e587b23054e83fb36155e762bc818077ca5e7889dd6a17cfc6f4ba"
+table_root = "6b7bedfa500f1174c5b4b6c14e2f49a618705733a20ff4cdeeaf807bab1e8705"
+table_record_digest = "5765142c04912bb754cb0aace2d3191906c16c9d33360c5063822d8bedc39974"
+table_configuration = "b45ea4f770ee9e3d511fa048b06262afc2fed44f5b4367d45d126958ad0a37e4"
+code_log_n = 17
+code_ell = 65539
+code_r = 8192
+table_v = 10
+answers = 1
+salt_bytes = 40
+distance_radius = 16384
+distance_later_radius = 16384
+distance_m_once = 0
+distance_m_later = 0
+matrix_rows_log = 10
+k_lo = 6
+k_col = 16
+protocol_identity = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+
+[[case]]
+case_id = "gpt2-seq512"
+sequence_length = 512
+anchor_id = "9dc8d6c91fd2d3c23eaee8a32fae4ad5ad44385c7a173b5ad2b4097940e73080"
+model_id = "6d35b05739f33e2d2c969f55fafd79c22a96d2264683a4d9a63ecb842438d271"
+output_mode = "expected"
+expected_output_sha256 = "eac0949d6463927eb9a961d61d618fb703e4b02169e89db10dbada94a5f0dfdd"
+output_digest_algorithm = "sha256"
+output_type = "argmax"
+output_encoding = "i32-le"
+output_elements = 512
+
+[case.limited_table_identity]
+version = 1
+model = "gpt2"
+model_version = 2
+case_id = "gpt2-seq512"
+anchor_id = "fd6164aea096b3e6a872e3d0ac5d63d2860581d93001b38a83d4f604a25e942e"
+model_id = "6d35b05739f33e2d2c969f55fafd79c22a96d2264683a4d9a63ecb842438d271"
+asset_id = 192
+asset_table_identity = "e1c5430264e587b23054e83fb36155e762bc818077ca5e7889dd6a17cfc6f4ba"
+table_root = "eda7df5c305f3d6afdc59cbff7bf42b75665ef9cb36da33f258e74b2714ba0ef"
+table_record_digest = "395c32e4706450d666da2d4a9e93b0a6fe05a94db7fd7baf9ad723572e8ec483"
+table_configuration = "3f4cc6a53c3cdbf8c424946821d155113ca82cdcaeb02dac7cdd9b5191ee4576"
+code_log_n = 17
+code_ell = 65539
+code_r = 8192
+table_v = 10
+answers = 1
+salt_bytes = 40
+distance_radius = 16384
+distance_later_radius = 16384
+distance_m_once = 0
+distance_m_later = 0
+matrix_rows_log = 10
+k_lo = 6
+k_col = 16
+protocol_identity = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"

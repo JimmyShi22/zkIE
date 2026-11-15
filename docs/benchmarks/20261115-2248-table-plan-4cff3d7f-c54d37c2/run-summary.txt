@@ -1,0 +1,25 @@
+TRACE docs/benchmarks/20261115-2248-table-plan-4cff3d7f-c54d37c2
+commit gpt2-seq16 EXIT 0 WALL_MS 3864
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"commit","error_code":null,"last_completed_stage":"commit","last_event_seq":3,"outcome":"PASS","output_binding":null,"progress_path":"docs/benchmarks/20261115-2248-table-plan-4cff3d7f-c54d37c2/instance/gpt2-seq16/commit-run/progress.jsonl","proof_bytes":null,"protocol_wall_ms":3862,"run_id":"commit","stage_wall_ms":3862,"vmhwm_kib":357680}
+anchor gpt2-seq16 EXIT 2
+commit gpt2-seq512 EXIT 0 WALL_MS 3867
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"commit","error_code":null,"last_completed_stage":"commit","last_event_seq":3,"outcome":"PASS","output_binding":null,"progress_path":"docs/benchmarks/20261115-2248-table-plan-4cff3d7f-c54d37c2/instance/gpt2-seq512/commit-run/progress.jsonl","proof_bytes":null,"protocol_wall_ms":3864,"run_id":"commit","stage_wall_ms":3864,"vmhwm_kib":357480}
+anchor gpt2-seq512 EXIT 2
+run gpt2-seq16 EXIT 2 WALL_MS 2
+
+
+run gpt2-seq512 EXIT 2 WALL_MS 2
+
+
+DONE docs/benchmarks/20261115-2248-table-plan-4cff3d7f-c54d37c2
+anchor gpt2-seq16 EXIT 0
+anchor gpt2-seq512 EXIT 0
+run gpt2-seq16 EXIT 1 WALL_MS 14109
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"prove","error_code":null,"last_completed_stage":"prove","last_event_seq":75,"outcome":"PASS","output_binding":null,"progress_path":"docs/benchmarks/20261115-2248-table-plan-4cff3d7f-c54d37c2/instance/gpt2-seq16/run/prove/progress.jsonl","proof_bytes":1887840915,"protocol_wall_ms":14041,"run_id":"prove","stage_wall_ms":14041,"vmhwm_kib":3897632}
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"verify","error_code":"statement_mismatch","last_completed_stage":"verify","last_event_seq":2,"outcome":"FAIL","output_binding":null,"progress_path":"docs/benchmarks/20261115-2248-table-plan-4cff3d7f-c54d37c2/instance/gpt2-seq16/run/verify/progress.jsonl","proof_bytes":null,"protocol_wall_ms":0,"run_id":"verify","stage_wall_ms":0,"vmhwm_kib":3604}
+1887836942 docs/benchmarks/20261115-2248-table-plan-4cff3d7f-c54d37c2/instance/gpt2-seq16/run/proof/proof.bin
+run gpt2-seq512 EXIT 1 WALL_MS 44726
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"prove","error_code":null,"last_completed_stage":"prove","last_event_seq":55,"outcome":"PASS","output_binding":null,"progress_path":"docs/benchmarks/20261115-2248-table-plan-4cff3d7f-c54d37c2/instance/gpt2-seq512/run/prove/progress.jsonl","proof_bytes":6798965242,"protocol_wall_ms":44508,"run_id":"prove","stage_wall_ms":44508,"vmhwm_kib":18922904}
+{"authenticated_output_digest":null,"authenticated_output_elements":null,"command":"verify","error_code":"statement_mismatch","last_completed_stage":"verify","last_event_seq":2,"outcome":"FAIL","output_binding":null,"progress_path":"docs/benchmarks/20261115-2248-table-plan-4cff3d7f-c54d37c2/instance/gpt2-seq512/run/verify/progress.jsonl","proof_bytes":null,"protocol_wall_ms":0,"run_id":"verify","stage_wall_ms":0,"vmhwm_kib":3612}
+6798955310 docs/benchmarks/20261115-2248-table-plan-4cff3d7f-c54d37c2/instance/gpt2-seq512/run/proof/proof.bin
+DONE docs/benchmarks/20261115-2248-table-plan-4cff3d7f-c54d37c2
