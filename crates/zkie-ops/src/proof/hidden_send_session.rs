@@ -10430,6 +10430,117 @@ impl ProximityTreeSource<'_> {
 
 
 
+
+// ---------------------------------------------------------------------------
+// The public plan of the key chain's first part
+// ---------------------------------------------------------------------------
+
+/// Version of the key first plan's canonical encoding.
+pub(crate) const KEY_FIRST_PLAN_VERSION: u64 = 1;
+
+/// The public plan of the key chain's first part: the table's identity and
+/// configuration, the declared entry range, the lookup plan and its message
+/// commitments, the at_start index mask, and the request-level W message. The
+/// first chain's statement digest binds all of it, so a swapped table, range,
+/// message or mask changes every challenge and the seal.
+#[derive(Clone, Debug)]
+pub(crate) struct KeyFirstPlan {
+    pub table_identity: Digest,
+    pub table_configuration: Digest,
+    pub range: crate::proof::table_range::TableKeyRangeConfig,
+    pub lookup: crate::proof::lookup::LookupPlan,
+    pub commit: crate::proof::lookup_messages::LookupCommitPlan,
+    pub index: IndexMaskPlan,
+    pub w: WShape,
+    pub w_oracle: u64,
+    pub group: u64,
+    pub bits_bat: u64,
+    pub mask_bat: u64,
+}
+
+fn key_first_put_code(w: &mut CanonicalWriter, code: &CodeParams) {
+    w.put_u64(code.log_n as u64);
+    w.put_u64(code.ell);
+    w.put_u64(code.r);
+}
+
+fn key_first_put_tree(w: &mut CanonicalWriter, tree: &RuntimeTreePlan) {
+    w.put_u64(tree.tree_number);
+    w.put_u64(tree.leaf_class as u64);
+    w.put_u64(tree.log_n as u64);
+    w.put_u64(tree.log_n_zk as u64);
+    w.put_u64(tree.parts.len() as u64);
+    for part in &tree.parts {
+        w.put_u64(part.main_symbols);
+        w.put_u64(part.mask_symbols);
+    }
+    w.put_u64(tree.salt_bytes as u64);
+    w.put_digest(&tree.run);
+    w.put_digest(&tree.configuration);
+}
+
+fn key_first_put_w_shape(w: &mut CanonicalWriter, shape: &WShape) {
+    key_first_put_code(w, &shape.code);
+    w.put_u64(shape.main_rows);
+    w.put_u64(shape.answers as u64);
+    w.put_u64(shape.salt_bytes as u64);
+    w.put_u64(shape.tree_number);
+    w.put_u64(shape.leaf_class as u64);
+    w.put_digest(&shape.run);
+    w.put_digest(&shape.configuration);
+}
+
+impl KeyFirstPlan {
+    /// The canonical bytes of the public plan.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = CanonicalWriter::new();
+        w.put_u64(KEY_FIRST_PLAN_VERSION);
+        w.put_digest(&self.table_identity);
+        w.put_digest(&self.table_configuration);
+        w.put_digest(&self.range.digest());
+        let lookup = self.lookup.digest();
+        w.put_u64(self.lookup.key_bits as u64);
+        w.put_u64(self.lookup.mu as u64);
+        w.put_u64(self.lookup.table_log as u64);
+        w.put_u64(self.lookup.columns as u64);
+        w.put_digest(&Digest(lookup));
+        w.put_u64(self.commit.bits_oracle);
+        w.put_u64(self.commit.mask_oracle);
+        w.put_u64(self.commit.group);
+        w.put_u64(self.commit.bits_openings as u64);
+        w.put_u64(self.commit.mask_openings as u64);
+        w.put_u64(self.commit.mask_rows);
+        key_first_put_code(&mut w, &self.commit.mask_code);
+        key_first_put_w_shape(&mut w, &self.commit.bits_shape);
+        key_first_put_tree(&mut w, &self.commit.mask_tree);
+        w.put_u64(self.index.oracle);
+        w.put_u64(self.index.group);
+        w.put_u64(self.index.mask_rows);
+        w.put_u64(self.index.answers as u64);
+        w.put_u64(self.index.openings as u64);
+        key_first_put_code(&mut w, &self.index.mask_code);
+        key_first_put_tree(&mut w, &self.index.tree);
+        w.put_u64(self.index.entries.positions as u64);
+        w.put_u64(self.index.entries.variables as u64);
+        w.put_u64(self.index.entries.hiding as u64);
+        w.put_u64(self.index.entries.end as u64);
+        w.put_u64(self.index.entries.claim as u64);
+        w.put_u64(self.index.entries.tilde as u64);
+        w.put_u64(self.index.entries.eval as u64);
+        key_first_put_w_shape(&mut w, &self.w);
+        w.put_u64(self.w_oracle);
+        w.put_u64(self.group);
+        w.put_u64(self.bits_bat);
+        w.put_u64(self.mask_bat);
+        w.into_bytes()
+    }
+
+    /// The digest the first chain's statement binds.
+    pub fn statement_digest(&self) -> Digest {
+        zkie_core::artifact::digest_bytes(&self.encode())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The key chain's lookup
 // ---------------------------------------------------------------------------
@@ -35976,4 +36087,113 @@ mod iopp_stage_plan_tests {
         assert!(iopp_stage_fault(&wrong_last, main, mask, 2).is_some());
     }
 
+}
+
+
+#[cfg(test)]
+mod key_first_plan_tests {
+    use super::*;
+
+    fn sample_plan() -> KeyFirstPlan {
+        let code = CodeParams {
+            log_n: 10,
+            ell: 512,
+            r: 32,
+        };
+        let tree = RuntimeTreePlan {
+            tree_number: 1,
+            leaf_class: 1,
+            log_n: 10,
+            log_n_zk: 10,
+            parts: vec![RuntimeTreePart {
+                main_symbols: 0,
+                mask_symbols: 3,
+            }],
+            salt_bytes: 40,
+            run: Digest([1; 32]),
+            configuration: Digest([2; 32]),
+        };
+        let w = WShape {
+            code,
+            main_rows: 8,
+            answers: 1,
+            salt_bytes: 40,
+            tree_number: 2,
+            leaf_class: 2,
+            run: Digest([3; 32]),
+            configuration: Digest([4; 32]),
+        };
+        let range_plan = crate::proof::table_range::derive_entry_range(
+            4,
+            2,
+            crate::proof::table_range::EntryRange::new(-8, 7).unwrap(),
+            crate::proof::table_range::EntryRangeLimits {
+                max_table_log: 8,
+                max_bit_entries: 1 << 16,
+            },
+        )
+        .unwrap();
+        KeyFirstPlan {
+            table_identity: Digest([9; 32]),
+            table_configuration: Digest([8; 32]),
+            range: crate::proof::table_range::table_key_range_config(&range_plan),
+            lookup: crate::proof::lookup::LookupPlan {
+                key_bits: 4,
+                mu: 3,
+                table_log: 4,
+                columns: 1,
+            },
+            commit: crate::proof::lookup_messages::LookupCommitPlan {
+                bits_shape: w,
+                bits_oracle: 5,
+                group: 7,
+                bits_openings: 1,
+                mask_oracle: 6,
+                mask_code: code,
+                mask_rows: 1,
+                mask_openings: 1,
+                mask_tree: tree.clone(),
+            },
+            index: IndexMaskPlan {
+                oracle: 60,
+                group: 7,
+                mask_code: code,
+                mask_rows: 1,
+                answers: 1,
+                openings: 1,
+                tree,
+                entries: MaskEntryAllocation::for_variables(4, 1).unwrap(),
+            },
+            w,
+            w_oracle: 100,
+            group: 7,
+            bits_bat: 10,
+            mask_bat: 11,
+        }
+    }
+
+    #[test]
+    fn the_same_plan_binds_the_same_statement() {
+        let first = sample_plan();
+        let second = sample_plan();
+        assert_eq!(first.statement_digest(), second.statement_digest());
+        assert_eq!(first.encode(), second.encode());
+    }
+
+    #[test]
+    fn a_swapped_public_value_changes_the_statement() {
+        let base = sample_plan();
+        let mut other = sample_plan();
+        other.w_oracle += 1;
+        assert_ne!(base.statement_digest(), other.statement_digest());
+        let mut other = sample_plan();
+        other.table_identity = Digest([0x55; 32]);
+        assert_ne!(base.statement_digest(), other.statement_digest());
+        let mut other = sample_plan();
+        other.index.mask_rows = 2;
+        assert_ne!(base.statement_digest(), other.statement_digest());
+        let mut other = sample_plan();
+        other.commit.bits_oracle = 77;
+        assert_ne!(base.statement_digest(), other.statement_digest());
+    }
 }
