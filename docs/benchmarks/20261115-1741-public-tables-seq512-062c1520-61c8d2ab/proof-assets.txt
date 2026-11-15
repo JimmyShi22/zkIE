@@ -1,0 +1,2 @@
+docs/benchmarks/20261115-1741-public-tables-seq512-062c1520-61c8d2ab/before/gpt2-seq512/proof/proof.bin: tokens=512 assets=199
+docs/benchmarks/20261115-1741-public-tables-seq512-062c1520-61c8d2ab/after/gpt2-seq512/proof/proof.bin: tokens=512 assets=196
