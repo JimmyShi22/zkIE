@@ -304,6 +304,221 @@ impl EntryRangePlan {
     }
 }
 
+// ---------------------------------------------------------------------------
+// The range lookup over the committed matrix
+// ---------------------------------------------------------------------------
+
+use crate::proof::hidden_member::{MaskTerm as PendingMaskTerm, PendingRow, WeightBlock};
+use crate::proof::lookup::{eq_weights, LookupPlan, LookupTable};
+use crate::proof::lookup_table::{TableConfig, TABLE_ENCODING_VERSION};
+use crate::proof::psc_general::GeneralClaim;
+
+/// The public range table `0 .. 2^table_log - 1` as a lookup table. The rows
+/// are the integers in the canonical signed 32-bit encoding, so every row is
+/// public and no value is committed. The verifier evaluates the table's
+/// multilinear extension at a point in closed form; a caller that wants the
+/// actual table-side checks runs the lookup's table levels, which this table
+/// answers at every challenge point.
+pub struct IntegerRangeTable {
+    identity: Digest,
+    config: TableConfig,
+    table_log: u32,
+    max_root_rows: u64,
+}
+
+impl IntegerRangeTable {
+    /// Opens the range table of one plan. The content root costs one pass over
+    /// the table, bounded by `max_root_rows`.
+    pub fn new(plan: &EntryRangePlan, max_root_rows: u64) -> Result<Self> {
+        if plan.table_log == 0 || plan.table_log > RANGE_TABLE_MAX_LOG {
+            return Err(Error::InvalidConfig);
+        }
+        if plan.identity != entry_range_table_identity(plan.table_log)? {
+            return Err(Error::InvalidConfig);
+        }
+        let row_count = 1u64 << plan.table_log;
+        let content_root = entry_range_content_root(plan.table_log, max_root_rows)?;
+        Ok(Self {
+            identity: plan.identity,
+            config: TableConfig {
+                identity: plan.identity,
+                content_root,
+                real_len: usize::try_from(row_count).map_err(|_| Error::ResourceLimit)?,
+                encoding: TableEncoding::I32Le,
+                version: TABLE_ENCODING_VERSION,
+            },
+            table_log: plan.table_log,
+            max_root_rows,
+        })
+    }
+
+    pub fn row_count(&self) -> u64 {
+        1u64 << self.table_log
+    }
+}
+
+impl LookupTable for IntegerRangeTable {
+    fn columns(&self) -> usize {
+        1
+    }
+
+    fn row_count(&self) -> usize {
+        1usize << self.table_log
+    }
+
+    fn identity(&self) -> Digest {
+        self.identity
+    }
+
+    /// The multilinear extension of the identity function `f(t) = t`: at a
+    /// point it is `sum over the bits of 2^i * r_i`.
+    fn column_at(&self, column: usize, point: &[Fp3]) -> Result<Fp3> {
+        if column != 0 || point.len() != self.table_log as usize {
+            return Err(Error::InvalidConfig);
+        }
+        let mut value = Fp3::ZERO;
+        for (bit, coordinate) in point.iter().enumerate() {
+            value = value.add(&coordinate.mul(&Fp3::from_u64(1u64 << bit)));
+        }
+        Ok(value)
+    }
+
+    fn column_rows(&self, column: usize) -> Result<Vec<Fp3>> {
+        if column != 0 {
+            return Err(Error::InvalidIndex);
+        }
+        Ok((0..self.row_count()).map(Fp3::from_u64).collect())
+    }
+
+    fn config(&self) -> TableConfig {
+        self.config.clone()
+    }
+
+    fn check_content(&self) -> Result<()> {
+        let root = entry_range_content_root(self.table_log, self.max_root_rows)?;
+        if root != self.config.content_root {
+            return Err(Error::StatementMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// The lookup plan that proves the plan's declared range over the committed
+/// matrix: one key for each matrix entry, one value column, the range table's
+/// rows, and the multiplicity planes the key count requires.
+pub fn range_lookup_plan(plan: &EntryRangePlan) -> Result<LookupPlan> {
+    let lookup = LookupPlan {
+        key_bits: plan.key_bits,
+        mu: plan.mu,
+        table_log: plan.table_log,
+        columns: 1,
+    };
+    lookup.validate()?;
+    Ok(lookup)
+}
+
+/// The key of every matrix entry, in row-major order: the entry plus the
+/// public offset, in the extension field the messages use.
+pub fn range_key_values(plan: &EntryRangePlan, entries: &[Fp3]) -> Result<Vec<Fp3>> {
+    let count = plan
+        .matrix_rows
+        .checked_mul(1u64 << plan.column_bits)
+        .ok_or(Error::ResourceLimit)?;
+    if entries.len() as u64 != count {
+        return Err(Error::ShapeMismatch);
+    }
+    Ok(entries.iter().map(|entry| plan.offset.add(entry)).collect())
+}
+
+/// The multiplicity of every row of the range table: how often that range
+/// value occurs among the keys. A key outside the table is refused.
+pub fn range_multiplicities(plan: &EntryRangePlan, keys: &[Fp3]) -> Result<Vec<u64>> {
+    let rows = 1usize << plan.table_log;
+    let mut counts = vec![0u64; rows];
+    for key in keys {
+        if !plan.is_table_key(key) {
+            return Err(Error::BoundViolation);
+        }
+        let row = usize::try_from(key.c[0].as_canonical_u64()).map_err(|_| Error::ResourceLimit)?;
+        let slot = counts.get_mut(row).ok_or(Error::BoundViolation)?;
+        *slot = slot.checked_add(1).ok_or(Error::ResourceLimit)?;
+    }
+    Ok(counts)
+}
+
+/// The multiplicity-bit values of the lookup's message, plane-major:
+/// `bits[j + planes * row]` is bit `j` of the row's multiplicity.
+pub fn range_bit_values(plan: &EntryRangePlan, counts: &[u64]) -> Result<Vec<Fp3>> {
+    let planes = 1usize << plan.mu;
+    let rows = 1usize << plan.table_log;
+    if counts.len() != rows {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut bits = vec![Fp3::ZERO; planes * rows];
+    for (row, count) in counts.iter().enumerate() {
+        for plane in 0..planes {
+            if (count >> plane) & 1 == 1 {
+                bits[plane + planes * row] = Fp3::ONE;
+            }
+        }
+    }
+    Ok(bits)
+}
+
+/// The pending claim the range lookup leaves on the matrix, from the lookup's
+/// key claim: the matrix is weighted by the equality weights of the key
+/// point's place coordinates, the column point is the key point's column
+/// coordinates, the covered places' share of the offset moves into the target,
+/// and the claim's mask terms are kept with their index-mask oracle.
+pub fn range_pending_row(
+    plan: &EntryRangePlan,
+    claim: &GeneralClaim,
+    index_oracle: u64,
+) -> Result<PendingRow> {
+    if claim.point.len() != plan.key_bits as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    let column_bits = plan.column_bits as usize;
+    let place_point = &claim.point[column_bits..];
+    let weights = eq_weights(place_point);
+    if weights.len() != (1usize << plan.place_bits) {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut covered = Fp3::ZERO;
+    for weight in &weights {
+        covered = covered.add(weight);
+    }
+    let blocks = if plan.place_bits == 0 {
+        vec![WeightBlock::Scalar {
+            row: 0,
+            value: weights[0],
+        }]
+    } else {
+        vec![WeightBlock::Dense {
+            first_row: 0,
+            log_rows: plan.place_bits,
+            values: weights,
+        }]
+    };
+    let ps: Vec<Fp3> = claim.point[..column_bits].to_vec();
+    let target = claim.value.sub(&covered.mul(&plan.offset));
+    let masks = claim
+        .masks
+        .iter()
+        .map(|term| PendingMaskTerm {
+            oracle: index_oracle,
+            slot: term.slot as u64,
+            coeff: term.coefficient,
+        })
+        .collect();
+    Ok(PendingRow {
+        weights: blocks,
+        psi: ps,
+        target,
+        masks,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -440,6 +655,206 @@ mod tests {
         assert_eq!(
             entry_range_content_root(31, 1 << 40),
             Err(Error::InvalidConfig)
+        );
+    }
+}
+
+#[cfg(test)]
+mod range_lookup_tests {
+    use super::*;
+    use crate::proof::psc_general::MaskTerm as ClaimMaskTerm;
+
+    const ROWS: u64 = 4;
+    const K_COL: u32 = 2;
+
+    fn signed(bits: u32) -> EntryRange {
+        EntryRange::new(-(1i64 << bits), (1i64 << bits) - 1).unwrap()
+    }
+
+    fn plan(bits: u32) -> EntryRangePlan {
+        derive_entry_range(
+            ROWS,
+            K_COL,
+            signed(bits),
+            EntryRangeLimits {
+                max_table_log: 30,
+                max_bit_entries: 1 << 20,
+            },
+        )
+        .unwrap()
+    }
+
+    fn eq_at(point: &[Fp3], index: u64) -> Fp3 {
+        let mut value = Fp3::ONE;
+        for (bit, coordinate) in point.iter().enumerate() {
+            let one_minus = Fp3::ONE.sub(coordinate);
+            let factor = if (index >> bit) & 1 == 1 {
+                *coordinate
+            } else {
+                one_minus
+            };
+            value = value.mul(&factor);
+        }
+        value
+    }
+
+    fn field(value: i64) -> Fp3 {
+        Fp3::from_base(fp_from_signed_word(value as u64))
+    }
+
+    #[test]
+    fn the_range_table_evaluates_like_its_rows() {
+        let plan = plan(3);
+        let table = IntegerRangeTable::new(&plan, 1 << 8).unwrap();
+        assert_eq!(table.row_count(), 1 << plan.table_log);
+        assert_eq!(table.identity(), plan.identity);
+        assert_eq!(table.config().real_len, 1 << plan.table_log);
+        table.check_content().unwrap();
+        let point = [
+            Fp3::from_u64(3),
+            Fp3::from_u64(5),
+            Fp3::from_u64(7),
+            Fp3::from_u64(11),
+        ];
+        let mut brute = Fp3::ZERO;
+        for row in 0..(1u64 << plan.table_log) {
+            brute = brute.add(&Fp3::from_u64(row).mul(&eq_at(&point, row)));
+        }
+        assert_eq!(table.column_at(0, &point).unwrap(), brute);
+        assert!(table.column_at(1, &point).is_err());
+        assert!(table.column_at(0, &point[..2]).is_err());
+        let rows = table.column_rows(0).unwrap();
+        assert_eq!(rows.len(), 1 << plan.table_log);
+        assert_eq!(rows[3], Fp3::from_u64(3));
+    }
+
+    #[test]
+    fn the_lookup_plan_matches_the_range_plan() {
+        let plan = plan(3);
+        let lookup = range_lookup_plan(&plan).unwrap();
+        assert_eq!(lookup.key_bits, plan.key_bits);
+        assert_eq!(lookup.mu, plan.mu);
+        assert_eq!(lookup.table_log, plan.table_log);
+        assert_eq!(lookup.columns, 1);
+    }
+
+    #[test]
+    fn the_multiplicity_bits_reconstruct_the_counts() {
+        let plan = plan(3);
+        let matrix = [-8i64, -1, 0, 1, 2, 3, 4, 5, 6, 7, -8, 0, 1, 2, 3, 4];
+        let entries: Vec<Fp3> = matrix.iter().map(|value| field(*value)).collect();
+        let keys = range_key_values(&plan, &entries).unwrap();
+        let counts = range_multiplicities(&plan, &keys).unwrap();
+        assert_eq!(counts.iter().sum::<u64>(), 16);
+        let bits = range_bit_values(&plan, &counts).unwrap();
+        assert_eq!(bits.len() as u64, plan.bit_entries);
+        let planes = 1usize << plan.mu;
+        for (row, count) in counts.iter().enumerate() {
+            let mut rebuilt = 0u64;
+            for plane in 0..planes {
+                if bits[plane + planes * row] == Fp3::ONE {
+                    rebuilt |= 1 << plane;
+                }
+            }
+            assert_eq!(rebuilt, *count);
+        }
+    }
+
+    #[test]
+    fn an_entry_outside_the_declared_range_has_no_key() {
+        let plan = plan(3);
+        let mut entries = vec![Fp3::ZERO; (ROWS << K_COL) as usize];
+        entries[5] = field(plan.range.hi() + 1);
+        let keys = range_key_values(&plan, &entries).unwrap();
+        assert_eq!(
+            range_multiplicities(&plan, &keys),
+            Err(Error::BoundViolation)
+        );
+        entries[5] = field(plan.range.lo() - 1);
+        let keys = range_key_values(&plan, &entries).unwrap();
+        assert_eq!(
+            range_multiplicities(&plan, &keys),
+            Err(Error::BoundViolation)
+        );
+    }
+
+    #[test]
+    fn the_pending_row_rebuilds_the_matrix_claim() {
+        let plan = plan(3);
+        let columns = 1usize << K_COL;
+        let matrix: Vec<Vec<i64>> = vec![
+            vec![-8, -7, -6, -5],
+            vec![-4, -3, -2, -1],
+            vec![0, 1, 2, 3],
+            vec![4, 5, 6, 7],
+        ];
+        let point = [
+            Fp3::from_u64(2),
+            Fp3::from_u64(3),
+            Fp3::from_u64(5),
+            Fp3::from_u64(7),
+        ];
+        let mut key_value = Fp3::ZERO;
+        for row in 0..ROWS as usize {
+            for column in 0..columns {
+                let number = column as u64 + ((row as u64) << K_COL);
+                let key = plan.offset.add(&field(matrix[row][column]));
+                key_value = key_value.add(&key.mul(&eq_at(&point, number)));
+            }
+        }
+        let mask_value = field(37);
+        let claim = GeneralClaim {
+            point: point.to_vec(),
+            value: key_value.add(&field(5).mul(&mask_value)),
+            masks: vec![ClaimMaskTerm {
+                slot: 7,
+                coefficient: field(5),
+            }],
+        };
+        let row = range_pending_row(&plan, &claim, 60).unwrap();
+        assert_eq!(row.psi, point[..K_COL as usize].to_vec());
+        assert_eq!(row.masks.len(), 1);
+        assert_eq!(row.masks[0].oracle, 60);
+        assert_eq!(row.masks[0].slot, 7);
+        assert_eq!(row.masks[0].coeff, field(5));
+        assert_eq!(row.weights.len(), 1);
+        let (block, weights) = match &row.weights[0] {
+            WeightBlock::Dense {
+                first_row,
+                log_rows,
+                values,
+            } => (*first_row, (*log_rows, values)),
+            _ => panic!("the one part covers a dense row block"),
+        };
+        assert_eq!(block, 0);
+        assert_eq!(weights.0, plan.place_bits);
+        // The row's weighted matrix sum plus its mask terms must be the target.
+        let mut matrix_sum = Fp3::ZERO;
+        for (place, weight) in weights.1.iter().enumerate() {
+            for column in 0..columns {
+                let column_weight = eq_at(&point[..K_COL as usize], column as u64);
+                matrix_sum = matrix_sum.add(
+                    &weight
+                        .mul(&column_weight)
+                        .mul(&field(matrix[place][column])),
+                );
+            }
+        }
+        let lhs = matrix_sum.add(&field(5).mul(&mask_value));
+        assert_eq!(lhs, row.target);
+    }
+
+    #[test]
+    fn a_key_point_of_the_wrong_size_is_refused() {
+        let plan = plan(3);
+        let claim = GeneralClaim {
+            point: vec![Fp3::ONE; 3],
+            value: Fp3::ZERO,
+            masks: Vec::new(),
+        };
+        assert_eq!(
+            range_pending_row(&plan, &claim, 60),
+            Err(Error::ShapeMismatch)
         );
     }
 }
