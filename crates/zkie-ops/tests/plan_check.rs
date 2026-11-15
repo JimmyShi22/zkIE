@@ -1029,3 +1029,208 @@ fn public_table_wrong_output_is_rejected() {
     fixture.trace.argmax[0] ^= 1;
     assert!(verify_public_trace(&fixture, &fixture.plan, Some(&fixture.root)).is_err());
 }
+
+// ---- trusted public extension table in the rms norm consumer ----
+
+#[derive(Clone)]
+struct RmsPublicFixture {
+    public: ModelCommitmentPublic,
+    trace: SharedTrace,
+    tokens: Vec<u32>,
+    plan: TracePlan,
+    root: PathBuf,
+    opening: Vec<zkie_ops::proof::model_commitment::AssetOpening>,
+}
+
+fn rms_public_table(root: &PathBuf, locator: &str, values: &[i32]) -> zkie_ops::proof::plan::PublicTable {
+    let bytes = fs::read(root.join(locator)).unwrap();
+    zkie_ops::proof::plan::PublicTable {
+        locator: locator.into(),
+        digest: zkie_core::artifact::digest_bytes(&bytes),
+        entries: values.len() as u64,
+        encoding: zkie_ops::proof::plan::PublicTableEncoding::I32LeSigned,
+    }
+}
+
+fn rms_public_fixture(
+    x: i32,
+    base_values: &[i32],
+    ext_values: &[i32],
+    plan_ext_entries: Option<u64>,
+    plan_ext_digest: Option<Digest>,
+) -> RmsPublicFixture {
+    let root = temp_dir();
+    write_i32(&root.join("base_i32.bin"), base_values);
+    write_i32(&root.join("ext_i32.bin"), ext_values);
+    let base = rms_public_table(&root, "base_i32.bin", base_values);
+    let mut ext = rms_public_table(&root, "ext_i32.bin", ext_values);
+    if let Some(entries) = plan_ext_entries {
+        ext.entries = entries;
+    }
+    if let Some(digest) = plan_ext_digest {
+        ext.digest = digest;
+    }
+    // A small committed asset keeps the public commitment well-formed; the
+    // rms inputs come from the trusted public files, not from an opening.
+    let specs = vec![ModelAssetSpec {
+        asset_id: 0,
+        path: "dummy_i32.bin".into(),
+        element_count: 4,
+        row_width: 4,
+        encoding: "i32-le".into(),
+    }];
+    write_i32(&root.join("dummy_i32.bin"), &[1, 2, 3, 4]);
+    let commitment = commit_assets(&root, Digest([11; 32]), Digest([12; 32]), &specs).unwrap();
+    let public = ModelCommitmentPublic::from_commitment(&commitment);
+    let opening = AssetStore::open(&commitment).unwrap().open_all().unwrap();
+
+    let op = zkie_ops::profile_rms::ProfileRmsNormOp {
+        rows: 1,
+        cols: 1,
+        valid_cols: 1,
+        output_shift: 0,
+        clamp: None,
+    };
+    let rms_config = vec![1, 1, 1, 0, 0, 0, 0];
+    let inputs = vec![vec![x as i64], vec![1], base_values.iter().map(|v| *v as i64).collect(), ext_values.iter().map(|v| *v as i64).collect()];
+    let (rms_step, rms_out) = make_step(
+        &op,
+        &inputs,
+        &rms_config,
+        &[],
+        vec![None, None, None, None],
+        vec![None, None, None, None],
+    );
+    let (argmax_step, argmax_out) = make_step(
+        &ArgmaxOp,
+        &[rms_out[0].clone()],
+        &[],
+        &[],
+        vec![None],
+        vec![Some((0, 0))],
+    );
+
+    let mut builder = PlanBuilder::new();
+    let rms = builder.step(
+        OpCode::ProfileRmsNorm,
+        config(rms_config.clone()),
+        vec![
+            PlanSource::Constant(PlanConstant::Literal(vec![x as i64])),
+            PlanSource::Constant(PlanConstant::Literal(vec![1])),
+            PlanSource::public_table(base),
+            PlanSource::public_table(ext),
+        ],
+        1,
+    );
+    let argmax = builder.step(
+        OpCode::Argmax,
+        config(Vec::new()),
+        vec![PlanSource::prev(rms, 0)],
+        1,
+    );
+    builder.argmax_step(argmax);
+    let plan = builder.finish();
+
+    let trace = SharedTrace {
+        tokens: vec![1],
+        assets: Vec::new(),
+        steps: vec![rms_step, argmax_step],
+        argmax: vec![argmax_out[0][0] as u32],
+        output: Vec::new(),
+    };
+    RmsPublicFixture {
+        public,
+        trace,
+        tokens: vec![1],
+        plan,
+        root,
+        opening,
+    }
+}
+
+fn verify_rms_public(fixture: &RmsPublicFixture) -> Result<Vec<u32>, zkie_core::error::Error> {
+    let bytes = bincode::serialize(&fixture.trace).unwrap();
+    let trace: SharedTrace = bincode::deserialize(&bytes).unwrap();
+    zkie_ops::proof::model_commitment::verify_shared_trace(
+        &fixture.public,
+        &trace,
+        &fixture.tokens,
+        &fixture.plan,
+        Some(&fixture.root),
+    )
+}
+
+#[test]
+fn rms_extension_reads_the_trusted_public_file() {
+    // x^2 / 2^18 = 4: the index is exactly the base length, so the extension's
+    // first entry is consumed.
+    let fixture = rms_public_fixture(1024, &[100, 200, 300, 400], &[500, 600, 700, 800], None, None);
+    assert!(fixture.trace.assets.is_empty());
+    let argmax = verify_rms_public(&fixture).unwrap();
+    assert_eq!(argmax, vec![0]);
+    // x^2 / 2^18 = 3: the last base entry is consumed, not the extension.
+    let base_side = rms_public_fixture(887, &[100, 200, 300, 400], &[500, 600, 700, 800], None, None);
+    let argmax = verify_rms_public(&base_side).unwrap();
+    assert_eq!(argmax, vec![0]);
+}
+
+#[test]
+fn rms_extension_file_tamper_is_rejected() {
+    let swapped = rms_public_fixture(1024, &[100, 200, 300, 400], &[500, 600, 700, 800], None, None);
+    let bytes: Vec<u8> = [501i32, 600, 700, 800]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    fs::write(swapped.root.join("ext_i32.bin"), bytes).unwrap();
+    assert!(verify_rms_public(&swapped).is_err());
+
+    let missing = rms_public_fixture(1024, &[100, 200, 300, 400], &[500, 600, 700, 800], None, None);
+    fs::remove_file(missing.root.join("ext_i32.bin")).unwrap();
+    assert!(verify_rms_public(&missing).is_err());
+
+    let truncated = rms_public_fixture(1024, &[100, 200, 300, 400], &[500, 600, 700, 800], None, None);
+    let bytes = fs::read(truncated.root.join("ext_i32.bin")).unwrap();
+    fs::write(truncated.root.join("ext_i32.bin"), &bytes[..bytes.len() - 4]).unwrap();
+    assert!(verify_rms_public(&truncated).is_err());
+
+    let padded = rms_public_fixture(1024, &[100, 200, 300, 400], &[500, 600, 700, 800], None, None);
+    let mut bytes = fs::read(padded.root.join("ext_i32.bin")).unwrap();
+    bytes.push(0);
+    fs::write(padded.root.join("ext_i32.bin"), bytes).unwrap();
+    assert!(verify_rms_public(&padded).is_err());
+}
+
+#[test]
+fn rms_extension_wrong_identity_or_short_table_is_rejected() {
+    let wrong_digest = rms_public_fixture(
+        1024,
+        &[100, 200, 300, 400],
+        &[500, 600, 700, 800],
+        None,
+        Some(Digest([9; 32])),
+    );
+    assert!(verify_rms_public(&wrong_digest).is_err());
+
+    // The fixed entry count does not match the trusted file's byte length.
+    let short = rms_public_fixture(
+        1024,
+        &[100, 200, 300, 400],
+        &[500, 600, 700, 800],
+        Some(3),
+        None,
+    );
+    assert!(verify_rms_public(&short).is_err());
+}
+
+#[test]
+fn rms_extension_prover_supplied_opening_is_rejected() {
+    let mut fixture = rms_public_fixture(1024, &[100, 200, 300, 400], &[500, 600, 700, 800], None, None);
+    fixture.trace.assets = fixture.opening.clone();
+    fixture.trace.steps[0].external[3] = Some(0);
+    let code = verify_rms_public(&fixture)
+        .err()
+        .expect("expected rejection")
+        .code()
+        .to_owned();
+    assert_eq!(code, "statement_mismatch");
+}

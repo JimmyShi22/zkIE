@@ -449,6 +449,7 @@ pub fn public_table_paths() -> &'static [&'static str] {
         "models/gpt2/weights/exp_table_i32.bin",
         "models/gpt2/weights/rsqrt_table_i32.bin",
         "models/gpt2/weights/gelu_table_i32.bin",
+        EXTENSION_PATH,
     ]
 }
 
@@ -482,11 +483,16 @@ fn public_tables() -> Vec<(String, zkie_ops::proof::plan::PublicTable)> {
             "42cd0f218e5635bb2c1e94076f8f5da3d92456ce30960b1463774dca2dad3e5d",
             16_777_216,
         ),
+        table(
+            EXTENSION_PATH,
+            "59fc2554a5d0f13abb265ed2eb5b56d5e75d82616561c60545013be7aa6dcf50",
+            14_849_263,
+        ),
     ]
 }
 
-/// The production plan: the shared tables are trusted public files; the
-/// rsqrt extension and the RoPE tables keep their original sources.
+/// The production plan: the shared tables and the rsqrt extension are
+/// trusted public files; the RoPE tables keep their original sources.
 pub fn trace_plan_public(m: usize) -> Result<TracePlan> {
     let mut plan = trace_plan(m)?;
     zkie_ops::proof::plan::promote_public_tables(&mut plan, &public_tables());
@@ -500,6 +506,54 @@ pub fn asset_specs() -> Vec<ModelAssetSpec> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn asset_paths(source: &PlanSource, out: &mut Vec<String>) {
+        match source {
+            PlanSource::Asset { path, .. } => out.push(path.clone()),
+            PlanSource::PublicTable { table, .. } => out.push(table.locator.clone()),
+            PlanSource::Concat(parts) | PlanSource::HeadConcat { parts, .. } => {
+                for part in parts {
+                    asset_paths(part, out);
+                }
+            }
+            PlanSource::Layout(inner, _) => asset_paths(inner, out),
+            PlanSource::Prev { .. } | PlanSource::Constant(_) => {}
+        }
+    }
+
+    #[test]
+    fn the_public_plan_promotes_the_rsqrt_extension() {
+        assert!(public_table_paths().contains(&EXTENSION_PATH));
+        let plan = trace_plan_public(16).unwrap();
+        let mut extension_public = false;
+        for step in &plan.steps {
+            for source in &step.inputs {
+                match source {
+                    PlanSource::Asset { path, .. } => {
+                        assert_ne!(path, EXTENSION_PATH, "the extension stays an asset");
+                    }
+                    PlanSource::PublicTable { table, .. } => {
+                        if table.locator == EXTENSION_PATH {
+                            extension_public = true;
+                            assert_eq!(table.entries, 14_849_263);
+                            assert_eq!(
+                                table.digest,
+                                zkie_core::artifact::digest_from_hex(
+                                    "59fc2554a5d0f13abb265ed2eb5b56d5e75d82616561c60545013be7aa6dcf50"
+                                )
+                                .unwrap()
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                let mut paths = Vec::new();
+                asset_paths(source, &mut paths);
+                assert!(!paths.iter().any(|path| path == EXTENSION_PATH) || extension_public);
+            }
+        }
+        assert!(extension_public, "the extension source is public");
+    }
 
     #[test]
     fn plan_step_counts_match_executor() {

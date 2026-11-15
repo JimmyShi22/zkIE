@@ -278,7 +278,7 @@ fn rms(
     base: Vec<i64>,
     base_pool: Option<usize>,
     extension: Vec<i64>,
-    extension_pool: usize,
+    extension_pool: Option<usize>,
     rows: usize,
     cols: usize,
     valid: usize,
@@ -294,7 +294,7 @@ fn rms(
         (x, None),
         (broadcast(&weight, rows), None),
         (base, base_pool),
-        (extension, Some(extension_pool)),
+        (extension, extension_pool),
     ];
     let (outputs, step) = builder.step(&op, inputs, vec![Some((x_step, 0)), None, None, None])?;
     Ok((outputs[0].clone(), step))
@@ -368,7 +368,7 @@ fn execute_shared_inner(
     let base = weight(&base_path)?;
     let base_pool = public_pool(&base_path)?;
     let extension = weight(EXTENSION_PATH)?;
-    let extension_pool = pool(EXTENSION_PATH)?;
+    let extension_pool = public_pool(EXTENSION_PATH)?;
     let exp_table = weight(&exp_path)?;
     let exp_pool = public_pool(&exp_path)?;
 
