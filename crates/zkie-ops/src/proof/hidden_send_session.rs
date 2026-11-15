@@ -10715,6 +10715,67 @@ fn key_lookup_key_plan(plan: &KeyFirstPlan) -> crate::proof::lookup::LookupKeyPl
     }
 }
 
+/// The verifier's own verified state of the key first part: the seal, the
+/// binding root, and everything the second chain consumes, rebuilt on this
+/// side. No caller-reported value is taken.
+pub(crate) struct KeyFirstVerified {
+    pub seal: Digest,
+    pub binding_root: crate::proof::lin_binding::LinBindingRoot,
+    pub claims: crate::proof::lookup::LookupOutcome,
+    pub samples: [KeySample; 2],
+    pub index_sample: KeySample,
+    pub index_root: Digest,
+    pub index_answer: Fp3,
+    pub w_root: Digest,
+    pub psi: Vec<Fp3>,
+    pub eval_target: Fp3,
+    pub member: crate::proof::hidden_member::PendingRow,
+}
+
+/// What the shared part verified, as the second chain consumes it.
+#[derive(Clone, Copy)]
+pub(crate) struct KeySecondInputs<'a> {
+    pub shared_seal: Digest,
+    pub shared_code: CodeParams,
+    pub shared_mask_code: CodeParams,
+    pub shared_table: Digest,
+    pub shared_configuration: Digest,
+    pub omega_root: Digest,
+    pub shared_point: &'a [Fp3],
+    pub zeta: &'a [Fp3],
+}
+
+/// Starts the key mode's second chain from the verified key-first seal and the
+/// verified shared result. The two chains' codes, table and configuration are
+/// compared before the second transcript starts; the first binding is the
+/// verifier's own key-first seal.
+pub(crate) fn key_second_chain(
+    plan: &KeyFirstPlan,
+    reader: &IndexReader,
+    first: &KeyFirstVerified,
+    shared: &KeySecondInputs<'_>,
+) -> Result<Chain> {
+    if plan.table_identity != shared.shared_table
+        || plan.table_configuration != shared.shared_configuration
+        || plan.commit.bits_shape.code != shared.shared_code
+        || plan.commit.mask_code != shared.shared_mask_code
+        || shared.shared_seal == Digest::ZERO
+        || shared.omega_root == Digest::ZERO
+        || shared.shared_point.is_empty()
+    {
+        return Err(Error::StatementMismatch);
+    }
+    second_chain_from(
+        &plan.statement_digest(),
+        &reader.name(),
+        &first.seal,
+        &shared.shared_seal,
+        &shared.omega_root,
+        shared.shared_point,
+        shared.zeta,
+    )
+}
+
 fn key_mask_units(
     plan: &KeyFirstPlan,
     member: &crate::proof::hidden_member::PendingRow,
@@ -10913,7 +10974,7 @@ pub(crate) fn key_first_verify(
     reader: &IndexReader,
     lookup_table: &dyn crate::proof::lookup::LookupTable,
     messages: &KeyFirstMessages,
-) -> Result<(Digest, crate::proof::lin_binding::LinBindingRoot)> {
+) -> Result<KeyFirstVerified> {
     let statement_digest = plan.statement_digest();
     let mut chain = Chain::begin(
         KEY_FIRST_CHAIN_LABEL,
@@ -10973,7 +11034,19 @@ pub(crate) fn key_first_verify(
     if binding_root.fault().is_some() {
         return Err(Error::InvalidConfig);
     }
-    Ok((seal, binding_root))
+    Ok(KeyFirstVerified {
+        seal,
+        binding_root,
+        claims,
+        samples,
+        index_sample: index_sample[0].clone(),
+        index_root: messages.index_root,
+        index_answer: messages.index_answer,
+        w_root: messages.w_root,
+        psi: messages.psi.clone(),
+        eval_target: messages.eval_target,
+        member,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -15159,9 +15232,33 @@ fn second_chain(
     shared_point: &[Fp3],
     zeta: &[Fp3],
 ) -> Result<Chain> {
+    second_chain_from(
+        &plan.parameters_digest(),
+        &reader.name(),
+        first_query,
+        shared_seal,
+        omega_root,
+        shared_point,
+        zeta,
+    )
+}
+
+/// The second chain's start from plain public parameters: the first binding,
+/// the shared seal, the shared Omega root and the shared points. Both modes
+/// share this body; the key mode passes its own verified seal as the first
+/// binding.
+fn second_chain_from(
+    parameters: &Digest,
+    record: &[u8],
+    first_binding: &Digest,
+    shared_seal: &Digest,
+    omega_root: &Digest,
+    shared_point: &[Fp3],
+    zeta: &[Fp3],
+) -> Result<Chain> {
     let mut writer = CanonicalWriter::new();
     writer.put_u64(HIDDEN_SEND_SCHEMA_VERSION);
-    writer.put_digest(first_query);
+    writer.put_digest(first_binding);
     writer.put_digest(shared_seal);
     writer.put_digest(omega_root);
     writer.put_u64(shared_point.len() as u64);
@@ -15173,17 +15270,11 @@ fn second_chain(
         writer.put_fp3(value);
     }
     let statement = writer.into_bytes();
-    let mut chain = Chain::begin(
-        FINAL_CHAIN_LABEL,
-        &plan.parameters_digest(),
-        &statement,
-        &reader.name(),
-        None,
-    )?;
+    let mut chain = Chain::begin(FINAL_CHAIN_LABEL, parameters, &statement, record, None)?;
     absorb_digest_round(
         &mut chain,
         2,
-        &[plan.parameters_digest(), *first_query, *shared_seal, *omega_root],
+        &[*parameters, *first_binding, *shared_seal, *omega_root],
         &[shared_point.len() as u64, zeta.len() as u64],
     )?;
     Ok(chain)
@@ -37231,9 +37322,9 @@ mod key_first_flow_tests {
     #[test]
     fn the_shared_chain_starts_from_the_verified_binding_root() {
         let (plan, reader, table, messages, _seal, _witness, root) = flow_run();
-        let (_verified_seal, verified) = key_first_verify(&plan, &reader, &table, &messages)
+        let verified = key_first_verify(&plan, &reader, &table, &messages)
             .expect("the key first part verifies");
-        assert_eq!(verified, root);
+        assert_eq!(verified.binding_root, root);
         let record = reader.name();
         let start = |binding: &crate::proof::lin_binding::LinBindingRoot| {
             shared_start_chain_from_binding(
@@ -37247,13 +37338,54 @@ mod key_first_flow_tests {
             .map(|chain| *chain.value())
             .unwrap()
         };
-        let first = start(&verified);
-        assert_eq!(first, start(&verified));
+        let first = start(&verified.binding_root);
+        assert_eq!(first, start(&verified.binding_root));
         let other = start(&crate::proof::lin_binding::LinBindingRoot {
             digest: Digest([0x55; 32]),
             places: 1,
         });
         assert_ne!(first, other);
+    }
+
+    #[test]
+    fn the_second_chain_starts_from_the_verified_seal() {
+        let (plan, reader, table, messages, _seal, _witness, _root) = flow_run();
+        let verified = key_first_verify(&plan, &reader, &table, &messages)
+            .expect("the key first part verifies");
+        let shared = KeySecondInputs {
+            shared_seal: Digest([0x61; 32]),
+            shared_code: plan.commit.bits_shape.code,
+            shared_mask_code: plan.commit.mask_code,
+            shared_table: plan.table_identity,
+            shared_configuration: plan.table_configuration,
+            omega_root: Digest([0x62; 32]),
+            shared_point: &verified.psi,
+            zeta: &verified.psi,
+        };
+        let chain = key_second_chain(&plan, &reader, &verified, &shared).unwrap();
+        let again = key_second_chain(&plan, &reader, &verified, &shared).unwrap();
+        assert_eq!(*chain.value(), *again.value());
+        let other = key_second_chain(
+            &plan,
+            &reader,
+            &verified,
+            &KeySecondInputs {
+                shared_seal: Digest([0x63; 32]),
+                ..shared
+            },
+        )
+        .unwrap();
+        assert_ne!(*chain.value(), *other.value());
+        let wrong = key_second_chain(
+            &plan,
+            &reader,
+            &verified,
+            &KeySecondInputs {
+                shared_table: Digest([0x64; 32]),
+                ..shared
+            },
+        );
+        assert!(wrong.is_err());
     }
 
     #[test]
@@ -37296,10 +37428,10 @@ mod key_first_flow_tests {
     #[test]
     fn the_key_first_part_proves_and_verifies() {
         let (plan, reader, table, messages, seal, _witness, binding_root) = flow_run();
-        let (verified, read_root) = key_first_verify(&plan, &reader, &table, &messages).unwrap();
-        assert_eq!(verified, seal);
-        assert_eq!(read_root, binding_root);
-        assert_eq!(read_root.places, 1);
+        let verified = key_first_verify(&plan, &reader, &table, &messages).unwrap();
+        assert_eq!(verified.seal, seal);
+        assert_eq!(verified.binding_root, binding_root);
+        assert_eq!(verified.binding_root.places, 1);
         let mut changed = messages.clone();
         changed.eval_target = changed.eval_target.add(&Fp3::ONE);
         assert!(key_first_verify(&plan, &reader, &table, &changed).is_err());
@@ -37333,8 +37465,8 @@ mod key_first_flow_tests {
         // Another salt leads to another root: the shared chain would differ.
         let mut changed = messages;
         changed.binding.salt[0] ^= 1;
-        let (_, ground_root) = key_first_verify(&plan, &reader, &table, &changed).unwrap();
-        assert_ne!(ground_root, binding_root);
+        let ground = key_first_verify(&plan, &reader, &table, &changed).unwrap();
+        assert_ne!(ground.binding_root, binding_root);
     }
 }
 
