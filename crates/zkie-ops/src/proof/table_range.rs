@@ -554,6 +554,110 @@ pub fn range_pending_row(
     })
 }
 
+// ---------------------------------------------------------------------------
+// The lookup message of the range plan
+// ---------------------------------------------------------------------------
+
+use zkie_engine::pcs::request::code::CodeParams;
+use zkie_engine::pcs::request::field::E_DEGREE;
+
+use crate::proof::hidden_send_session::WShape;
+use crate::proof::lookup::mask_count;
+
+/// The lookup message of one range plan: the multiplicity-bit message, its
+/// shape and the mask message's size. The caller fixes the codes and the
+/// message identities; the plan fixes the entries.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RangeLookupMessage {
+    pub lookup: LookupPlan,
+    /// Entries of the bit message: `2^(mu + table_log)`.
+    pub bits_entries: u64,
+    /// The bit message's shape: one message tree, one sample answer.
+    pub bits_shape: WShape,
+    /// Mask entries the lookup takes.
+    pub mask_entries: usize,
+    /// Rows of the mask message: the smallest power of two that holds the
+    /// entries beside the SEND pad.
+    pub mask_rows: u64,
+}
+
+/// The smallest power-of-two row count of a mask message whose free entries
+/// (`rows * ell - 1`) hold `entries`.
+pub fn smallest_mask_rows(entries: usize, ell: u64) -> Result<u64> {
+    if entries == 0 || ell == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let mut rows = 1u64;
+    loop {
+        let capacity = rows
+            .checked_mul(ell)
+            .and_then(|value| value.checked_sub(1))
+            .ok_or(Error::ResourceLimit)?;
+        if capacity >= entries as u64 {
+            return Ok(rows);
+        }
+        rows = rows.checked_mul(2).ok_or(Error::ResourceLimit)?;
+    }
+}
+
+/// Derives the range lookup's message from the plan and the codes. The bit
+/// message carries the plan's bit entries; the mask message carries the
+/// lookup's mask entries.
+#[allow(clippy::too_many_arguments)]
+pub fn derive_range_lookup_message(
+    plan: &EntryRangePlan,
+    code: CodeParams,
+    mask_code: CodeParams,
+    salt_bytes: usize,
+    bits_tree: u64,
+    bits_leaf_class: u32,
+    run: Digest,
+    configuration: Digest,
+) -> Result<RangeLookupMessage> {
+    let lookup = range_lookup_plan(plan)?;
+    let bits_entries = plan.bit_entries;
+    let columns = usize::try_from(bits_entries).map_err(|_| Error::ResourceLimit)?;
+    let mask_entries = mask_count(&lookup)?;
+    let mask_rows = smallest_mask_rows(mask_entries, mask_code.ell)?;
+    // The mask tree's part is `mask_rows * E_DEGREE` symbols, and the mask
+    // code's tree depth must hold it.
+    let symbols = mask_rows
+        .checked_mul(E_DEGREE as u64)
+        .ok_or(Error::ResourceLimit)?;
+    if symbols > (1u64 << mask_code.log_n) {
+        return Err(Error::ResourceLimit);
+    }
+    let bits_shape = WShape::new(
+        bits_entries,
+        code,
+        1,
+        1,
+        salt_bytes,
+        bits_tree,
+        bits_leaf_class,
+        run,
+        configuration,
+    )?;
+    if bits_shape.fault(bits_entries, 1).is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let main_symbols = bits_shape
+        .main_rows
+        .checked_mul(E_DEGREE as u64)
+        .ok_or(Error::ResourceLimit)?;
+    if main_symbols > (1u64 << code.log_n) {
+        return Err(Error::ResourceLimit);
+    }
+    let _ = columns;
+    Ok(RangeLookupMessage {
+        lookup,
+        bits_entries,
+        bits_shape,
+        mask_entries,
+        mask_rows,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -946,5 +1050,107 @@ mod range_lookup_tests {
             range_pending_row(&plan, &claim, 60),
             Err(Error::ShapeMismatch)
         );
+    }
+}
+
+#[cfg(test)]
+mod range_message_tests {
+    use super::*;
+    use zkie_engine::pcs::request::runtime_tree::{RuntimeTreePart, RuntimeTreePlan};
+
+    const SALT: usize = 40;
+
+    fn frozen_plan() -> EntryRangePlan {
+        derive_entry_range(
+            1024,
+            10,
+            EntryRange::new(-131072, 131071).unwrap(),
+            EntryRangeLimits {
+                max_table_log: 19,
+                max_bit_entries: 1 << 24,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_range_message_fits_the_frozen_geometry() {
+        let plan = frozen_plan();
+        let code = zkie_engine::pcs::request::code::build_code_plan(15, 2048, 128).unwrap();
+        let mask_code = zkie_engine::pcs::request::code::build_code_plan(15, 256, 66).unwrap();
+        let message = derive_range_lookup_message(
+            &plan,
+            code,
+            mask_code,
+            SALT,
+            100,
+            1,
+            Digest([0x41; 32]),
+            Digest([0x51; 32]),
+        )
+        .unwrap();
+        assert_eq!(message.bits_entries, 1 << 23);
+        // The last place of a full row falls on the row's sample pad, so the
+        // message takes one more power-of-two row.
+        assert_eq!(message.bits_shape.main_rows, 8192);
+        assert_eq!(message.bits_shape.answers, 1);
+        assert!(message.mask_entries > 0);
+        assert!(message.mask_rows.is_power_of_two());
+        assert!(message.mask_rows * mask_code.ell - 1 >= message.mask_entries as u64);
+        assert!(message.mask_rows * E_DEGREE as u64 <= (1u64 << mask_code.log_n));
+        let commit = crate::proof::lookup_messages::LookupCommitPlan {
+            bits_shape: message.bits_shape,
+            bits_oracle: 1,
+            group: 7,
+            bits_openings: 1,
+            mask_oracle: 2,
+            mask_code,
+            mask_rows: message.mask_rows,
+            mask_openings: 1,
+            mask_tree: RuntimeTreePlan {
+                tree_number: 101,
+                leaf_class: 3,
+                log_n: mask_code.log_n,
+                log_n_zk: mask_code.log_n,
+                parts: vec![RuntimeTreePart {
+                    main_symbols: 0,
+                    mask_symbols: message.mask_rows * E_DEGREE as u64,
+                }],
+                salt_bytes: SALT,
+                run: Digest([0x42; 32]),
+                configuration: Digest([0x52; 32]),
+            },
+        };
+        commit
+            .validate(message.bits_entries as usize, message.mask_entries)
+            .unwrap();
+    }
+
+    #[test]
+    fn a_code_without_room_for_the_bit_tree_is_refused() {
+        let plan = frozen_plan();
+        let code = zkie_engine::pcs::request::code::build_code_plan(12, 2048, 128).unwrap();
+        let mask_code = zkie_engine::pcs::request::code::build_code_plan(15, 256, 66).unwrap();
+        assert_eq!(
+            derive_range_lookup_message(
+                &plan,
+                code,
+                mask_code,
+                SALT,
+                100,
+                1,
+                Digest([0x41; 32]),
+                Digest([0x51; 32]),
+            ),
+            Err(Error::ResourceLimit)
+        );
+    }
+
+    #[test]
+    fn the_mask_rows_hold_the_entries() {
+        assert_eq!(smallest_mask_rows(255, 256).unwrap(), 1);
+        assert_eq!(smallest_mask_rows(256, 256).unwrap(), 2);
+        assert_eq!(smallest_mask_rows(0, 256), Err(Error::InvalidConfig));
+        assert_eq!(smallest_mask_rows(3, 0), Err(Error::InvalidConfig));
     }
 }
