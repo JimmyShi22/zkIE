@@ -1,0 +1,5 @@
+gpt2-seq16 result.proof_bytes 1980405259 proof.bin 1980401278 diff 3981
+gemma3-seq16 result.proof_bytes 6013559226 proof.bin 6013555254 diff 3972
+timesfm-16patch result.proof_bytes 3740935379 proof.bin 3740667388 diff 267991
+gpt2-seq512 result.proof_bytes 10917933294 proof.bin 10917923358 diff 9936
+gemma3-seq512 result.proof_bytes 16368611194 proof.bin 16368601254 diff 9940

@@ -1,0 +1,40 @@
+file_len 16368601254
+serialized 16368601254
+tokens 2056
+assets 5710016064
+steps 10658581070
+argmax 2056
+output 8
+top_sum 16368601254
+asset_links 100672
+asset_row_values 5703289576
+asset_row_paths 3302256
+asset_identity_bookkeeping 3323552
+asset_rows 412782
+asset_outer_prefix 8
+asset_sum 5710016064
+asset_category embedding_output 2 4301284336
+asset_category extension 1 118794632
+asset_category norm 109 729296
+asset_category rope 4 2148320
+asset_category weights 126 1287059472
+relation_proof_field_inputs 34648
+relation_proof_field_outputs 4717651648
+relation_proof_field_raw 5930789664
+relation_proof_field_quotients 12048
+relation_proof_field_helpers 12048
+relation_proof_field_aux 9641408
+relation_proofs 10658258512
+relation_proof_lengths 117048
+relation_oracle_total 10658141464
+relation_oracle_value_payload 9736908800
+relation_oracle_paths 0
+relation_oracle_bookkeeping 921232664
+relation_roots 211488
+relation_config 43408
+relation_external_inputs 14088
+relation_port_wiring 50554
+relation_opcode_tags 3012
+step_outer_prefix 8
+step_sum 10658581070
+asset_row_value_payload 5699987320
