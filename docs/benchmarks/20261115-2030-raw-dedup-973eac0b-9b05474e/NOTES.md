@@ -185,3 +185,15 @@ separately; none of the relation negatives is a broken Merkle path.
   `run-summary.txt`; `proof-assets.py` and `proof-assets.txt`. Per-stage
   `result.json` and `progress.jsonl` stay under each run directory; proof
   binaries stay on disk and are gitignored. Not pushed.
+
+## Round closure
+
+- Expert batch review: the whole round is accepted, no further rework.
+- Final commit list, in order: `973eac0b` (production change: the shared
+  matrix relations no longer carry the redundant raw declaration),
+  `9e5549b6` (test assertion), `030d5d1d` (evidence record), and this closing
+  commit (round flag, NOTES record only; no code change).
+- State at closure: hard gate 45,080 B untouched; no anchor, policy, asset,
+  ground truth or commitment registration changed; the workspace suite is
+  green (1173 passed / 0 failed / 20 ignored); source and evidence are on
+  the branch, not pushed.
