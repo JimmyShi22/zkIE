@@ -260,7 +260,7 @@ fn w_shape(positions: u32) -> WShape {
     WShape::new(COLUMNS, code(), 1, positions, SALT, 100, 1, W_RUN, W_CONFIGURATION).unwrap()
 }
 
-fn gu_shape(code: CodeParams, mask_log_n: u32) -> GuShape {
+fn gu_shape(code: CodeParams, mask_log_n: u32, index: IndexShape) -> GuShape {
     GuShape {
         oracle: GU_ORACLE,
         group: GU_GROUP,
@@ -275,11 +275,16 @@ fn gu_shape(code: CodeParams, mask_log_n: u32) -> GuShape {
             mask_code: None,
             answers: 1,
         },
-        index: table_shape(),
+        index,
     }
 }
 
-fn omega_shape(code: CodeParams, mask_log_n: u32) -> OmegaShapePlan {
+fn omega_shape(
+    code: CodeParams,
+    mask_log_n: u32,
+    matrix_rows: u64,
+    k_lo: u32,
+) -> OmegaShapePlan {
     OmegaShapePlan {
         oracle: OMEGA_ORACLE,
         group: GU_GROUP,
@@ -293,8 +298,8 @@ fn omega_shape(code: CodeParams, mask_log_n: u32) -> OmegaShapePlan {
             answers: 1,
         },
         rows_high: true,
-        matrix_rows: MATRIX_ROWS,
-        k_lo: K_LO,
+        matrix_rows,
+        k_lo,
     }
 }
 
@@ -826,8 +831,8 @@ fn plan_for(
         masks: vec![Vec::new(); positions as usize],
         weights: field_rows(activation_rows),
         proximity: HiddenProximityPlan {
-            gu: gu_shape(code(), CODE_LOG_N),
-            omega: omega_shape(code(), CODE_LOG_N),
+            gu: gu_shape(code(), CODE_LOG_N, table_shape()),
+            omega: omega_shape(code(), CODE_LOG_N, MATRIX_ROWS, K_LO),
             code: code(),
             mask_code: code(),
             shared_mask_tree: mask_tree(200, CODE_LOG_N, 1),
@@ -868,12 +873,17 @@ const INDEX_MASK_RUN: Digest = Digest([0x66; 32]);
 const DOT_ORACLE: u64 = 12;
 const DOT_RUN: Digest = Digest([0x67; 32]);
 
-fn index_mask_plan(positions: u32, mask_code: CodeParams) -> IndexMaskPlan {
+fn index_mask_plan(
+    positions: u32,
+    mask_code: CodeParams,
+    variables: usize,
+    mask_rows: u64,
+) -> IndexMaskPlan {
     IndexMaskPlan {
         oracle: INDEX_MASK_ORACLE,
         group: GROUP,
         mask_code,
-        mask_rows: 4,
+        mask_rows,
         answers: 1,
         openings: 1,
         tree: RuntimeTreePlan {
@@ -885,17 +895,13 @@ fn index_mask_plan(positions: u32, mask_code: CodeParams) -> IndexMaskPlan {
             log_n_zk: mask_code.log_n,
             parts: vec![RuntimeTreePart {
                 main_symbols: 0,
-                mask_symbols: 4 * E_DEGREE as u64,
+                mask_symbols: mask_rows * E_DEGREE as u64,
             }],
             salt_bytes: SALT,
             run: INDEX_MASK_RUN,
             configuration: W_CONFIGURATION,
         },
-        entries: MaskEntryAllocation::for_variables(
-            MATRIX_ROWS.trailing_zeros() as usize,
-            positions,
-        )
-        .unwrap(),
+        entries: MaskEntryAllocation::for_variables(variables, positions).unwrap(),
     }
 }
 
@@ -1131,8 +1137,8 @@ fn hidden_plan_with_table(
         masks: vec![Vec::new(); positions as usize],
         weights: Vec::new(),
         proximity: HiddenProximityPlan {
-            gu: gu_shape(code, mask_code.log_n),
-            omega: omega_shape(code, mask_code.log_n),
+            gu: gu_shape(code, mask_code.log_n, index_shape),
+            omega: omega_shape(code, mask_code.log_n, MATRIX_ROWS, K_LO),
             code,
             mask_code,
             shared_mask_tree: mask_tree(
@@ -1167,7 +1173,12 @@ fn hidden_plan_with_table(
         output_relation: None,
         closure: None,
     };
-    let index_plan = index_mask_plan(positions, mask_code);
+    let index_plan = index_mask_plan(
+        positions,
+        mask_code,
+        MATRIX_ROWS.trailing_zeros() as usize,
+        4,
+    );
     let pending_mask_slot = index_plan.entries.total().expect("mask allocation") as u64;
     plan.send.index_mask = Some(index_plan);
     // The fresh own mask covers the index-mask block plus the segment chain
@@ -1363,6 +1374,250 @@ fn hidden_plan_with_table(
             configuration: Digest([0x72; 32]),
         },
     });
+    plan
+}
+
+/// The assembly input of the legal local prefix. The own group is the
+/// per-position `W` messages, Omega, the at_start index-mask block and the
+/// shown-map message; the shared group is the folded table row and Omega. No
+/// request chain, closure, norm or consumer member takes part, so no chain
+/// mask block is reserved. Shapes come from the public configuration; only the
+/// message identities (oracles, tree numbers, runs) are fixed.
+fn prefix_assembly_input(
+    positions: u32,
+    columns: u64,
+    hidden: u64,
+    openings: u64,
+    index_rows: u64,
+    index_openings: usize,
+) -> AssemblyInput {
+    let mut own_objects = Vec::new();
+    for _ in 0..positions {
+        own_objects.push(AssemblyOwnObject {
+            member: AssemblyMember::Columns {
+                entries: columns,
+                answers: 1,
+            },
+            shared_too: false,
+            spent: openings,
+        });
+    }
+    // Omega: the folded table row, read by both tests.
+    own_objects.push(AssemblyOwnObject {
+        member: AssemblyMember::Fixed {
+            main_rows: 1,
+            mask_rows: 0,
+        },
+        shared_too: true,
+        spent: 0,
+    });
+    // The at_start index mask: mask rows only, sampled once by SEND.
+    own_objects.push(AssemblyOwnObject {
+        member: AssemblyMember::Fixed {
+            main_rows: 0,
+            mask_rows: index_rows,
+        },
+        shared_too: false,
+        spent: index_openings as u64,
+    });
+    // The shown-map message: the activation tensor as one committed map.
+    own_objects.push(AssemblyOwnObject {
+        member: AssemblyMember::Columns {
+            entries: positions as u64 * hidden,
+            answers: 1,
+        },
+        shared_too: false,
+        spent: 0,
+    });
+    AssemblyInput {
+        shared_members: vec![
+            // The folded table row.
+            AssemblyMember::Fixed {
+                main_rows: 1,
+                mask_rows: 0,
+            },
+            // Omega.
+            AssemblyMember::Fixed {
+                main_rows: 1,
+                mask_rows: 0,
+            },
+        ],
+        own_objects,
+        shared_mask_spent: 0,
+        requests: 1,
+        samples: 1,
+        columns,
+        circle: false,
+    }
+}
+
+/// The local first+shared prefix plan, assembled from the same public
+/// configuration the registered table commit used: the table shape, the row
+/// count, the column domain and the derived one-time column count. The plan is
+/// planner-checked, so its validation re-derives the assembly from its public
+/// shapes: every stage, fold bit, BASE count and fresh-mask row count is
+/// checked against the trusted derivation rather than trusted from this
+/// fixture.
+fn prefix_plan_from_config(
+    derived: &zkie_models_gpt2::plan::DerivedTablePlan,
+    activation: &CommittedActivation,
+    table_identity: Digest,
+    positions: u32,
+) -> HiddenLinPlan {
+    let matrix_rows = derived.params.shape.rows();
+    let k_lo = zkie_models_gpt2::plan::TABLE_PLAN_CANDIDATE.k_lo;
+    let columns = matrix_rows
+        .checked_shl(k_lo)
+        .expect("the public column domain");
+    let hidden = activation.shape().hidden as u64;
+    let answers = derived.params.shape.answers;
+    let salt_bytes = derived.params.shape.salt_bytes;
+    // The fixed SEND openings of one W message: the sample answer and the
+    // Eval point of the first stage.
+    let openings = 2usize;
+    let variables = matrix_rows.trailing_zeros() as usize;
+    let allocation =
+        MaskEntryAllocation::for_variables(variables, positions).expect("the mask allocation");
+    let allocated = allocation.total().expect("the mask entry count") as u64;
+    // The index-mask rows are the smallest row count whose free entries hold
+    // the allocation beside the SEND pads. The row count feeds the own group's
+    // fresh-mask size, so it is fixed together with the assembly codes.
+    let mut index_rows = 1u64;
+    let mut assembled = None;
+    for _ in 0..8 {
+        let input = prefix_assembly_input(
+            positions,
+            columns,
+            hidden,
+            openings as u64,
+            index_rows,
+            1,
+        );
+        let solved = assemble_proximity(&input)
+            .expect("the trusted assembly finds the legal prefix proximity plan");
+        let free = |rows: u64| rows.saturating_mul(solved.first_mask.ell).saturating_sub(1);
+        let mut needed = 1u64;
+        while free(needed) < allocated {
+            needed += 1;
+        }
+        if needed == index_rows {
+            assembled = Some(solved);
+            break;
+        }
+        index_rows = needed;
+    }
+    let assembled = assembled.expect("the index-mask row count reaches a fixed point");
+    let code = assembled.first_main;
+    let mask_code = assembled.first_mask;
+    let mut plan = HiddenLinPlan {
+        norm: None,
+        send: HiddenSendPlan {
+            activation: activation.shape(),
+            activation_configuration: ACTIVATION_CONFIGURATION,
+            activation_root: activation.root(),
+            activation_source: zkie_ops::proof::hidden_send_session::ActivationSource::Commitment,
+            table_shape: derived.params.shape,
+            table_identity,
+            matrix_rows,
+            k_lo,
+            columns,
+            group: GROUP,
+            oracle_base: ORACLE_BASE,
+            openings_per_oracle: openings,
+            w: WShape::new(
+                columns,
+                code,
+                answers,
+                positions,
+                salt_bytes,
+                100,
+                1,
+                W_RUN,
+                W_CONFIGURATION,
+            )
+            .expect("the W message shape"),
+            index_mask: Some(index_mask_plan(
+                positions,
+                mask_code,
+                variables,
+                index_rows,
+            )),
+            dot: Some(DotMapPlan {
+                oracle: DOT_ORACLE,
+                group: GROUP,
+                shape: WShape::new(
+                    positions as u64 * hidden,
+                    code,
+                    1,
+                    positions,
+                    salt_bytes,
+                    400,
+                    2,
+                    DOT_RUN,
+                    W_CONFIGURATION,
+                )
+                .expect("the shown-map message shape"),
+                hidden: hidden as u32,
+            }),
+            expected_dot_root: None,
+            expected_roots: None,
+            member: None,
+            request_chain: None,
+            chain_mask: None,
+            request_reads: None,
+            request_w: None,
+            source_data: None,
+            segment_mask_tree: None,
+            range: None,
+            digit_lookups: Vec::new(),
+        },
+        output: HiddenOutputShape {
+            positions,
+            columns,
+        },
+        masks: vec![Vec::new(); positions as usize],
+        weights: Vec::new(),
+        proximity: HiddenProximityPlan {
+            gu: gu_shape(code, mask_code.log_n, derived.params.shape),
+            omega: omega_shape(code, mask_code.log_n, matrix_rows, k_lo),
+            code,
+            mask_code,
+            shared_mask_tree: mask_tree(200, mask_code.log_n, 1u64 << assembled.shared[0].h),
+            own_mask_tree: mask_tree(201, mask_code.log_n, 1u64 << assembled.own[0].h),
+            // The fresh-mask ids sit above the members of their groups: the
+            // shared group has two members, and the own member bound is one W
+            // per position, Omega, the index mask and the shown map with the
+            // closure allowance the plan's own check reserves.
+            shared_fresh: 2,
+            own_fresh: positions as u64 * 4 + 4,
+            column_draws: derived.total_columns as usize,
+            column_budget: derived.total_columns as usize,
+            ledger: zkie_ops::proof::hidden_send_session::ReadLedgerCell::new(
+                derived.total_columns,
+            ),
+            column_work_bits: 0,
+            shared_base_positions: assembled.shared.last().unwrap().positions as usize,
+            own_base_positions: assembled.own.last().unwrap().positions as usize,
+            shared_stages: assembled.shared.iter().map(stage_plan).collect(),
+            own_stages: assembled.own.iter().map(stage_plan).collect(),
+            planner_checked: true,
+            lin_check: Some(derived.lin_check),
+        },
+        output_relation: None,
+        closure: None,
+    };
+    // The own fresh mask covers the at_start index block. The planner check
+    // ties this row count to the own first stage's fold bits.
+    plan.proximity.own_mask_tree.mask_rows = zkie_ops::proof::hidden_norm_psc::norm_own_mask_rows(
+        plan.send
+            .index_mask
+            .as_ref()
+            .unwrap()
+            .tree_rows()
+            .expect("index mask rows"),
+        0,
+    )
+    .expect("own mask rows");
     plan
 }
 
@@ -2261,40 +2516,7 @@ fn the_registered_instance_feeds_the_local_table_check_prefix() {
 
     let mut keeper = make_table(&messages);
     let activation = activation(&activation_rows, positions);
-    let mut hidden_plan = hidden_plan_with_table(
-        &activation,
-        positions,
-        tensor_limbs(&activation_rows),
-        plan.params.shape,
-        table_identity,
-        plan.total_columns,
-    );
-    // The legal local prefix mode carries no request chain: the chain-only
-    // objects are absent rather than filled with placeholders, and the own
-    // mask capacity no longer includes the chain mask block.
-    hidden_plan.send.request_chain = None;
-    hidden_plan.send.chain_mask = None;
-    hidden_plan.send.source_data = None;
-    hidden_plan.send.segment_mask_tree = None;
-    hidden_plan.send.range = None;
-    hidden_plan.send.request_reads = None;
-    hidden_plan.send.request_w = None;
-    hidden_plan.send.digit_lookups.clear();
-    hidden_plan.send.expected_roots = None;
-    let index_rows = hidden_plan
-        .send
-        .index_mask
-        .as_ref()
-        .expect("the segment assembly carries an index mask")
-        .tree_rows()
-        .expect("index mask rows");
-    // The closed consumer pieces (pending claim, index mask, dot map) are not
-    // part of the legal local prefix; the task's closure is the table stage.
-    hidden_plan.send.member = None;
-    hidden_plan.send.dot = None;
-    hidden_plan.proximity.own_mask_tree.mask_rows =
-        zkie_ops::proof::hidden_norm_psc::norm_own_mask_rows(index_rows, 0)
-            .expect("own mask rows");
+    let hidden_plan = prefix_plan_from_config(&plan, &activation, table_identity, positions);
     eprintln!(
         "plan fields: shape={:?} identity={} draws={} budget={} lin={:?} stages={}/{} code={:?} mask={:?}",
         hidden_plan.send.table_shape,
@@ -2311,9 +2533,37 @@ fn the_registered_instance_feeds_the_local_table_check_prefix() {
         Ok(()) => eprintln!("plan validate ok"),
         Err(error) => panic!("plan validate failed: {:?}", error),
     }
+    eprintln!(
+        "prefix geometry: matrix_rows={} columns={} hidden={} openings={} index_rows={} own_mask_rows={} fresh={}/{} shared_base={} own_base={} shared_positions={:?} own_positions={:?}",
+        hidden_plan.send.matrix_rows,
+        hidden_plan.send.columns,
+        hidden_plan.send.dot.as_ref().unwrap().hidden,
+        hidden_plan.send.openings_per_oracle,
+        hidden_plan.send.index_mask.as_ref().unwrap().mask_rows,
+        hidden_plan.proximity.own_mask_tree.mask_rows,
+        hidden_plan.proximity.shared_fresh,
+        hidden_plan.proximity.own_fresh,
+        hidden_plan.proximity.shared_base_positions,
+        hidden_plan.proximity.own_base_positions,
+        hidden_plan
+            .proximity
+            .shared_stages
+            .iter()
+            .map(|stage| stage.positions)
+            .collect::<Vec<_>>(),
+        hidden_plan
+            .proximity
+            .own_stages
+            .iter()
+            .map(|stage| stage.positions)
+            .collect::<Vec<_>>()
+    );
+    let prove_start = std::time::Instant::now();
     let (first, shared) =
         prove_hidden_lin_hidden_shared_seal(&hidden_plan, &activation, &mut keeper, SEED, None)
             .unwrap();
+    let prove_time = prove_start.elapsed();
+    let verify_start = std::time::Instant::now();
     let seal = match verify_hidden_lin_hidden_shared_seal(
         &hidden_plan,
         &trusted_reader,
@@ -2324,11 +2574,18 @@ fn the_registered_instance_feeds_the_local_table_check_prefix() {
         Ok(seal) => seal,
         Err(error) => panic!("table-plan verify failed: {:?}", error),
     };
+    let verify_time = verify_start.elapsed();
+    let first_bytes = first.encode().expect("first prefix bytes").len();
+    let shared_bytes = shared.encode().expect("shared prefix bytes").len();
     println!(
-        "table-plan prefix seal={} reserved={} total={}",
+        "table-plan prefix seal={} reserved={} total={} first_bytes={} shared_bytes={} prove_ms={} verify_ms={}",
         digest_to_hex(&seal),
         keeper.budget.count().unwrap(),
-        plan.total_columns
+        plan.total_columns,
+        first_bytes,
+        shared_bytes,
+        prove_time.as_millis(),
+        verify_time.as_millis()
     );
     assert_eq!(keeper.budget.count().unwrap(), plan.total_columns);
 
@@ -2354,8 +2611,20 @@ fn the_registered_instance_feeds_the_local_table_check_prefix() {
     .is_err());
 
     let mut bad_meta = meta.clone();
-    bad_meta.root = Digest([0x66; 32]);
+    bad_meta.identity = Digest([0x66; 32]);
     assert!(verify_asset_table_meta(&bad_meta, plan.table_model_identity, spec, &plan.params).is_err());
+    // The table root is bound by the reader identity the plan carries: the
+    // same proof against a reader with another root is rejected.
+    let mut bad_reader = trusted_reader.clone();
+    bad_reader.root = Digest([0x67; 32]);
+    assert!(verify_hidden_lin_hidden_shared_seal(
+        &hidden_plan,
+        &bad_reader,
+        &first,
+        &shared,
+        None
+    )
+    .is_err());
     let mut bad_shape = meta.clone();
     bad_shape.shape.distances.m_once += 1;
     assert!(verify_asset_table_meta(&bad_shape, plan.table_model_identity, spec, &plan.params).is_err());
