@@ -3141,6 +3141,39 @@ fn derive_w_rows_from_weights(
 /// witness. Each message is placed in its main rows, encoded with the product
 /// form and committed under its runtime tree. The sample pads are reserved at
 /// the end of the last row and filled from the supplied private randomness.
+/// Draws the private randomness of one logical W message: one non-zero pad
+/// per answer, one encoding tail for every encoded row and one salt for each
+/// tree column.
+pub(crate) fn draw_w_message_randomness(
+    coins: &mut ByteMaskCoins,
+    shape: &WShape,
+) -> Result<(Vec<Fp3>, Vec<Fp3>, Vec<Vec<u8>>)> {
+    let answers = shape.answers as usize;
+    let rows = usize::try_from(shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let tail_len = usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
+    let mut pads = Vec::with_capacity(answers);
+    for _ in 0..answers {
+        let mut pad = Fp3::ZERO;
+        for _ in 0..64 {
+            pad = coins.draw()?.0;
+            if pad != Fp3::ZERO {
+                break;
+            }
+        }
+        if pad == Fp3::ZERO {
+            return Err(Error::InvalidConfig);
+        }
+        pads.push(pad);
+    }
+    let mut tail = Vec::with_capacity(rows * tail_len);
+    for _ in 0..rows * tail_len {
+        tail.push(coins.draw()?.0);
+    }
+    let columns = usize::try_from(shape.code.n()).map_err(|_| Error::ResourceLimit)?;
+    let salts = draw_salt_bytes(coins, columns, shape.salt_bytes)?;
+    Ok((pads, tail, salts))
+}
+
 /// Commits the at_start index-mask message: its mask rows, their encoding
 /// tails and salts, under its runtime tree. The witness checks itself against
 /// the plan.
@@ -10455,6 +10488,10 @@ pub(crate) const KEY_FIRST_PLAN_VERSION: u64 = 1;
 pub(crate) struct KeyFirstPlan {
     pub table_identity: Digest,
     pub table_configuration: Digest,
+    pub table_shape: IndexShape,
+    pub matrix_rows: u64,
+    pub k_lo: u32,
+    pub columns: u64,
     pub range: crate::proof::table_range::TableKeyRangeConfig,
     pub lookup: crate::proof::lookup::LookupPlan,
     pub commit: crate::proof::lookup_messages::LookupCommitPlan,
@@ -10505,6 +10542,17 @@ impl KeyFirstPlan {
         w.put_u64(KEY_FIRST_PLAN_VERSION);
         w.put_digest(&self.table_identity);
         w.put_digest(&self.table_configuration);
+        key_first_put_code(&mut w, &self.table_shape.code);
+        w.put_u64(self.table_shape.v as u64);
+        w.put_u64(self.table_shape.answers as u64);
+        w.put_u64(self.table_shape.salt_bytes as u64);
+        w.put_u64(self.table_shape.distances.radius);
+        w.put_u64(self.table_shape.distances.later_radius);
+        w.put_u64(self.table_shape.distances.m_once);
+        w.put_u64(self.table_shape.distances.m_later);
+        w.put_u64(self.matrix_rows);
+        w.put_u64(self.k_lo as u64);
+        w.put_u64(self.columns);
         w.put_digest(&self.range.digest());
         let lookup = self.lookup.digest();
         w.put_u64(self.lookup.key_bits as u64);
@@ -36144,6 +36192,21 @@ mod key_first_plan_tests {
         KeyFirstPlan {
             table_identity: Digest([9; 32]),
             table_configuration: Digest([8; 32]),
+            table_shape: IndexShape {
+                code,
+                v: 2,
+                answers: 1,
+                salt_bytes: 40,
+                distances: zkie_engine::pcs::request::table::TableDistances {
+                    radius: 0,
+                    later_radius: 0,
+                    m_once: 1,
+                    m_later: 0,
+                },
+            },
+            matrix_rows: 4,
+            k_lo: 0,
+            columns: 4,
             range: crate::proof::table_range::table_key_range_config(&range_plan),
             lookup: crate::proof::lookup::LookupPlan {
                 key_bits: 4,
