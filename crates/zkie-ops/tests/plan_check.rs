@@ -2007,3 +2007,185 @@ fn shared_matmul_malformed_bias_config_is_rejected_before_relation() {
         .to_owned();
     assert_eq!(code, "statement_mismatch");
 }
+
+// ---- shared softmax declarations ----
+
+#[derive(Clone)]
+struct SoftmaxSharedFixture {
+    public: ModelCommitmentPublic,
+    trace: SharedTrace,
+    tokens: Vec<u32>,
+    plan: TracePlan,
+    root: PathBuf,
+}
+
+#[derive(Clone, Copy)]
+enum SoftmaxTamper {
+    ExpEntry,
+    Denominator,
+}
+
+struct TamperedSoftmax {
+    inner: zkie_ops::softmax::SoftmaxOp,
+    target: SoftmaxTamper,
+}
+
+impl PureForward for TamperedSoftmax {
+    fn opcode(&self) -> OpCode {
+        self.inner.opcode()
+    }
+
+    fn infer_specs(
+        &self,
+        inputs: &[TensorSpec],
+    ) -> Result<Vec<TensorSpec>, zkie_core::error::Error> {
+        self.inner.infer_specs(inputs)
+    }
+
+    fn forward_values(
+        &self,
+        inputs: &[Vec<i64>],
+    ) -> Result<KernelRecord, zkie_core::error::Error> {
+        let mut record = self.inner.forward_values(inputs)?;
+        match self.target {
+            SoftmaxTamper::ExpEntry => record.auxiliaries[1][0] ^= 1,
+            SoftmaxTamper::Denominator => record.auxiliaries[2][0] ^= 1,
+        }
+        Ok(record)
+    }
+}
+
+fn softmax_shared_fixture_with(
+    plan_table: &[i64],
+    op: &dyn PureForward,
+    proved_table: &[i64],
+) -> SoftmaxSharedFixture {
+    let root = temp_dir();
+    let specs = vec![ModelAssetSpec {
+        asset_id: 0,
+        path: "dummy_i32.bin".into(),
+        element_count: 4,
+        row_width: 4,
+        encoding: "i32-le".into(),
+    }];
+    write_i32(&root.join("dummy_i32.bin"), &[1, 2, 3, 4]);
+    let commitment = commit_assets(&root, Digest([41; 32]), Digest([42; 32]), &specs).unwrap();
+    let public = ModelCommitmentPublic::from_commitment(&commitment);
+    let logits = vec![1i64, 2, 3];
+    let relation_config = vec![0];
+    let (softmax_step, softmax_out) = make_step(
+        op,
+        &[logits.clone(), proved_table.to_vec()],
+        &relation_config,
+        &[],
+        vec![None, None],
+        vec![None, None],
+    );
+    let (argmax_step, argmax_out) = make_step(
+        &ArgmaxOp,
+        &[softmax_out[0].clone()],
+        &[],
+        &[],
+        vec![None],
+        vec![Some((0, 0))],
+    );
+    let mut builder = PlanBuilder::new();
+    let softmax = builder.step(
+        OpCode::Softmax,
+        config(relation_config.clone()),
+        vec![
+            PlanSource::Constant(PlanConstant::Literal(logits)),
+            PlanSource::Constant(PlanConstant::Literal(plan_table.to_vec())),
+        ],
+        1,
+    );
+    let argmax = builder.step(
+        OpCode::Argmax,
+        config(Vec::new()),
+        vec![PlanSource::prev(softmax, 0)],
+        1,
+    );
+    builder.argmax_step(argmax);
+    let plan = builder.finish();
+    let trace = SharedTrace {
+        tokens: vec![1],
+        assets: Vec::new(),
+        steps: vec![softmax_step, argmax_step],
+        argmax: vec![argmax_out[0][0] as u32],
+        output: Vec::new(),
+    };
+    SoftmaxSharedFixture {
+        public,
+        trace,
+        tokens: vec![1],
+        plan,
+        root,
+    }
+}
+
+fn softmax_shared_fixture(plan_table: &[i64], proved_table: &[i64]) -> SoftmaxSharedFixture {
+    let op = zkie_ops::softmax::SoftmaxOp { shift: 0 };
+    softmax_shared_fixture_with(plan_table, &op, proved_table)
+}
+
+fn verify_softmax_shared(
+    fixture: &SoftmaxSharedFixture,
+) -> Result<Vec<u32>, zkie_core::error::Error> {
+    let bytes = bincode::serialize(&fixture.trace).unwrap();
+    let trace: SharedTrace = bincode::deserialize(&bytes).unwrap();
+    zkie_ops::proof::model_commitment::verify_shared_trace(
+        &fixture.public,
+        &trace,
+        &fixture.tokens,
+        &fixture.plan,
+        Some(&fixture.root),
+    )
+}
+
+#[test]
+fn shared_softmax_carries_no_raw_and_verifies() {
+    let table = vec![1i64, 2, 3, 4, 5, 6, 7, 8];
+    let fixture = softmax_shared_fixture(&table, &table);
+    assert!(fixture.trace.steps[0].message.proof.raw.is_empty());
+    assert!(fixture.trace.steps[0].message.proof.lengths.raw.is_empty());
+    verify_softmax_shared(&fixture).unwrap();
+}
+
+#[test]
+fn shared_softmax_aux_tamper_is_rejected_by_the_relation() {
+    // The exp entry and the denominator are checked against the actual table
+    // lookup; altering either declaration is rebuilt into the commitment and
+    // then rejected by the numerical relation.
+    let table = vec![1i64, 2, 3, 4, 5, 6, 7, 8];
+    for target in [SoftmaxTamper::ExpEntry, SoftmaxTamper::Denominator] {
+        let op = TamperedSoftmax {
+            inner: zkie_ops::softmax::SoftmaxOp { shift: 0 },
+            target,
+        };
+        let fixture = softmax_shared_fixture_with(&table, &op, &table);
+        committed_openings_authenticate(&fixture.trace.steps[0])
+            .expect("the committed material is authenticated");
+        let code = verify_softmax_shared(&fixture)
+            .err()
+            .expect("expected rejection")
+            .code()
+            .to_owned();
+        assert_eq!(code, "invalid_proof");
+    }
+}
+
+#[test]
+fn shared_softmax_table_replacement_is_rejected_by_the_relation() {
+    // The proof is produced with one trusted table while the plan materializes
+    // another of the same length; the verifier recomputes the exp entries and
+    // rejects the committed auxiliary values.
+    let proved = vec![1i64, 2, 3, 4, 5, 6, 7, 8];
+    let planned = vec![2i64, 2, 2, 2, 2, 2, 2, 2];
+    let fixture = softmax_shared_fixture(&planned, &proved);
+    let code = verify_softmax_shared(&fixture)
+        .err()
+        .expect("expected rejection")
+        .code()
+        .to_owned();
+    assert_eq!(code, "invalid_proof");
+}
