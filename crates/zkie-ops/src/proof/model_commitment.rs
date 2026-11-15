@@ -262,7 +262,15 @@ pub fn commit_assets(
     parameters_digest: Digest,
     specs: &[ModelAssetSpec],
 ) -> Result<ModelCommitment> {
-    commit_assets_inner(root, model_commitment, parameters_digest, specs, false, &[])
+    commit_assets_inner(
+        root,
+        model_commitment,
+        model_commitment,
+        parameters_digest,
+        specs,
+        false,
+        &[],
+    )
         .map(|(commitment, _)| commitment)
 }
 
@@ -275,7 +283,15 @@ pub fn commit_assets_with_digests(
     parameters_digest: Digest,
     specs: &[ModelAssetSpec],
 ) -> Result<(ModelCommitment, Vec<AssetDigest>)> {
-    commit_assets_inner(root, model_commitment, parameters_digest, specs, true, &[])
+    commit_assets_inner(
+        root,
+        model_commitment,
+        model_commitment,
+        parameters_digest,
+        specs,
+        true,
+        &[],
+    )
 }
 
 /// Commits the raw asset rows and, for every table in `tables`, the encoded
@@ -288,8 +304,40 @@ pub fn commit_assets_with_tables(
     specs: &[ModelAssetSpec],
     tables: &[AssetTableInput],
 ) -> Result<ModelCommitment> {
-    commit_assets_inner(root, model_commitment, parameters_digest, specs, false, tables)
-        .map(|(commitment, _)| commitment)
+    commit_assets_inner(
+        root,
+        model_commitment,
+        model_commitment,
+        parameters_digest,
+        specs,
+        false,
+        tables,
+    )
+    .map(|(commitment, _)| commitment)
+}
+
+/// Commits the assets and encoded tables with a table-level public model
+/// identity. The anchor keeps the request's model commitment; the table
+/// configuration and plan identity come from the table-level identity, so one
+/// table configuration is shared across request shapes of the same model.
+pub fn commit_assets_with_tables_on_identity(
+    root: &Path,
+    model_commitment: Digest,
+    table_model_identity: Digest,
+    parameters_digest: Digest,
+    specs: &[ModelAssetSpec],
+    tables: &[AssetTableInput],
+) -> Result<ModelCommitment> {
+    commit_assets_inner(
+        root,
+        model_commitment,
+        table_model_identity,
+        parameters_digest,
+        specs,
+        false,
+        tables,
+    )
+    .map(|(commitment, _)| commitment)
 }
 
 /// Like `commit_assets_with_tables`, and returns one SHA-256 per asset. The
@@ -302,12 +350,42 @@ pub fn commit_assets_with_digests_and_tables(
     specs: &[ModelAssetSpec],
     tables: &[AssetTableInput],
 ) -> Result<(ModelCommitment, Vec<AssetDigest>)> {
-    commit_assets_inner(root, model_commitment, parameters_digest, specs, true, tables)
+    commit_assets_inner(
+        root,
+        model_commitment,
+        model_commitment,
+        parameters_digest,
+        specs,
+        true,
+        tables,
+    )
+}
+
+/// Like `commit_assets_with_digests_and_tables` with a table-level public
+/// model identity for the encoded tables.
+pub fn commit_assets_with_digests_and_tables_on_identity(
+    root: &Path,
+    model_commitment: Digest,
+    table_model_identity: Digest,
+    parameters_digest: Digest,
+    specs: &[ModelAssetSpec],
+    tables: &[AssetTableInput],
+) -> Result<(ModelCommitment, Vec<AssetDigest>)> {
+    commit_assets_inner(
+        root,
+        model_commitment,
+        table_model_identity,
+        parameters_digest,
+        specs,
+        true,
+        tables,
+    )
 }
 
 fn commit_assets_inner(
     root: &Path,
     model_commitment: Digest,
+    table_model_identity: Digest,
     parameters_digest: Digest,
     specs: &[ModelAssetSpec],
     emit_digests: bool,
@@ -400,7 +478,7 @@ fn commit_assets_inner(
                 return Err(Error::StatementMismatch);
             }
             let meta =
-                build_asset_table(&reader, model_commitment, spec, input, 1 << 30)?;
+                build_asset_table(&reader, table_model_identity, spec, input, 1 << 30)?;
             table_by_asset.insert(spec.asset_id, meta);
         }
     }
@@ -1048,6 +1126,32 @@ pub fn verify_model_anchor_with_tables(
     table_metas: &[AssetTableMeta],
     tables: &[AssetTableParams],
 ) -> Result<()> {
+    verify_model_anchor_with_tables_on_identity(
+        public,
+        expected_anchor_id,
+        expected_model_commitment,
+        expected_model_commitment,
+        expected_parameters_digest,
+        specs,
+        table_metas,
+        tables,
+    )
+}
+
+/// Verifies the anchor and the encoded table metadata with the table-level
+/// public model identity used at commit. The anchor record keeps the request's
+/// model commitment; only the table configuration and plan identity use the
+/// table-level identity.
+pub fn verify_model_anchor_with_tables_on_identity(
+    public: &ModelCommitmentPublic,
+    expected_anchor_id: Digest,
+    expected_model_commitment: Digest,
+    table_model_identity: Digest,
+    expected_parameters_digest: Digest,
+    specs: &[ModelAssetSpec],
+    table_metas: &[AssetTableMeta],
+    tables: &[AssetTableParams],
+) -> Result<()> {
     let anchor = &public.anchor;
     if anchor.anchor_id != expected_anchor_id
         || anchor.model_commitment != expected_model_commitment
@@ -1114,7 +1218,7 @@ pub fn verify_model_anchor_with_tables(
         if !table_ids.insert(meta.asset_id) {
             return Err(Error::StatementMismatch);
         }
-        verify_asset_table_meta(meta, anchor.model_commitment, spec, params)?;
+        verify_asset_table_meta(meta, table_model_identity, spec, params)?;
         records.push(LeafRecord {
             leaf_id: specs.len() as u64 + index as u64,
             generation: 0,

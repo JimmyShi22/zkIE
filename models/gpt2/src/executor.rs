@@ -17,7 +17,8 @@ use zkie_ops::profile_norm::ProfileLayerNormOp;
 use zkie_ops::projection::ProjectionOp;
 use zkie_ops::proof::asset_table::AssetTableInput;
 use zkie_ops::proof::model_commitment::{
-    commit_assets_with_tables, AssetOpening, AssetStore, ModelAssetSpec, ModelCommitment,
+    commit_assets_with_tables_on_identity, AssetOpening, AssetStore, ModelAssetSpec,
+    ModelCommitment,
     SharedTrace, SharedTraceStep,
 };
 use zkie_ops::proof::relations::{
@@ -575,5 +576,12 @@ pub fn build_commitment(
         None,
         &tokens.iter().flat_map(|token| token.to_le_bytes()).collect::<Vec<_>>(),
     )?;
-    commit_assets_with_tables(asset_root, model, parameters, &asset_specs(), tables)
+    commit_assets_with_tables_on_identity(
+        asset_root,
+        model,
+        crate::plan::table_model_identity()?,
+        parameters,
+        &asset_specs(),
+        tables,
+    )
 }

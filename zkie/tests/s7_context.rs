@@ -101,6 +101,26 @@ fn the_real_context_is_loaded_with_the_lm_head_identity() {
         return;
     };
     let statement_data = read_statement(&statement);
+    let table_metas: Vec<zkie_ops::proof::asset_table::AssetTableMeta> =
+        bincode::deserialize(&fs::read(public.join("asset-tables.bin")).expect("asset tables"))
+            .expect("asset tables");
+    let plan = zkie_models_gpt2::plan::derive_table_plan(
+        &zkie_models_gpt2::plan::TABLE_PLAN_CANDIDATE,
+    )
+    .expect("table plan");
+    if table_metas.first().map(|meta| meta.identity) != Some(plan.table_identity) {
+        // The archived instance predates the current table plan. The current
+        // verifier must reject it; a fresh instance is registered separately.
+        assert!(load_gpt2_lm_head_context(
+            &case,
+            &policy,
+            &public,
+            &statement,
+            statement_data.model_commitment,
+        )
+        .is_err());
+        return;
+    }
     let context = load_gpt2_lm_head_context(
         &case,
         &policy,

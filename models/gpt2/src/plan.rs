@@ -7,9 +7,17 @@ use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 use zkie_ops::op::OpCode;
 use zkie_ops::proof::model_commitment::ModelAssetSpec;
-use zkie_engine::pcs::request::code::CodeParams;
+use zkie_engine::pcs::request::code::{build_code_plan, CodeParams};
 use zkie_engine::pcs::request::table::{IndexShape, TableDistances};
-use zkie_ops::proof::asset_table::{AssetTableLayout, AssetTableParams};
+use zkie_ops::proof::asset_table::{
+    asset_table_configuration, asset_table_identity, validate_asset_table_params,
+    AssetTableLayout, AssetTableParams,
+};
+use zkie_ops::proof::hidden_send_session::SharedLinCheck;
+use zkie_ops::proof::proximity_planner::{
+    recorded_table_distance, shared_lin_columns, shared_lin_plan_fault, SharedLinPlanFault,
+    SharedLinShape,
+};
 use zkie_ops::proof::plan::{
     config, PlanBuilder, PlanConstant, PlanLayout, PlanSource, TracePlan,
 };
@@ -462,53 +470,207 @@ pub fn asset_specs() -> Vec<ModelAssetSpec> {
     crate::executor::asset_specs()
 }
 
-/// The trusted table parameters of one square projection weight. The table
-/// geometry is plan data: 1024 rows, a 2048-entry message with an eight-entry
-/// code tail, and a 1024-element valid row. The parameters are validated
-/// against the asset specification before they are used.
-pub fn projection_table_params(path: &str) -> Option<AssetTableParams> {
-    let spec = asset_specs().into_iter().find(|spec| spec.path == path)?;
-    if spec.row_width != HIDDEN as usize || spec.element_count != (HIDDEN as u64) * (HIDDEN as u64) {
-        return None;
+/// The fixed public candidate of the production encoded table. The candidate
+/// is chosen offline inside the declared support domain and written here; the
+/// derivation below only expands and checks it, it never searches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TablePlanCandidate {
+    pub log_n: u32,
+    pub ell: u64,
+    pub r: u64,
+    pub v: u32,
+    pub answers: u32,
+    pub salt_bytes: usize,
+    pub matrix_rows_log: u32,
+    pub k_lo: u32,
+    pub sharing: u64,
+    pub later_batches: u64,
+}
+
+/// The candidate declared for this round. The random tail carries the
+/// derived one-time query count and the declared later batches (none this
+/// round); the later distance capability is not derived or claimed.
+pub const TABLE_PLAN_CANDIDATE: TablePlanCandidate = TablePlanCandidate {
+    log_n: 12,
+    ell: 2048,
+    r: 128,
+    v: 10,
+    answers: 1,
+    salt_bytes: 40,
+    matrix_rows_log: 10,
+    k_lo: 0,
+    sharing: 1,
+    later_batches: 0,
+};
+
+const FIRST_PROJECTION: &str = "gpt2/weights/L0_k_w_i32.bin";
+
+/// The public model-level identity of the encoded tables. It covers the model
+/// name, version, parameters and asset identities, never the request tokens,
+/// so one table configuration is shared by seq16 and seq512.
+pub fn table_model_identity() -> Result<Digest> {
+    let parameters = parameters_digest()?;
+    let mut data = Vec::new();
+    data.extend_from_slice(b"gpt2-table-model-v1");
+    data.extend_from_slice(&MODEL_VERSION.to_le_bytes());
+    data.extend_from_slice(&parameters.0);
+    for spec in asset_specs() {
+        data.extend_from_slice(
+            &zkie_ops::proof::model_commitment::asset_identity(&spec).0,
+        );
     }
-    Some(AssetTableParams {
+    zkie_engine::primitives::transcript::hash_labeled(
+        zkie_engine::primitives::transcript::tag_word(
+            zkie_engine::primitives::transcript::STATEMENT,
+            20,
+        ),
+        0,
+        None,
+        &data,
+    )
+}
+
+/// The deterministically derived table plan of one candidate. The table
+/// configuration and plan identity are known before any randomness or tree;
+/// the instance root and record are produced by the commit and checked
+/// against the trusted meta afterwards.
+#[derive(Clone, Debug)]
+pub struct DerivedTablePlan {
+    pub params: AssetTableParams,
+    pub table_shape: IndexShape,
+    pub table_configuration: Digest,
+    pub table_identity: Digest,
+    pub table_model_identity: Digest,
+    pub one_time_columns: u64,
+    pub later_batch_columns: u64,
+    pub total_columns: u64,
+    pub lin_check: SharedLinCheck,
+}
+
+/// Derives and checks the table plan of one fixed candidate. The one-time
+/// distance comes from `recorded_table_distance`; the query count from
+/// `shared_lin_columns`; the plan is checked by `shared_lin_plan_fault`. The
+/// later distance is not derived this round and no later batch is accepted.
+/// The total declared column use must fit the real hiding positions.
+pub fn derive_table_plan(candidate: &TablePlanCandidate) -> Result<DerivedTablePlan> {
+    if candidate.later_batches != 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let spec = asset_specs()
+        .into_iter()
+        .find(|spec| spec.path == FIRST_PROJECTION)
+        .ok_or(Error::InvalidConfig)?;
+    if spec.row_width != HIDDEN as usize
+        || spec.element_count != (HIDDEN as u64) * (HIDDEN as u64)
+    {
+        return Err(Error::InvalidConfig);
+    }
+    let code = build_code_plan(candidate.log_n, candidate.ell, candidate.r)?;
+    let rows_log = candidate.matrix_rows_log;
+    let one_time_distance = recorded_table_distance(
+        code,
+        candidate.v,
+        candidate.answers,
+        candidate.v,
+        candidate.sharing,
+        0,
+    )?;
+    let shape = SharedLinShape {
+        v: candidate.v,
+        k_lo: candidate.k_lo,
+        instances: 1,
+        rows_log,
+    };
+    let one_time_columns = shared_lin_columns(shape, code, one_time_distance, 0, 0)?;
+    let total_columns = one_time_columns;
+    if total_columns > code.r {
+        return Err(Error::InvalidConfig);
+    }
+    let fault = SharedLinPlanFault {
+        v: candidate.v,
+        k_lo: candidate.k_lo,
+        rows_log,
+        m: one_time_distance,
+        column_draws: one_time_columns,
+        point_work_bits: 0,
+        column_work_bits: 0,
+        zeta_work_bits: 0,
+    };
+    shared_lin_plan_fault(fault, code)?;
+    let table_shape = IndexShape {
+        code,
+        v: candidate.v,
+        answers: candidate.answers,
+        salt_bytes: candidate.salt_bytes,
+        distances: TableDistances {
+            radius: 0,
+            later_radius: 0,
+            m_once: one_time_distance,
+            m_later: 0,
+        },
+    };
+    let pads = 3u64
+        .checked_mul(candidate.answers as u64)
+        .ok_or(Error::ResourceLimit)?;
+    let layout = AssetTableLayout {
+        row_width: spec.row_width as u64,
+        message_len: candidate.ell,
+        tail_len: candidate.r,
+        pads,
+        valid_elements: spec.element_count,
+        padding_zero: true,
+    };
+    let params = AssetTableParams {
         asset_id: spec.asset_id,
         path: spec.path.clone(),
         element_count: spec.element_count,
         row_width: spec.row_width as u64,
         encoding: spec.encoding.clone(),
-        shape: IndexShape {
-            code: CodeParams { log_n: 12, ell: 2048, r: 8 },
-            v: 10,
-            answers: 1,
-            salt_bytes: 40,
-            distances: TableDistances {
-                radius: 0,
-                later_radius: 0,
-                m_once: 0,
-                m_later: 0,
-            },
-        },
+        shape: table_shape,
         valid_min: i32::MIN as i64,
         valid_max: i32::MAX as i64,
-        layout: AssetTableLayout {
-            row_width: spec.row_width as u64,
-            message_len: 2048,
-            tail_len: 8,
-            pads: 3,
-            valid_elements: spec.element_count,
-            padding_zero: true,
-        },
+        layout,
+    };
+    validate_asset_table_params(&spec, &params)?;
+    let table_model_identity = table_model_identity()?;
+    let table_configuration =
+        asset_table_configuration(table_model_identity, &spec, &params)?;
+    let table_identity = asset_table_identity(table_model_identity, &spec, &params)?;
+    let lin_check = SharedLinCheck {
+        point_work_bits: 0,
+        zeta_work_bits: 0,
+    };
+    Ok(DerivedTablePlan {
+        params,
+        table_shape,
+        table_configuration,
+        table_identity,
+        table_model_identity,
+        one_time_columns,
+        later_batch_columns: 0,
+        total_columns,
+        lin_check,
     })
+}
+
+/// The trusted table parameters of one square projection weight, derived from
+/// the fixed public candidate. Only the registered first projection is
+/// admitted; every other path keeps the raw row commitment.
+pub fn projection_table_params(path: &str) -> Option<AssetTableParams> {
+    if path != FIRST_PROJECTION {
+        return None;
+    }
+    derive_table_plan(&TABLE_PLAN_CANDIDATE)
+        .ok()
+        .map(|plan| plan.params)
 }
 
 /// The trusted encoded-table list of the model plan. The layer-0 key
 /// projection weight is the first migrated consumer; every other asset keeps
 /// the raw row commitment until its own consumer relation closes.
 pub fn asset_table_params() -> Result<Vec<AssetTableParams>> {
-    const FIRST_PROJECTION: &str = "gpt2/weights/L0_k_w_i32.bin";
-    let params = projection_table_params(FIRST_PROJECTION).ok_or(Error::InvalidConfig)?;
-    Ok(vec![params])
+    let plan = derive_table_plan(&TABLE_PLAN_CANDIDATE)?;
+    Ok(vec![plan.params])
 }
 
 #[cfg(test)]
@@ -523,9 +685,60 @@ mod tests {
             .into_iter()
             .find(|spec| spec.path == path)
             .expect("asset spec");
-        zkie_ops::proof::asset_table::validate_asset_table_params(&spec, &params).unwrap();
+        validate_asset_table_params(&spec, &params).unwrap();
         assert_eq!(params.shape.rows(), 1024);
         assert_eq!(params.element_count, 1024 * 1024);
+        assert_eq!(params.shape.code.ell, 2048);
+        assert_eq!(params.shape.code.r, 128);
+        assert!(params.shape.distances.m_once >= 3);
+        assert_eq!(params.shape.distances.m_later, 0);
+        assert_eq!(params.layout.tail_len, 128);
+        assert_eq!(projection_table_params("gpt2/weights/L1_k_w_i32.bin"), None);
+    }
+
+    #[test]
+    fn the_table_plan_is_derived_and_checked() {
+        let plan = derive_table_plan(&TABLE_PLAN_CANDIDATE).expect("derived plan");
+        let again = derive_table_plan(&TABLE_PLAN_CANDIDATE).expect("derived plan");
+        assert_eq!(plan.params.shape, again.params.shape);
+        assert_eq!(plan.params.layout, again.params.layout);
+        assert_eq!(plan.params.path, again.params.path);
+        assert_eq!(plan.table_identity, again.table_identity);
+        assert_eq!(plan.table_configuration, again.table_configuration);
+        assert!(plan.total_columns > 0);
+        assert!(plan.total_columns <= plan.params.shape.code.r);
+        assert_eq!(plan.one_time_columns, plan.total_columns);
+        assert_eq!(plan.params.shape.distances.m_once, {
+            let code = build_code_plan(
+                TABLE_PLAN_CANDIDATE.log_n,
+                TABLE_PLAN_CANDIDATE.ell,
+                TABLE_PLAN_CANDIDATE.r,
+            )
+            .unwrap();
+            recorded_table_distance(
+                code,
+                TABLE_PLAN_CANDIDATE.v,
+                TABLE_PLAN_CANDIDATE.answers,
+                TABLE_PLAN_CANDIDATE.v,
+                TABLE_PLAN_CANDIDATE.sharing,
+                0,
+            )
+            .unwrap()
+        });
+    }
+
+    #[test]
+    fn a_short_tail_or_declared_later_batch_is_refused() {
+        let mut short = TABLE_PLAN_CANDIDATE;
+        short.r = 8;
+        assert!(derive_table_plan(&short).is_err());
+        let mut later = TABLE_PLAN_CANDIDATE;
+        later.later_batches = 1;
+        assert!(derive_table_plan(&later).is_err());
+        let mut wider = TABLE_PLAN_CANDIDATE;
+        wider.r = 256;
+        let plan = derive_table_plan(&wider).unwrap();
+        assert_ne!(plan.table_identity, derive_table_plan(&TABLE_PLAN_CANDIDATE).unwrap().table_identity);
     }
 
     #[test]

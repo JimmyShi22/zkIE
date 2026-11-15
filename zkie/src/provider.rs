@@ -26,7 +26,8 @@ use zkie_ops::pipeline::{
     ProofReceipt, ProveRequest, VerifyReceipt, VerifyRequest,
 };
 use zkie_ops::proof::model_commitment::{
-    verify_model_anchor_with_tables, verify_shared_trace, verify_shared_trace_output,
+    verify_model_anchor_with_tables, verify_model_anchor_with_tables_on_identity,
+    verify_shared_trace, verify_shared_trace_output,
     ModelCommitmentPublic, SharedTrace,
 };
 use zkie_ops::proof::asset_table::{
@@ -495,10 +496,11 @@ impl PipelineProvider for ProductionProvider {
                 }
                 let parameters = zkie_models_gpt2::plan::parameters_digest()?;
                 let specs = zkie_models_gpt2::plan::asset_specs();
-                verify_model_anchor_with_tables(
+                verify_model_anchor_with_tables_on_identity(
                     &public,
                     trusted.anchor_id,
                     model_id,
+                    zkie_models_gpt2::plan::table_model_identity()?,
                     parameters,
                     &specs,
                     &table_metas,

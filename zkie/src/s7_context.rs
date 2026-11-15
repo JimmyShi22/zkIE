@@ -34,7 +34,8 @@ use zkie_ops::op::OpCode;
 use zkie_ops::proof::binding::oracle_start;
 use zkie_ops::proof::asset_table::AssetTableMeta;
 use zkie_ops::proof::model_commitment::{
-    asset_table_identity, expected_asset_rows, verify_model_anchor_with_tables, ModelAssetSpec,
+    asset_table_identity, expected_asset_rows, verify_model_anchor_with_tables_on_identity,
+    ModelAssetSpec,
     ModelCommitmentPublic,
 };
 use zkie_ops::proof::plan::{PlanConfigValue, PlanSource, TracePlan};
@@ -246,10 +247,11 @@ pub fn load_gpt2_lm_head_context(
             Err(_) => Vec::new(),
         };
     let table_params = zkie_models_gpt2::plan::asset_table_params()?;
-    verify_model_anchor_with_tables(
+    verify_model_anchor_with_tables_on_identity(
         &public,
         trusted.anchor_id,
         model_id,
+        zkie_models_gpt2::plan::table_model_identity()?,
         parameters,
         &specs,
         &table_metas,

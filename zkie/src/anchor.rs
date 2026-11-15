@@ -14,7 +14,8 @@ use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 use zkie_ops::proof::asset_table::decode_asset_table_randomness_set;
 use zkie_ops::proof::model_commitment::{
-    commit_assets_with_digests_and_tables, AssetDigest, ModelCommitment,
+    commit_assets_with_digests_and_tables,
+    commit_assets_with_digests_and_tables_on_identity, AssetDigest, ModelCommitment,
 };
 
 use crate::report::{parse_flags, path_flag};
@@ -166,13 +167,14 @@ fn confirmation(
     table_randomness: Option<&Path>,
 ) -> Result<Confirmation> {
     let tokens: Vec<u32> = values.iter().map(|value| *value as u32).collect();
-    let (model_id, parameters, specs, spec_version, table_params) = match model {
+    let (model_id, parameters, specs, spec_version, table_params, table_identity) = match model {
         "gpt2" => (
             zkie_models_gpt2::plan::model_commitment(&tokens)?,
             zkie_models_gpt2::plan::parameters_digest()?,
             zkie_models_gpt2::plan::asset_specs(),
             zkie_models_gpt2::plan::MODEL_VERSION,
             zkie_models_gpt2::plan::asset_table_params()?,
+            Some(zkie_models_gpt2::plan::table_model_identity()?),
         ),
         "gemma3" => (
             zkie_models_gemma3::plan::model_commitment(&tokens)?,
@@ -180,6 +182,7 @@ fn confirmation(
             zkie_models_gemma3::plan::asset_specs(),
             zkie_models_gemma3::plan::MODEL_VERSION,
             Vec::new(),
+            None,
         ),
         "timesfm" => (
             zkie_models_timesfm::plan::model_commitment(&tokens)?,
@@ -187,6 +190,7 @@ fn confirmation(
             zkie_models_timesfm::plan::asset_specs(),
             zkie_models_timesfm::plan::MODEL_VERSION,
             Vec::new(),
+            None,
         ),
         _ => return Err(Error::UnsupportedPrimitive),
     };
@@ -204,8 +208,23 @@ fn confirmation(
         decode_asset_table_randomness_set(&bytes, &table_params)?
     };
     let spec_count = specs.len();
-    let (commitment, digests) =
-        commit_assets_with_digests_and_tables(asset_root, model_id, parameters, &specs, &tables)?;
+    let (commitment, digests) = match table_identity {
+        Some(identity) => commit_assets_with_digests_and_tables_on_identity(
+            asset_root,
+            model_id,
+            identity,
+            parameters,
+            &specs,
+            &tables,
+        )?,
+        None => commit_assets_with_digests_and_tables(
+            asset_root,
+            model_id,
+            parameters,
+            &specs,
+            &tables,
+        )?,
+    };
     if commitment.anchor.record.model_commitment != model_id
         || commitment.anchor.record.parameters_digest != parameters
         || commitment.assets.len() != spec_count
