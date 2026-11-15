@@ -12,7 +12,9 @@
 use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
+use zkie_core::artifact::{digest_bytes, digest_to_hex};
 use zkie_core::common::field::PrimeCharacteristicRing;
 use zkie_core::types::Digest;
 use zkie_engine::pcs::request::code::{build_code_plan, CodeParams};
@@ -25,7 +27,10 @@ use zkie_engine::pcs::request::table::{
     TableRowSource, VecTableSource,
 };
 use zkie_ops::op::OpCode;
-use zkie_ops::proof::asset_table::decode_asset_table_randomness_set;
+use zkie_ops::proof::asset_table::{
+    decode_asset_table_randomness_set, sample_asset_table_randomness, AssetTableLayout,
+    AssetTableParams, AssetTableRandomness,
+};
 use zkie_ops::proof::column_session::fp_from_signed_word;
 use zkie_ops::proof::hidden_send_session::{
     derive_chain_pending, diagnostic_chain_stack, diagnostic_hiding_entries,
@@ -80,7 +85,6 @@ const SALT: usize = 40;
 const GROUP: u64 = 7;
 const ORACLE_BASE: u64 = 20;
 const TABLE_ROWS: u64 = 1024;
-const TABLE_CONFIGURATION: Digest = Digest([0x21; 32]);
 const ACTIVATION_CONFIGURATION: Digest = Digest([0x31; 32]);
 const W_CONFIGURATION: Digest = Digest([0x51; 32]);
 const W_RUN: Digest = Digest([0x41; 32]);
@@ -165,6 +169,44 @@ fn table_code() -> CodeParams {
 
 fn code() -> CodeParams {
     build_code_plan(CODE_LOG_N, CODE_ELL, CODE_R).unwrap()
+}
+
+/// The independent local table's configuration. It is a fixed local public
+/// input, distinct from the registered production table configuration: this
+/// round closes a local table identity, not the registered one.
+const LOCAL_TABLE_CONFIGURATION: Digest = Digest([0x5B; 32]);
+
+fn local_table_params() -> AssetTableParams {
+    AssetTableParams {
+        asset_id: 192,
+        path: "gpt2/weights/L0_k_w_i32.bin".into(),
+        element_count: (HIDDEN * HIDDEN) as u64,
+        row_width: HIDDEN as u64,
+        encoding: "i32-le".into(),
+        shape: table_shape(),
+        valid_min: i32::MIN as i64,
+        valid_max: i32::MAX as i64,
+        layout: AssetTableLayout {
+            row_width: HIDDEN as u64,
+            message_len: TABLE_ELL,
+            tail_len: TABLE_R,
+            pads: 3,
+            valid_elements: (HIDDEN * HIDDEN) as u64,
+            padding_zero: true,
+        },
+    }
+}
+
+/// The local table's private randomness comes from the existing sampling
+/// mechanism once per process: salts and tails are genuine random values, and
+/// every table built in this process reuses the same instance so its identity
+/// and ledger stay fixed.
+static LOCAL_TABLE_RANDOMNESS: OnceLock<AssetTableRandomness> = OnceLock::new();
+
+fn local_table_randomness() -> &'static AssetTableRandomness {
+    LOCAL_TABLE_RANDOMNESS.get_or_init(|| {
+        sample_asset_table_randomness(&local_table_params()).expect("local table randomness")
+    })
 }
 
 /// The table's one-time distance, derived from its code and the plan's point
@@ -351,16 +393,13 @@ fn diagnostic_table(weights: &[i64]) -> Table {
             message[input] = fp_from_signed_word(value as u64);
         }
     }
-    let tails = vec![vec![Fp::ZERO; TABLE_R as usize]; TABLE_ROWS as usize];
-    let mut source = VecTableSource::new(messages, tails).unwrap();
-    let salts: Vec<Vec<u8>> = (0..table_code().n())
-        .map(|position| vec![(position as u8) ^ 0x5A; SALT])
-        .collect();
+    let randomness = local_table_randomness();
+    let mut source = VecTableSource::new(messages, randomness.tails.clone()).unwrap();
     let table = commit_table_streaming(
         &mut source,
         shape,
-        TABLE_CONFIGURATION,
-        &salts,
+        LOCAL_TABLE_CONFIGURATION,
+        &randomness.salts,
         64,
         u64::MAX,
     )
@@ -1696,10 +1735,15 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
                     .map(|line| line.trim().to_string())
             })
             .unwrap_or_else(|| "VmHWM unavailable".to_string());
+        let local_root = digest_to_hex(&session_table.reader.root);
+        let local_record = digest_to_hex(&digest_bytes(&session_table.reader.record.encode()));
         eprintln!(
-            "SHARED SEAL EVIDENCE (local first+shared chains, not R5): limbs={} discovery={:?} seal_bytes={} seal_prove={:?} seal_verify={:?} negatives={}/{} count_before_rerun={} count_after_rerun={} lifetime={} {}",
+            "SHARED SEAL EVIDENCE (independent local table, not the registered table; local first+shared chains, not R5): limbs={} discovery={:?} table_config={} table_root={} table_record={} seal_bytes={} seal_prove={:?} seal_verify={:?} negatives={}/{} count_before_rerun={} count_after_rerun={} lifetime={} {}",
             limbs,
             discovery,
+            digest_to_hex(&LOCAL_TABLE_CONFIGURATION),
+            local_root,
+            local_record,
             seal_bytes,
             seal_prove_time,
             seal_verify_time,
