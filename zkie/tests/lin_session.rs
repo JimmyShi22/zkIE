@@ -1014,7 +1014,7 @@ fn selected_gpt2_output_head_request_session() {
     // X and Y come only from the verified trace outputs.
     let _profile_trace = zkie_engine::profile::Scope::new("harness.trace_verify");
     let started = Instant::now();
-    let outputs = verify_shared_trace_outputs(&public, &trace, &trace.tokens, &plan).unwrap();
+    let outputs = verify_shared_trace_outputs(&public, &trace, &trace.tokens, &plan, None).unwrap();
     println!("trace_verify_ms={}", started.elapsed().as_millis());
     drop(_profile_trace);
     let request = prepare_output_head_trace(&public, &plan, &trace, &outputs, shape).unwrap();

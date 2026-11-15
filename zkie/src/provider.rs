@@ -497,7 +497,7 @@ impl PipelineProvider for ProductionProvider {
                     &table_params,
                 )?;
                 let argmax =
-                    verify_shared_trace(&public, &trace, &statement.tokens, &plan)?;
+                    verify_shared_trace(&public, &trace, &statement.tokens, &plan, None)?;
                 let computed: Vec<i64> = argmax.iter().map(|value| *value as i64).collect();
                 let bound = crate::output::bind(
                     &trusted.output,
@@ -532,7 +532,7 @@ impl PipelineProvider for ProductionProvider {
                     &table_params,
                 )?;
                 let argmax =
-                    verify_shared_trace(&public, &trace, &statement.tokens, &plan)?;
+                    verify_shared_trace(&public, &trace, &statement.tokens, &plan, None)?;
                 let computed: Vec<i64> = argmax.iter().map(|value| *value as i64).collect();
                 let bound = crate::output::bind(
                     &trusted.output,
@@ -574,6 +574,7 @@ impl PipelineProvider for ProductionProvider {
                     &trace,
                     &statement.tokens,
                     &plan,
+                    None,
                 )?;
                 if output.len() != zkie_models_timesfm::plan::output_elements(patches)? {
                     return Err(Error::ShapeMismatch);

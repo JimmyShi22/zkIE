@@ -1298,7 +1298,7 @@ pub(crate) fn verify_trace(
     setup: &OutputHeadLinSetup,
 ) -> Result<(OutputHeadTrace, OutputHeadLinClaims)> {
     shape.check()?;
-    let outputs = verify_shared_trace_outputs(public, trace, expected_tokens, plan)?;
+    let outputs = verify_shared_trace_outputs(public, trace, expected_tokens, plan, None)?;
     let rows = usize::try_from(shape.matrix_rows).map_err(|_| Error::ResourceLimit)?;
     let columns = usize::try_from(shape.matrix_columns()?).map_err(|_| Error::ResourceLimit)?;
     let positions = outputs

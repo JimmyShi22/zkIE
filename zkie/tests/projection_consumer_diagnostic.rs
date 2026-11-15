@@ -500,7 +500,7 @@ fn real_projection_consumer_closes_on_the_diagnostic_hidden_session() {
     let trace_bytes = fs::read(base.join("proof/proof.bin")).expect("proof bytes");
     let trace: SharedTrace = bincode::deserialize(&trace_bytes).expect("trace");
     let plan = zkie_models_gpt2::plan::trace_plan(statement.tokens.len()).expect("plan");
-    let outputs = verify_shared_trace_outputs(&public, &trace, &statement.tokens, &plan)
+    let outputs = verify_shared_trace_outputs(&public, &trace, &statement.tokens, &plan, None)
         .expect("verified trace outputs");
 
     let (activation_step, consumers) = projection_consumers(&plan);
@@ -651,7 +651,7 @@ fn the_committed_source_follows_the_trusted_layout() {
     let trace_bytes = fs::read(base.join("proof/proof.bin")).expect("proof bytes");
     let trace: SharedTrace = bincode::deserialize(&trace_bytes).expect("trace");
     let plan = zkie_models_gpt2::plan::trace_plan(statement.tokens.len()).expect("plan");
-    let outputs = verify_shared_trace_outputs(&public, &trace, &statement.tokens, &plan)
+    let outputs = verify_shared_trace_outputs(&public, &trace, &statement.tokens, &plan, None)
         .expect("verified trace outputs");
     let (activation_step, consumers) = projection_consumers(&plan);
 
@@ -1342,7 +1342,7 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
     let trace_bytes = fs::read(base.join("proof/proof.bin")).expect("proof bytes");
     let trace: SharedTrace = bincode::deserialize(&trace_bytes).expect("trace");
     let plan = zkie_models_gpt2::plan::trace_plan(statement.tokens.len()).expect("plan");
-    let outputs = verify_shared_trace_outputs(&public, &trace, &statement.tokens, &plan)
+    let outputs = verify_shared_trace_outputs(&public, &trace, &statement.tokens, &plan, None)
         .expect("verified trace outputs");
 
     let (activation_step, consumers) = projection_consumers(&plan);

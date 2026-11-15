@@ -108,8 +108,9 @@ pub struct PublicTable {
 /// identity: the byte length equals the fixed entry count times four and the
 /// content digest equals the fixed one. A missing or different file is an
 /// error, never a silent fallback.
-pub fn read_public_table(table: &PublicTable) -> Result<Vec<i64>> {
-    let bytes = std::fs::read(&table.locator).map_err(|_| Error::Io)?;
+pub fn read_public_table(root: &std::path::Path, table: &PublicTable) -> Result<Vec<i64>> {
+    let path = root.join(&table.locator);
+    let bytes = std::fs::read(&path).map_err(|_| Error::Io)?;
     let expected = table.entries.checked_mul(4).ok_or(Error::ResourceLimit)?;
     if bytes.len() as u64 != expected {
         return Err(Error::ShapeMismatch);
@@ -873,6 +874,7 @@ fn count_source(source: &PlanSource, counts: &mut BTreeMap<(String, PlanLayout),
 pub(crate) struct AssetView<'a> {
     public: &'a ModelCommitmentPublic,
     trace: &'a SharedTrace,
+    public_root: Option<&'a std::path::Path>,
     model_version: u32,
     cache_keys: AssetCacheKeys,
     full_cache: RefCell<BTreeMap<AssetCacheKey, Rc<Vec<i64>>>>,
@@ -887,10 +889,12 @@ impl<'a> AssetView<'a> {
         public: &'a ModelCommitmentPublic,
         trace: &'a SharedTrace,
         plan: &TracePlan,
+        public_root: Option<&'a std::path::Path>,
     ) -> Self {
         Self {
             public,
             trace,
+            public_root,
             model_version: plan.model_version,
             cache_keys: cache_keys(plan),
             full_cache: RefCell::new(BTreeMap::new()),
@@ -1070,7 +1074,8 @@ fn materialize<'a>(
             Ok(Materialized::Owned(assets.source_values(path, layout)?))
         }
         PlanSource::PublicTable { table, layout } => {
-            let values = read_public_table(table)?;
+            let root = assets.public_root.ok_or(Error::InvalidConfig)?;
+            let values = read_public_table(root, table)?;
             if matches!(layout, PlanLayout::Flat) {
                 Ok(Materialized::Owned(Rc::new(values)))
             } else {
@@ -1398,26 +1403,26 @@ mod tests {
             .collect();
         std::fs::write(&path, &bytes).unwrap();
         let table = PublicTable {
-            locator: path.to_string_lossy().into_owned(),
+            locator: "table.bin".into(),
             digest: digest_bytes(&bytes),
             entries: values.len() as u64,
             encoding: PublicTableEncoding::I32LeSigned,
         };
         assert_eq!(
-            read_public_table(&table).unwrap(),
+            read_public_table(&dir, &table).unwrap(),
             values.iter().map(|value| *value as i64).collect::<Vec<_>>()
         );
         let mut wrong_digest = table.clone();
         wrong_digest.digest = Digest([0xAB; 32]);
-        assert!(read_public_table(&wrong_digest).is_err());
+        assert!(read_public_table(&dir, &wrong_digest).is_err());
         let mut wrong_size = table.clone();
         wrong_size.entries -= 1;
-        assert!(read_public_table(&wrong_size).is_err());
+        assert!(read_public_table(&dir, &wrong_size).is_err());
         let missing = PublicTable {
-            locator: dir.join("absent.bin").to_string_lossy().into_owned(),
+            locator: "absent.bin".into(),
             ..table.clone()
         };
-        assert!(read_public_table(&missing).is_err());
+        assert!(read_public_table(&dir, &missing).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

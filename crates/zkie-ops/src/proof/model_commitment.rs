@@ -871,8 +871,9 @@ pub fn verify_shared_trace(
     trace: &SharedTrace,
     expected_tokens: &[u32],
     plan: &crate::proof::plan::TracePlan,
+    public_root: Option<&std::path::Path>,
 ) -> Result<Vec<u32>> {
-    verify_shared_trace_steps(public, trace, expected_tokens, plan)?;
+    verify_shared_trace_steps(public, trace, expected_tokens, plan, public_root)?;
     Ok(trace.argmax.clone())
 }
 
@@ -885,8 +886,9 @@ pub fn verify_shared_trace_outputs(
     trace: &SharedTrace,
     expected_tokens: &[u32],
     plan: &crate::proof::plan::TracePlan,
+    public_root: Option<&std::path::Path>,
 ) -> Result<Vec<Vec<Vec<i64>>>> {
-    verify_shared_trace_steps(public, trace, expected_tokens, plan)
+    verify_shared_trace_steps(public, trace, expected_tokens, plan, public_root)
 }
 
 /// Verifies the trace and returns the recorded final output tensor, which must
@@ -896,8 +898,9 @@ pub fn verify_shared_trace_output(
     trace: &SharedTrace,
     expected_tokens: &[u32],
     plan: &crate::proof::plan::TracePlan,
+    public_root: Option<&std::path::Path>,
 ) -> Result<Vec<i64>> {
-    let outputs = verify_shared_trace_steps(public, trace, expected_tokens, plan)?;
+    let outputs = verify_shared_trace_steps(public, trace, expected_tokens, plan, public_root)?;
     if trace.output.is_empty() {
         return Err(Error::StatementMismatch);
     }
@@ -917,6 +920,7 @@ fn verify_shared_trace_steps(
     trace: &SharedTrace,
     expected_tokens: &[u32],
     plan: &crate::proof::plan::TracePlan,
+    public_root: Option<&std::path::Path>,
 ) -> Result<Vec<Vec<Vec<i64>>>> {
     if trace.tokens != expected_tokens {
         return Err(Error::StatementMismatch);
@@ -932,7 +936,7 @@ fn verify_shared_trace_steps(
         .par_iter()
         .try_for_each(|opening| public.verify_opening(opening))?;
     let mut outputs: Vec<Vec<Vec<i64>>> = Vec::with_capacity(trace.steps.len());
-    let assets = crate::proof::plan::AssetView::new(public, trace, plan);
+    let assets = crate::proof::plan::AssetView::new(public, trace, plan, public_root);
     for (step_index, step) in trace.steps.iter().enumerate() {
         let plan_step = plan
             .steps

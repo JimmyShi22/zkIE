@@ -183,6 +183,7 @@ fn rejection_code(fixture: &Fixture) -> String {
             &trace,
             &fixture.tokens,
             &fixture.plan,
+            None,
         )
         .map(|_| ())
     } else {
@@ -191,6 +192,7 @@ fn rejection_code(fixture: &Fixture) -> String {
             &trace,
             &fixture.tokens,
             &fixture.plan,
+            None,
         )
         .map(|_| ())
     };
@@ -209,6 +211,7 @@ fn positive_and_missing_extra_reorder() {
         &fixture.trace,
         &fixture.tokens,
         &fixture.plan,
+        None,
     )
     .unwrap();
     assert_eq!(argmax, vec![0]);
@@ -420,6 +423,7 @@ fn negative_cross_step_edge_with_equal_values() {
         &fixture.trace,
         &fixture.tokens,
         &fixture.plan,
+        None,
     )
     .unwrap();
 
@@ -507,6 +511,7 @@ fn negative_slice() {
         &positive.trace,
         &positive.tokens,
         &positive.plan,
+        None,
     )
     .unwrap();
     assert_eq!(output, vec![10, 30]);
@@ -543,6 +548,7 @@ fn negative_final_output() {
         &fixture.trace,
         &fixture.tokens,
         &fixture.plan,
+        None,
     )
     .unwrap();
     assert_eq!(result, vec![30]);
@@ -708,6 +714,7 @@ fn negative_external_opening_must_cover_the_full_asset() {
         &fixture.trace,
         &fixture.tokens,
         &fixture.plan,
+        None,
     )
     .unwrap();
 
