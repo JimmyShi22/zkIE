@@ -2199,6 +2199,76 @@ pub fn solve_first_stage(
     })
 }
 
+
+/// The converged first stage of one group solved on its own draws.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SingleFirstStage {
+    pub k: u32,
+    pub h: u32,
+    pub positions: u64,
+    pub main_tail: u64,
+    pub mask_tail: u64,
+}
+
+/// Solves the first stage of one group on its own draws. It is the own-group
+/// branch of [`solve_first_stage`] without the groups that read the same
+/// messages: the main and mask words are opened at the group's own position
+/// count, and the batched rows are the group's statement rows. The error
+/// analysis is the same `sized_step` the joint solve uses.
+pub fn solve_single_first_stage(
+    main: CodeParams,
+    mask: CodeParams,
+    main_rows: u64,
+    mask_rows: u64,
+    rows: u64,
+    circle: bool,
+) -> std::result::Result<SingleFirstStage, StageFailure> {
+    if rows == 0 || main_rows == 0 {
+        return Err(StageFailure {
+            stage: 0,
+            point: "the group has no rows",
+        });
+    }
+    let (k, h) = lin_group_bits(&[main_rows], &[mask_rows]).map_err(|_| StageFailure {
+        stage: 0,
+        point: "the group's member rows do not form a group",
+    })?;
+    let shape = group_shape(main, mask, k, h).map_err(|_| StageFailure {
+        stage: 0,
+        point: "the group's codes do not form a group",
+    })?;
+    let extra = margin_bound();
+    let mut t = 0u64;
+    for _ in 0..MAX_STAGE_ROUNDS {
+        let (step, serves) =
+            sized_step(&shape, t, t, rows, circle, &extra).map_err(|point| StageFailure {
+                stage: 0,
+                point,
+            })?;
+        let next = t.max(step);
+        if next == t {
+            if !serves {
+                return Err(StageFailure {
+                    stage: 0,
+                    point: "no distance under its rule holds the group's rounds at the target",
+                });
+            }
+            return Ok(SingleFirstStage {
+                k,
+                h,
+                positions: t,
+                main_tail: stage_tail(t, circle),
+                mask_tail: stage_tail(t, circle),
+            });
+        }
+        t = next;
+    }
+    Err(StageFailure {
+        stage: 0,
+        point: "positions and random coordinates do not settle",
+    })
+}
+
 /// Solves the first stage of both groups when they share one mask code, as
 /// the current executor's layout requires. The mask code's random tail is one
 /// number: it must hide both groups' stage-0 lists, so the coupled solve uses
@@ -3648,5 +3718,159 @@ mod assembly_tests {
         let error = assemble_proximity(&input).unwrap_err();
         assert!(error.contains("no candidate found within the searched domain"));
         assert!(error.contains("the own group's member rows do not form a group"));
+    }
+}
+
+
+
+/// One group's derived chain: the first-stage codes with their tails and the
+/// solved stage list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DerivedSingleGroup {
+    pub first_main: CodeParams,
+    pub first_mask: CodeParams,
+    pub stages: Vec<SolvedStage>,
+}
+
+/// Derives one group's stage chain from the message it carries. The first
+/// stage is solved on the group's own draws by [`solve_single_first_stage`];
+/// the later stages are the production candidate's own chain, solved by
+/// [`solve_chain_stages`] exactly as the joint assembly does. The candidate
+/// whose first codes hold the message and whose chain validates is the plan;
+/// when none passes, the error names the last failing point.
+pub fn derive_single_group_stages(
+    bit_entries: u64,
+    mask_rows: u64,
+    rows: u64,
+    samples: u32,
+    circle: bool,
+) -> std::result::Result<DerivedSingleGroup, StageFailure> {
+    let mut last = StageFailure {
+        stage: 0,
+        point: "the candidate list is empty",
+    };
+    for candidate in production_candidates() {
+        let ell = 1u64 << candidate.first_log_ell;
+        let mask_ell = 1u64 << candidate.first_mask_log_ell;
+        let main_rows = match rows_for_columns(bit_entries, ell, 1) {
+            Ok(rows) => rows,
+            Err(_) => continue,
+        };
+        if main_rows == 0 || !main_rows.is_power_of_two() {
+            continue;
+        }
+        let main = CodeParams {
+            log_n: candidate.first_log_n,
+            ell,
+            r: 0,
+        };
+        let mask = CodeParams {
+            log_n: candidate.first_mask_log_n,
+            ell: mask_ell,
+            r: 0,
+        };
+        let first = match solve_single_first_stage(main, mask, main_rows, mask_rows, rows, circle)
+        {
+            Ok(first) => first,
+            Err(failure) => {
+                last = failure;
+                continue;
+            }
+        };
+        let start = ChainStart {
+            main_ell: ell,
+            mask_ell,
+            k: first.k,
+            h: first.h,
+            positions: first.positions,
+            main_r: first.main_tail,
+            mask_r: first.mask_tail,
+        };
+        for later in [&candidate.own_choices, &candidate.shared_choices] {
+            let mut choices = Vec::with_capacity(later.len() + 1);
+            choices.push(StageChoice {
+                log_n: candidate.first_log_n,
+                mask_log_n: candidate.first_mask_log_n,
+                k: 0,
+                h: 0,
+            });
+            choices.extend(later.iter().copied());
+            match solve_chain_stages(start, samples, circle, &choices) {
+                Ok(stages) => {
+                    if let Err(failure) = validate_solved_chain(&stages, samples) {
+                        last = failure;
+                        continue;
+                    }
+                    return Ok(DerivedSingleGroup {
+                        first_main: CodeParams {
+                            log_n: candidate.first_log_n,
+                            ell,
+                            r: first.main_tail,
+                        },
+                        first_mask: CodeParams {
+                            log_n: candidate.first_mask_log_n,
+                            ell: mask_ell,
+                            r: first.mask_tail,
+                        },
+                        stages,
+                    });
+                }
+                Err(failure) => last = failure,
+            }
+        }
+    }
+    Err(last)
+}
+
+#[cfg(test)]
+mod single_group_stage_tests {
+    use super::*;
+    use zkie_engine::pcs::request::code::build_code_plan;
+
+    #[test]
+    fn the_single_group_first_stage_settles() {
+        let main = build_code_plan(17, 65_536, 8_192).unwrap();
+        let mask = build_code_plan(17, 512, 256).unwrap();
+        let stage = solve_single_first_stage(main, mask, 16_384, 4, 5, false).unwrap();
+        assert_eq!(stage.k, 14);
+        assert_eq!(stage.h, 2);
+        assert!(stage.positions > 0);
+        assert_eq!(stage.main_tail, stage.positions);
+        assert_eq!(stage.mask_tail, stage.positions);
+    }
+
+
+    #[test]
+    fn the_frozen_message_derives_a_group_chain() {
+        // The frozen geometry's bit message: 2^23 entries, one mask row, and
+        // the four rows the lookup registers on its own group.
+        match derive_single_group_stages(1 << 23, 1, 4, 1, false) {
+            Ok(group) => {
+                assert!(!group.stages.is_empty());
+                assert_eq!(group.stages[0].main_ell, group.first_main.ell);
+                assert_eq!(group.stages[0].mask_ell, group.first_mask.ell);
+                assert!(group.first_main.r > 0);
+                assert!(group.first_mask.r > 0);
+            }
+            Err(failure) => panic!(
+                "the frozen message must derive a chain: stage {}: {}",
+                failure.stage, failure.point
+            ),
+        }
+    }
+
+    #[test]
+    fn a_group_without_rows_is_refused() {
+        let main = build_code_plan(17, 65_536, 8_192).unwrap();
+        let mask = build_code_plan(17, 512, 256).unwrap();
+        assert!(solve_single_first_stage(main, mask, 16_384, 4, 0, false).is_err());
+        assert!(solve_single_first_stage(main, mask, 0, 4, 5, false).is_err());
+    }
+
+    #[test]
+    fn a_code_that_cannot_hold_the_group_is_refused() {
+        let main = build_code_plan(4, 8, 1).unwrap();
+        let mask = build_code_plan(4, 8, 1).unwrap();
+        assert!(solve_single_first_stage(main, mask, 16_384, 4, 5, false).is_err());
     }
 }
