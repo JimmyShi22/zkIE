@@ -10602,7 +10602,7 @@ impl KeyFirstPlan {
 // The key chain's first part
 // ---------------------------------------------------------------------------
 
-pub(crate) const KEY_FIRST_CHAIN_LABEL: u64 = 0x4B45_5946_4952_5354;
+pub(crate) const KEY_FIRST_CHAIN_LABEL: u64 = 0x4B46_0001;
 const KEY_W_ROOT_TAG: u64 = 81;
 const KEY_EVAL_TARGET_TAG: u64 = 82;
 
@@ -10616,6 +10616,8 @@ pub(crate) struct KeyFirstMessages {
     pub w_root: Digest,
     pub psi: Vec<Fp3>,
     pub eval_target: Fp3,
+    /// The first chain's seal, recomputed by the verifier and compared.
+    pub seal: Digest,
 }
 
 /// What the prover keeps of the key first part.
@@ -10653,13 +10655,13 @@ fn key_mask_units(
 ) -> Result<Vec<(u64, u64, Fp3)>> {
     let mut units = Vec::with_capacity(member.masks.len());
     for term in &member.masks {
-        if term.oracle != plan.index.oracle {
+        if term.oracle != plan.commit.mask_oracle {
             return Err(Error::StatementMismatch);
         }
         let slot = usize::try_from(term.slot).map_err(|_| Error::ResourceLimit)?;
         units.push((
-            plan.index.oracle,
-            plan.index.entry_virtual_index(slot)?,
+            plan.commit.mask_oracle,
+            lookup_mask_virtual_index(&plan.commit, slot)?,
             term.coeff,
         ));
     }
@@ -10668,18 +10670,15 @@ fn key_mask_units(
 
 fn key_eval_target(
     plan: &KeyFirstPlan,
-    index: &IndexMaskWitness,
+    messages: &crate::proof::lookup_messages::LookupMessages,
     member: &crate::proof::hidden_member::PendingRow,
     w_values: &[Fp3],
     psi: &[Fp3],
 ) -> Result<Fp3> {
     let mut target = eval_fp3_vector(w_values, psi)?;
-    let ell = usize::try_from(plan.index.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
     for term in &member.masks {
         let slot = usize::try_from(term.slot).map_err(|_| Error::ResourceLimit)?;
-        let offset = plan.index.entry_offset(slot)?;
-        let row = index.rows.get(offset / ell).ok_or(Error::ShapeMismatch)?;
-        let value = *row.get(offset % ell).ok_or(Error::ShapeMismatch)?;
+        let value = messages.mask_entry(&plan.commit, slot)?;
         target = target.add(&term.coeff.mul(&value));
     }
     Ok(target)
@@ -10725,7 +10724,7 @@ pub(crate) fn key_first_prove(
         &mut chain,
     )?;
     let member =
-        crate::proof::table_range::range_pending_row_with(&plan.range, &lookup.claims.key, plan.index.oracle)?;
+        crate::proof::table_range::range_pending_row_with(&plan.range, &lookup.claims.key, plan.commit.mask_oracle)?;
     let g = pending_row_weights(&member, plan.matrix_rows)?;
     let w_values = derive_w_values(
         &plan.table_shape,
@@ -10748,13 +10747,10 @@ pub(crate) fn key_first_prove(
     )?;
     let w_root = *w.roots.first().ok_or(Error::ShapeMismatch)?;
     absorb_digest_round(&mut chain, KEY_W_ROOT_TAG, &[w_root], &[plan.w_oracle])?;
-    let psi = draw_point_round(
-        &mut chain,
-        KIND_ALGEBRAIC,
-        &[plan.columns],
-        plan.columns.trailing_zeros(),
-    )?;
-    let eval_target = key_eval_target(plan, &index, &member, &w_values, &psi)?;
+    // The Eval row is evaluated at the claim's own column point: the pending
+    // claim and the row are two forms of the same statement.
+    let psi = member.psi.clone();
+    let eval_target = key_eval_target(plan, &lookup.commit_messages, &member, &w_values, &psi)?;
     absorb_key_fp3(&mut chain, KEY_EVAL_TARGET_TAG, eval_target)?;
     let eval_row = request_eval_row(
         TableLayout::of(&plan.w),
@@ -10773,6 +10769,7 @@ pub(crate) fn key_first_prove(
             w_root,
             psi,
             eval_target,
+            seal,
         },
         seal,
         KeyFirstWitness {
@@ -10815,17 +10812,21 @@ pub(crate) fn key_first_verify(
     )?;
     let _ = claims;
     absorb_digest_round(&mut chain, KEY_W_ROOT_TAG, &[messages.w_root], &[plan.w_oracle])?;
-    let psi = draw_point_round(
-        &mut chain,
-        KIND_ALGEBRAIC,
-        &[plan.columns],
-        plan.columns.trailing_zeros(),
-    )?;
-    if psi != messages.psi {
+    // The Eval target is the verified lookup's pending claim target and the
+    // row's point is that claim's column point: the member is rebuilt from the
+    // lookup key claim the verifier checked.
+    let member =
+        crate::proof::table_range::range_pending_row_with(&plan.range, &claims.key, plan.commit.mask_oracle)?;
+    if member.psi != messages.psi {
         return Err(Error::InvalidProof);
     }
+    let _ = member.target;
     absorb_key_fp3(&mut chain, KEY_EVAL_TARGET_TAG, messages.eval_target)?;
-    Ok(*chain.value())
+    let seal = *chain.value();
+    if seal != messages.seal {
+        return Err(Error::InvalidProof);
+    }
+    Ok(seal)
 }
 
 // ---------------------------------------------------------------------------
@@ -36497,5 +36498,189 @@ mod key_first_plan_tests {
         let mut other = sample_plan();
         other.commit.bits_oracle = 77;
         assert_ne!(base.statement_digest(), other.statement_digest());
+    }
+}
+
+
+#[cfg(test)]
+mod key_first_flow_tests {
+    use super::*;
+    use crate::proof::table_range::{
+        derive_entry_range, derive_range_lookup_message, range_bit_values, range_key_values,
+        range_multiplicities, range_pending_row_with, EntryRange, EntryRangeLimits,
+        IntegerRangeTable,
+    };
+
+    fn flow_plan() -> (KeyFirstPlan, Vec<Fp3>, Vec<Fp3>) {
+        let code = zkie_engine::pcs::request::code::build_code_plan(4, 8, 1).unwrap();
+        let bits_code = zkie_engine::pcs::request::code::build_code_plan(15, 2048, 128).unwrap();
+        let mask_code = zkie_engine::pcs::request::code::build_code_plan(15, 256, 66).unwrap();
+        let range = EntryRange::new(-8, 7).unwrap();
+        let range_plan = derive_entry_range(
+            4,
+            2,
+            range,
+            EntryRangeLimits {
+                max_table_log: 8,
+                max_bit_entries: 1 << 16,
+            },
+        )
+        .unwrap();
+        let message = derive_range_lookup_message(
+            &range_plan,
+            bits_code,
+            mask_code,
+            40,
+            100,
+            1,
+            Digest([0x41; 32]),
+            Digest([0x51; 32]),
+        )
+        .unwrap();
+        let values: Vec<i64> = vec![-8, -7, -6, -5, -4, -3, -2, -1, 0, 1, 2, 3, 4, 5, 6, 7];
+        let entries: Vec<Fp3> = values
+            .iter()
+            .map(|value| Fp3::from_base(crate::proof::column_session::fp_from_signed_word(*value as u64)))
+            .collect();
+        let keys = range_key_values(&range_plan, &entries).unwrap();
+        let counts = range_multiplicities(&range_plan, &keys).unwrap();
+        let bits = range_bit_values(&range_plan, &counts).unwrap();
+        let mask_tree = RuntimeTreePlan {
+            tree_number: 101,
+            leaf_class: 3,
+            log_n: mask_code.log_n,
+            log_n_zk: mask_code.log_n,
+            parts: vec![RuntimeTreePart {
+                main_symbols: 0,
+                mask_symbols: message.mask_rows * E_DEGREE as u64,
+            }],
+            salt_bytes: 40,
+            run: Digest([0x42; 32]),
+            configuration: Digest([0x52; 32]),
+        };
+        let index_code = mask_code;
+        let plan = KeyFirstPlan {
+            table_identity: Digest([9; 32]),
+            table_configuration: Digest([8; 32]),
+            table_shape: zkie_engine::pcs::request::table::IndexShape {
+                code,
+                v: 2,
+                answers: 1,
+                salt_bytes: 40,
+                distances: zkie_engine::pcs::request::table::TableDistances {
+                    radius: 0,
+                    later_radius: 0,
+                    m_once: 1,
+                    m_later: 0,
+                },
+            },
+            matrix_rows: 4,
+            k_lo: 0,
+            columns: 4,
+            range: crate::proof::table_range::table_key_range_config(&range_plan),
+            lookup: message.lookup.clone(),
+            commit: crate::proof::lookup_messages::LookupCommitPlan {
+                bits_shape: message.bits_shape,
+                bits_oracle: 1,
+                group: 7,
+                bits_openings: 1,
+                mask_oracle: 2,
+                mask_code,
+                mask_rows: message.mask_rows,
+                mask_openings: 1,
+                mask_tree,
+            },
+            index: IndexMaskPlan {
+                oracle: 60,
+                group: 7,
+                mask_code: index_code,
+                mask_rows: 1,
+                answers: 1,
+                openings: 1,
+                tree: RuntimeTreePlan {
+                    tree_number: 202,
+                    leaf_class: 10,
+                    log_n: index_code.log_n,
+                    log_n_zk: index_code.log_n,
+                    parts: vec![RuntimeTreePart {
+                        main_symbols: 0,
+                        mask_symbols: 3,
+                    }],
+                    salt_bytes: 40,
+                    run: Digest([0x66; 32]),
+                    configuration: Digest([0x51; 32]),
+                },
+                entries: MaskEntryAllocation::for_variables(2, 1).unwrap(),
+            },
+            w: WShape::new(
+                4,
+                code,
+                1,
+                1,
+                40,
+                90,
+                3,
+                Digest([0x43; 32]),
+                Digest([0x53; 32]),
+            )
+            .unwrap(),
+            w_oracle: 5,
+            group: 7,
+            bits_bat: 10,
+            mask_bat: 11,
+        };
+        (plan, keys, bits)
+    }
+
+    #[test]
+    fn the_key_first_part_proves_and_verifies() {
+        let (plan, keys, bits) = flow_plan();
+        let mut message_rows = vec![vec![Fp::ZERO; 8]; 4];
+        for row in 0..4 {
+            for column in 0..4 {
+                message_rows[row][column] =
+                    crate::proof::column_session::fp_from_signed_word((row as i64 * 4 + column as i64 - 8) as u64);
+            }
+        }
+        let tails = vec![vec![Fp::ZERO; 1]; 4];
+        let mut source =
+            zkie_engine::pcs::request::table::VecTableSource::new(message_rows, tails).unwrap();
+        let reader = IndexReader {
+            shape: plan.table_shape,
+            configuration: plan.table_configuration,
+            root: Digest([3; 32]),
+            record: zkie_engine::pcs::request::table::IndexRecord { y: Vec::new() },
+        };
+        let range_plan = derive_entry_range(
+            4,
+            2,
+            EntryRange::new(-8, 7).unwrap(),
+            EntryRangeLimits {
+                max_table_log: 8,
+                max_bit_entries: 1 << 16,
+            },
+        )
+        .unwrap();
+        let table = IntegerRangeTable::new(&range_plan, 1 << 8).unwrap();
+        let mut coins = ByteMaskCoins::new(Digest([5; 32])).unwrap();
+        let index_randomness =
+            IndexMaskRandomness::from_coins(&mut coins, &plan.index).unwrap();
+        let seed = Digest([7; 32]);
+        let (messages, seal, _witness) = key_first_prove(
+            &plan,
+            &reader,
+            &mut source,
+            &table,
+            &keys,
+            &bits,
+            &index_randomness,
+            seed,
+        )
+        .unwrap();
+        let verified = key_first_verify(&plan, &reader, &table, &messages).unwrap();
+        assert_eq!(verified, seal);
+        let mut changed = messages;
+        changed.w_root = Digest([0x77; 32]);
+        assert!(key_first_verify(&plan, &reader, &table, &changed).is_err());
     }
 }
