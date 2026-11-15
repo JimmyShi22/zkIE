@@ -1,0 +1,6 @@
+docs/benchmarks/20261115-1727-public-tables-062c1520-61c8d2ab/before/gpt2-seq16/proof/proof.bin: tokens=16 assets=199
+docs/benchmarks/20261115-1727-public-tables-062c1520-61c8d2ab/after/gpt2-seq16/proof/proof.bin: tokens=16 assets=196
+docs/benchmarks/20261115-1727-public-tables-062c1520-61c8d2ab/before/gemma3-seq16/proof/proof.bin: tokens=16 assets=245
+docs/benchmarks/20261115-1727-public-tables-062c1520-61c8d2ab/after/gemma3-seq16/proof/proof.bin: tokens=16 assets=242
+docs/benchmarks/20261115-1727-public-tables-062c1520-61c8d2ab/before/timesfm-16patch/proof/proof.bin: tokens=512 assets=241
+docs/benchmarks/20261115-1727-public-tables-062c1520-61c8d2ab/after/timesfm-16patch/proof/proof.bin: tokens=512 assets=238

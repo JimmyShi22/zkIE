@@ -1,0 +1,20 @@
+gpt2-seq16 before prove PASS 14655 4488956 2190159493
+gpt2-seq16 before verify PASS 17607 4102616 None
+gpt2-seq16 before proof.bin 2190155518
+gpt2-seq16 after prove PASS 14246 4088916 1980405259
+gpt2-seq16 after verify PASS 12084 3895816 None
+gpt2-seq16 after proof.bin 1980401278
+gemma3-seq16 before prove PASS 35334 12718900 6223297337
+gemma3-seq16 before verify PASS 30132 10949088 None
+gemma3-seq16 before proof.bin 6223293366
+gemma3-seq16 after commit-run PASS 9558 1085692 None
+gemma3-seq16 after prove PASS 34982 12379076 6013559226
+gemma3-seq16 after verify PASS 26891 10711320 None
+gemma3-seq16 after proof.bin 6013555254
+timesfm-16patch before prove PASS 23724 8207512 3824905648
+timesfm-16patch before verify PASS 22200 4209436 None
+timesfm-16patch before proof.bin 3824637660
+timesfm-16patch after commit-run PASS 5539 175604 None
+timesfm-16patch after prove PASS 23686 8044568 3740935379
+timesfm-16patch after verify PASS 21266 4112944 None
+timesfm-16patch after proof.bin 3740667388

@@ -1,0 +1,8 @@
+c6a3e6fae423e86bc2598392e4055c938381616c738414fa8bad859da4004f55  /data/zkie-assets/models/gpt2/weights/exp_table_i32.bin
+7cba6a7c88053b99112c1271a2d593e1147a4b3b4a92fe1091c148e2e33573ed  /data/zkie-assets/models/gpt2/weights/rsqrt_table_i32.bin
+42cd0f218e5635bb2c1e94076f8f5da3d92456ce30960b1463774dca2dad3e5d  /data/zkie-assets/models/gpt2/weights/gelu_table_i32.bin
+107fba3ab21394f02ff1869ca8aaeda98f70f092a96e61bcf646cb53af19d6c7  /data/zkie-assets/models/timesfm/weights/silu_table_i32.bin
+8388608 /data/zkie-assets/models/gpt2/weights/exp_table_i32.bin
+29360128 /data/zkie-assets/models/gpt2/weights/rsqrt_table_i32.bin
+67108864 /data/zkie-assets/models/gpt2/weights/gelu_table_i32.bin
+4194304 /data/zkie-assets/models/timesfm/weights/silu_table_i32.bin
