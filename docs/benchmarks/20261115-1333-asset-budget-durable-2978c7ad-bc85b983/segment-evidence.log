@@ -1,0 +1,299 @@
+warning: unused variable: `number`
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1513:9
+     |
+1513 |         number: u32,
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_number`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:881:5
+    |
+881 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: field `target` is never read
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1118:5
+     |
+1112 | struct FoldOutputMeta {
+     |        -------------- field in this struct
+...
+1118 |     target: Fp3,
+     |     ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-engine` (lib) generated 4 warnings (run `cargo fix --lib -p zkie-engine` to apply 3 suggestions)
+   Compiling zkie-ops v0.1.0 (/data/zkIE/crates/zkie-ops)
+warning: unused import: `MODULUS`
+   --> crates/zkie-ops/src/proof/bat_fold_session.rs:147:59
+    |
+147 | use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE, MODULUS};
+    |                                                           ^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `verify_last_base_proof_with_positions`
+  --> crates/zkie-ops/src/proof/multi_stage_iopp.rs:46:29
+   |
+46 |     encode_last_base_proof, verify_last_base_proof_with_positions, verify_last_base_proof_with_positions_and_chain, LastBaseProver,
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:603:13
+    |
+603 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reader`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:3051:5
+     |
+3051 |     reader: &IndexReader,
+     |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_reader`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `combinations`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:6663:17
+     |
+6663 |             let combinations = range_plan.combinations as usize;
+     |                 ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_combinations`
+
+warning: unused variable: `first`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:19767:5
+      |
+19767 |     first: &HiddenSendMessages,
+      |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_first`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:20573:9
+      |
+20573 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:20673:9
+      |
+20673 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: unused variable: `n`
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:218:9
+    |
+218 |     let n = word_n(word)?;
+    |         ^ help: if this is intentional, prefix it with an underscore: `_n`
+
+warning: value assigned to `serves_folded` is never read
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:1895:29
+     |
+1895 |     let mut serves_folded = false;
+     |                             ^^^^^ this value is reassigned later and never used
+...
+1934 |         serves_folded = folded_step.1;
+     |         ----------------------------- `serves_folded` is overwritten here before the previous value is read
+     |
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `serves_omega` is never read
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:1896:28
+     |
+1896 |     let mut serves_omega = false;
+     |                            ^^^^^ this value is reassigned later and never used
+...
+1935 |         serves_omega = omega_step.map_or(false, |step| step.1);
+     |         ------------------------------------------------------ `serves_omega` is overwritten here before the previous value is read
+
+warning: value assigned to `serves_own` is never read
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:1897:26
+     |
+1897 |     let mut serves_own = false;
+     |                          ^^^^^ this value is reassigned later and never used
+...
+1936 |         serves_own = own_step.1;
+     |         ----------------------- `serves_own` is overwritten here before the previous value is read
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:201:5
+    |
+195 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+201 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `stack_hiding` is never read
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:7383:5
+     |
+7381 | struct SegmentSlotLayout {
+     |        ----------------- field in this struct
+7382 |     token_hiding: usize,
+7383 |     stack_hiding: usize,
+     |     ^^^^^^^^^^^^
+
+warning: field `m` is never read
+  --> crates/zkie-ops/src/proof/proximity_planner.rs:57:5
+   |
+52 | struct Proximity {
+   |        --------- field in this struct
+...
+57 |     m: u64,
+   |     ^
+   |
+   = note: `Proximity` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `batched_rows` is never used
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:2389:4
+     |
+2389 | fn batched_rows(word: &Word) -> u64 {
+     |    ^^^^^^^^^^^^
+
+   Compiling zkie-models-common v0.1.0 (/data/zkIE/models/common)
+   Compiling zkie-models-gemma3 v0.1.0 (/data/zkIE/models/gemma3)
+   Compiling zkie-models-timesfm v0.1.0 (/data/zkIE/models/timesfm)
+   Compiling zkie-models-gpt2 v0.1.0 (/data/zkIE/models/gpt2)
+warning: unused import: `zkie_engine::pcs::request::field::E_DEGREE`
+  --> models/gpt2/src/lm_head_plan.rs:11:5
+   |
+11 | use zkie_engine::pcs::request::field::E_DEGREE;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `m`
+   --> models/gemma3/src/executor.rs:277:5
+    |
+277 |     m: usize,
+    |     ^ help: if this is intentional, prefix it with an underscore: `_m`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:347:21
+    |
+347 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_rot_step`
+   --> models/gemma3/src/executor.rs:390:21
+    |
+390 |         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
+    |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_rot_step`
+
+   Compiling zkie v0.1.0 (/data/zkIE/zkie)
+warning: unused import: `digest_to_hex`
+  --> zkie/src/policy.rs:12:58
+   |
+12 | use zkie_core::artifact::{digest_bytes, digest_from_hex, digest_to_hex};
+   |                                                          ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `VecTableSource` and `commit_table_streaming`
+  --> zkie/src/lm_head_key.rs:58:5
+   |
+58 |     commit_table_streaming, verify_columns, ColumnOpening, IndexReader, IndexShape, SampleSeed,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+59 |     EncodedRowStore, StreamingHolder, TableRowSource, VecTableSource,
+   |                                                       ^^^^^^^^^^^^^^
+
+warning: unused import: `zkie_core::common::field::PrimeCharacteristicRing`
+  --> zkie/src/lm_head_key.rs:15:5
+   |
+15 | use zkie_core::common::field::PrimeCharacteristicRing;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> zkie/src/bounded_trace.rs:705:9
+    |
+705 |     let mut file = fs::File::open(path).map_err(|_| Error::IncompleteArtifact)?;
+    |         ----^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-models-gpt2` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gpt2` to apply 2 suggestions)
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+warning: unused variable: `mask_oracle`
+    --> zkie/src/lm_head_key.rs:3415:9
+     |
+3415 |     let mask_oracle = MaskOracle {
+     |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_oracle`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> zkie/src/lm_head_key.rs:4281:9
+     |
+4281 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ----^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: unused variable: `mask_tail`
+    --> zkie/src/lm_head_key.rs:4281:9
+     |
+4281 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_tail`
+
+warning: variable does not need to be mutable
+   --> zkie/src/lm_head_stage.rs:288:9
+    |
+288 |     let mut options = if private {
+    |         ----^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: field `tree` is never read
+    --> zkie/src/lm_head_key.rs:1534:5
+     |
+1530 | pub struct LmHeadOmegaProvider {
+     |            ------------------- field in this struct
+...
+1534 |     tree: RuntimeTreePlan,
+     |     ^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie` (lib) generated 9 warnings (run `cargo fix --lib -p zkie` to apply 7 suggestions)
+warning: `zkie-ops` (lib) generated 16 warnings (run `cargo fix --lib -p zkie-ops` to apply 9 suggestions)
+warning: unused variable: `code`
+   --> zkie/tests/projection_consumer_diagnostic.rs:896:20
+    |
+896 | fn chain_mask_plan(code: CodeParams, mask_code: CodeParams) -> zkie_ops::proof::request_chain::ChainMaskPlan {
+    |                    ^^^^ help: if this is intentional, prefix it with an underscore: `_code`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `consumers`
+    --> zkie/tests/projection_consumer_diagnostic.rs:1259:27
+     |
+1259 |     let (activation_step, consumers) = projection_consumers(&plan);
+     |                           ^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_consumers`
+
+warning: `zkie` (test "projection_consumer_diagnostic") generated 2 warnings (run `cargo fix --test "projection_consumer_diagnostic" -p zkie` to apply 2 suggestions)
+    Finished `release` profile [optimized] target(s) in 16.54s
+     Running tests/projection_consumer_diagnostic.rs (target/release/deps/projection_consumer_diagnostic-5f7a79dc8ceb2a18)
+
+running 1 test
+test real_projection_consumer_closes_in_hidden_input_mode has been running for over 60 seconds
+SEGMENT EVIDENCE (local segment, not R5): limbs=3 discovery=26.694718437s segment_bytes=2031224 segment_prove=26.267332462s segment_verify=11.152409406s negatives=9/9 VmHWM:	 8946020 kB
+test real_projection_consumer_closes_in_hidden_input_mode ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 108.35s
+
+EXIT=0
