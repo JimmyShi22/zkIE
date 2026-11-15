@@ -197,7 +197,7 @@
 //! tilde masks are independent draws from the same stage-1 stream; the one
 //! difference row is their only consistency use and does not force equality.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rayon::prelude::*;
 use zkie_core::common::codec::DecodeLimits;
@@ -234,7 +234,7 @@ use zkie_engine::pcs::request::params::{
 };
 use zkie_engine::pcs::request::pow::{search_nonce_for_plan, verify_nonce};
 use zkie_engine::pcs::request::proximity::SingleRows;
-use zkie_engine::pcs::request::read::unique_sorted;
+use zkie_engine::pcs::request::read::{unique_sorted, HidingState, ReadLedger, VerifierReads};
 use zkie_engine::pcs::request::relation::{
     column_row, foldeq_weights, gu_sample_pad_offsets, gu_table, oracle_sample_row, record_row,
     sample_cube_of, sample_row, GuRelationKind, GuRelationRow, GuWitness,
@@ -12614,6 +12614,27 @@ fn table_column_map(
     Ok(map)
 }
 
+/// The verified columns of one shared read, one entry per unique position.
+fn column_map_from_reads(
+    unique: &[u64],
+    columns: &[Vec<Fp>],
+) -> Result<Vec<(u64, Vec<Fp3>)>> {
+    if unique.len() != columns.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut map = Vec::with_capacity(unique.len());
+    for (position, column) in unique.iter().zip(columns) {
+        map.push((
+            *position,
+            column
+                .iter()
+                .map(|value| Fp3::from_base(*value))
+                .collect(),
+        ));
+    }
+    Ok(map)
+}
+
 fn column_for(map: &[(u64, Vec<Fp3>)], position: u64) -> Result<Vec<Fp3>> {
     map.iter()
         .find(|(at, _)| *at == position)
@@ -12952,6 +12973,12 @@ fn prove_shared(
     {
         return Err(Error::ShapeMismatch);
     }
+    // The provider hides the columns it exposes: the batch's columns are
+    // charged against the table's random tail before any opening, a repeated
+    // position is free, and the reservation is never refunded.
+    let mut hiding = HidingState::new(reader.root, 1, reader.shape.code.r as u64);
+    let charge = hiding.begin_charge(reader.root, 1, unique.len())?;
+    let _fresh = charge.consume(&unique)?;
     let _profile_open_columns = zkie_engine::profile::Scope::new("shared.table_open_columns");
     let gu_openings = table.open_columns(&unique)?;
     drop(_profile_open_columns);
@@ -13381,9 +13408,14 @@ fn verify_shared(
         return Err(Error::ShapeMismatch);
     }
     let _profile_columns = zkie_engine::profile::Scope::new("verify.shared.columns");
-    let column_map = table_column_map(reader, &positions, &messages.column_openings)?;
+    // The reads are reserved and committed against one ledger before the
+    // columns are used; a repeated position must return the same column.
+    let mut reads = VerifierReads::new(Arc::new(Mutex::new(ReadLedger::new(
+        plan.proximity.column_budget as u64,
+    ))));
+    let columns = reads.read(reader, &unique, &messages.column_openings)?;
+    let column_map = column_map_from_reads(&unique, &columns)?;
     drop(_profile_columns);
-    let _ = unique;
     let mut registry = GuRegistry::new();
     registry.receive(
         &gu,
@@ -31219,6 +31251,20 @@ mod merged_tests {
             &messages,
             &witness,
         ));
+    }
+
+    /// The one-time fresh masks belong to one chain each: naming the same id
+    /// for the shared and the own test is refused before any challenge.
+    #[test]
+    fn the_one_time_masks_stay_in_their_chains() {
+        let activation = activation();
+        let (plan, _) = member_plan_for(&activation);
+        let mut changed = plan.clone();
+        changed.proximity.own_fresh = changed.proximity.shared_fresh;
+        assert!(changed.validate().is_err());
+        let mut changed = plan.clone();
+        changed.proximity.shared_fresh = changed.proximity.own_fresh;
+        assert!(changed.validate().is_err());
     }
 
     #[test]
