@@ -563,6 +563,7 @@ use zkie_engine::pcs::request::field::E_DEGREE;
 
 use crate::proof::hidden_send_session::WShape;
 use crate::proof::lookup::mask_count;
+use crate::proof::proximity_planner::smallest_mask_rows;
 
 /// The lookup message of one range plan: the multiplicity-bit message, its
 /// shape and the mask message's size. The caller fixes the codes and the
@@ -579,25 +580,6 @@ pub struct RangeLookupMessage {
     /// Rows of the mask message: the smallest power of two that holds the
     /// entries beside the SEND pad.
     pub mask_rows: u64,
-}
-
-/// The smallest power-of-two row count of a mask message whose free entries
-/// (`rows * ell - 1`) hold `entries`.
-pub fn smallest_mask_rows(entries: usize, ell: u64) -> Result<u64> {
-    if entries == 0 || ell == 0 {
-        return Err(Error::InvalidConfig);
-    }
-    let mut rows = 1u64;
-    loop {
-        let capacity = rows
-            .checked_mul(ell)
-            .and_then(|value| value.checked_sub(1))
-            .ok_or(Error::ResourceLimit)?;
-        if capacity >= entries as u64 {
-            return Ok(rows);
-        }
-        rows = rows.checked_mul(2).ok_or(Error::ResourceLimit)?;
-    }
 }
 
 /// Derives the range lookup's message from the plan and the codes. The bit

@@ -3738,69 +3738,91 @@ pub struct DerivedSingleGroup {
 /// [`solve_chain_stages`] exactly as the joint assembly does. The candidate
 /// whose first codes hold the message and whose chain validates is the plan;
 /// when none passes, the error names the last failing point.
-pub fn derive_single_group_stages(
+/// One group's derived plan: the chosen first-stage codes, the mask message's
+/// row count and the solved stage chain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DerivedSingleGroupPlan {
+    pub first_main: CodeParams,
+    pub first_mask: CodeParams,
+    pub mask_rows: u64,
+    pub stages: Vec<SolvedStage>,
+}
+
+/// The smallest power-of-two row count of a mask message whose free entries
+/// (`rows * ell - 1`) hold `entries`.
+pub fn smallest_mask_rows(entries: usize, ell: u64) -> Result<u64> {
+    if entries == 0 || ell == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let mut rows = 1u64;
+    loop {
+        let capacity = rows
+            .checked_mul(ell)
+            .and_then(|value| value.checked_sub(1))
+            .ok_or(Error::ResourceLimit)?;
+        if capacity >= entries as u64 {
+            return Ok(rows);
+        }
+        rows = rows.checked_mul(2).ok_or(Error::ResourceLimit)?;
+    }
+}
+
+fn derive_candidate_group(
+    candidate: &AssemblyCandidate,
     bit_entries: u64,
     mask_rows: u64,
     rows: u64,
     samples: u32,
     circle: bool,
 ) -> std::result::Result<DerivedSingleGroup, StageFailure> {
+    let ell = 1u64 << candidate.first_log_ell;
+    let mask_ell = 1u64 << candidate.first_mask_log_ell;
+    let main_rows = rows_for_columns(bit_entries, ell, 1).map_err(|_| StageFailure {
+        stage: 0,
+        point: "the bit message does not fit the candidate's main code",
+    })?;
+    if main_rows == 0 || !main_rows.is_power_of_two() {
+        return Err(StageFailure {
+            stage: 0,
+            point: "the bit message has no power-of-two row count",
+        });
+    }
+    let main = CodeParams {
+        log_n: candidate.first_log_n,
+        ell,
+        r: 0,
+    };
+    let mask = CodeParams {
+        log_n: candidate.first_mask_log_n,
+        ell: mask_ell,
+        r: 0,
+    };
+    let first = solve_single_first_stage(main, mask, main_rows, mask_rows, rows, circle)?;
+    let start = ChainStart {
+        main_ell: ell,
+        mask_ell,
+        k: first.k,
+        h: first.h,
+        positions: first.positions,
+        main_r: first.main_tail,
+        mask_r: first.mask_tail,
+    };
     let mut last = StageFailure {
         stage: 0,
-        point: "the candidate list is empty",
+        point: "no candidate chain holds the group",
     };
-    for candidate in production_candidates() {
-        let ell = 1u64 << candidate.first_log_ell;
-        let mask_ell = 1u64 << candidate.first_mask_log_ell;
-        let main_rows = match rows_for_columns(bit_entries, ell, 1) {
-            Ok(rows) => rows,
-            Err(_) => continue,
-        };
-        if main_rows == 0 || !main_rows.is_power_of_two() {
-            continue;
-        }
-        let main = CodeParams {
+    for later in [&candidate.own_choices, &candidate.shared_choices] {
+        let mut choices = Vec::with_capacity(later.len() + 1);
+        choices.push(StageChoice {
             log_n: candidate.first_log_n,
-            ell,
-            r: 0,
-        };
-        let mask = CodeParams {
-            log_n: candidate.first_mask_log_n,
-            ell: mask_ell,
-            r: 0,
-        };
-        let first = match solve_single_first_stage(main, mask, main_rows, mask_rows, rows, circle)
-        {
-            Ok(first) => first,
-            Err(failure) => {
-                last = failure;
-                continue;
-            }
-        };
-        let start = ChainStart {
-            main_ell: ell,
-            mask_ell,
-            k: first.k,
-            h: first.h,
-            positions: first.positions,
-            main_r: first.main_tail,
-            mask_r: first.mask_tail,
-        };
-        for later in [&candidate.own_choices, &candidate.shared_choices] {
-            let mut choices = Vec::with_capacity(later.len() + 1);
-            choices.push(StageChoice {
-                log_n: candidate.first_log_n,
-                mask_log_n: candidate.first_mask_log_n,
-                k: 0,
-                h: 0,
-            });
-            choices.extend(later.iter().copied());
-            match solve_chain_stages(start, samples, circle, &choices) {
-                Ok(stages) => {
-                    if let Err(failure) = validate_solved_chain(&stages, samples) {
-                        last = failure;
-                        continue;
-                    }
+            mask_log_n: candidate.first_mask_log_n,
+            k: 0,
+            h: 0,
+        });
+        choices.extend(later.iter().copied());
+        match solve_chain_stages(start, samples, circle, &choices) {
+            Ok(stages) => match validate_solved_chain(&stages, samples) {
+                Ok(()) => {
                     return Ok(DerivedSingleGroup {
                         first_main: CodeParams {
                             log_n: candidate.first_log_n,
@@ -3816,7 +3838,69 @@ pub fn derive_single_group_stages(
                     });
                 }
                 Err(failure) => last = failure,
+            },
+            Err(failure) => last = failure,
+        }
+    }
+    Err(last)
+}
+
+/// Derives one group's chain for a known mask row count.
+pub fn derive_single_group_stages(
+    bit_entries: u64,
+    mask_rows: u64,
+    rows: u64,
+    samples: u32,
+    circle: bool,
+) -> std::result::Result<DerivedSingleGroup, StageFailure> {
+    let mut last = StageFailure {
+        stage: 0,
+        point: "the candidate list is empty",
+    };
+    for candidate in production_candidates() {
+        match derive_candidate_group(&candidate, bit_entries, mask_rows, rows, samples, circle) {
+            Ok(group) => return Ok(group),
+            Err(failure) => last = failure,
+        }
+    }
+    Err(last)
+}
+
+/// Derives one group's plan with the mask message's row count taken from its
+/// entry count and the candidate's mask code.
+pub fn derive_single_group_plan(
+    bit_entries: u64,
+    mask_entries: usize,
+    rows: u64,
+    samples: u32,
+    circle: bool,
+) -> std::result::Result<DerivedSingleGroupPlan, StageFailure> {
+    let mut last = StageFailure {
+        stage: 0,
+        point: "the candidate list is empty",
+    };
+    for candidate in production_candidates() {
+        let mask_ell = 1u64 << candidate.first_mask_log_ell;
+        let mask_rows = match smallest_mask_rows(mask_entries, mask_ell) {
+            Ok(rows) => rows,
+            Err(_) => {
+                last = StageFailure {
+                    stage: 0,
+                    point: "the mask entries do not fit the candidate's mask code",
+                };
+                continue;
             }
+        };
+        match derive_candidate_group(&candidate, bit_entries, mask_rows, rows, samples, circle) {
+            Ok(group) => {
+                return Ok(DerivedSingleGroupPlan {
+                    first_main: group.first_main,
+                    first_mask: group.first_mask,
+                    mask_rows,
+                    stages: group.stages,
+                });
+            }
+            Err(failure) => last = failure,
         }
     }
     Err(last)
@@ -3858,6 +3942,34 @@ mod single_group_stage_tests {
                 failure.stage, failure.point
             ),
         }
+    }
+
+
+    #[test]
+    fn the_frozen_range_group_derives_its_plan() {
+        use crate::proof::table_range::{
+            derive_entry_range, range_lookup_plan, EntryRange, EntryRangeLimits,
+        };
+        let range = EntryRange::new(-131072, 131071).unwrap();
+        let plan = derive_entry_range(
+            1024,
+            10,
+            range,
+            EntryRangeLimits {
+                max_table_log: 19,
+                max_bit_entries: 1 << 24,
+            },
+        )
+        .unwrap();
+        let lookup = range_lookup_plan(&plan).unwrap();
+        let mask_entries = crate::proof::lookup::mask_count(&lookup).unwrap();
+        let group =
+            derive_single_group_plan(plan.bit_entries, mask_entries, 73, 1, false).unwrap();
+        assert_eq!(group.stages[0].main_ell, group.first_main.ell);
+        assert_eq!(group.stages[0].mask_ell, group.first_mask.ell);
+        assert!(group.first_main.r > 0);
+        assert!(group.mask_rows.is_power_of_two());
+        assert!(group.mask_rows * group.first_mask.ell - 1 >= mask_entries as u64);
     }
 
     #[test]
