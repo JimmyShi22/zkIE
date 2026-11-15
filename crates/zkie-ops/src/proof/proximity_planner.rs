@@ -3771,6 +3771,7 @@ fn derive_candidate_group(
     candidate: &AssemblyCandidate,
     bit_entries: u64,
     mask_rows: u64,
+    extra_mask_rows: u64,
     rows: u64,
     samples: u32,
     circle: bool,
@@ -3787,6 +3788,12 @@ fn derive_candidate_group(
             point: "the bit message has no power-of-two row count",
         });
     }
+    let total_mask_rows = mask_rows
+        .checked_add(extra_mask_rows)
+        .ok_or(StageFailure {
+            stage: 0,
+            point: "the group's mask blocks overflow",
+        })?;
     let main = CodeParams {
         log_n: candidate.first_log_n,
         ell,
@@ -3797,7 +3804,7 @@ fn derive_candidate_group(
         ell: mask_ell,
         r: 0,
     };
-    let first = solve_single_first_stage(main, mask, main_rows, mask_rows, rows, circle)?;
+    let first = solve_single_first_stage(main, mask, main_rows, total_mask_rows, rows, circle)?;
     let start = ChainStart {
         main_ell: ell,
         mask_ell,
@@ -3858,7 +3865,7 @@ pub fn derive_single_group_stages(
         point: "the candidate list is empty",
     };
     for candidate in production_candidates() {
-        match derive_candidate_group(&candidate, bit_entries, mask_rows, rows, samples, circle) {
+        match derive_candidate_group(&candidate, bit_entries, mask_rows, 0, rows, samples, circle) {
             Ok(group) => return Ok(group),
             Err(failure) => last = failure,
         }
@@ -3871,6 +3878,39 @@ pub fn derive_single_group_stages(
 pub fn derive_single_group_plan(
     bit_entries: u64,
     mask_entries: usize,
+    rows: u64,
+    samples: u32,
+    circle: bool,
+) -> std::result::Result<DerivedSingleGroupPlan, StageFailure> {
+    derive_plan_with_extra_mask_rows(bit_entries, mask_entries, 0, rows, samples, circle)
+}
+
+/// Derives one group's plan when the group carries another mask-only member
+/// whose aligned row block is `extra_mask_rows`. The returned `mask_rows` is
+/// the lookup mask message's own row count; the extra block only enters the
+/// fold bits.
+pub fn derive_single_group_plan_with_extra_mask_rows(
+    bit_entries: u64,
+    mask_entries: usize,
+    extra_mask_rows: u64,
+    rows: u64,
+    samples: u32,
+    circle: bool,
+) -> std::result::Result<DerivedSingleGroupPlan, StageFailure> {
+    derive_plan_with_extra_mask_rows(
+        bit_entries,
+        mask_entries,
+        extra_mask_rows,
+        rows,
+        samples,
+        circle,
+    )
+}
+
+fn derive_plan_with_extra_mask_rows(
+    bit_entries: u64,
+    mask_entries: usize,
+    extra_mask_rows: u64,
     rows: u64,
     samples: u32,
     circle: bool,
@@ -3891,7 +3931,15 @@ pub fn derive_single_group_plan(
                 continue;
             }
         };
-        match derive_candidate_group(&candidate, bit_entries, mask_rows, rows, samples, circle) {
+        match derive_candidate_group(
+            &candidate,
+            bit_entries,
+            mask_rows,
+            extra_mask_rows,
+            rows,
+            samples,
+            circle,
+        ) {
             Ok(group) => {
                 return Ok(DerivedSingleGroupPlan {
                     first_main: group.first_main,

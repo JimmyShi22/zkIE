@@ -3177,23 +3177,33 @@ pub(crate) fn draw_w_message_randomness(
 /// Commits the at_start index-mask message: its mask rows, their encoding
 /// tails and salts, under its runtime tree. The witness checks itself against
 /// the plan.
-pub(crate) fn commit_index_mask(
+/// The committed tree of the index-mask message's encoded rows.
+pub(crate) fn index_mask_tree(
     index: &IndexMaskPlan,
-    randomness: &IndexMaskRandomness,
-) -> Result<IndexMaskWitness> {
-    let mut codewords = Vec::with_capacity(randomness.rows.len());
-    for (row, tail) in randomness.rows.iter().zip(&randomness.tails) {
+    rows: &[Vec<Fp3>],
+    tails: &[Vec<Fp3>],
+    salts: &[Vec<u8>],
+) -> Result<RuntimeTree> {
+    let mut codewords = Vec::with_capacity(rows.len());
+    for (row, tail) in rows.iter().zip(tails) {
         codewords.push(encode_row_fp3(&index.mask_code, row, tail)?);
     }
-    let tree = RuntimeTree::commit(
+    RuntimeTree::commit(
         index.tree.clone(),
         &[RuntimePartRows {
             main: Vec::new(),
             mask: codewords,
             main_deg: 1,
         }],
-        &randomness.salts,
-    )?;
+        salts,
+    )
+}
+
+pub(crate) fn commit_index_mask(
+    index: &IndexMaskPlan,
+    randomness: &IndexMaskRandomness,
+) -> Result<IndexMaskWitness> {
+    let tree = index_mask_tree(index, &randomness.rows, &randomness.tails, &randomness.salts)?;
     let witness = IndexMaskWitness {
         rows: randomness.rows.clone(),
         tails: randomness.tails.clone(),
@@ -7839,7 +7849,18 @@ fn index_mask_sample_row(
     if message.sample.answers.len() != 1 || message.sample.seed.len() < 1 {
         return Err(Error::ShapeMismatch);
     }
-    let seed = &message.sample.seed[0];
+    index_mask_sample_row_at(plan, &message.sample.seed[0], target)
+}
+
+/// The SEND sample row of the mask-only message from one recorded seed.
+fn index_mask_sample_row_at(
+    plan: &IndexMaskPlan,
+    seed: &zkie_engine::pcs::request::table::SampleSeed,
+    target: Fp3,
+) -> Result<GuRelationRow> {
+    if plan.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
     let bits = plan.sample_bits()?;
     if seed.z.len() < bits as usize || seed.beta == Fp3::ZERO {
         return Err(Error::ShapeMismatch);
@@ -10501,6 +10522,8 @@ pub(crate) struct KeyFirstPlan {
     pub group: u64,
     pub bits_bat: u64,
     pub mask_bat: u64,
+    /// The BAT id of the index-mask member of the key group.
+    pub index_bat: u64,
     /// The shape of the one-leaf binding tree over the first chain's seal.
     pub binding: crate::proof::lin_binding::LinBindingShape,
     /// The public parameters of the key group's derived chain.
@@ -10605,6 +10628,7 @@ impl KeyFirstPlan {
         w.put_u64(self.group);
         w.put_u64(self.bits_bat);
         w.put_u64(self.mask_bat);
+        w.put_u64(self.index_bat);
         w.put_bytes(&self.binding.encode());
         w.put_u64(self.group_config.fresh);
         w.put_u64(self.group_config.mask_tree_number);
@@ -10651,6 +10675,7 @@ pub(crate) struct KeyFirstMessages {
 /// What the prover keeps of the key first part.
 pub(crate) struct KeyFirstWitness {
     pub index: IndexMaskWitness,
+    pub index_sample: KeySample,
     pub lookup: KeyLookupProof,
     pub w: crate::proof::output_closure::CommittedValueGroup,
     pub member: crate::proof::hidden_member::PendingRow,
@@ -10669,6 +10694,19 @@ fn absorb_key_fp3(chain: &mut Chain, tag: u64, value: Fp3) -> Result<()> {
     Ok(())
 }
 
+/// The index mask's claim-mask class entries in slot order, and the class's
+/// first slot. The lookup's last key level allocates its claim masks here.
+fn index_claim_masks(index: &IndexMaskPlan, rows: &[Vec<Fp3>]) -> Result<(Vec<Fp3>, usize)> {
+    let range = index.entries.end_range()?;
+    let ell = usize::try_from(index.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+    let mut values = Vec::with_capacity(range.end);
+    for slot in 0..range.end {
+        let row = rows.get(slot / ell).ok_or(Error::ShapeMismatch)?;
+        values.push(*row.get(slot % ell).ok_or(Error::ShapeMismatch)?);
+    }
+    Ok((values, range.start))
+}
+
 fn key_lookup_key_plan(plan: &KeyFirstPlan) -> crate::proof::lookup::LookupKeyPlan {
     crate::proof::lookup::LookupKeyPlan {
         sources: Vec::new(),
@@ -10683,13 +10721,13 @@ fn key_mask_units(
 ) -> Result<Vec<(u64, u64, Fp3)>> {
     let mut units = Vec::with_capacity(member.masks.len());
     for term in &member.masks {
-        if term.oracle != plan.commit.mask_oracle {
+        if term.oracle != plan.index.oracle {
             return Err(Error::StatementMismatch);
         }
         let slot = usize::try_from(term.slot).map_err(|_| Error::ResourceLimit)?;
         units.push((
-            plan.commit.mask_oracle,
-            lookup_mask_virtual_index(&plan.commit, slot)?,
+            plan.index.oracle,
+            plan.index.entry_virtual_index(slot)?,
             term.coeff,
         ));
     }
@@ -10698,15 +10736,25 @@ fn key_mask_units(
 
 fn key_eval_target(
     plan: &KeyFirstPlan,
-    messages: &crate::proof::lookup_messages::LookupMessages,
+    index: &IndexMaskWitness,
     member: &crate::proof::hidden_member::PendingRow,
     w_values: &[Fp3],
     psi: &[Fp3],
 ) -> Result<Fp3> {
     let mut target = eval_fp3_vector(w_values, psi)?;
+    let class = plan.index.entries.end_range()?;
+    let ell = usize::try_from(plan.index.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
     for term in &member.masks {
+        if term.oracle != plan.index.oracle {
+            return Err(Error::StatementMismatch);
+        }
         let slot = usize::try_from(term.slot).map_err(|_| Error::ResourceLimit)?;
-        let value = messages.mask_entry(&plan.commit, slot)?;
+        if !class.contains(&slot) {
+            return Err(Error::StatementMismatch);
+        }
+        let offset = plan.index.entry_offset(slot)?;
+        let row = index.rows.get(offset / ell).ok_or(Error::ShapeMismatch)?;
+        let value = *row.get(offset % ell).ok_or(Error::ShapeMismatch)?;
         target = target.add(&term.coeff.mul(&value));
     }
     Ok(target)
@@ -10748,6 +10796,8 @@ pub(crate) fn key_first_prove(
     let lookup = table_key_lookup_prove(
         &plan.lookup,
         &plan.commit,
+        &plan.index,
+        &index.rows,
         &key_plan,
         lookup_key_values,
         &crate::proof::lookup::LookupWitness {
@@ -10758,7 +10808,7 @@ pub(crate) fn key_first_prove(
         &mut chain,
     )?;
     let member =
-        crate::proof::table_range::range_pending_row_with(&plan.range, &lookup.claims.key, plan.commit.mask_oracle)?;
+        crate::proof::table_range::range_pending_row_with(&plan.range, &lookup.claims.key, plan.index.oracle)?;
     let g = pending_row_weights(&member, plan.matrix_rows)?;
     let w_values = derive_w_values(
         &plan.table_shape,
@@ -10784,7 +10834,7 @@ pub(crate) fn key_first_prove(
     // The Eval row is evaluated at the claim's own column point: the pending
     // claim and the row are two forms of the same statement.
     let psi = member.psi.clone();
-    let eval_target = key_eval_target(plan, &lookup.commit_messages, &member, &w_values, &psi)?;
+    let eval_target = key_eval_target(plan, &index, &member, &w_values, &psi)?;
     absorb_key_fp3(&mut chain, KEY_EVAL_TARGET_TAG, eval_target)?;
     let eval_row = request_eval_row(
         TableLayout::of(&plan.w),
@@ -10794,7 +10844,8 @@ pub(crate) fn key_first_prove(
         &key_mask_units(plan, &member)?,
         eval_target,
     )?;
-    let group = key_group_prover(plan, &lookup)?;
+    let index_sample = (index_seeds[0].clone(), index_answer);
+    let group = key_group_prover(plan, &lookup, &index, &index_sample)?;
     let members = table_key_members(&group, true)?;
     let trees = vec![
         (
@@ -10802,6 +10853,15 @@ pub(crate) fn key_first_prove(
             retained_member_tree(&lookup.commit_messages.bits.trees, 0, &members[0])?,
         ),
         (plan.commit.mask_oracle, lookup.mask_tree.clone()),
+        (
+            plan.index.oracle,
+            std::sync::Arc::new(index_mask_tree(
+                &plan.index,
+                &index.rows,
+                &index.tails,
+                &index.salts,
+            )?),
+        ),
     ];
     let group_proof =
         table_key_group_prove(chain, &group, trees, derive_run_seed(&seed, 11, 0)?)?;
@@ -10837,6 +10897,7 @@ pub(crate) fn key_first_prove(
         seal,
         binding_root,
         KeyFirstWitness {
+            index_sample: (index_seeds[0].clone(), index_answer),
             index,
             lookup,
             w,
@@ -10863,13 +10924,13 @@ pub(crate) fn key_first_verify(
     )?;
     absorb_index_mask_root(&mut chain, &plan.index, &messages.index_root)?;
     let index_seeds = draw_seed_set(&mut chain, plan.index.sample_bits()?, 1)?;
-    let _ = index_seeds;
     absorb_index_mask_answer(&mut chain, messages.index_answer)?;
     let _positions = draw_index_mask_positions(&mut chain, &plan.index)?;
     let key_plan = key_lookup_key_plan(plan);
     let (claims, samples) = table_key_lookup_verify(
         &plan.lookup,
         &plan.commit,
+        &plan.index,
         &key_plan,
         &messages.lookup,
         lookup_table,
@@ -10880,12 +10941,20 @@ pub(crate) fn key_first_verify(
     // row's point is that claim's column point: the member is rebuilt from the
     // lookup key claim the verifier checked.
     let member =
-        crate::proof::table_range::range_pending_row_with(&plan.range, &claims.key, plan.commit.mask_oracle)?;
+        crate::proof::table_range::range_pending_row_with(&plan.range, &claims.key, plan.index.oracle)?;
     if member.psi != messages.psi || member.target != messages.eval_target {
         return Err(Error::InvalidProof);
     }
     absorb_key_fp3(&mut chain, KEY_EVAL_TARGET_TAG, messages.eval_target)?;
-    let group = key_group_verifier(plan, &claims, &samples, &messages.lookup)?;
+    let index_sample = [(index_seeds[0].clone(), messages.index_answer)];
+    let group = key_group_verifier(
+        plan,
+        &claims,
+        &samples,
+        &index_sample,
+        messages.index_root,
+        &messages.lookup,
+    )?;
     let verification = table_key_group_verify(chain, &group, &messages.group)?;
     let chain = verification.chain;
     let seal = *chain.value();
@@ -10944,6 +11013,8 @@ pub(crate) struct KeyLookupProof {
 pub(crate) fn table_key_lookup_prove(
     plan: &crate::proof::lookup::LookupPlan,
     commit: &crate::proof::lookup_messages::LookupCommitPlan,
+    index: &IndexMaskPlan,
+    index_rows: &[Vec<Fp3>],
     key_plan: &crate::proof::lookup::LookupKeyPlan,
     key_values: &[Fp3],
     witness: &crate::proof::lookup::LookupWitness,
@@ -10982,9 +11053,20 @@ pub(crate) fn table_key_lookup_prove(
     let mask_seeds = draw_seed_set(chain, lookup_mask_sample_bits(commit)?, 1)?;
     let mask_answer = lookup_mask_answer(commit, &messages.mask_rows, &mask_seeds[0])?;
     absorb_digit_lookup_answer(chain, KEY_MASK_ANSWER_TAG, mask_answer)?;
-    let (proof, claims) = crate::proof::lookup::prove_lookup_with_key_values(
-        plan, commit, key_plan, key_values, witness, &messages, table, chain,
-    )?;
+    let (claim_mask_values, claim_mask_base) = index_claim_masks(index, index_rows)?;
+    let (proof, claims) =
+        crate::proof::lookup::prove_lookup_with_key_values_and_claim_masks(
+            plan,
+            commit,
+            key_plan,
+            key_values,
+            witness,
+            &messages,
+            table,
+            &claim_mask_values,
+            claim_mask_base,
+            chain,
+        )?;
     Ok(KeyLookupProof {
         messages: KeyLookupMessages {
             bits_root,
@@ -11009,6 +11091,7 @@ pub(crate) fn table_key_lookup_prove(
 pub(crate) fn table_key_lookup_verify(
     plan: &crate::proof::lookup::LookupPlan,
     commit: &crate::proof::lookup_messages::LookupCommitPlan,
+    index: &IndexMaskPlan,
     key_plan: &crate::proof::lookup::LookupKeyPlan,
     messages: &KeyLookupMessages,
     table: &dyn crate::proof::lookup::LookupTable,
@@ -11024,13 +11107,15 @@ pub(crate) fn table_key_lookup_verify(
         bits: messages.bits_root,
         mask: messages.mask_root,
     };
-    let claims = crate::proof::lookup::verify_lookup(
+    let claim_mask_base = index.entries.end_range()?.start;
+    let claims = crate::proof::lookup::verify_lookup_with_claim_mask_base(
         plan,
         commit,
         key_plan,
         &roots,
         &messages.proof,
         table,
+        claim_mask_base,
         chain,
     )?;
     Ok((
@@ -11065,6 +11150,14 @@ pub(crate) struct TableKeyGroup<'a> {
     pub bits_tails: Vec<Fp3>,
     pub mask_message: Vec<Vec<Fp3>>,
     pub mask_tails: Vec<Vec<Fp3>>,
+    /// The index-mask member: its plan, BAT id, root and committed rows. The
+    /// verifier carries only the root.
+    pub index: &'a IndexMaskPlan,
+    pub index_bat: u64,
+    pub index_root: Digest,
+    pub index_message: Vec<Vec<Fp3>>,
+    pub index_tails: Vec<Vec<Fp3>>,
+    pub index_samples: &'a [KeySample],
     pub first_main: CodeParams,
     pub first_mask: CodeParams,
     pub stages: Vec<IoppStagePlan>,
@@ -11081,7 +11174,10 @@ pub(crate) struct TableKeyGroup<'a> {
 
 fn table_key_members(group: &TableKeyGroup<'_>, prover: bool) -> Result<Vec<ProximityMember>> {
     let shape = group.commit.bits_shape;
-    if group.bits_samples.len() != 1 || group.mask_samples.len() != 1 {
+    if group.bits_samples.len() != 1
+        || group.mask_samples.len() != 1
+        || group.index_samples.len() != group.index.answers as usize
+    {
         return Err(Error::ShapeMismatch);
     }
     let bits_root = group.bits_root;
@@ -11135,7 +11231,30 @@ fn table_key_members(group: &TableKeyGroup<'_>, prover: bool) -> Result<Vec<Prox
             Vec::new()
         },
     };
-    Ok(vec![bits, mask])
+    let index = ProximityMember {
+        bat_oracle: group.index_bat,
+        source_oracle: group.index.oracle,
+        main_code: group.first_main,
+        mask_code: group.index.mask_code,
+        main_rows: 0,
+        mask_rows: group.index.mask_rows,
+        answers: group.index.answers,
+        root: group.index_root,
+        tree_plan: group.index.tree.clone(),
+        message: Vec::new(),
+        tails: Vec::new(),
+        mask_message: if prover {
+            group.index_message.clone()
+        } else {
+            Vec::new()
+        },
+        mask_tails: if prover {
+            group.index_tails.clone()
+        } else {
+            Vec::new()
+        },
+    };
+    Ok(vec![bits, mask, index])
 }
 
 fn table_key_sample_rows(
@@ -11164,7 +11283,11 @@ fn table_key_sample_rows(
             *answer,
         )?);
     }
-    let rows = vec![bits, mask];
+    let mut index_rows = Vec::with_capacity(group.index_samples.len());
+    for (seed, answer) in group.index_samples {
+        index_rows.push(index_mask_sample_row_at(group.index, seed, *answer)?);
+    }
+    let rows = vec![bits, mask, index_rows];
     for (index, member) in members.iter().enumerate() {
         if rows[index].len() != member.answers as usize {
             return Err(Error::ShapeMismatch);
@@ -11256,13 +11379,19 @@ pub(crate) fn derive_key_group_plan(
     config: &KeyGroupConfig,
     bit_entries: u64,
     mask_entries: usize,
+    extra_mask_rows: u64,
     rows: u64,
 ) -> Result<KeyGroupPlan> {
     if config.fresh == 0 {
         return Err(Error::InvalidConfig);
     }
-    let derived = crate::proof::proximity_planner::derive_single_group_plan(
-        bit_entries, mask_entries, rows, 1, false,
+    let derived = crate::proof::proximity_planner::derive_single_group_plan_with_extra_mask_rows(
+        bit_entries,
+        mask_entries,
+        extra_mask_rows,
+        rows,
+        1,
+        false,
     )
     .map_err(|_| Error::InvalidConfig)?;
     let stages: Vec<IoppStagePlan> = derived.stages.iter().map(key_group_stage).collect();
@@ -11320,7 +11449,8 @@ fn key_group_plan_for(
     plan: &KeyFirstPlan,
     claims: &crate::proof::lookup::LookupOutcome,
 ) -> Result<KeyGroupPlan> {
-    let mut plain = lookup_remaining_rows(&plan.lookup, &plan.commit, claims, plan.mask_bat)?;
+    let mut plain =
+        lookup_remaining_rows(&plan.lookup, &plan.commit, claims, plan.mask_bat)?;
     plain.extend(lookup_group_rows(
         &plan.lookup,
         &plan.commit,
@@ -11328,14 +11458,18 @@ fn key_group_plan_for(
         plan.bits_bat,
         plan.mask_bat,
     )?);
+    let answers = plan.commit.bits_shape.answers as u64
+        + 1
+        + plan.index.answers as u64;
     let planned = (plain.len() as u64)
-        .checked_add(2)
+        .checked_add(answers)
         .ok_or(Error::ResourceLimit)?;
     let mask_entries = crate::proof::lookup::mask_count(&plan.lookup)?;
     derive_key_group_plan(
         &plan.group_config,
         key_bit_entries(plan)?,
         mask_entries,
+        plan.index.mask_rows,
         planned,
     )
 }
@@ -11345,6 +11479,8 @@ fn key_group_plan_for(
 fn key_group_prover<'a>(
     plan: &'a KeyFirstPlan,
     lookup: &'a KeyLookupProof,
+    index: &'a IndexMaskWitness,
+    index_sample: &'a KeySample,
 ) -> Result<TableKeyGroup<'a>> {
     let group_plan = key_group_plan_for(plan, &lookup.claims)?;
     let bound = key_group_bound(plan, &group_plan)?;
@@ -11371,6 +11507,12 @@ fn key_group_prover<'a>(
         bits_tails: lookup.commit_messages.bits_tails.clone(),
         mask_message: lookup.commit_messages.mask_rows.clone(),
         mask_tails: lookup.commit_messages.mask_tails.clone(),
+        index: &plan.index,
+        index_bat: plan.index_bat,
+        index_root: index.root,
+        index_message: index.rows.clone(),
+        index_tails: index.tails.clone(),
+        index_samples: std::slice::from_ref(index_sample),
         first_main: group_plan.first_main,
         first_mask: group_plan.first_mask,
         stages: group_plan.stages,
@@ -11392,6 +11534,8 @@ fn key_group_verifier<'a>(
     plan: &'a KeyFirstPlan,
     claims: &'a crate::proof::lookup::LookupOutcome,
     samples: &'a [KeySample; 2],
+    index_samples: &'a [KeySample],
+    index_root: Digest,
     messages: &KeyLookupMessages,
 ) -> Result<TableKeyGroup<'a>> {
     let group_plan = key_group_plan_for(plan, claims)?;
@@ -11406,6 +11550,12 @@ fn key_group_verifier<'a>(
         bits_tails: Vec::new(),
         mask_message: Vec::new(),
         mask_tails: Vec::new(),
+        index: &plan.index,
+        index_bat: plan.index_bat,
+        index_root,
+        index_message: Vec::new(),
+        index_tails: Vec::new(),
+        index_samples,
         first_main: group_plan.first_main,
         first_mask: group_plan.first_mask,
         stages: group_plan.stages,
@@ -11430,15 +11580,18 @@ pub(crate) fn key_group_bound(
     group: &KeyGroupPlan,
 ) -> Result<crate::proof::proximity_iopp::IoppBoundIds> {
     if plan.bits_bat == plan.mask_bat
+        || plan.index_bat == plan.bits_bat
+        || plan.index_bat == plan.mask_bat
         || group.fresh == plan.bits_bat
         || group.fresh == plan.mask_bat
+        || group.fresh == plan.index_bat
         || group.fresh != plan.group_config.fresh
         || group.mask_tree.tree_number != plan.group_config.mask_tree_number
     {
         return Err(Error::InvalidConfig);
     }
     Ok(crate::proof::proximity_iopp::IoppBoundIds::new(
-        vec![0, plan.bits_bat, plan.mask_bat, group.fresh],
+        vec![0, plan.bits_bat, plan.mask_bat, plan.index_bat, group.fresh],
         vec![
             plan.commit.bits_shape.tree_number,
             plan.commit.mask_tree.tree_number,
@@ -36789,6 +36942,7 @@ mod key_first_plan_tests {
             group: 7,
             bits_bat: 10,
             mask_bat: 11,
+            index_bat: 12,
             binding: crate::proof::lin_binding::LinBindingShape {
                 log_leaves: 0,
                 salt_bytes: 40,
@@ -36840,7 +36994,6 @@ mod key_first_flow_tests {
 
     fn flow_plan() -> (KeyFirstPlan, Vec<Fp3>, Vec<Fp3>) {
         let code = zkie_engine::pcs::request::code::build_code_plan(4, 8, 1).unwrap();
-        let index_code = zkie_engine::pcs::request::code::build_code_plan(15, 256, 66).unwrap();
         let range = EntryRange::new(-8, 7).unwrap();
         let range_plan = derive_entry_range(
             4,
@@ -36858,9 +37011,10 @@ mod key_first_flow_tests {
         let leaf_index = (lookup_plan.planes().unwrap() - 1)
             + lookup_plan.key_bits as usize
             + lookup_plan.table_log as usize;
-        // The group's BAT rows: one sample row per member and the lookup's
-        // plain rows, which are one per remaining relation plus four.
-        let planned = (leaf_index + 6) as u64;
+        // The group's BAT rows: one sample row per member (bits, mask and
+        // index mask) and the lookup's plain rows, which are one per
+        // remaining relation plus four.
+        let planned = (leaf_index + 7) as u64;
         let group_config = KeyGroupConfig {
             fresh: 95,
             mask_tree_number: 301,
@@ -36869,7 +37023,10 @@ mod key_first_flow_tests {
             configuration: Digest([0x72; 32]),
         };
         let group_plan =
-            derive_key_group_plan(&group_config, bit_entries, mask_entries, planned).unwrap();
+            derive_key_group_plan(&group_config, bit_entries, mask_entries, 1, planned).unwrap();
+        // The index mask joins the same fold group, so it shares the group's
+        // first mask code.
+        let index_code = group_plan.first_mask;
         // The lookup messages are committed under the group's first codes, so
         // the members and the FOLD share one pair of codes.
         let message = derive_range_lookup_message(
@@ -36974,6 +37131,7 @@ mod key_first_flow_tests {
             group: 7,
             bits_bat: 0,
             mask_bat: 1,
+            index_bat: 2,
             binding: crate::proof::lin_binding::LinBindingShape {
                 log_leaves: 0,
                 salt_bytes: 40,

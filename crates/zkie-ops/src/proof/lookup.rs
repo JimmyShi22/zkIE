@@ -671,6 +671,12 @@ pub struct MaskSlots {
 }
 
 impl MaskSlots {
+    /// A cursor over an external message's entries, starting at the first slot
+    /// of the class the claim masks live in.
+    pub fn starting_at(start: usize) -> Self {
+        Self { next: start }
+    }
+
     pub fn take(&mut self, count: usize) -> Result<Vec<usize>> {
         let end = self
             .next
@@ -804,6 +810,7 @@ struct ProverStep {
 
 fn prove_step(
     masks: &mut ProverMasks,
+    external_shown: Option<&mut ProverMasks>,
     challenges: &mut LookupChallenges,
     variables: &[Weight],
     claim_masks: &[MaskTerm],
@@ -816,15 +823,28 @@ fn prove_step(
     let hiding = crate::proof::psc::hp_entries(&all_variables)?;
     let shown = summand.shown();
     let hiding_slots = masks.slots.take(hiding)?;
-    let shown_slots = masks.slots.take(shown)?;
     let mut hiding_values = Vec::with_capacity(hiding);
     for slot in &hiding_slots {
         hiding_values.push(masks.value(*slot)?);
     }
-    let mut shown_values = Vec::with_capacity(shown);
-    for slot in &shown_slots {
-        shown_values.push(masks.value(*slot)?);
-    }
+    let (shown_slots, shown_values) = match external_shown {
+        Some(space) => {
+            let slots = space.slots.take(shown)?;
+            let mut values = Vec::with_capacity(shown);
+            for slot in &slots {
+                values.push(space.value(*slot)?);
+            }
+            (slots, values)
+        }
+        None => {
+            let slots = masks.slots.take(shown)?;
+            let mut values = Vec::with_capacity(shown);
+            for slot in &slots {
+                values.push(masks.value(*slot)?);
+            }
+            (slots, values)
+        }
+    };
     let entries = GeneralMaskEntries {
         hiding: hiding_values,
         shown: shown_values,
@@ -851,6 +871,7 @@ fn prove_step(
 
 fn verify_step(
     slots: &mut MaskSlots,
+    external_shown: Option<&mut MaskSlots>,
     challenges: &mut LookupChallenges,
     variables: &[Weight],
     claim_masks: &[MaskTerm],
@@ -863,7 +884,10 @@ fn verify_step(
     let hiding = crate::proof::psc::hp_entries(&all_variables)?;
     let shown = summand.shown();
     let hiding_slots = slots.take(hiding)?;
-    let shown_slots = slots.take(shown)?;
+    let shown_slots = match external_shown {
+        Some(space) => space.take(shown)?,
+        None => slots.take(shown)?,
+    };
     let output = verify_general(
         variables,
         claim_masks,
@@ -1005,6 +1029,7 @@ pub fn prove_lookup_with_messages(
         key_plan,
         None,
         Some(key_rows),
+        None,
         witness,
         messages,
         table,
@@ -1032,6 +1057,39 @@ pub fn prove_lookup_with_key_values(
         key_plan,
         Some(key_values),
         None,
+        None,
+        witness,
+        messages,
+        table,
+        chain,
+    )
+}
+
+/// Proves one lookup with an already resolved key vector and with the last key
+/// level's claim masks taken from an external message: `claim_mask_values` are
+/// that message's entries in slot order and `claim_mask_base` is the first slot
+/// of the class the claim masks live in. The lookup's own mask message keeps
+/// the hiding entries.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_lookup_with_key_values_and_claim_masks(
+    plan: &LookupPlan,
+    commit_plan: &LookupCommitPlan,
+    key_plan: &LookupKeyPlan,
+    key_values: &[Fp3],
+    witness: &LookupWitness,
+    messages: &LookupMessages,
+    table: &dyn LookupTable,
+    claim_mask_values: &[Fp3],
+    claim_mask_base: usize,
+    chain: &mut Chain,
+) -> Result<(LookupProof, LookupOutcome)> {
+    prove_lookup_inner(
+        plan,
+        commit_plan,
+        key_plan,
+        Some(key_values),
+        None,
+        Some((claim_mask_values, claim_mask_base)),
         witness,
         messages,
         table,
@@ -1045,6 +1103,7 @@ fn prove_lookup_inner(
     key_plan: &LookupKeyPlan,
     key_values: Option<&[Fp3]>,
     key_rows: Option<&[Vec<Vec<Fp3>>]>,
+    external_claim_masks: Option<(&[Fp3], usize)>,
     witness: &LookupWitness,
     messages: &LookupMessages,
     table: &dyn LookupTable,
@@ -1108,6 +1167,13 @@ fn prove_lookup_inner(
         mask_values.push(messages.mask_entry(commit_plan, slot)?);
     }
     let mut masks = ProverMasks::from_entries(mask_values);
+    let mut external_masks = match external_claim_masks {
+        Some((values, base)) => Some(ProverMasks {
+            values: values.to_vec(),
+            slots: MaskSlots::starting_at(base),
+        }),
+        None => None,
+    };
     let mut rows_out = Vec::new();
     let mut slots_out: Vec<Vec<usize>> = Vec::new();
     let mut hiding_out: Vec<Vec<usize>> = Vec::new();
@@ -1148,6 +1214,7 @@ fn prove_lookup_inner(
         let mut inner = ScalarInner::new(&values)?;
         let step = match prove_step(
             &mut masks,
+            None,
             &mut challenges,
             &[],
             &claim_masks,
@@ -1190,12 +1257,14 @@ fn prove_lookup_inner(
     let mut key_proofs = Vec::new();
     let mut key_claim = on_root;
     for level in 0..plan.key_bits as usize {
+        let last = level + 1 == plan.key_bits as usize;
         let next = &key_levels[level + 1];
         let half = next.len() / 2;
         let mut inner = if level == 0 {
             let mut scalar = ScalarInner::new(&[next[0], next[1]])?;
             let step = prove_step(
                 &mut masks,
+                if last { external_masks.as_mut() } else { None },
                 &mut challenges,
                 &[],
                 &key_claim.masks,
@@ -1222,6 +1291,7 @@ fn prove_lookup_inner(
         let variables = equality_variables(&key_claim.point, 0)?;
         let step = prove_step(
             &mut masks,
+            if last { external_masks.as_mut() } else { None },
             &mut challenges,
             &variables,
             &key_claim.masks,
@@ -1255,6 +1325,7 @@ fn prove_lookup_inner(
             WeightedProductInner::new(&next[..half], &next[half..], &table_claim.point)?;
         let step = prove_step(
             &mut masks,
+            None,
             &mut challenges,
             &variables,
             &table_claim.masks,
@@ -1283,6 +1354,7 @@ fn prove_lookup_inner(
     )?;
     let leaves_step = prove_step(
         &mut masks,
+        None,
         &mut challenges,
         &leaves_variables,
         &table_claim.masks,
@@ -1306,6 +1378,7 @@ fn prove_lookup_inner(
     let mut bits_inner = WeightedBitsInner::new(&witness.bits, &bit_point)?;
     let bits_step = prove_step(
         &mut masks,
+        None,
         &mut challenges,
         &bit_variables,
         &[],
@@ -1356,6 +1429,48 @@ pub fn verify_lookup(
     table: &dyn LookupTable,
     chain: &mut Chain,
 ) -> Result<LookupOutcome> {
+    verify_lookup_inner(
+        plan, commit_plan, key_plan, roots, proof, table, None, chain,
+    )
+}
+
+/// Verifies one lookup whose last key level's claim masks live in an external
+/// message starting at `claim_mask_base`. The lookup's own mask message keeps
+/// the hiding entries; the claim-mask class is checked against the external
+/// message's commitment by the caller's group test.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_lookup_with_claim_mask_base(
+    plan: &LookupPlan,
+    commit_plan: &LookupCommitPlan,
+    key_plan: &LookupKeyPlan,
+    roots: &LookupRoots,
+    proof: &LookupProof,
+    table: &dyn LookupTable,
+    claim_mask_base: usize,
+    chain: &mut Chain,
+) -> Result<LookupOutcome> {
+    verify_lookup_inner(
+        plan,
+        commit_plan,
+        key_plan,
+        roots,
+        proof,
+        table,
+        Some(claim_mask_base),
+        chain,
+    )
+}
+
+fn verify_lookup_inner(
+    plan: &LookupPlan,
+    commit_plan: &LookupCommitPlan,
+    key_plan: &LookupKeyPlan,
+    roots: &LookupRoots,
+    proof: &LookupProof,
+    table: &dyn LookupTable,
+    external_claim_base: Option<usize>,
+    chain: &mut Chain,
+) -> Result<LookupOutcome> {
     plan.validate()?;
     let planes = plan.planes()?;
     let table_rows = plan.table_rows()?;
@@ -1379,6 +1494,7 @@ pub fn verify_lookup(
     };
     let alpha = challenges.draw()?;
     let mut slots = MaskSlots::default();
+    let mut external_slots = external_claim_base.map(MaskSlots::starting_at);
     let mut rows_out = Vec::new();
     let mut slots_out: Vec<Vec<usize>> = Vec::new();
     let mut hiding_out: Vec<Vec<usize>> = Vec::new();
@@ -1404,6 +1520,7 @@ pub fn verify_lookup(
         };
         let (output, shown, hiding) = verify_step(
             &mut slots,
+            None,
             &mut challenges,
             &[],
             &claim_masks,
@@ -1441,9 +1558,11 @@ pub fn verify_lookup(
     }
     let mut key_claim = on_root;
     for level in 0..plan.key_bits as usize {
+        let last = level + 1 == plan.key_bits as usize;
         let variables = equality_variables(&key_claim.point, 0)?;
         let (output, shown, hiding) = verify_step(
             &mut slots,
+            if last { external_slots.as_mut() } else { None },
             &mut challenges,
             &variables,
             &key_claim.masks,
@@ -1470,6 +1589,7 @@ pub fn verify_lookup(
         let variables = equality_variables(&table_claim.point, 0)?;
         let (output, shown, hiding) = verify_step(
             &mut slots,
+            None,
             &mut challenges,
             &variables,
             &table_claim.masks,
@@ -1488,6 +1608,7 @@ pub fn verify_lookup(
     let leaves_variables = equality_variables(&table_claim.point, plan.mu as usize)?;
     let (leaves_output, leaves_shown, hiding) = verify_step(
         &mut slots,
+        None,
         &mut challenges,
         &leaves_variables,
         &table_claim.masks,
@@ -1510,6 +1631,7 @@ pub fn verify_lookup(
     let bit_variables = equality_variables(&bit_point, 0)?;
     let (bits_output, shown, hiding) = verify_step(
         &mut slots,
+        None,
         &mut challenges,
         &bit_variables,
         &[],
