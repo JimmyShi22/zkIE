@@ -18232,6 +18232,155 @@ fn lookup_mask_virtual_index(
 /// rounding cells, the multiplicity row on the multiplicity bits, the leaf
 /// kept-map row and the bit summand's hiding and shown-end claims. Every mask
 /// term becomes a unit on the committed lookup mask member.
+/// The BAT rows of one lookup's outcome on its own group: the multiplicity
+/// row, the leaf kept-map row, the bit summand's hiding and shown-end rows,
+/// and the end row. The key claim's registration is the caller's: a request
+/// registers it on committed key messages, a table key leaves it as a
+/// pending row on the matrix.
+pub(crate) fn lookup_group_rows(
+    lookup: &crate::proof::lookup::LookupPlan,
+    commit: &crate::proof::lookup_messages::LookupCommitPlan,
+    claims: &crate::proof::lookup::LookupOutcome,
+    bits_oracle: u64,
+    mask_oracle: u64,
+) -> Result<Vec<BatRow>> {
+    let mut rows = Vec::new();
+    let planes = lookup.planes()?;
+    let table_rows = lookup.table_rows()?;
+    let bits_columns = planes
+        .checked_mul(table_rows)
+        .ok_or(Error::ResourceLimit)?;
+    // The multiplicity row: the binary counts sum to the key count.
+    let mut multiplicity = BatRow::new(BatRowKind::Plain);
+    multiplicity.add_term(
+        bits_oracle,
+        BatPart::Main,
+        scatter_message_coefficients(
+            &commit.bits_shape,
+            bits_columns as u64,
+            &claims.multiplicity.0,
+        )?,
+    );
+    multiplicity.target = claims.multiplicity.1;
+    rows.push(multiplicity);
+
+    // The leaf kept-map row and the bit summand's hiding and shown-end claims
+    // all land on the committed multiplicity-bit message.
+    let leaf_index = (planes - 1)
+        .checked_add(lookup.key_bits as usize)
+        .and_then(|value| value.checked_add(lookup.table_log as usize))
+        .ok_or(Error::ResourceLimit)?;
+    let bits_index = leaf_index.checked_add(1).ok_or(Error::ResourceLimit)?;
+    if claims.rows.len() != bits_index + 1 {
+        return Err(Error::ShapeMismatch);
+    }
+    let leaf = &claims.rows[leaf_index];
+    if leaf.row_maps.len() != 1 {
+        return Err(Error::ShapeMismatch);
+    }
+    let (map_index, map_coefficient) = leaf.row_maps[0];
+    if map_index != 0 {
+        return Err(Error::ShapeMismatch);
+    }
+    let eq = crate::proof::output_closure::eq_vector(&leaf.point)?;
+    if eq.len() != bits_columns {
+        return Err(Error::ShapeMismatch);
+    }
+    let dense = eq
+        .iter()
+        .map(|value| map_coefficient.mul(value))
+        .collect::<Vec<_>>();
+    let mut row = BatRow::new(BatRowKind::Plain);
+    row.add_term(
+        bits_oracle,
+        BatPart::Main,
+        scatter_message_coefficients(&commit.bits_shape, bits_columns as u64, &dense)?,
+    );
+    let leaf_hiding = claims
+        .hiding_slots
+        .get(leaf_index)
+        .ok_or(Error::ShapeMismatch)?;
+    if leaf_hiding.len() != leaf.hiding_form.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    for (slot, coefficient) in leaf_hiding.iter().zip(&leaf.hiding_form) {
+        row.add_unit(
+            mask_oracle,
+            BatPart::Mask,
+            lookup_mask_virtual_index(commit, *slot)?,
+            *coefficient,
+        );
+    }
+    for term in &leaf.claim_masks {
+        row.add_unit(
+            mask_oracle,
+            BatPart::Mask,
+            lookup_mask_virtual_index(commit, term.slot)?,
+            term.coefficient,
+        );
+    }
+    row.target = leaf.row_target;
+    rows.push(row);
+
+    let bits_output = &claims.rows[bits_index];
+    let bits_hiding = claims
+        .hiding_slots
+        .get(bits_index)
+        .ok_or(Error::ShapeMismatch)?;
+    if bits_hiding.len() != bits_output.hiding_form.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut row = BatRow::new(BatRowKind::Plain);
+    for (slot, coefficient) in bits_hiding.iter().zip(&bits_output.hiding_form) {
+        row.add_unit(
+            mask_oracle,
+            BatPart::Mask,
+            lookup_mask_virtual_index(commit, *slot)?,
+            *coefficient,
+        );
+    }
+    for term in &bits_output.claim_masks {
+        row.add_unit(
+            mask_oracle,
+            BatPart::Mask,
+            lookup_mask_virtual_index(commit, term.slot)?,
+            term.coefficient,
+        );
+    }
+    row.target = bits_output.row_target;
+    rows.push(row);
+
+    if bits_output.ends.len() != 1 {
+        return Err(Error::ShapeMismatch);
+    }
+    let end = &bits_output.ends[0];
+    let eq = crate::proof::output_closure::eq_vector(&end.point)?;
+    if eq.len() != bits_columns {
+        return Err(Error::ShapeMismatch);
+    }
+    let shown_slot = claims
+        .end_slots
+        .get(bits_index)
+        .and_then(|slots| slots.first())
+        .copied()
+        .ok_or(Error::ShapeMismatch)?;
+    let mut row = BatRow::new(BatRowKind::Plain);
+    row.add_term(
+        bits_oracle,
+        BatPart::Main,
+        scatter_message_coefficients(&commit.bits_shape, bits_columns as u64, &eq)?,
+    );
+    row.add_unit(
+        mask_oracle,
+        BatPart::Mask,
+        lookup_mask_virtual_index(commit, shown_slot)?,
+        end.mask_scale,
+    );
+    row.target = end.value;
+    rows.push(row);
+    Ok(rows)
+}
+
 fn lookup_plain_rows(
     plan: &HiddenLinPlan,
     lookup_plan: &dyn crate::proof::hidden_norm_psc::NormLookupView,
@@ -18318,134 +18467,13 @@ fn lookup_plain_rows(
         &|slot| lookup_mask_virtual_index(commit, slot),
     )?);
 
-    // The multiplicity row: the binary counts sum to the key count.
-    let mut multiplicity = BatRow::new(BatRowKind::Plain);
-    multiplicity.add_term(
+    rows.extend(lookup_group_rows(
+        lookup,
+        commit,
+        claims,
         bits_member.bat_oracle,
-        BatPart::Main,
-        scatter_message_coefficients(
-            &commit.bits_shape,
-            bits_columns as u64,
-            &claims.multiplicity.0,
-        )?,
-    );
-    multiplicity.target = claims.multiplicity.1;
-    rows.push(multiplicity);
-
-    // The leaf kept-map row and the bit summand's hiding and shown-end claims
-    // all land on the committed multiplicity-bit message.
-    let leaf_index = (planes - 1)
-        .checked_add(lookup.key_bits as usize)
-        .and_then(|value| value.checked_add(lookup.table_log as usize))
-        .ok_or(Error::ResourceLimit)?;
-    let bits_index = leaf_index.checked_add(1).ok_or(Error::ResourceLimit)?;
-    if claims.rows.len() != bits_index + 1 {
-        return Err(Error::ShapeMismatch);
-    }
-    let leaf = &claims.rows[leaf_index];
-    if leaf.row_maps.len() != 1 {
-        return Err(Error::ShapeMismatch);
-    }
-    let (map_index, map_coefficient) = leaf.row_maps[0];
-    if map_index != 0 {
-        return Err(Error::ShapeMismatch);
-    }
-    let eq = crate::proof::output_closure::eq_vector(&leaf.point)?;
-    if eq.len() != bits_columns {
-        return Err(Error::ShapeMismatch);
-    }
-    let dense = eq
-        .iter()
-        .map(|value| map_coefficient.mul(value))
-        .collect::<Vec<_>>();
-    let mut row = BatRow::new(BatRowKind::Plain);
-    row.add_term(
-        bits_member.bat_oracle,
-        BatPart::Main,
-        scatter_message_coefficients(&commit.bits_shape, bits_columns as u64, &dense)?,
-    );
-    let leaf_hiding = claims
-        .hiding_slots
-        .get(leaf_index)
-        .ok_or(Error::ShapeMismatch)?;
-    if leaf_hiding.len() != leaf.hiding_form.len() {
-        return Err(Error::ShapeMismatch);
-    }
-    for (slot, coefficient) in leaf_hiding.iter().zip(&leaf.hiding_form) {
-        row.add_unit(
-            mask_member.bat_oracle,
-            BatPart::Mask,
-            lookup_mask_virtual_index(commit, *slot)?,
-            *coefficient,
-        );
-    }
-    for term in &leaf.claim_masks {
-        row.add_unit(
-            mask_member.bat_oracle,
-            BatPart::Mask,
-            lookup_mask_virtual_index(commit, term.slot)?,
-            term.coefficient,
-        );
-    }
-    row.target = leaf.row_target;
-    rows.push(row);
-
-    let bits_output = &claims.rows[bits_index];
-    let bits_hiding = claims
-        .hiding_slots
-        .get(bits_index)
-        .ok_or(Error::ShapeMismatch)?;
-    if bits_hiding.len() != bits_output.hiding_form.len() {
-        return Err(Error::ShapeMismatch);
-    }
-    let mut row = BatRow::new(BatRowKind::Plain);
-    for (slot, coefficient) in bits_hiding.iter().zip(&bits_output.hiding_form) {
-        row.add_unit(
-            mask_member.bat_oracle,
-            BatPart::Mask,
-            lookup_mask_virtual_index(commit, *slot)?,
-            *coefficient,
-        );
-    }
-    for term in &bits_output.claim_masks {
-        row.add_unit(
-            mask_member.bat_oracle,
-            BatPart::Mask,
-            lookup_mask_virtual_index(commit, term.slot)?,
-            term.coefficient,
-        );
-    }
-    row.target = bits_output.row_target;
-    rows.push(row);
-
-    if bits_output.ends.len() != 1 {
-        return Err(Error::ShapeMismatch);
-    }
-    let end = &bits_output.ends[0];
-    let eq = crate::proof::output_closure::eq_vector(&end.point)?;
-    if eq.len() != bits_columns {
-        return Err(Error::ShapeMismatch);
-    }
-    let shown_slot = claims
-        .end_slots
-        .get(bits_index)
-        .and_then(|slots| slots.first())
-        .copied()
-        .ok_or(Error::ShapeMismatch)?;
-    let mut row = BatRow::new(BatRowKind::Plain);
-    row.add_term(
-        bits_member.bat_oracle,
-        BatPart::Main,
-        scatter_message_coefficients(&commit.bits_shape, bits_columns as u64, &eq)?,
-    );
-    row.add_unit(
         mask_member.bat_oracle,
-        BatPart::Mask,
-        lookup_mask_virtual_index(commit, shown_slot)?,
-        end.mask_scale,
-    );
-    row.target = end.value;
-    rows.push(row);
+    )?);
     Ok(rows)
 }
 
