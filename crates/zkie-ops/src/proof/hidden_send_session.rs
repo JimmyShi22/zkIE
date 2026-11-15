@@ -29167,6 +29167,68 @@ mod merged_tests {
         }
     }
 
+    /// The shared Fold row is `Omega` at zeta against the folded row `G_u`
+    /// at the shared point and zeta: both messages enter the row, the target
+    /// is zero, and another point or a short shape changes the relation.
+    #[test]
+    fn the_shared_fold_row_ties_omega_to_the_folded_table() {
+        let gu = gu_shape();
+        let omega = omega_shape();
+        let k_lo = omega.k_lo;
+        let matrix_rows = omega.matrix_rows;
+        let psi = (0..k_lo as usize + gu.index.v as usize)
+            .map(|index| Fp3::from_u64(index as u64 + 2))
+            .collect::<Vec<_>>();
+        let zeta = (0..matrix_rows.trailing_zeros() as usize)
+            .map(|index| Fp3::from_u64(index as u64 + 3))
+            .collect::<Vec<_>>();
+        let row = super::fold_plain_row(&gu, &omega, 0, 1, &psi, &zeta, matrix_rows, k_lo)
+            .unwrap();
+        assert_eq!(row.target, Fp3::ZERO);
+        assert!(row
+            .terms
+            .iter()
+            .any(|term| term.oracle == 0 && term.values.iter().any(|value| !value.is_zero())));
+        assert!(row
+            .terms
+            .iter()
+            .any(|term| term.oracle == 1 && term.values.iter().any(|value| !value.is_zero())));
+        let mut other_psi = psi.clone();
+        other_psi[0] = other_psi[0].add(&Fp3::ONE);
+        let changed =
+            super::fold_plain_row(&gu, &omega, 0, 1, &other_psi, &zeta, matrix_rows, k_lo)
+                .unwrap();
+        assert_ne!(changed.terms, row.terms);
+        let mut other_zeta = zeta.clone();
+        other_zeta[0] = other_zeta[0].add(&Fp3::ONE);
+        let changed =
+            super::fold_plain_row(&gu, &omega, 0, 1, &psi, &other_zeta, matrix_rows, k_lo)
+                .unwrap();
+        assert_ne!(changed.terms, row.terms);
+        assert!(super::fold_plain_row(
+            &gu,
+            &omega,
+            0,
+            1,
+            &psi[..psi.len() - 1],
+            &zeta,
+            matrix_rows,
+            k_lo
+        )
+        .is_err());
+        assert!(super::fold_plain_row(
+            &gu,
+            &omega,
+            0,
+            1,
+            &psi,
+            &zeta[..zeta.len() - 1],
+            matrix_rows,
+            k_lo
+        )
+        .is_err());
+    }
+
     #[test]
     fn the_chain_segment_runs_inside_the_first_chain() {
         use crate::proof::psc_general::{GeneralMaskEntries, MaskTerm, Summand};
@@ -31150,6 +31212,60 @@ mod merged_tests {
         ));
         let (plan, mut messages, witness) = run();
         messages.shared.seal.0[0] ^= 1;
+        assert_reject(verify_hidden_lin_with_witness(
+            &plan,
+            &table.reader,
+            &output,
+            &messages,
+            &witness,
+        ));
+    }
+
+    #[test]
+    fn the_shared_fold_transcript_and_binding_are_checked() {
+        let activation = activation();
+        let output = output_values(&activation);
+        let table = table();
+        // The shared chain is bound to the request's first seal: another seal
+        // no longer matches the chain the prover ran.
+        let (plan, mut messages, witness) = run();
+        messages.first_seal.0[0] ^= 1;
+        assert_reject(verify_hidden_lin_with_witness(
+            &plan,
+            &table.reader,
+            &output,
+            &messages,
+            &witness,
+        ));
+        // The fold start and every fold round belong to the shared transcript.
+        let (plan, mut messages, witness) = run();
+        messages.shared.fold_start.sum = messages.shared.fold_start.sum.add(&Fp3::ONE);
+        assert_reject(verify_hidden_lin_with_witness(
+            &plan,
+            &table.reader,
+            &output,
+            &messages,
+            &witness,
+        ));
+        let (plan, mut messages, witness) = run();
+        assert!(!messages.shared.fold_rounds.is_empty());
+        messages.shared.fold_rounds[0].0 =
+            messages.shared.fold_rounds[0].0.add(&Fp3::ONE);
+        assert_reject(verify_hidden_lin_with_witness(
+            &plan,
+            &table.reader,
+            &output,
+            &messages,
+            &witness,
+        ));
+        // The shared proximity tail is the group's end and is checked.
+        let (plan, mut messages, witness) = run();
+        match &mut messages.shared.tail {
+            ProximityTail::Single { base_rows, .. } => {
+                base_rows.base.lambda = base_rows.base.lambda.add(&Fp3::ONE);
+            }
+            ProximityTail::Stages(_) => panic!("the fixture has no stages"),
+        }
         assert_reject(verify_hidden_lin_with_witness(
             &plan,
             &table.reader,
