@@ -134,3 +134,15 @@ Negatives (rejected through the same path; split by what each shows):
   run summary `run-summary.txt`; `proof-assets.py` and `proof-assets.txt`.
   Per-stage `result.json` and `progress.jsonl` stay under each run
   directory; proof binaries stay on disk and are gitignored.
+
+## Round closure
+
+- Expert batch review: the whole round is accepted, no further rework.
+- Final commit list, in order: `7f143a6f` (production change: the four rope
+  coefficient tables read through the trusted public files), `339adc55`
+  (test tidy), `ec0ac723` (evidence record), and this closing commit (round
+  flag, NOTES record only; no code change).
+- State at closure: hard gate 45,080 B untouched; no anchor, policy, asset,
+  ground truth or commitment registration changed; the workspace suite is
+  green (1163 passed / 0 failed / 20 ignored); source and evidence are on
+  the branch, not pushed.
