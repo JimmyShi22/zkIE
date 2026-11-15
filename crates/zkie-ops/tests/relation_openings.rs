@@ -8,8 +8,8 @@ use zkie_ops::proof::binding::{
 };
 use zkie_ops::proof::relations::{
     proof_input_values, prove_op_relation_shared, prove_op_relation_with_inputs,
-    verify_op_relation_with_external, OpRelationProof, OpRelationPublic, RelationConfig,
-    RelationLengths,
+    verify_op_relation_shared_with_external, verify_op_relation_with_external, OpRelationProof,
+    OpRelationPublic, RelationConfig, RelationLengths,
 };
 use zkie_ops::softmax::SoftmaxOp;
 
@@ -120,8 +120,12 @@ fn shared_form_carries_no_input_openings() {
         .input_oracles
         .iter()
         .all(|oracle| oracle.0 == u64::MAX));
+    // The shared matrix form carries no raw declaration either: the verifier
+    // recomputes the same value from the materialized inputs.
+    assert!(proof.raw.is_empty());
+    assert!(proof.lengths.raw.is_empty());
     let values: Vec<Option<Vec<i64>>> = inputs.iter().cloned().map(Some).collect();
-    verify_op_relation_with_external(&public, &proof, &config, &values).unwrap();
+    verify_op_relation_shared_with_external(&public, &proof, &config, &values).unwrap();
 
     // A materialized value that differs from the prover's input is rejected by
     // the relation equation.
@@ -129,7 +133,7 @@ fn shared_form_carries_no_input_openings() {
     changed[0][0] ^= 1;
     let wrong: Vec<Option<Vec<i64>>> = changed.into_iter().map(Some).collect();
     assert_eq!(
-        verify_op_relation_with_external(&public, &proof, &config, &wrong)
+        verify_op_relation_shared_with_external(&public, &proof, &config, &wrong)
             .unwrap_err()
             .code(),
         "invalid_proof"
@@ -137,11 +141,97 @@ fn shared_form_carries_no_input_openings() {
 
     // Missing materialized values are missing authentication.
     assert_eq!(
-        verify_op_relation_with_external(&public, &proof, &config, &[])
+        verify_op_relation_shared_with_external(&public, &proof, &config, &[])
             .unwrap_err()
             .code(),
         "statement_mismatch"
     );
+}
+
+#[test]
+fn shared_non_matrix_relations_keep_their_raw_declaration() {
+    let op = AffineScaleOp {
+        multiplier: 3,
+        addend: 5,
+        shift: 2,
+        clamp: None,
+    };
+    let inputs = vec![vec![1, 2, 3]];
+    let config = op.relation_config(&inputs).unwrap();
+    let (public, proof) = prove_op_relation_shared(&op, &inputs, &config, &[]).unwrap();
+    assert!(!proof.raw.is_empty());
+    assert_eq!(proof.lengths.raw.len(), 1);
+    let values: Vec<Option<Vec<i64>>> = inputs.iter().cloned().map(Some).collect();
+    verify_op_relation_shared_with_external(&public, &proof, &config, &values).unwrap();
+
+    let mut changed = proof.clone();
+    changed.lengths.raw[0] ^= 1;
+    assert_eq!(
+        verify_op_relation_shared_with_external(&public, &changed, &config, &values)
+            .unwrap_err()
+            .code(),
+        "shape_mismatch"
+    );
+}
+
+#[test]
+fn shared_entry_rejects_the_ordinary_raw_form() {
+    let op = MatMulOp {
+        m: 3,
+        n: 2,
+        k: 2,
+        shift: 0,
+    };
+    let lhs = (1..=6).collect::<Vec<i64>>();
+    let rhs = (1..=4).map(|value| value * 2).collect::<Vec<i64>>();
+    let inputs = vec![lhs, rhs];
+    let config = op.relation_config(&inputs).unwrap();
+    let (public, proof) =
+        prove_op_relation_with_inputs(&op, &inputs, &config, &[0, 1]).unwrap();
+    let values: Vec<Option<Vec<i64>>> = inputs.clone().into_iter().map(Some).collect();
+    // The ordinary entry accepts the same proof; the shared entry must reject
+    // its legacy raw declaration.
+    verify_op_relation_with_external(&public, &proof, &config, &values).unwrap();
+    assert_eq!(
+        verify_op_relation_shared_with_external(&public, &proof, &config, &values)
+            .unwrap_err()
+            .code(),
+        "statement_mismatch"
+    );
+}
+
+#[test]
+fn shared_entry_rejects_raw_books_that_do_not_match_the_empty_form() {
+    let (public, proof, config, inputs) = shared_fixture();
+    let values: Vec<Option<Vec<i64>>> = inputs.into_iter().map(Some).collect();
+
+    let mut length_only = proof.clone();
+    length_only.lengths.raw = vec![6];
+    assert_eq!(
+        verify_op_relation_shared_with_external(&public, &length_only, &config, &values)
+            .unwrap_err()
+            .code(),
+        "statement_mismatch"
+    );
+
+    let mut opening_only = proof.clone();
+    opening_only.raw.push(Vec::new());
+    assert_eq!(
+        verify_op_relation_shared_with_external(&public, &opening_only, &config, &values)
+            .unwrap_err()
+            .code(),
+        "statement_mismatch"
+    );
+}
+
+#[test]
+fn a_short_bias_is_rejected_before_slot_indexing() {
+    let (public, proof, _config) = matmul_fixture();
+    let mut malformed = public.clone();
+    malformed.config = vec![3, 2, 2, 0, 1, 7];
+    let expected = malformed.config.clone();
+    let result = verify_op_relation_with_external(&malformed, &proof, &expected, &[]);
+    assert_eq!(result.unwrap_err().code(), "shape_mismatch");
 }
 
 #[test]

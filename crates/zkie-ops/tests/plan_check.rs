@@ -1329,9 +1329,9 @@ fn rms_extension_index_past_the_end_is_rejected() {
 }
 
 /// Re-verifies every committed declaration group of the step against the
-/// roots carried in the message, using the same Merkle verification routine
-/// as the production opening check. The fixture commits every group as a
-/// single row, so one opening covers its root.
+/// roots carried in the message, using the production Merkle primitives. A
+/// full-coverage group carries every leaf and no path, so its root is rebuilt
+/// from those leaves; a path form is checked per opening.
 fn committed_openings_authenticate(
     step: &SharedTraceStep,
 ) -> Result<(), zkie_core::error::Error> {
@@ -1349,16 +1349,34 @@ fn committed_openings_authenticate(
         .chain(&step.message.proof.helpers)
         .chain(&step.message.proof.aux);
     for group in groups {
-        for opening in group {
-            let count = registry
-                .get(opening.oracle)
-                .ok_or(zkie_core::error::Error::ProverStateMissing)?
-                .count;
-            assert_eq!(
-                count, 1,
-                "the fixture commits single-row declaration groups"
-            );
-            zkie_ops::proof::binding::verify_opening(&registry, opening, count)?;
+        if group.is_empty() {
+            continue;
+        }
+        let oracle = group[0].oracle;
+        let root = registry
+            .get(oracle)
+            .ok_or(zkie_core::error::Error::ProverStateMissing)?;
+        if group.len() as u64 != root.count
+            || group.iter().any(|opening| opening.oracle != oracle)
+        {
+            return Err(zkie_core::error::Error::StatementMismatch);
+        }
+        if group.iter().all(|opening| opening.path.is_empty()) {
+            let mut leaves = Vec::with_capacity(group.len());
+            for opening in group {
+                leaves.push(zkie_ops::proof::binding::oracle_leaf(
+                    opening.index,
+                    &opening.values,
+                ));
+            }
+            let rebuilt = zkie_engine::compute::cpu::merkle_build(&root.start, &leaves)?;
+            if rebuilt.root != root.root {
+                return Err(zkie_core::error::Error::InvalidProof);
+            }
+        } else {
+            for opening in group {
+                zkie_ops::proof::binding::verify_opening(&registry, opening, root.count)?;
+            }
         }
     }
     Ok(())
@@ -1646,6 +1664,290 @@ fn rope_public_port_injection_is_rejected() {
     fixture.trace.assets = fixture.opening.clone();
     fixture.trace.steps[0].external[1] = Some(0);
     let code = verify_rope_public(&fixture)
+        .err()
+        .expect("expected rejection")
+        .code()
+        .to_owned();
+    assert_eq!(code, "statement_mismatch");
+}
+
+// ---- shared matrix relations without the raw declaration ----
+
+#[derive(Clone)]
+struct MatMulSharedFixture {
+    public: ModelCommitmentPublic,
+    trace: SharedTrace,
+    tokens: Vec<u32>,
+    plan: TracePlan,
+    root: PathBuf,
+}
+
+struct TamperedMatMul {
+    inner: zkie_ops::matmul::MatMulOp,
+    output_xor: i64,
+}
+
+impl PureForward for TamperedMatMul {
+    fn opcode(&self) -> OpCode {
+        self.inner.opcode()
+    }
+
+    fn infer_specs(
+        &self,
+        inputs: &[TensorSpec],
+    ) -> Result<Vec<TensorSpec>, zkie_core::error::Error> {
+        self.inner.infer_specs(inputs)
+    }
+
+    fn forward_values(
+        &self,
+        inputs: &[Vec<i64>],
+    ) -> Result<KernelRecord, zkie_core::error::Error> {
+        let mut record = self.inner.forward_values(inputs)?;
+        record.outputs[0][0] ^= self.output_xor;
+        Ok(record)
+    }
+}
+
+fn matmul_shared_config() -> Vec<i64> {
+    vec![2, 2, 2, 0, 0]
+}
+
+fn matmul_shared_fixture_with(
+    plan_lhs: &[i64],
+    plan_rhs: &[i64],
+    op: &dyn PureForward,
+    proved_lhs: &[i64],
+    proved_rhs: &[i64],
+) -> MatMulSharedFixture {
+    let root = temp_dir();
+    let specs = vec![ModelAssetSpec {
+        asset_id: 0,
+        path: "dummy_i32.bin".into(),
+        element_count: 4,
+        row_width: 4,
+        encoding: "i32-le".into(),
+    }];
+    write_i32(&root.join("dummy_i32.bin"), &[1, 2, 3, 4]);
+    let commitment = commit_assets(&root, Digest([31; 32]), Digest([32; 32]), &specs).unwrap();
+    let public = ModelCommitmentPublic::from_commitment(&commitment);
+    let relation_config = matmul_shared_config();
+    let (matmul_step, matmul_out) = make_step(
+        op,
+        &[proved_lhs.to_vec(), proved_rhs.to_vec()],
+        &relation_config,
+        &[],
+        vec![None, None],
+        vec![None, None],
+    );
+    let (argmax_step, argmax_out) = make_step(
+        &ArgmaxOp,
+        &[matmul_out[0].clone()],
+        &[],
+        &[],
+        vec![None],
+        vec![Some((0, 0))],
+    );
+    let mut builder = PlanBuilder::new();
+    let matmul = builder.step(
+        OpCode::MatMul,
+        config(relation_config.clone()),
+        vec![
+            PlanSource::Constant(PlanConstant::Literal(plan_lhs.to_vec())),
+            PlanSource::Constant(PlanConstant::Literal(plan_rhs.to_vec())),
+        ],
+        1,
+    );
+    let argmax = builder.step(
+        OpCode::Argmax,
+        config(Vec::new()),
+        vec![PlanSource::prev(matmul, 0)],
+        1,
+    );
+    builder.argmax_step(argmax);
+    let plan = builder.finish();
+    let trace = SharedTrace {
+        tokens: vec![1],
+        assets: Vec::new(),
+        steps: vec![matmul_step, argmax_step],
+        argmax: vec![argmax_out[0][0] as u32],
+        output: Vec::new(),
+    };
+    MatMulSharedFixture {
+        public,
+        trace,
+        tokens: vec![1],
+        plan,
+        root,
+    }
+}
+
+fn matmul_shared_fixture(plan_lhs: &[i64], plan_rhs: &[i64]) -> MatMulSharedFixture {
+    let op = zkie_ops::matmul::MatMulOp {
+        m: 2,
+        n: 2,
+        k: 2,
+        shift: 0,
+    };
+    matmul_shared_fixture_with(plan_lhs, plan_rhs, &op, plan_lhs, plan_rhs)
+}
+
+fn verify_matmul_shared(
+    fixture: &MatMulSharedFixture,
+) -> Result<Vec<u32>, zkie_core::error::Error> {
+    let bytes = bincode::serialize(&fixture.trace).unwrap();
+    let trace: SharedTrace = bincode::deserialize(&bytes).unwrap();
+    zkie_ops::proof::model_commitment::verify_shared_trace(
+        &fixture.public,
+        &trace,
+        &fixture.tokens,
+        &fixture.plan,
+        Some(&fixture.root),
+    )
+}
+
+#[test]
+fn shared_matmul_carries_no_raw_declaration() {
+    let fixture = matmul_shared_fixture(&[3, 1, 2, 4], &[1, 2, 3, 4]);
+    let proof = &fixture.trace.steps[0].message.proof;
+    assert!(proof.raw.is_empty());
+    assert!(proof.lengths.raw.is_empty());
+    committed_openings_authenticate(&fixture.trace.steps[0])
+        .expect("the committed material is authenticated");
+    let argmax = verify_matmul_shared(&fixture).unwrap();
+    assert_eq!(argmax, vec![3]);
+}
+
+#[test]
+fn shared_matmul_output_tamper_is_rejected_by_the_relation() {
+    let op = TamperedMatMul {
+        inner: zkie_ops::matmul::MatMulOp {
+            m: 2,
+            n: 2,
+            k: 2,
+            shift: 0,
+        },
+        output_xor: 1,
+    };
+    let fixture = matmul_shared_fixture_with(
+        &[3, 1, 2, 4],
+        &[1, 2, 3, 4],
+        &op,
+        &[3, 1, 2, 4],
+        &[1, 2, 3, 4],
+    );
+    committed_openings_authenticate(&fixture.trace.steps[0])
+        .expect("the committed material is authenticated");
+    let code = verify_matmul_shared(&fixture)
+        .err()
+        .expect("expected rejection")
+        .code()
+        .to_owned();
+    assert_eq!(code, "invalid_proof");
+}
+
+#[test]
+fn shared_matmul_plan_input_replacement_is_rejected_by_the_relation() {
+    let fixture = matmul_shared_fixture_with(
+        &[4, 1, 2, 4],
+        &[1, 2, 3, 4],
+        &zkie_ops::matmul::MatMulOp {
+            m: 2,
+            n: 2,
+            k: 2,
+            shift: 0,
+        },
+        &[3, 1, 2, 4],
+        &[1, 2, 3, 4],
+    );
+    let code = verify_matmul_shared(&fixture)
+        .err()
+        .expect("expected rejection")
+        .code()
+        .to_owned();
+    assert_eq!(code, "invalid_proof");
+}
+
+#[test]
+fn shared_matmul_legacy_raw_declaration_is_rejected() {
+    let fixture = matmul_shared_fixture(&[3, 1, 2, 4], &[1, 2, 3, 4]);
+    let op = zkie_ops::matmul::MatMulOp {
+        m: 2,
+        n: 2,
+        k: 2,
+        shift: 0,
+    };
+    let config = matmul_shared_config();
+    let (public, proof) = prove_op_relation_with_inputs(
+        &op,
+        &[vec![3, 1, 2, 4], vec![1, 2, 3, 4]],
+        &config,
+        &[0, 1],
+    )
+    .unwrap();
+    assert!(!proof.raw.is_empty());
+    let mut roots = Vec::new();
+    for id in public.registry.ids() {
+        let root = public.registry.get(id).unwrap();
+        roots.push((root.root, root.start, root.count));
+    }
+    let legacy = SharedTraceStep {
+        message: RelationReceiptMessage {
+            opcode: OpCode::MatMul as u16,
+            config: config.clone(),
+            roots,
+            external_inputs: vec![0, 1],
+            proof,
+        },
+        external: vec![None, None],
+        sources: vec![None, None],
+    };
+    let mut trace = fixture.trace.clone();
+    trace.steps[0] = legacy;
+    let changed = MatMulSharedFixture {
+        public: fixture.public.clone(),
+        trace,
+        tokens: fixture.tokens.clone(),
+        plan: fixture.plan.clone(),
+        root: fixture.root.clone(),
+    };
+    let code = verify_matmul_shared(&changed)
+        .err()
+        .expect("expected rejection")
+        .code()
+        .to_owned();
+    assert_eq!(code, "statement_mismatch");
+}
+
+#[test]
+fn shared_matmul_raw_books_that_do_not_match_the_empty_form_are_rejected() {
+    let mut length_only = matmul_shared_fixture(&[3, 1, 2, 4], &[1, 2, 3, 4]);
+    length_only.trace.steps[0].message.proof.lengths.raw = vec![4];
+    let code = verify_matmul_shared(&length_only)
+        .err()
+        .expect("expected rejection")
+        .code()
+        .to_owned();
+    assert_eq!(code, "statement_mismatch");
+
+    let mut opening_only = matmul_shared_fixture(&[3, 1, 2, 4], &[1, 2, 3, 4]);
+    opening_only.trace.steps[0].message.proof.raw.push(Vec::new());
+    let code = verify_matmul_shared(&opening_only)
+        .err()
+        .expect("expected rejection")
+        .code()
+        .to_owned();
+    assert_eq!(code, "statement_mismatch");
+}
+
+#[test]
+fn shared_matmul_malformed_bias_config_is_rejected_before_relation() {
+    // The proof declares one bias value for four output slots while the
+    // trusted plan declares none; the real entry rejects the config, it does
+    // not reach a slot index.
+    let mut fixture = matmul_shared_fixture(&[3, 1, 2, 4], &[1, 2, 3, 4]);
+    fixture.trace.steps[0].message.config = vec![2, 2, 2, 0, 1, 7];
+    let code = verify_matmul_shared(&fixture)
         .err()
         .expect("expected rejection")
         .code()

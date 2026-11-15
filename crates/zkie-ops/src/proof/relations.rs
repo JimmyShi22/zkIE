@@ -465,7 +465,10 @@ pub fn prove_op_relation_with_inputs(
 /// Prove a relation where every input is supplied by the trusted plan and is
 /// materialized by the verifier: no input oracle is committed and no input
 /// opening is carried. The external list still marks the plan-mapped asset
-/// ports; those inputs carry no opening in either form.
+/// ports; those inputs carry no opening in either form. The matrix opcodes
+/// also carry no raw declaration: the verifier recomputes the same expected
+/// value from the trusted inputs and checks the authenticated output against
+/// it.
 pub fn prove_op_relation_shared(
     op: &dyn PureForward,
     inputs: &[Vec<i64>],
@@ -473,6 +476,15 @@ pub fn prove_op_relation_shared(
     external: &[usize],
 ) -> Result<(OpRelationPublic, OpRelationProof)> {
     prove_op_relation_inner(op, inputs, config, external, false)
+}
+
+/// The matrix relations whose raw accumulator is fully recomputed by the
+/// verifier from the trusted inputs; only the shared trace form may omit it.
+fn omits_shared_raw(opcode: OpCode) -> bool {
+    matches!(
+        opcode,
+        OpCode::MatMul | OpCode::Projection | OpCode::RegressionHead
+    )
 }
 
 fn prove_op_relation_inner(
@@ -485,6 +497,7 @@ fn prove_op_relation_inner(
     let _profile = zkie_core::profile::Scope::operator(op.opcode() as u16);
     let record = op.forward_values(inputs)?;
     let opcode = op.opcode();
+    let omit_raw = !commit_inputs && omits_shared_raw(opcode);
     let label = relation_label(opcode, config);
     let mut registry = OracleRegistry::new();
     let input_lengths: Vec<usize> = inputs.iter().map(Vec::len).collect();
@@ -521,8 +534,10 @@ fn prove_op_relation_inner(
         output_openings.push(openings);
     }
     let mut raw = Vec::new();
-    for values in &record.raw_accumulators {
-        raw.push(commit_group_wide(&mut registry, &label, values)?);
+    if !omit_raw {
+        for values in &record.raw_accumulators {
+            raw.push(commit_group_wide(&mut registry, &label, values)?);
+        }
     }
     let mut quotients = Vec::new();
     for values in &record.quotients {
@@ -539,7 +554,11 @@ fn prove_op_relation_inner(
     let lengths = RelationLengths {
         inputs: inputs.iter().map(Vec::len).collect(),
         outputs: record.outputs.iter().map(Vec::len).collect(),
-        raw: record.raw_accumulators.iter().map(Vec::len).collect(),
+        raw: if omit_raw {
+            Vec::new()
+        } else {
+            record.raw_accumulators.iter().map(Vec::len).collect()
+        },
         quotients: record.quotients.iter().map(Vec::len).collect(),
         helpers: record.range_helpers.iter().map(Vec::len).collect(),
         aux: record.auxiliaries.iter().map(Vec::len).collect(),
@@ -764,8 +783,36 @@ pub fn verify_op_relation_with_external(
     expected_config: &[i64],
     external_values: &[Option<Vec<i64>>],
 ) -> Result<()> {
+    verify_op_relation_with_external_form(public, proof, expected_config, external_values, false)
+}
+
+/// Verify the shared trace form: every input is materialized from the trusted
+/// plan and the matrix opcodes carry no raw declaration. This entry is chosen
+/// by the trusted shared verification path, never by the proof. A proof that
+/// still carries raw in this form is rejected; the ordinary entry keeps
+/// requiring it.
+pub fn verify_op_relation_shared_with_external(
+    public: &OpRelationPublic,
+    proof: &OpRelationProof,
+    expected_config: &[i64],
+    external_values: &[Option<Vec<i64>>],
+) -> Result<()> {
+    verify_op_relation_with_external_form(public, proof, expected_config, external_values, true)
+}
+
+fn verify_op_relation_with_external_form(
+    public: &OpRelationPublic,
+    proof: &OpRelationProof,
+    expected_config: &[i64],
+    external_values: &[Option<Vec<i64>>],
+    shared_form: bool,
+) -> Result<()> {
     let _profile = zkie_core::profile::Scope::operator(public.opcode as u16);
+    let omit_raw = shared_form && omits_shared_raw(public.opcode);
     if public.config != expected_config {
+        return Err(Error::StatementMismatch);
+    }
+    if omit_raw && (!proof.raw.is_empty() || !proof.lengths.raw.is_empty()) {
         return Err(Error::StatementMismatch);
     }
     if public.input_oracles.len() != proof.inputs.len()
@@ -810,14 +857,16 @@ pub fn verify_op_relation_with_external(
             false,
         )?;
     }
-    for (index, openings) in proof.raw.iter().enumerate() {
-        verify_group(
-            &public.registry,
-            openings,
-            *proof.lengths.raw.get(index).ok_or(Error::ShapeMismatch)?,
-            0,
-            true,
-        )?;
+    if !omit_raw {
+        for (index, openings) in proof.raw.iter().enumerate() {
+            verify_group(
+                &public.registry,
+                openings,
+                *proof.lengths.raw.get(index).ok_or(Error::ShapeMismatch)?,
+                0,
+                true,
+            )?;
+        }
     }
     for (index, openings) in proof.quotients.iter().enumerate() {
         verify_group(
@@ -873,12 +922,16 @@ pub fn verify_op_relation_with_external(
         .zip(&proof.lengths.outputs)
         .map(|(openings, len)| decode(openings, *len))
         .collect::<Result<_>>()?;
-    let raw: Vec<Vec<i128>> = proof
-        .raw
-        .iter()
-        .zip(&proof.lengths.raw)
-        .map(|(openings, len)| decode_wide(openings, *len))
-        .collect::<Result<_>>()?;
+    let raw: Vec<Vec<i128>> = if omit_raw {
+        Vec::new()
+    } else {
+        proof
+            .raw
+            .iter()
+            .zip(&proof.lengths.raw)
+            .map(|(openings, len)| decode_wide(openings, *len))
+            .collect::<Result<_>>()?
+    };
     let quotients: Vec<Vec<i64>> = proof
         .quotients
         .iter()
@@ -982,8 +1035,13 @@ pub fn verify_op_relation_with_external(
                 || inputs[0].len() != left
                 || inputs[1].len() != right
                 || outputs[0].len() != output_len
-                || raw.is_empty() || raw[0].len() != output_len
+                || (!omit_raw && (raw.is_empty() || raw[0].len() != output_len))
             {
+                return Err(Error::ShapeMismatch);
+            }
+            // A non-zero bias is indexed by output slot; it must have exactly
+            // one entry per output before any slot is read.
+            if bias_len != 0 && bias_len != output_len {
                 return Err(Error::ShapeMismatch);
             }
             let bias = &config[5..bias_header];
@@ -996,7 +1054,7 @@ pub fn verify_op_relation_with_external(
                         bias[slot] as i128
                     })
                     .ok_or(Error::BoundViolation)?;
-                if raw[0][slot] != expected
+                if (!omit_raw && raw[0][slot] != expected)
                     || rq(expected, shift)? != outputs[0][slot] as i128
                 {
                     return Err(Error::InvalidProof);

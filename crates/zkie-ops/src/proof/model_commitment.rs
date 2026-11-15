@@ -989,7 +989,7 @@ fn verify_shared_trace_steps(
         )?;
         let external_values: Vec<Option<Vec<i64>>> =
             materialized.into_iter().map(Some).collect();
-        crate::proof::relations::verify_op_relation_with_external(
+        crate::proof::relations::verify_op_relation_shared_with_external(
             &public_relation,
             &step.message.proof,
             &step.message.config,
