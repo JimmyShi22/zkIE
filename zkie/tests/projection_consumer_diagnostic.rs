@@ -28,8 +28,8 @@ use zkie_engine::pcs::request::table::{
 };
 use zkie_ops::op::OpCode;
 use zkie_ops::proof::asset_table::{
-    decode_asset_table_randomness_set, sample_asset_table_randomness, AssetTableLayout,
-    AssetTableParams, AssetTableRandomness,
+    decode_asset_table_randomness_set, sample_asset_table_randomness, verify_asset_table_meta,
+    AssetTableLayout, AssetTableMeta, AssetTableParams, AssetTableRandomness,
 };
 use zkie_ops::proof::column_session::fp_from_signed_word;
 use zkie_ops::proof::hidden_send_session::{
@@ -60,8 +60,10 @@ use zkie_ops::proof::proximity_planner::{
 use zkie::lm_head_stage::{
     read_manifest, write_manifest, ManifestFile, VerificationManifest,
 };
+use zkie_ops::proof::column_session::column_ledger_dir;
 use zkie_ops::proof::model_commitment::{
-    verify_shared_trace_outputs, ModelCommitmentPublic, SharedTrace,
+    verify_model_anchor_with_tables_on_identity, verify_shared_trace_outputs,
+    ModelCommitmentPublic, SharedTrace,
 };
 use zkie_ops::proof::plan::{PlanConfigValue, PlanSource};
 use zkie_ops::proof::projection_claim::{
@@ -1070,6 +1072,24 @@ fn hidden_plan_for(
     positions: u32,
     limbs: u32,
 ) -> HiddenLinPlan {
+    hidden_plan_with_table(
+        activation,
+        positions,
+        limbs,
+        table_shape(),
+        reader_table_identity(&table.reader).unwrap(),
+        shared_lin_columns(),
+    )
+}
+
+fn hidden_plan_with_table(
+    activation: &CommittedActivation,
+    positions: u32,
+    limbs: u32,
+    index_shape: IndexShape,
+    table_identity: Digest,
+    columns: u64,
+) -> HiddenLinPlan {
     let assembled = assemble_proximity(&assembly_input(positions))
         .expect("the trusted assembly finds the production proximity plan");
     let code = assembled.first_main;
@@ -1081,8 +1101,8 @@ fn hidden_plan_for(
             activation_configuration: ACTIVATION_CONFIGURATION,
             activation_root: activation.root(),
             activation_source: zkie_ops::proof::hidden_send_session::ActivationSource::Commitment,
-            table_shape: table_shape(),
-            table_identity: reader_table_identity(&table.reader).unwrap(),
+            table_shape: index_shape,
+            table_identity,
             matrix_rows: MATRIX_ROWS,
             k_lo: K_LO,
             columns: COLUMNS,
@@ -1123,11 +1143,9 @@ fn hidden_plan_for(
             own_mask_tree: mask_tree(201, mask_code.log_n, 1u64 << assembled.own[0].h),
             shared_fresh: 90,
             own_fresh: 91,
-            column_draws: shared_lin_columns() as usize,
-            column_budget: shared_lin_columns() as usize,
-            ledger: zkie_ops::proof::hidden_send_session::ReadLedgerCell::new(
-                shared_lin_columns(),
-            ),
+            column_draws: columns as usize,
+            column_budget: columns as usize,
+            ledger: zkie_ops::proof::hidden_send_session::ReadLedgerCell::new(columns),
             column_work_bits: 0,
             shared_base_positions: assembled.shared.last().unwrap().positions as usize,
             own_base_positions: assembled.own.last().unwrap().positions as usize,
@@ -2070,4 +2088,278 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
     assert!(
         prove_hidden_lin_hidden(&changed_identity, &activation, &mut source_table, SEED).is_err()
     );
+}
+
+/// The registered production instance feeds the local first+shared table check
+/// prefix. The test reads the candidate commit's public metadata, the same
+/// private randomness, the real weight rows and the verified real activation;
+/// it rebuilds the table and checks its root/record against the trusted meta,
+/// then runs the existing shared-seal prefix entry with the derived plan. This
+/// is a prefix check, not a complete one-time authentication and not the
+/// second chain.
+#[test]
+fn the_registered_instance_feeds_the_local_table_check_prefix() {
+    let Ok(trace_dir) = std::env::var("ZKIE_TABLE_PLAN_TRACE") else {
+        return;
+    };
+    let base = Path::new(&trace_dir).join("instance/gpt2-seq16");
+    let commit = base.join("commit");
+    let run = base.join("run2");
+    let public: ModelCommitmentPublic =
+        bincode::deserialize(&fs::read(commit.join("public/model-commitment.bin")).unwrap())
+            .unwrap();
+    let metas: Vec<AssetTableMeta> =
+        bincode::deserialize(&fs::read(commit.join("public/asset-tables.bin")).unwrap()).unwrap();
+    let config: zkie::provider::ProviderConfig =
+        bincode::deserialize(&fs::read(commit.join("public/provider-config.bin")).unwrap())
+            .unwrap();
+    let statement: zkie::provider::StatementData =
+        bincode::deserialize(&fs::read(run.join("proof/statement.bin")).unwrap()).unwrap();
+    let trace: SharedTrace =
+        bincode::deserialize(&fs::read(run.join("proof/proof.bin")).unwrap()).unwrap();
+    let policy = zkie::policy::parse(
+        &fs::read(Path::new(&trace_dir).join("instance/case.policy")).unwrap(),
+    )
+    .unwrap();
+    let trusted = zkie::policy::select(
+        &policy,
+        &statement.case_id,
+        &statement.model,
+        statement.tokens.len(),
+    )
+    .unwrap();
+
+    let plan = zkie_models_gpt2::plan::derive_table_plan(
+        &zkie_models_gpt2::plan::TABLE_PLAN_CANDIDATE,
+    )
+    .unwrap();
+    let specs = zkie_models_gpt2::plan::asset_specs();
+    let spec = specs
+        .iter()
+        .find(|spec| spec.path == "gpt2/weights/L0_k_w_i32.bin")
+        .unwrap();
+    let meta = metas.iter().find(|meta| meta.path == spec.path).unwrap();
+    assert_eq!(meta.identity, plan.table_identity);
+    assert_eq!(meta.configuration, plan.table_configuration);
+    assert_eq!(meta.shape, plan.params.shape);
+    verify_asset_table_meta(meta, plan.table_model_identity, spec, &plan.params).unwrap();
+    eprintln!(
+        "anchors policy={} public={} model={}/{} params={}/{} leaves={} specs={} assets={} metas={}",
+        digest_to_hex(&trusted.anchor_id),
+        digest_to_hex(&public.anchor.anchor_id),
+        digest_to_hex(&trusted.model_id),
+        digest_to_hex(&public.anchor.model_commitment),
+        digest_to_hex(&zkie_models_gpt2::plan::parameters_digest().unwrap()),
+        digest_to_hex(&public.anchor.parameters_digest),
+        public.anchor.leaf_count,
+        specs.len(),
+        public.assets.len(),
+        metas.len()
+    );
+    let mut leaf_ids: Vec<u64> = public.assets.iter().map(|asset| asset.leaf_record.leaf_id).collect();
+    leaf_ids.sort_unstable();
+    eprintln!("leaf ids: count={} first={:?} last={:?} unique={}", leaf_ids.len(), leaf_ids.first(), leaf_ids.last(), leaf_ids.windows(2).all(|pair| pair[0] != pair[1]));
+    verify_model_anchor_with_tables_on_identity(
+        &public,
+        trusted.anchor_id,
+        trusted.model_id,
+        plan.table_model_identity,
+        zkie_models_gpt2::plan::parameters_digest().unwrap(),
+        &specs,
+        &metas,
+        &zkie_models_gpt2::plan::asset_table_params().unwrap(),
+    )
+    .unwrap();
+
+    let trace_plan = zkie_models_gpt2::plan::trace_plan_public(statement.tokens.len()).unwrap();
+    let outputs =
+        verify_shared_trace_outputs(&public, &trace, &statement.tokens, &trace_plan, Some(Path::new(&config.asset_root))).unwrap();
+    let (activation_step, _consumers) = projection_consumers(&trace_plan);
+    let positions = 2u32;
+    let activation_rows: Vec<Vec<i64>> = (0..positions as usize)
+        .map(|position| {
+            outputs[activation_step][0][position * HIDDEN..(position + 1) * HIDDEN].to_vec()
+        })
+        .collect();
+
+    let inputs = decode_asset_table_randomness_set(
+        &fs::read(commit.join("private/asset-table-randomness.bin")).unwrap(),
+        &[plan.params.clone()],
+    )
+    .unwrap();
+    let salts = inputs[0].randomness.salts.clone();
+    let tails = inputs[0].randomness.tails.clone();
+    let weight_path = Path::new(&config.asset_root).join("gpt2/weights/L0_k_w_i32.bin");
+    let weight_bytes = fs::read(&weight_path).unwrap();
+    let values: Vec<i64> = weight_bytes
+        .chunks_exact(4)
+        .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as i64)
+        .collect();
+    let rows_count = plan.params.shape.rows() as usize;
+    let row_width = plan.params.layout.row_width as usize;
+    let plain = plan.params.shape.plain() as usize;
+    let ell = plan.params.shape.code.ell as usize;
+    let mut messages = vec![vec![Fp::ZERO; ell]; rows_count];
+    for row in 0..rows_count {
+        for column in 0..row_width {
+            messages[row][column] = fp_from_signed_word(values[row * row_width + column] as u64);
+        }
+    }
+    assert!(plain >= row_width);
+    let ledger = std::env::var("ZKIE_TABLE_PLAN_LEDGER")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| column_ledger_dir(Path::new(&config.asset_root), meta.root));
+    if !ledger.join("columns.count").exists() {
+        fs::create_dir_all(&ledger).unwrap();
+        zkie_engine::pcs::request::read::DurableColumnBudget::initialize(
+            ledger.clone(),
+            ledger.join("columns.count"),
+        )
+        .unwrap();
+    }
+    let count = ledger.join("columns.count");
+    let make_table = |messages: &Vec<Vec<Fp>>| -> Table {
+        let mut source = VecTableSource::new(messages.clone(), tails.clone()).unwrap();
+        let table = commit_table_streaming(
+            &mut source,
+            plan.params.shape,
+            plan.table_configuration,
+            &salts,
+            64,
+            u64::MAX,
+        )
+        .unwrap();
+        assert_eq!(table.reader.root, meta.root);
+        assert_eq!(table.reader.record, meta.record);
+        let reader = table.reader.clone();
+        let budget = zkie_engine::pcs::request::read::DurableColumnBudget::open(
+            ledger.clone(),
+            count.clone(),
+            plan.total_columns,
+            plan.total_columns,
+        )
+        .unwrap();
+        Table {
+            table,
+            source: RefCell::new(source),
+            hiding: zkie_engine::pcs::request::read::HidingState::new(
+                reader.root,
+                1,
+                plan.total_columns,
+            ),
+            budget,
+            reader,
+        }
+    };
+    let trusted_reader = IndexReader {
+        shape: meta.shape,
+        configuration: meta.configuration,
+        root: meta.root,
+        record: meta.record.clone(),
+    };
+    let table_identity = reader_table_identity(&trusted_reader).unwrap();
+
+    let mut keeper = make_table(&messages);
+    let activation = activation(&activation_rows, positions);
+    let hidden_plan = hidden_plan_with_table(
+        &activation,
+        positions,
+        tensor_limbs(&activation_rows),
+        plan.params.shape,
+        table_identity,
+        plan.total_columns,
+    );
+    let (first, shared) =
+        prove_hidden_lin_hidden_shared_seal(&hidden_plan, &activation, &mut keeper, SEED, None)
+            .unwrap();
+    let seal = match verify_hidden_lin_hidden_shared_seal(
+        &hidden_plan,
+        &trusted_reader,
+        &first,
+        &shared,
+        None,
+    ) {
+        Ok(seal) => seal,
+        Err(error) => panic!("table-plan verify failed: {:?}", error),
+    };
+    println!(
+        "table-plan prefix seal={} reserved={} total={}",
+        digest_to_hex(&seal),
+        keeper.budget.count().unwrap(),
+        plan.total_columns
+    );
+    assert_eq!(keeper.budget.count().unwrap(), plan.total_columns);
+
+    let mut changed_identity = hidden_plan.clone();
+    changed_identity.send.table_identity = Digest([0x55; 32]);
+    assert!(verify_hidden_lin_hidden_shared_seal(
+        &changed_identity,
+        &trusted_reader,
+        &first,
+        &shared,
+        None
+    )
+    .is_err());
+    let mut changed_shape = hidden_plan.clone();
+    changed_shape.send.table_shape.code.r = 256;
+    assert!(verify_hidden_lin_hidden_shared_seal(
+        &changed_shape,
+        &trusted_reader,
+        &first,
+        &shared,
+        None
+    )
+    .is_err());
+
+    let mut bad_meta = meta.clone();
+    bad_meta.root = Digest([0x66; 32]);
+    assert!(verify_asset_table_meta(&bad_meta, plan.table_model_identity, spec, &plan.params).is_err());
+    let mut bad_shape = meta.clone();
+    bad_shape.shape.distances.m_once += 1;
+    assert!(verify_asset_table_meta(&bad_shape, plan.table_model_identity, spec, &plan.params).is_err());
+
+    let mut restarted = make_table(&messages);
+    assert_eq!(restarted.budget.count().unwrap(), plan.total_columns);
+    assert!(prove_hidden_lin_hidden_shared_seal(
+        &hidden_plan,
+        &activation,
+        &mut restarted,
+        SEED,
+        None
+    )
+    .is_err());
+    assert_eq!(restarted.budget.count().unwrap(), plan.total_columns);
+}
+
+#[test]
+fn the_old_registered_instance_is_rejected_by_the_current_plan() {
+    let Some(base) = artifacts() else {
+        return;
+    };
+    let public: ModelCommitmentPublic =
+        bincode::deserialize(&fs::read(base.join("commit/public/model-commitment.bin")).unwrap())
+            .unwrap();
+    let metas: Vec<AssetTableMeta> = bincode::deserialize(
+        &fs::read(base.join("commit/public/asset-tables.bin")).unwrap(),
+    )
+    .unwrap();
+    let plan = zkie_models_gpt2::plan::derive_table_plan(
+        &zkie_models_gpt2::plan::TABLE_PLAN_CANDIDATE,
+    )
+    .unwrap();
+    if metas.first().map(|meta| meta.identity) == Some(plan.table_identity) {
+        return;
+    }
+    let specs = zkie_models_gpt2::plan::asset_specs();
+    assert!(verify_model_anchor_with_tables_on_identity(
+        &public,
+        public.anchor.anchor_id,
+        public.anchor.model_commitment,
+        plan.table_model_identity,
+        zkie_models_gpt2::plan::parameters_digest().unwrap(),
+        &specs,
+        &metas,
+        &zkie_models_gpt2::plan::asset_table_params().unwrap(),
+    )
+    .is_err());
 }
