@@ -18527,6 +18527,61 @@ fn digit_lookup_mask_sample_row(
 /// digit message, the multiplicity row on the multiplicity-bit message, every
 /// remaining relation of the tie, key-level and table-level sumchecks, the
 /// leaf kept-map row, the bit summand's hiding/shown rows and its end row.
+/// The remaining relation rows of a lookup outcome: the tie rows and the
+/// key-level and table-level rows, each on the lookup mask member by its own
+/// hiding slots, claim masks and target. A skipped row would leave that
+/// relation unchecked.
+pub(crate) fn lookup_remaining_rows(
+    lookup: &crate::proof::lookup::LookupPlan,
+    commit: &crate::proof::lookup_messages::LookupCommitPlan,
+    claims: &crate::proof::lookup::LookupOutcome,
+    mask_oracle: u64,
+) -> Result<Vec<BatRow>> {
+    let planes = lookup.planes()?;
+    let leaf_index = (planes - 1)
+        .checked_add(lookup.key_bits as usize)
+        .and_then(|value| value.checked_add(lookup.table_log as usize))
+        .ok_or(Error::ResourceLimit)?;
+    let mut rows = Vec::new();
+    // Every remaining relation the lookup sumchecks leave: the tie rows and
+    // the key-level and table-level rows. Each output lands on the committed
+    // lookup mask member by its own hiding slots, its claim masks and its
+    // target; a skipped row would leave that relation unchecked.
+    for index in 0..leaf_index {
+        let output = &claims.rows[index];
+        if !output.row_maps.is_empty() {
+            return Err(Error::UnsupportedPrimitive);
+        }
+        let hiding = claims
+            .hiding_slots
+            .get(index)
+            .ok_or(Error::ShapeMismatch)?;
+        if hiding.len() != output.hiding_form.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut row = BatRow::new(BatRowKind::Plain);
+        for (slot, coefficient) in hiding.iter().zip(&output.hiding_form) {
+            row.add_unit(
+                mask_oracle,
+                BatPart::Mask,
+                lookup_mask_virtual_index(commit, *slot)?,
+                *coefficient,
+            );
+        }
+        for term in &output.claim_masks {
+            row.add_unit(
+                mask_oracle,
+                BatPart::Mask,
+                lookup_mask_virtual_index(commit, term.slot)?,
+                term.coefficient,
+            );
+        }
+        row.target = output.row_target;
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
 fn digit_lookup_rows(
     plan: &HiddenSendPlan,
     lookup_plan: &crate::proof::digit_lookup::DigitLookupPlan,
@@ -18600,42 +18655,12 @@ fn digit_lookup_rows(
     if claims.rows.len() != bits_index + 1 {
         return Err(Error::ShapeMismatch);
     }
-    // Every remaining relation the lookup sumchecks leave: the tie rows and
-    // the key-level and table-level rows. Each output lands on the committed
-    // lookup mask member by its own hiding slots, its claim masks and its
-    // target; a skipped row would leave that relation unchecked.
-    for index in 0..leaf_index {
-        let output = &claims.rows[index];
-        if !output.row_maps.is_empty() {
-            return Err(Error::UnsupportedPrimitive);
-        }
-        let hiding = claims
-            .hiding_slots
-            .get(index)
-            .ok_or(Error::ShapeMismatch)?;
-        if hiding.len() != output.hiding_form.len() {
-            return Err(Error::ShapeMismatch);
-        }
-        let mut row = BatRow::new(BatRowKind::Plain);
-        for (slot, coefficient) in hiding.iter().zip(&output.hiding_form) {
-            row.add_unit(
-                mask_member.bat_oracle,
-                BatPart::Mask,
-                lookup_mask_virtual_index(commit, *slot)?,
-                *coefficient,
-            );
-        }
-        for term in &output.claim_masks {
-            row.add_unit(
-                mask_member.bat_oracle,
-                BatPart::Mask,
-                lookup_mask_virtual_index(commit, term.slot)?,
-                term.coefficient,
-            );
-        }
-        row.target = output.row_target;
-        rows.push(row);
-    }
+    rows.extend(lookup_remaining_rows(
+        lookup,
+        commit,
+        claims,
+        mask_member.bat_oracle,
+    )?);
     let leaf = &claims.rows[leaf_index];
     if leaf.row_maps.len() != 1 {
         return Err(Error::ShapeMismatch);
