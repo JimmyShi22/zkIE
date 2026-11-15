@@ -22251,6 +22251,53 @@ pub fn verify_hidden_lin_hidden_with_chain_segment(
     verify_hidden_lin_inner(plan, reader, None, messages, None, Some(_inputs))
 }
 
+/// Diagnostic evidence entry of the first chain: runs the request segment and
+/// the first part up to the seal, without the shared and second chains. It is
+/// a partial path for local evidence and never a production acceptance.
+pub fn prove_first_part_segment_evidence(
+    plan: &HiddenLinPlan,
+    activation: &CommittedActivation,
+    table: &mut dyn HiddenTableProver,
+    seed: Digest,
+    inputs: &crate::proof::request_chain::ChainInputs,
+) -> Result<HiddenSendMessages> {
+    if plan.send.request_chain.is_none() || seed == Digest::ZERO {
+        return Err(Error::InvalidConfig);
+    }
+    let mut coins = ByteMaskCoins::new(derive_run_seed(&seed, 1, 0)?)?;
+    let randomness =
+        WCommitRandomness::from_coins(&mut coins, &plan.send, plan.closure.as_ref())?;
+    let (first, _, _, _, _) = prove_first(
+        plan,
+        Some(activation),
+        table,
+        None,
+        &randomness,
+        None,
+        &seed,
+        None,
+        Some(inputs),
+        true,
+    )?;
+    Ok(first)
+}
+
+/// Verifier counterpart of the first-chain segment evidence entry: replays the
+/// first part and every segment check on the received message. The shared and
+/// second chains are outside this partial path.
+pub fn verify_first_part_segment_evidence(
+    plan: &HiddenLinPlan,
+    reader: &IndexReader,
+    messages: &HiddenSendMessages,
+    inputs: &crate::proof::request_chain::ChainInputs,
+) -> Result<()> {
+    if plan.send.request_chain.is_none() {
+        return Err(Error::InvalidConfig);
+    }
+    verify_first(plan, reader, None, messages, Some(inputs))?;
+    Ok(())
+}
+
 pub fn verify_hidden_lin_hidden(
     plan: &HiddenLinPlan,
     reader: &IndexReader,

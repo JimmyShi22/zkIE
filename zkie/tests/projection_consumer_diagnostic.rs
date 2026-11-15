@@ -30,11 +30,13 @@ use zkie_ops::proof::column_session::fp_from_signed_word;
 use zkie_ops::proof::hidden_send_session::{
     derive_chain_pending, diagnostic_chain_stack, diagnostic_hiding_entries,
     diagnostic_randomness,
-    prove_hidden_lin, prove_hidden_lin_hidden, prove_hidden_lin_hidden_with_chain_segment,
-    verify_hidden_lin, verify_hidden_lin_hidden,
+    prove_first_part_segment_evidence, prove_hidden_lin, prove_hidden_lin_hidden,
+    prove_hidden_lin_hidden_with_chain_segment,
+    verify_first_part_segment_evidence, verify_hidden_lin, verify_hidden_lin_hidden,
     verify_hidden_lin_hidden_with_chain_segment, ActivationShape, CommittedActivation,
-    DotMapPlan, HiddenLinPlan, HiddenOutputShape, HiddenProximityPlan, HiddenSendPlan,
-    HiddenTableProver, IndexMaskPlan, IoppStagePlan, MaskEntryAllocation, MemberPlan, WShape,
+    DotMapPlan, HiddenLinPlan, HiddenOutputShape, HiddenProximityPlan,
+    HiddenSendMessages, HiddenSendPlan, HiddenTableProver, IndexMaskPlan, IoppStagePlan,
+    MaskEntryAllocation, MemberPlan, WShape,
 };
 use zkie_ops::proof::psc::Weight;
 use zkie_ops::proof::psc_general::{general_variables, GeneralMaskEntries, Summand};
@@ -1446,6 +1448,131 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
             .expect("pending discovery");
     let discovery = _discovery.elapsed();
     hidden_plan.validate().expect("hidden plan");
+
+    if std::env::var("ZKIE_SEGMENT_EVIDENCE").is_ok() {
+        // Local segment evidence, not the full request session and not R5:
+        // the first chain up to its seal carries the committed group, the
+        // request segment (range, digit lookups, tie/X4, masks) and its
+        // proximity test. The shared and second chains are outside this path.
+        let segment_prove_start = std::time::Instant::now();
+        let segment_messages = prove_first_part_segment_evidence(
+            &hidden_plan,
+            &activation,
+            &mut session_table,
+            SEED,
+            &inputs,
+        )
+        .expect("segment prove");
+        let segment_prove_time = segment_prove_start.elapsed();
+        let segment_bytes = segment_messages.encode().expect("segment bytes").len();
+        let segment_verify_start = std::time::Instant::now();
+        verify_first_part_segment_evidence(
+            &hidden_plan,
+            session_table.reader(),
+            &segment_messages,
+            &inputs,
+        )
+        .expect("segment verify");
+        let segment_verify_time = segment_verify_start.elapsed();
+
+        let mut attempted = 0u32;
+        let mut rejected = 0u32;
+        let mut check = |label: &str, changed: HiddenSendMessages| {
+            attempted += 1;
+            match verify_first_part_segment_evidence(
+                &hidden_plan,
+                session_table.reader(),
+                &changed,
+                &inputs,
+            ) {
+                Ok(()) => eprintln!("SEGMENT EVIDENCE negative accepted: {label}"),
+                Err(_) => rejected += 1,
+            }
+        };
+        let mut changed = segment_messages.clone();
+        changed.digit_lookups[0].bits_root = Digest([0x5F; 32]);
+        check("changed digit lookup bits root", changed);
+        let mut changed = segment_messages.clone();
+        changed.digit_lookups[1].claims.multiplicity.1 =
+            changed.digit_lookups[1].claims.multiplicity.1.add(&Fp3::ONE);
+        check("changed digit lookup multiplicity", changed);
+        let mut changed = segment_messages.clone();
+        changed.range_array[0].root = Digest([0x5E; 32]);
+        check("changed packed array root", changed);
+        let mut changed = segment_messages.clone();
+        changed
+            .range_units
+            .as_mut()
+            .expect("range units")
+            .root = Digest([0x5D; 32]);
+        check("changed reduced table root", changed);
+        let mut changed = segment_messages.clone();
+        changed
+            .range_digits
+            .as_mut()
+            .expect("range digits")
+            .root = Digest([0x5C; 32]);
+        check("changed digit object root", changed);
+        let mut changed = segment_messages.clone();
+        changed
+            .chain_mask
+            .as_mut()
+            .expect("chain mask")
+            .root = Digest([0x5B; 32]);
+        check("changed segment mask root", changed);
+        let mut changed = segment_messages.clone();
+        changed
+            .source_data
+            .as_mut()
+            .expect("source data")
+            .root = Digest([0x5A; 32]);
+        check("changed source cell root", changed);
+        let mut changed = segment_messages.clone();
+        let merge_end = changed
+            .request
+            .as_ref()
+            .expect("request section")
+            .merge
+            .end_values[0]
+            .add(&Fp3::ONE);
+        changed
+            .request
+            .as_mut()
+            .expect("request section")
+            .merge
+            .end_values[0] = merge_end;
+        check("changed merge end value", changed);
+        let mut changed = segment_messages.clone();
+        changed
+            .segment_proximity
+            .as_mut()
+            .expect("segment proximity")
+            .seal
+            .0[0] ^= 1;
+        check("changed segment proximity seal", changed);
+        assert_eq!(rejected, attempted, "every segment negative is rejected");
+        let hwm = fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find(|line| line.starts_with("VmHWM:"))
+                    .map(|line| line.trim().to_string())
+            })
+            .unwrap_or_else(|| "VmHWM unavailable".to_string());
+        eprintln!(
+            "SEGMENT EVIDENCE (local segment, not R5): limbs={} discovery={:?} segment_bytes={} segment_prove={:?} segment_verify={:?} negatives={}/{} {}",
+            limbs,
+            discovery,
+            segment_bytes,
+            segment_prove_time,
+            segment_verify_time,
+            rejected,
+            attempted,
+            hwm,
+        );
+        return;
+    }
 
     let prove_start = std::time::Instant::now();
     let (messages, witness) = prove_hidden_lin_hidden_with_chain_segment(
