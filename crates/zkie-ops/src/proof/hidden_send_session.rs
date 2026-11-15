@@ -10754,7 +10754,7 @@ pub(crate) fn key_first_prove(
             bits: bit_values.to_vec(),
         },
         lookup_table,
-        plan.commit.bits_oracle ^ 0x4B45_594C,
+        &seed,
         &mut chain,
     )?;
     let member =
@@ -10948,12 +10948,15 @@ pub(crate) fn table_key_lookup_prove(
     key_values: &[Fp3],
     witness: &crate::proof::lookup::LookupWitness,
     table: &dyn crate::proof::lookup::LookupTable,
-    seed: u64,
+    seed: &Digest,
     chain: &mut Chain,
 ) -> Result<KeyLookupProof> {
     let mask_entries = crate::proof::lookup::mask_count(plan)?;
+    // The lookup messages' encoding material comes from the run's private
+    // coins, under a domain of its own: nothing is keyed by a public oracle
+    // number.
     let mut source =
-        crate::proof::lookup_messages::LookupRandomSource::new(seed ^ 0x4B45_594C);
+        crate::proof::lookup_messages::LookupCoins::new(derive_run_seed(seed, 12, 0)?)?;
     let messages = crate::proof::lookup_messages::commit_lookup(
         commit,
         &witness.bits,
