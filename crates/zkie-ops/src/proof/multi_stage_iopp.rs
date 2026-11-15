@@ -2222,6 +2222,288 @@ mod tests {
         (prover, verifier)
     }
 
+    // ---- minimal two-mask, h = 1 fixture (outside the key chain) ----------
+
+    fn h1_stages() -> Vec<IoppStagePlan> {
+        vec![
+            stage_plan(code(5, 8, 1), code(5, 16, 1), 1, 1, 1),
+            stage_plan(code(6, 4, 2), code(6, 32, 2), 1, 1, 1),
+            stage_plan(code(8, 4, 1), code(8, 128, 1), 0, 0, 1),
+        ]
+    }
+
+    fn h1_config() -> IoppChainConfig {
+        IoppChainConfig {
+            first_main: code(5, 8, 1),
+            first_mask: code(5, 16, 1),
+            base_positions: 1,
+            fold_ids: vec![IoppStageFoldIds {
+                group: GROUP + 1,
+                member: MEMBER1,
+                fresh: FRESH1,
+            }],
+            switch_tree_numbers: vec![0x310, 0x311],
+            fold_tree_numbers: vec![0x510],
+            mask_leaf_class: IOPP_MASK_LEAF_CLASS,
+            switch_salt_bytes: SALT_BYTES,
+            stage_seeds: vec![
+                IoppStageSeed {
+                    switch_run: SWITCH_RUN,
+                    mask_run: MASK_RUN,
+                    configuration: CONFIGURATION,
+                },
+                IoppStageSeed {
+                    switch_run: Digest([0xb1; 32]),
+                    mask_run: Digest([0xb2; 32]),
+                    configuration: Digest([0xb3; 32]),
+                },
+                IoppStageSeed {
+                    switch_run: Digest([0xc1; 32]),
+                    mask_run: Digest([0xc2; 32]),
+                    configuration: Digest([0xc3; 32]),
+                },
+            ],
+            base_star: base_star(),
+        }
+    }
+
+    fn h1_mask_plan(tree_number: u64, seed: u8) -> MaskTreePlan {
+        MaskTreePlan {
+            tree_number,
+            leaf_class: IOPP_MASK_LEAF_CLASS,
+            log_n: 5,
+            mask_rows: 2,
+            salt_bytes: SALT_BYTES,
+            run: Digest([seed; 32]),
+            configuration: CONFIGURATION,
+        }
+    }
+
+    fn h1_member_plan() -> RuntimeTreePlan {
+        RuntimeTreePlan {
+            tree_number: 0x211,
+            leaf_class: 2,
+            log_n: 5,
+            log_n_zk: 5,
+            parts: vec![RuntimeTreePart {
+                main_symbols: 6,
+                mask_symbols: 3,
+            }],
+            salt_bytes: SALT_BYTES,
+            run: Digest([0xa1; 32]),
+            configuration: CONFIGURATION,
+        }
+    }
+
+    fn h1_member_tree(
+        member_main: &[Vec<Fp3>],
+        member_tails: &[Vec<Fp3>],
+        mask_row: &[Fp3],
+        mask_tail: &[Fp3],
+    ) -> RuntimeTree {
+        let plan = h1_member_plan();
+        let mut main = Vec::with_capacity(member_main.len());
+        for (row, tail) in member_main.iter().zip(member_tails) {
+            main.push(encode_row_fp3(&code(5, 8, 1), row, tail).unwrap());
+        }
+        let mask = vec![encode_row_fp3(&code(5, 16, 1), mask_row, mask_tail).unwrap()];
+        RuntimeTree::commit(
+            plan,
+            &[RuntimePartRows {
+                main,
+                mask,
+                main_deg: E_DEGREE as u32,
+            }],
+            &salts(32, 0x11),
+        )
+        .unwrap()
+    }
+
+    fn h1_stage_zero() -> (IoppStageZero, IoppVerifyStageZero) {
+        let shape = FoldShape {
+            code: code(5, 8, 1),
+            mask_code: code(5, 16, 1),
+            k: 1,
+            h: 1,
+            mask_leaf_class: IOPP_MASK_LEAF_CLASS,
+        };
+        let layout = FoldGroupLayout {
+            group: GROUP,
+            k: 1,
+            h: 1,
+            members: vec![FoldMemberLayout {
+                oracle: MEMBER0,
+                main_rows: 2,
+                mask_rows: 1,
+                kept: false,
+            }],
+        };
+        assert!(layout.fault(&shape).is_none());
+        let gamma = vec![Fp3::from_u64(3)];
+        let eps = Fp3::from_u64(7);
+        let one_minus = Fp3::ONE.sub(&gamma[0]);
+        let main_claim = (1..=8).map(Fp3::from_u64).collect::<Vec<_>>();
+        let mask_claim = (0..16)
+            .map(|index| Fp3::from_u64(1000 + index))
+            .collect::<Vec<_>>();
+        let fresh_claim = fold_mask_weights(1, 1, 16, &gamma).unwrap();
+        // The member's old mask row and the fresh mask's two rows, as they
+        // enter the FOLD.
+        let old_mask_row = (0..16)
+            .map(|index| Fp3::from_u64(2000 + index))
+            .collect::<Vec<_>>();
+        let fresh_row0 = (0..16)
+            .map(|index| Fp3::from_u64(3000 + index))
+            .collect::<Vec<_>>();
+        let fresh_row1 = fresh_row0
+            .iter()
+            .map(|value| value.add(&Fp3::from_u64(100)))
+            .collect::<Vec<_>>();
+        let old_mask_tail = vec![Fp3::from_u64(51)];
+        let fresh_tail0 = vec![Fp3::from_u64(52)];
+        let fresh_tail1 = vec![Fp3::from_u64(54)];
+        // The layout's 2^h slots: the member row and an empty slot. The folded
+        // rows and tails follow fold_low with the same gamma coefficients; the
+        // masks of the stage-zero rows are these folded values, not the raw
+        // member rows and not one fresh row.
+        let mut folded_old = vec![Fp3::ZERO; 16];
+        for (at, value) in folded_old.iter_mut().enumerate() {
+            *value = one_minus.mul(&old_mask_row[at]);
+        }
+        let mut folded_fresh = vec![Fp3::ZERO; 16];
+        for (at, value) in folded_fresh.iter_mut().enumerate() {
+            *value = one_minus
+                .mul(&fresh_row0[at])
+                .add(&gamma[0].mul(&fresh_row1[at]));
+        }
+        let folded_old_tail = vec![one_minus.mul(&old_mask_tail[0])];
+        let folded_fresh_tail =
+            vec![one_minus.mul(&fresh_tail0[0]).add(&gamma[0].mul(&fresh_tail1[0]))];
+        let member_main = (0..2)
+            .map(|row| {
+                (0..8)
+                    .map(|column| Fp3::from_u64((row * 8 + column + 1) as u64))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let member_tails = (0..2)
+            .map(|row| vec![Fp3::from_u64(900 + row as u64)])
+            .collect::<Vec<_>>();
+        let weights = fold_coefficients(1, &gamma).unwrap();
+        let mut main_row = vec![Fp3::ZERO; 8];
+        for (weight, row) in weights.iter().zip(&member_main) {
+            for (value, entry) in main_row.iter_mut().zip(row) {
+                *value = value.add(&weight.mul(entry));
+            }
+        }
+        let mut main_tail = Fp3::ZERO;
+        for (weight, tail) in weights.iter().zip(&member_tails) {
+            main_tail = main_tail.add(&weight.mul(&tail[0]));
+        }
+        let mut target = Fp3::ZERO;
+        for (coefficient, value) in main_claim.iter().zip(&main_row) {
+            target = target.add(&coefficient.mul(value));
+        }
+        for (coefficient, value) in mask_claim.iter().zip(&folded_old) {
+            target = target.add(&coefficient.mul(value));
+        }
+        for (coefficient, value) in fresh_claim.iter().zip(&folded_fresh) {
+            target = target.add(&coefficient.mul(value));
+        }
+        let mut kept_factor = eps;
+        for challenge in &gamma {
+            kept_factor = kept_factor.mul(&Fp3::ONE.sub(challenge));
+        }
+        let sum = Fp3::from_u64(17);
+        let tree = h1_member_tree(&member_main, &member_tails, &old_mask_row, &old_mask_tail);
+        let fresh_plan = h1_mask_plan(0x480, 0xa1);
+        let fresh_tree = MaskTree::commit(
+            fresh_plan,
+            &shape,
+            &[fresh_row0.clone(), fresh_row1.clone()],
+            &[fresh_tail0.clone(), fresh_tail1.clone()],
+            &salts(32, 0x23),
+        )
+        .unwrap();
+        let handoff = FoldHandoff {
+            code: shape.code,
+            mask_code: shape.mask_code,
+            main_claim: main_claim.clone(),
+            mask_claim: mask_claim.clone(),
+            target,
+            fresh_claim: fresh_claim.clone(),
+            group: GROUP,
+            k: 1,
+            h: 1,
+            members: vec![MEMBER0],
+            gamma: gamma.clone(),
+            eps,
+            sum,
+            fresh: FRESH0,
+            fresh_root: fresh_tree.root,
+            tree_number: fresh_plan.tree_number,
+            kept_factor,
+            kept_rows: 0,
+            layout: layout.clone(),
+        };
+        let basis = FoldBasis {
+            layout: layout.clone(),
+            fresh_root: fresh_tree.root,
+            fresh_tree: fresh_plan,
+            members: vec![FoldMember {
+                oracle: MEMBER0,
+                main_code: shape.code,
+                mask_code: shape.mask_code,
+                root: *tree.root(),
+                tree: h1_member_plan(),
+            }],
+        };
+        let rows = SingleRows {
+            code: shape.code,
+            mask_code: shape.mask_code,
+            main: main_row,
+            main_tail: vec![main_tail],
+            masks: vec![folded_old, folded_fresh],
+            mask_tails: vec![folded_old_tail, folded_fresh_tail],
+            claim: main_claim,
+            mask_claims: vec![mask_claim, fresh_claim],
+            target,
+        };
+        rows.check().unwrap();
+        let prover = IoppStageZero {
+            handoff: handoff.clone(),
+            basis: basis.clone(),
+            rows,
+            member_trees: vec![Arc::new(tree)],
+            old_mask_tree: None,
+            fresh_tree,
+            member_opening: None,
+        };
+        let verifier = IoppVerifyStageZero {
+            handoff,
+            basis,
+            first_old_mask: None,
+        };
+        (prover, verifier)
+    }
+
+    #[test]
+    fn h1_two_mask_fixture_round_trips() {
+        let plan = IoppChain::derive(&h1_stages(), &h1_config()).unwrap();
+        let (zero, verify_zero) = h1_stage_zero();
+        let (proof, seal, _) = prove_multi_stage_iopp(
+            chain(),
+            &plan,
+            zero,
+            &switches(&plan),
+            &stage_folds(&plan),
+            &base_private(&plan),
+        )
+        .unwrap();
+        let verified = verify_multi_stage_iopp(chain(), &plan, verify_zero, &proof).unwrap();
+        assert_eq!(verified, seal);
+    }
+
     fn switches(chain_plan: &IoppChain) -> Vec<IoppSwitchPrivate> {
         chain_plan
             .stages
