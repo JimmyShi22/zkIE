@@ -30,6 +30,7 @@ pub mod psc_general;
 pub mod lookup;
 pub mod lookup_messages;
 pub mod lookup_table;
+pub mod lin_binding;
 pub mod table_range;
 pub mod relations;
 pub mod session_baseline;

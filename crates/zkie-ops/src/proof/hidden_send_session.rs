@@ -10501,6 +10501,23 @@ pub(crate) struct KeyFirstPlan {
     pub group: u64,
     pub bits_bat: u64,
     pub mask_bat: u64,
+    /// The shape of the one-leaf binding tree over the first chain's seal.
+    pub binding: crate::proof::lin_binding::LinBindingShape,
+    /// The public parameters of the key group's derived chain.
+    pub group_config: KeyGroupConfig,
+}
+
+/// The public parameters of the key group's chain: its fresh identifier, the
+/// fresh mask tree's number and salt length, and the tree's run and
+/// configuration starts. The stage chain and the BAT row count are derived
+/// from the rest of the plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct KeyGroupConfig {
+    pub fresh: u64,
+    pub mask_tree_number: u64,
+    pub salt_bytes: usize,
+    pub run: Digest,
+    pub configuration: Digest,
 }
 
 fn key_first_put_code(w: &mut CanonicalWriter, code: &CodeParams) {
@@ -10588,6 +10605,12 @@ impl KeyFirstPlan {
         w.put_u64(self.group);
         w.put_u64(self.bits_bat);
         w.put_u64(self.mask_bat);
+        w.put_bytes(&self.binding.encode());
+        w.put_u64(self.group_config.fresh);
+        w.put_u64(self.group_config.mask_tree_number);
+        w.put_u64(self.group_config.salt_bytes as u64);
+        w.put_digest(&self.group_config.run);
+        w.put_digest(&self.group_config.configuration);
         w.into_bytes()
     }
 
@@ -10618,6 +10641,9 @@ pub(crate) struct KeyFirstMessages {
     pub eval_target: Fp3,
     /// The first chain's seal, recomputed by the verifier and compared.
     pub seal: Digest,
+    /// The request's place in the binding tree, its leaf salt and the empty
+    /// sibling path of this round's one leaf.
+    pub binding: crate::proof::lin_binding::LinBindingPath,
 }
 
 /// What the prover keeps of the key first part.
@@ -10696,10 +10722,16 @@ pub(crate) fn key_first_prove(
     bit_values: &[Fp3],
     index_randomness: &IndexMaskRandomness,
     seed: Digest,
-) -> Result<(KeyFirstMessages, Digest, KeyFirstWitness)> {
+) -> Result<(
+    KeyFirstMessages,
+    Digest,
+    crate::proof::lin_binding::LinBindingRoot,
+    KeyFirstWitness,
+)> {
+    let statement_digest = plan.statement_digest();
     let mut chain = Chain::begin(
         KEY_FIRST_CHAIN_LABEL,
-        &plan.statement_digest(),
+        &statement_digest,
         &plan.range.encode(),
         &reader.name(),
         None,
@@ -10761,6 +10793,19 @@ pub(crate) fn key_first_prove(
         eval_target,
     )?;
     let seal = *chain.value();
+    if plan.binding.fault().is_some() || plan.binding.log_leaves != 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let mut binding_coins = ByteMaskCoins::new(derive_run_seed(&seed, 10, 0)?)?;
+    let salts = draw_salt_bytes(&mut binding_coins, 1, plan.binding.salt_bytes)?;
+    let mut binding_tree = crate::proof::lin_binding::LinBindingTree::new(
+        plan.binding,
+        statement_digest,
+        salts.concat(),
+    )?;
+    binding_tree.place(0, &seal)?;
+    let binding_root = binding_tree.root()?;
+    let binding = binding_tree.path(0)?;
     Ok((
         KeyFirstMessages {
             index_root: index.root,
@@ -10770,8 +10815,10 @@ pub(crate) fn key_first_prove(
             psi,
             eval_target,
             seal,
+            binding,
         },
         seal,
+        binding_root,
         KeyFirstWitness {
             index,
             lookup,
@@ -10788,10 +10835,11 @@ pub(crate) fn key_first_verify(
     reader: &IndexReader,
     lookup_table: &dyn crate::proof::lookup::LookupTable,
     messages: &KeyFirstMessages,
-) -> Result<Digest> {
+) -> Result<(Digest, crate::proof::lin_binding::LinBindingRoot)> {
+    let statement_digest = plan.statement_digest();
     let mut chain = Chain::begin(
         KEY_FIRST_CHAIN_LABEL,
-        &plan.statement_digest(),
+        &statement_digest,
         &plan.range.encode(),
         &reader.name(),
         None,
@@ -10825,7 +10873,19 @@ pub(crate) fn key_first_verify(
     if seal != messages.seal {
         return Err(Error::InvalidProof);
     }
-    Ok(seal)
+    if plan.binding.fault().is_some() || plan.binding.log_leaves != 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let binding_root = crate::proof::lin_binding::binding_root_from_path(
+        &plan.binding,
+        &statement_digest,
+        &seal,
+        &messages.binding,
+    )?;
+    if binding_root.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    Ok((seal, binding_root))
 }
 
 // ---------------------------------------------------------------------------
@@ -11171,16 +11231,12 @@ pub(crate) struct KeyGroupPlan {
 /// derived first codes are the codes the lookup messages are committed under,
 /// so the group's members and the FOLD share one pair of codes.
 pub(crate) fn derive_key_group_plan(
+    config: &KeyGroupConfig,
     bit_entries: u64,
     mask_entries: usize,
     rows: u64,
-    salt_bytes: usize,
-    fresh: u64,
-    mask_tree_number: u64,
-    run: Digest,
-    configuration: Digest,
 ) -> Result<KeyGroupPlan> {
-    if fresh == 0 {
+    if config.fresh == 0 {
         return Err(Error::InvalidConfig);
     }
     let derived = crate::proof::proximity_planner::derive_single_group_plan(
@@ -11192,13 +11248,13 @@ pub(crate) fn derive_key_group_plan(
     let first_h = stages.first().ok_or(Error::InvalidConfig)?.h;
     let tree_rows = 1u64.checked_shl(first_h).ok_or(Error::ResourceLimit)?;
     let mask_tree = MaskTreePlan {
-        tree_number: mask_tree_number,
+        tree_number: config.mask_tree_number,
         leaf_class: crate::proof::multi_stage_iopp::IOPP_MASK_LEAF_CLASS,
         log_n: derived.first_mask.log_n,
         mask_rows: tree_rows,
-        salt_bytes,
-        run,
-        configuration,
+        salt_bytes: config.salt_bytes,
+        run: config.run,
+        configuration: config.configuration,
     };
     if mask_tree.fault().is_some()
         || mask_tree.width()? > mask_tree.columns()
@@ -11219,7 +11275,7 @@ pub(crate) fn derive_key_group_plan(
         stages,
         base_positions,
         mask_tree,
-        fresh,
+        fresh: config.fresh,
     })
 }
 
@@ -11234,6 +11290,8 @@ pub(crate) fn key_group_bound(
     if plan.bits_bat == plan.mask_bat
         || group.fresh == plan.bits_bat
         || group.fresh == plan.mask_bat
+        || group.fresh != plan.group_config.fresh
+        || group.mask_tree.tree_number != plan.group_config.mask_tree_number
     {
         return Err(Error::InvalidConfig);
     }
@@ -36590,6 +36648,17 @@ mod key_first_plan_tests {
             group: 7,
             bits_bat: 10,
             mask_bat: 11,
+            binding: crate::proof::lin_binding::LinBindingShape {
+                log_leaves: 0,
+                salt_bytes: 40,
+            },
+            group_config: KeyGroupConfig {
+                fresh: 100,
+                mask_tree_number: 200,
+                salt_bytes: 40,
+                run: Digest([0x61; 32]),
+                configuration: Digest([0x62; 32]),
+            },
         }
     }
 
@@ -36651,17 +36720,15 @@ mod key_first_flow_tests {
         // The group's BAT rows: one sample row per member and the lookup's
         // plain rows, which are one per remaining relation plus four.
         let planned = (leaf_index + 6) as u64;
-        let group_plan = derive_key_group_plan(
-            bit_entries,
-            mask_entries,
-            planned,
-            40,
-            95,
-            301,
-            Digest([0x71; 32]),
-            Digest([0x72; 32]),
-        )
-        .unwrap();
+        let group_config = KeyGroupConfig {
+            fresh: 95,
+            mask_tree_number: 301,
+            salt_bytes: 40,
+            run: Digest([0x71; 32]),
+            configuration: Digest([0x72; 32]),
+        };
+        let group_plan =
+            derive_key_group_plan(&group_config, bit_entries, mask_entries, planned).unwrap();
         // The lookup messages are committed under the group's first codes, so
         // the members and the FOLD share one pair of codes.
         let message = derive_range_lookup_message(
@@ -36766,6 +36833,11 @@ mod key_first_flow_tests {
             group: 7,
             bits_bat: 0,
             mask_bat: 1,
+            binding: crate::proof::lin_binding::LinBindingShape {
+                log_leaves: 0,
+                salt_bytes: 40,
+            },
+            group_config,
         };
         (plan, keys, bits, group_plan, planned)
     }
@@ -36780,6 +36852,7 @@ mod key_first_flow_tests {
         KeyFirstWitness,
         KeyGroupPlan,
         u64,
+        crate::proof::lin_binding::LinBindingRoot,
     ) {
         let (plan, keys, bits, group_plan, planned) = flow_plan();
         // The table row is the matrix column: place row holds entry
@@ -36814,7 +36887,7 @@ mod key_first_flow_tests {
         let mut coins = ByteMaskCoins::new(Digest([5; 32])).unwrap();
         let index_randomness = IndexMaskRandomness::from_coins(&mut coins, &plan.index).unwrap();
         let seed = Digest([7; 32]);
-        let (messages, seal, witness) = key_first_prove(
+        let (messages, seal, binding_root, witness) = key_first_prove(
             &plan,
             &reader,
             &mut source,
@@ -36825,25 +36898,52 @@ mod key_first_flow_tests {
             seed,
         )
         .unwrap();
-        (plan, reader, table, messages, seal, witness, group_plan, planned)
+        (
+            plan,
+            reader,
+            table,
+            messages,
+            seal,
+            witness,
+            group_plan,
+            planned,
+            binding_root,
+        )
     }
 
     #[test]
     fn the_key_first_part_proves_and_verifies() {
-        let (plan, reader, table, messages, seal, _witness, _group_plan, _planned) = flow_run();
-        let verified = key_first_verify(&plan, &reader, &table, &messages).unwrap();
+        let (plan, reader, table, messages, seal, _witness, _group_plan, _planned, binding_root) =
+            flow_run();
+        let (verified, read_root) = key_first_verify(&plan, &reader, &table, &messages).unwrap();
         assert_eq!(verified, seal);
+        assert_eq!(read_root, binding_root);
+        assert_eq!(read_root.places, 1);
         let mut changed = messages.clone();
         changed.eval_target = changed.eval_target.add(&Fp3::ONE);
         assert!(key_first_verify(&plan, &reader, &table, &changed).is_err());
-        let mut changed = messages;
+        let mut changed = messages.clone();
         changed.w_root = Digest([0x77; 32]);
         assert!(key_first_verify(&plan, &reader, &table, &changed).is_err());
+        // A place outside the one-leaf tree is refused.
+        let mut changed = messages.clone();
+        changed.binding.place = 1;
+        assert!(key_first_verify(&plan, &reader, &table, &changed).is_err());
+        // A sibling the one-leaf shape does not have is refused.
+        let mut changed = messages.clone();
+        changed.binding.siblings.push(Digest([0x78; 32]));
+        assert!(key_first_verify(&plan, &reader, &table, &changed).is_err());
+        // Another salt leads to another root: the shared chain would differ.
+        let mut changed = messages;
+        changed.binding.salt[0] ^= 1;
+        let (_, ground_root) = key_first_verify(&plan, &reader, &table, &changed).unwrap();
+        assert_ne!(ground_root, binding_root);
     }
 
     #[test]
     fn the_key_group_proves_and_verifies() {
-        let (plan, reader, _table, _messages, _seal, witness, group_plan, planned) = flow_run();
+        let (plan, reader, _table, _messages, _seal, witness, group_plan, planned, _binding_root) =
+            flow_run();
         let claims = &witness.lookup.claims;
         let mut plain =
             lookup_remaining_rows(&plan.lookup, &plan.commit, claims, plan.mask_bat).unwrap();
