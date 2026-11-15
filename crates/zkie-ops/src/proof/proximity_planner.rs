@@ -515,6 +515,78 @@ fn scope_positions(agree: &Bound, work_bits: u32, extra: &Bound) -> u64 {
     positions(agree, bits, extra, 1)
 }
 
+/// The trusted parameters of one shared linear stage: the table's row
+/// variables, the shared point's low variables, how many requests share the
+/// point, and the comparison point's variables.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedLinShape {
+    pub v: u32,
+    pub k_lo: u32,
+    pub instances: u64,
+    pub rows_log: u32,
+}
+
+/// The derived query count and error terms of one shared linear stage.
+#[derive(Clone, Debug)]
+pub struct SharedLinBounds {
+    /// The fold point's error: `instances * field_error(v + k_lo)` plus the
+    /// folded table's error.
+    pub point: Bound,
+    /// The number of columns drawn for the table's agreement.
+    pub columns: u64,
+    /// `agree^columns`, the column round's error.
+    pub column_error: Bound,
+    /// `field_error(rows_log)`, the comparison point's error.
+    pub zeta: Bound,
+}
+
+/// Derives a shared linear stage's column query count and error terms from the
+/// table's tested distance. `agree` is the distance's agreement, `list` its
+/// list size and `proximity_error` its per-variable proximity error; the
+/// folded table's error is `v * proximity_error + list * field_error(v)`. The
+/// column count is the smallest `nu` whose `agree^nu` meets the query target
+/// with no extra term. Only this layer is derived; the fold round count and
+/// the hiding polynomial are not.
+pub fn shared_lin_bounds(
+    shape: SharedLinShape,
+    agree: &Bound,
+    list: &Big,
+    proximity_error: &Bound,
+    closeness_work_bits: u32,
+    query_work_bits: u32,
+) -> Result<SharedLinBounds> {
+    if shape.v == 0 || shape.instances == 0 || shape.rows_log == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let mut fold = Bound::from_u64(0);
+    for _ in 1..=shape.v {
+        fold = fold.add(proximity_error);
+    }
+    let fold = fold.add(
+        &Bound::from_big(list.clone()).mul(&field_error(u64::from(shape.v))),
+    );
+    let point = Bound::from_u64(shape.instances)
+        .mul(&field_error(u64::from(shape.v) + u64::from(shape.k_lo)))
+        .add(&fold);
+    if !surely_le(&Bound::from_real(point.error()), &goal(closeness_work_bits)) {
+        return Err(Error::InvalidConfig);
+    }
+    let columns = scope_positions(agree, query_work_bits, &Bound::from_u64(0));
+    if columns == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let column_error = agree.pow(columns);
+    if !surely_le(&column_error, &goal(query_work_bits)) {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(SharedLinBounds {
+        point,
+        columns,
+        column_error,
+        zeta: field_error(u64::from(shape.rows_log)),
+    })
+}
+
 fn stage_cube_bits(group: &GroupShape) -> u32 {
     let main = group.k + ceil_log2(group.main.ell);
     let mask = group.h + ceil_log2(group.mask.ell);
@@ -2531,6 +2603,53 @@ pub fn plan_own_two_stage(
 mod tests {
     use super::*;
     use zkie_engine::pcs::request::code::build_code_plan;
+
+    /// The shared linear layer derives exactly the three recorded terms: the
+    /// fold point's error, the agreement power at the column count, and the
+    /// comparison point's field error. An unreachable agreement and a zero
+    /// instance or row count are refused.
+    #[test]
+    fn the_shared_lin_bounds_derive_the_query_count_and_error_terms() {
+        let word = Word {
+            log_n: 12,
+            ell: 64,
+            k: 16,
+        };
+        let at = johnson(&word, 8).unwrap();
+        assert!(!at.bad());
+        let proximity = mca_error(&at);
+        let shape = SharedLinShape {
+            v: 10,
+            k_lo: 6,
+            instances: 2,
+            rows_log: 10,
+        };
+        let bounds = shared_lin_bounds(shape, &at.agree, &at.list, &proximity, 0, 0).unwrap();
+        let mut fold = Bound::from_u64(0);
+        for _ in 1..=shape.v {
+            fold = fold.add(&proximity);
+        }
+        let fold = fold.add(
+            &Bound::from_big(at.list.clone()).mul(&field_error(u64::from(shape.v))),
+        );
+        let expected = Bound::from_u64(shape.instances)
+            .mul(&field_error(u64::from(shape.v) + u64::from(shape.k_lo)))
+            .add(&fold);
+        assert_eq!(expected, bounds.point);
+        assert!(bounds.columns > 0);
+        assert!(surely_le(&bounds.column_error, &goal(0)));
+        let zeta = field_error(u64::from(shape.rows_log));
+        assert_eq!(zeta, bounds.zeta);
+
+        let one = Bound::from_u64(1);
+        assert!(shared_lin_bounds(shape, &one, &at.list, &proximity, 0, 0).is_err());
+        let mut bad = shape;
+        bad.instances = 0;
+        assert!(shared_lin_bounds(bad, &at.agree, &at.list, &proximity, 0, 0).is_err());
+        let mut bad = shape;
+        bad.v = 0;
+        assert!(shared_lin_bounds(bad, &at.agree, &at.list, &proximity, 0, 0).is_err());
+    }
 
     #[test]
     fn real_two_stage_plan_is_the_candidate() {
