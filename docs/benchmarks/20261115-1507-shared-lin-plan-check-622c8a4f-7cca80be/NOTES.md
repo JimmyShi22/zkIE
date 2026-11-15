@@ -26,6 +26,8 @@
   - Wiring negatives: a plan with one column fewer and a plan without the
     one-time distance are refused at validation.
 - Numbers:
+  - profile: debug (target/debug); the times and peak memory below are debug
+    diagnostics, not release performance and not comparable across builds.
   - derived: table distance 284; shared column draws 52; table code tail 128
   - real first+shared chains: seal bytes 2,742,312; prove 326.72 s; verify
     106.22 s; negatives 5/5; process VmHWM 8,954,768 kB; the 231.46 s

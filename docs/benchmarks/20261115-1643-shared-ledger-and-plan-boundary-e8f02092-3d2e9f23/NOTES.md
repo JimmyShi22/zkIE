@@ -25,8 +25,10 @@
   - Repeated verifications use a fresh plan-owned read ledger (a plan clone),
     so the tamper checks are genuine and do not pass by ledger exhaustion.
   - Evidence mode: the real first+shared chains are proven and verified, five
-    tampered messages are rejected, a re-opened table over the same stable
-    ledger proves again (count continues), the remaining lifetime is drained,
+    tampered messages are rejected, a second keeper in the same process
+    reopens the persistent ledger file and proves again (the count continues;
+    this is not a measured process restart, and the code fact is that opening
+    an existing ledger never resets it), the remaining lifetime is drained,
     and the next proof is refused at the reservation. Negatives: a plan
     without the check is refused at the production entry; a plan with one
     fewer column or without the distance is refused at validation.
@@ -41,6 +43,8 @@
     stable ledger holds the setup, the first prefix and the rerun.
   - attempt 3 (final): passed (log shared-seal.log).
 - Numbers (final, table tail 1024):
+  - profile: debug (target/debug); the times and peak memory below are debug
+    diagnostics, not release performance and not comparable across builds.
   - derived: table distance 530; shared column draws 129; lifetime 1024
   - real first+shared chains: seal bytes 3,365,736; prove 323.76 s; verify
     106.63 s; negatives 5/5; ledger count before rerun 387 and after 516;
