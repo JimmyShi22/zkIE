@@ -478,12 +478,25 @@ pub fn prove_op_relation_shared(
     prove_op_relation_inner(op, inputs, config, external, false)
 }
 
-/// The matrix relations whose raw accumulator is fully recomputed by the
-/// verifier from the trusted inputs; only the shared trace form may omit it.
+/// The relations whose raw accumulator is fully recomputed by the verifier
+/// from the trusted inputs; only the shared trace form may omit it. Every
+/// listed branch still performs its full integer computation and every
+/// output, auxiliary and source check.
 fn omits_shared_raw(opcode: OpCode) -> bool {
     matches!(
         opcode,
-        OpCode::MatMul | OpCode::Projection | OpCode::RegressionHead
+        OpCode::MatMul
+            | OpCode::Projection
+            | OpCode::RegressionHead
+            | OpCode::AffineScale
+            | OpCode::Softmax
+            | OpCode::SoftmaxRows
+            | OpCode::Hadamard
+            | OpCode::GatedFfn
+            | OpCode::ProfileLayerNorm
+            | OpCode::ProfileRmsNorm
+            | OpCode::ProfileRope
+            | OpCode::ProfileStandardize
     )
 }
 
@@ -996,12 +1009,15 @@ fn verify_op_relation_with_external_form(
             let multiplier = *config.first().ok_or(Error::InvalidConfig)? as i128;
             let addend = *config.get(1).ok_or(Error::InvalidConfig)? as i128;
             let shift = *config.get(2).ok_or(Error::InvalidConfig)? as u32;
-            if inputs.len() != 1 || outputs[0].len() != inputs[0].len() || raw.is_empty() {
+            if inputs.len() != 1
+                || outputs[0].len() != inputs[0].len()
+                || (!omit_raw && raw.is_empty())
+            {
                 return Err(Error::ShapeMismatch);
             }
             for index in 0..inputs[0].len() {
                 let expected = multiplier * inputs[0][index] as i128 + addend;
-                if raw[0].get(index) != Some(&expected) {
+                if !omit_raw && raw[0].get(index) != Some(&expected) {
                     return Err(Error::InvalidProof);
                 }
                 let quantized = i64::try_from(rq(expected, shift)?).map_err(|_| Error::BoundViolation)?;
@@ -1086,11 +1102,15 @@ fn verify_op_relation_with_external_form(
         }
         OpCode::Softmax => {
             let shift = *config.first().ok_or(Error::InvalidConfig)? as u32;
-            if inputs.len() != 2 || inputs[0].is_empty() || raw.is_empty() || outputs[0].len() != inputs[0].len() {
+            if inputs.len() != 2
+                || inputs[0].is_empty()
+                || (!omit_raw && raw.is_empty())
+                || outputs[0].len() != inputs[0].len()
+            {
                 return Err(Error::ShapeMismatch);
             }
             let length = inputs[0].len();
-            if raw[0].len() != length {
+            if !omit_raw && raw[0].len() != length {
                 return Err(Error::ShapeMismatch);
             }
             let max = *inputs[0].iter().max().ok_or(Error::InvalidProof)?;
@@ -1116,7 +1136,7 @@ fn verify_op_relation_with_external_form(
                 let numerator = (aux[1][index] as i128)
                     .checked_mul(scale)
                     .ok_or(Error::BoundViolation)?;
-                if raw[0][index] != numerator
+                if (!omit_raw && raw[0][index] != numerator)
                     || outputs[0][index] as i128 != crate::registry::round_div_half_up(numerator, denominator)?
                 {
                     return Err(Error::InvalidProof);
@@ -1134,7 +1154,7 @@ fn verify_op_relation_with_external_form(
                 || inputs[0].len() != count
                 || inputs[1].is_empty()
                 || outputs[0].len() != count
-                || raw.is_empty() || raw[0].len() != count
+                || (!omit_raw && (raw.is_empty() || raw[0].len() != count))
                 || aux.len() != 2
                 || aux[0].len() != rows
                 || aux[1].len() != rows
@@ -1174,7 +1194,7 @@ fn verify_op_relation_with_external_form(
                         .checked_mul(scale)
                         .ok_or(Error::BoundViolation)?;
                     let slot = start + index;
-                    if raw[0][slot] != numerator
+                    if (!omit_raw && raw[0][slot] != numerator)
                         || outputs[0][slot] as i128
                             != crate::registry::round_div_half_up(numerator, denominator)?
                     {
@@ -1517,12 +1537,18 @@ fn verify_op_relation_with_external_form(
         }
         OpCode::Hadamard | OpCode::GatedFfn => {
             let shift = *config.first().ok_or(Error::InvalidConfig)? as u32;
-            if inputs.len() != 2 || inputs[0].len() != inputs[1].len() || outputs[0].len() != inputs[0].len() || raw.is_empty() || raw[0].len() != inputs[0].len() {
+            if inputs.len() != 2
+                || inputs[0].len() != inputs[1].len()
+                || outputs[0].len() != inputs[0].len()
+                || (!omit_raw && (raw.is_empty() || raw[0].len() != inputs[0].len()))
+            {
                 return Err(Error::ShapeMismatch);
             }
             for index in 0..inputs[0].len() {
                 let expected = inputs[0][index] as i128 * inputs[1][index] as i128;
-                if raw[0][index] != expected || rq(expected, shift)? != outputs[0][index] as i128 {
+                if (!omit_raw && raw[0][index] != expected)
+                    || rq(expected, shift)? != outputs[0][index] as i128
+                {
                     return Err(Error::InvalidProof);
                 }
             }
@@ -1693,7 +1719,7 @@ fn verify_op_relation_with_external_form(
                 || inputs[2].len() != cells
                 || inputs[3].is_empty()
                 || outputs[0].len() != cells
-                || raw.is_empty() || raw[0].len() != cells
+                || (!omit_raw && (raw.is_empty() || raw[0].len() != cells))
                 || aux.len() != 3
                 || aux[0].len() != rows
                 || aux[1].len() != rows
@@ -1738,7 +1764,7 @@ fn verify_op_relation_with_external_form(
                     let expected = round_div_half_up(image, 1i128 << output_shift)?
                         + inputs[2][start + index] as i128;
                     let expected = i64::try_from(expected).map_err(|_| Error::BoundViolation)?;
-                    if raw[0][start + index] != image
+                    if (!omit_raw && raw[0][start + index] != image)
                         || outputs[0][start + index] != clamp_value(expected, config, 4)?
                     {
                         return Err(Error::InvalidProof);
@@ -1800,7 +1826,7 @@ fn verify_op_relation_with_external_form(
                 || inputs[1].len() != cells
                 || inputs[2].is_empty()
                 || outputs[0].len() != cells
-                || raw.is_empty() || raw[0].len() != cells
+                || (!omit_raw && (raw.is_empty() || raw[0].len() != cells))
                 || aux.len() != 2
                 || aux[0].len() != rows
                 || aux[1].len() != rows
@@ -1853,7 +1879,7 @@ fn verify_op_relation_with_external_form(
                     };
                     let expected = i64::try_from(round_div_half_up(image, 1i128 << output_shift)?)
                         .map_err(|_| Error::BoundViolation)?;
-                    if raw[0][start + index] != image
+                    if (!omit_raw && raw[0][start + index] != image)
                         || outputs[0][start + index] != clamp_value(expected, config, 4)?
                     {
                         return Err(Error::InvalidProof);
@@ -1869,7 +1895,7 @@ fn verify_op_relation_with_external_form(
                 || inputs[1].len() != inputs[0].len() / 2
                 || inputs[2].len() != inputs[0].len() / 2
                 || outputs[0].len() != inputs[0].len()
-                || raw.is_empty() || raw[0].len() != inputs[0].len()
+                || (!omit_raw && (raw.is_empty() || raw[0].len() != inputs[0].len()))
             {
                 return Err(Error::ShapeMismatch);
             }
@@ -1883,8 +1909,9 @@ fn verify_op_relation_with_external_form(
                     let s = inputs[2][row * half + index] as i128;
                     let rotated_even = even.checked_mul(c).and_then(|v| v.checked_sub(odd.checked_mul(s)?)).ok_or(Error::BoundViolation)?;
                     let rotated_odd = even.checked_mul(s).and_then(|v| v.checked_add(odd.checked_mul(c)?)).ok_or(Error::BoundViolation)?;
-                    if raw[0][row * head_dim + index] != rotated_even
-                        || raw[0][row * head_dim + half + index] != rotated_odd
+                    if (!omit_raw
+                        && (raw[0][row * head_dim + index] != rotated_even
+                            || raw[0][row * head_dim + half + index] != rotated_odd))
                         || outputs[0][row * head_dim + index] as i128 != rq(rotated_even, shift)?
                         || outputs[0][row * head_dim + half + index] as i128 != rq(rotated_odd, shift)?
                     {
@@ -1914,7 +1941,7 @@ fn verify_op_relation_with_external_form(
                 || inputs[0].len() != cells
                 || inputs[1].is_empty()
                 || outputs[0].len() != out_cells
-                || raw.is_empty() || raw[0].len() != out_cells
+                || (!omit_raw && (raw.is_empty() || raw[0].len() != out_cells))
                 || aux.len() != 3
                 || aux[0].len() != 1
                 || aux[1].len() != 1
@@ -1965,7 +1992,7 @@ fn verify_op_relation_with_external_form(
                     };
                     let expected = i64::try_from(round_div_half_up(image, 1i128 << output_shift)?)
                         .map_err(|_| Error::BoundViolation)?;
-                    if raw[0][row * output_cols + index] != image
+                    if (!omit_raw && raw[0][row * output_cols + index] != image)
                         || outputs[0][row * output_cols + index] != clamp_value(expected, config, 6)?
                     {
                         return Err(Error::InvalidProof);

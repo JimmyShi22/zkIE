@@ -1066,7 +1066,6 @@ fn rms_public_fixture(
 enum RmsTamper {
     MeanSquare,
     Rstd,
-    Raw,
     Output,
 }
 
@@ -1100,7 +1099,6 @@ impl PureForward for TamperedRmsNorm {
         match self.target {
             RmsTamper::MeanSquare => record.auxiliaries[0][0] ^= 1,
             RmsTamper::Rstd => record.auxiliaries[1][0] ^= 1,
-            RmsTamper::Raw => record.raw_accumulators[0][0] ^= 1,
             RmsTamper::Output => record.outputs[0][0] ^= 1,
         }
         Ok(record)
@@ -1389,14 +1387,13 @@ fn rms_extension_consumption_tamper_is_rejected() {
     // roots of the altered declarations, so the opening checks accept the
     // material. The full verification then rejects because the ProfileRmsNorm
     // relation recomputes the declaration from the trusted inputs and
-    // compares it with the committed value (mean square, rstd, raw product,
-    // norm output in that check order).
+    // compares it with the committed value (mean square, rstd, norm output in
+    // that check order). The raw product is no longer a declaration.
     let base = [100, 200, 300, 400];
     let ext = [500, 600, 700, 800];
     for (target, label) in [
         (RmsTamper::MeanSquare, "mean-square"),
         (RmsTamper::Rstd, "rstd"),
-        (RmsTamper::Raw, "raw"),
         (RmsTamper::Output, "norm output"),
     ] {
         let fixture =
@@ -1413,6 +1410,62 @@ fn rms_extension_consumption_tamper_is_rejected() {
         eprintln!("{label} declaration: full verification rejects with {code}");
         assert_eq!(code, "invalid_proof");
     }
+}
+
+#[test]
+fn rms_extension_legacy_raw_form_is_rejected() {
+    // The same relation proved with the ordinary input-committed form still
+    // carries raw; the shared path rejects that form instead of accepting a
+    // relaxed second representation.
+    let fixture = rms_public_fixture(1024, &[100, 200, 300, 400], &[500, 600, 700, 800], None, None);
+    let op = zkie_ops::profile_rms::ProfileRmsNormOp {
+        rows: 1,
+        cols: 1,
+        valid_cols: 1,
+        output_shift: 0,
+        clamp: None,
+    };
+    let inputs = vec![
+        vec![1024],
+        vec![1],
+        vec![100, 200, 300, 400],
+        vec![500, 600, 700, 800],
+    ];
+    let config = vec![1, 1, 1, 0, 0, 0, 0];
+    let (public, proof) = prove_op_relation_with_inputs(&op, &inputs, &config, &[0, 1, 2, 3]).unwrap();
+    assert!(!proof.raw.is_empty());
+    let mut roots = Vec::new();
+    for id in public.registry.ids() {
+        let root = public.registry.get(id).unwrap();
+        roots.push((root.root, root.start, root.count));
+    }
+    let legacy = SharedTraceStep {
+        message: RelationReceiptMessage {
+            opcode: OpCode::ProfileRmsNorm as u16,
+            config: config.clone(),
+            roots,
+            external_inputs: vec![0, 1, 2, 3],
+            proof,
+        },
+        external: vec![None, None, None, None],
+        sources: vec![None, None, None, None],
+    };
+    let mut trace = fixture.trace.clone();
+    trace.steps[0] = legacy;
+    let changed = RmsPublicFixture {
+        public: fixture.public.clone(),
+        trace,
+        tokens: fixture.tokens.clone(),
+        plan: fixture.plan.clone(),
+        root: fixture.root.clone(),
+        opening: fixture.opening.clone(),
+    };
+    let code = verify_rms_public(&changed)
+        .err()
+        .expect("expected rejection")
+        .code()
+        .to_owned();
+    assert_eq!(code, "statement_mismatch");
 }
 
 // ---- trusted public rope coefficient tables ----

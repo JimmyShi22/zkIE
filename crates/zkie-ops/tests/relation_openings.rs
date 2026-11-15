@@ -1,8 +1,15 @@
 use zkie_core::error::Error;
-use zkie_core::types::Digest;
+use zkie_core::types::{Digest, TensorSpec};
 use zkie_ops::affine_scale::AffineScaleOp;
+use zkie_ops::gated_ffn::GatedFfnOp;
+use zkie_ops::hadamard::HadamardOp;
 use zkie_ops::matmul::MatMulOp;
 use zkie_ops::op::OpCode;
+use zkie_ops::profile_norm::ProfileLayerNormOp;
+use zkie_ops::profile_rms::ProfileRmsNormOp;
+use zkie_ops::profile_rope::ProfileRopeOp;
+use zkie_ops::profile_standardize::ProfileStandardizeOp;
+use zkie_ops::registry::{KernelRecord, PureForward};
 use zkie_ops::proof::binding::{
     commit_rows_with_openings, OracleId, OracleOpening, OracleRegistry,
 };
@@ -156,30 +163,164 @@ fn shared_form_carries_no_input_openings() {
     );
 }
 
+fn shared_derived_relation(op: &dyn PureForward, inputs: &[Vec<i64>], config: &[i64]) {
+    let (public, proof) = prove_op_relation_shared(op, inputs, config, &[]).unwrap();
+    assert!(proof.raw.is_empty(), "the shared derived relation carries no raw");
+    assert!(proof.lengths.raw.is_empty(), "the raw lengths are empty");
+    let values: Vec<Option<Vec<i64>>> = inputs.iter().cloned().map(Some).collect();
+    verify_op_relation_shared_with_external(&public, &proof, config, &values).unwrap();
+    // The ordinary entry keeps requiring raw; the empty shared form is not a
+    // second accepted form there.
+    assert_eq!(
+        verify_op_relation_with_external(&public, &proof, config, &values)
+            .unwrap_err()
+            .code(),
+        "shape_mismatch"
+    );
+}
+
 #[test]
-fn shared_non_matrix_relations_keep_their_raw_declaration() {
-    let op = AffineScaleOp {
+fn shared_derived_relations_carry_no_raw_declaration() {
+    let table = vec![1i64, 2, 3, 4, 5, 6, 7, 8];
+
+    let affine = AffineScaleOp {
         multiplier: 3,
         addend: 5,
         shift: 2,
         clamp: None,
     };
     let inputs = vec![vec![1, 2, 3]];
-    let config = op.relation_config(&inputs).unwrap();
+    let config = affine.relation_config(&inputs).unwrap();
+    shared_derived_relation(&affine, &inputs, &config);
+
+    let softmax = SoftmaxOp { shift: 0 };
+    let inputs = vec![vec![1, 2, 3], table.clone()];
+    let config = softmax.relation_config(&inputs).unwrap();
+    shared_derived_relation(&softmax, &inputs, &config);
+
+    let rows = zkie_ops::softmax_rows::SoftmaxRowsOp {
+        rows: 2,
+        cols: 2,
+        shift: 0,
+    };
+    let inputs = vec![vec![1, 2, 3, 4], table.clone()];
+    let config = rows.relation_config(&inputs).unwrap();
+    shared_derived_relation(&rows, &inputs, &config);
+
+    let hadamard = HadamardOp { shift: 0 };
+    let inputs = vec![vec![1, 2, 3], vec![4, 5, 6]];
+    let config = hadamard.relation_config(&inputs).unwrap();
+    shared_derived_relation(&hadamard, &inputs, &config);
+
+    let gated = GatedFfnOp { shift: 0 };
+    let inputs = vec![vec![1, 2, 3], vec![4, 5, 6]];
+    let config = gated.relation_config(&inputs).unwrap();
+    shared_derived_relation(&gated, &inputs, &config);
+
+    let layer_norm = ProfileLayerNormOp {
+        rows: 1,
+        cols: 2,
+        valid_cols: 2,
+        output_shift: 0,
+        clamp: None,
+    };
+    let inputs = vec![vec![3, 5], vec![1, 1], vec![0, 0], table.clone()];
+    let config = layer_norm.relation_config(&inputs).unwrap();
+    shared_derived_relation(&layer_norm, &inputs, &config);
+
+    let rms = ProfileRmsNormOp {
+        rows: 1,
+        cols: 2,
+        valid_cols: 2,
+        output_shift: 0,
+        clamp: None,
+    };
+    let inputs = vec![vec![3, 5], vec![1, 1], table.clone()];
+    let config = rms.relation_config(&inputs).unwrap();
+    shared_derived_relation(&rms, &inputs, &config);
+
+    let rope = ProfileRopeOp {
+        head_dim: 4,
+        shift: 0,
+    };
+    let inputs = vec![vec![3, 5, 7, 11], vec![10, 20], vec![5, 6]];
+    let config = rope.relation_config(&inputs).unwrap();
+    shared_derived_relation(&rope, &inputs, &config);
+
+    let standardize = ProfileStandardizeOp {
+        rows: 2,
+        cols: 2,
+        output_cols: 2,
+        valid_cols: 2,
+        source_row: 0,
+        output_shift: 0,
+        clamp: None,
+    };
+    let inputs = vec![vec![3, 5, 7, 11], table];
+    let config = standardize.relation_config(&inputs).unwrap();
+    shared_derived_relation(&standardize, &inputs, &config);
+}
+
+struct LegacyRopeOp;
+
+impl PureForward for LegacyRopeOp {
+    fn opcode(&self) -> OpCode {
+        OpCode::RopeProjection
+    }
+
+    fn infer_specs(
+        &self,
+        inputs: &[TensorSpec],
+    ) -> Result<Vec<TensorSpec>, zkie_core::error::Error> {
+        ProfileRopeOp {
+            head_dim: 4,
+            shift: 0,
+        }
+        .infer_specs(inputs)
+    }
+
+    fn forward_values(
+        &self,
+        inputs: &[Vec<i64>],
+    ) -> Result<KernelRecord, zkie_core::error::Error> {
+        let x = &inputs[0];
+        let cos = &inputs[1];
+        let sin = &inputs[2];
+        let pairs = x.len() / 2;
+        let mut output = vec![0i64; x.len()];
+        let mut raw = Vec::with_capacity(x.len());
+        for pair in 0..pairs {
+            let even = x[2 * pair] as i128;
+            let odd = x[2 * pair + 1] as i128;
+            let c = cos[pair] as i128;
+            let s = sin[pair] as i128;
+            let rotated_even = (even * c - odd * s) as i64;
+            let rotated_odd = (even * s + odd * c) as i64;
+            raw.push(rotated_even as i128);
+            raw.push(rotated_odd as i128);
+            output[2 * pair] = rotated_even;
+            output[2 * pair + 1] = rotated_odd;
+        }
+        Ok(KernelRecord {
+            outputs: vec![output],
+            raw_accumulators: vec![raw],
+            ..KernelRecord::default()
+        })
+    }
+}
+
+#[test]
+fn shared_unlisted_relations_keep_their_raw_declaration() {
+    // RopeProjection is outside the derived set; its shared form still carries
+    // raw and verifies through the shared entry.
+    let op = LegacyRopeOp;
+    let inputs = vec![vec![3, 5, 7, 11], vec![10, 20], vec![5, 6]];
+    let config = vec![0];
     let (public, proof) = prove_op_relation_shared(&op, &inputs, &config, &[]).unwrap();
     assert!(!proof.raw.is_empty());
-    assert_eq!(proof.lengths.raw.len(), 1);
-    let values: Vec<Option<Vec<i64>>> = inputs.iter().cloned().map(Some).collect();
+    assert_eq!(proof.lengths.raw, vec![4]);
+    let values: Vec<Option<Vec<i64>>> = inputs.into_iter().map(Some).collect();
     verify_op_relation_shared_with_external(&public, &proof, &config, &values).unwrap();
-
-    let mut changed = proof.clone();
-    changed.lengths.raw[0] ^= 1;
-    assert_eq!(
-        verify_op_relation_shared_with_external(&public, &changed, &config, &values)
-            .unwrap_err()
-            .code(),
-        "shape_mismatch"
-    );
 }
 
 #[test]
