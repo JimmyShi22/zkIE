@@ -107,6 +107,37 @@ pub struct EntryRangeLimits {
     pub max_bit_entries: u64,
 }
 
+// ---------------------------------------------------------------------------
+// The public range configuration of the first production weight table
+// ---------------------------------------------------------------------------
+
+/// The declared integer interval of the first production weight table. The
+/// interval enters the table configuration and the key parameters; a value
+/// outside it is refused when the table is built and again by the lookup.
+pub const PRODUCTION_TABLE_RANGE_LO: i64 = -131_072;
+pub const PRODUCTION_TABLE_RANGE_HI: i64 = 131_071;
+/// The matrix geometry: 1024 rows by 1024 columns.
+pub const PRODUCTION_TABLE_MATRIX_ROWS: u64 = 1_024;
+pub const PRODUCTION_TABLE_COLUMN_BITS: u32 = 10;
+/// The admitted resource limits of this implementation. They are resource
+/// bounds, not a wider protocol range.
+pub const PRODUCTION_TABLE_MAX_TABLE_LOG: u32 = 19;
+pub const PRODUCTION_TABLE_MAX_BIT_ENTRIES: u64 = 1 << 24;
+
+/// The public range plan of the first production weight table, derived from
+/// the fixed public configuration above.
+pub fn production_table_range() -> Result<EntryRangePlan> {
+    derive_entry_range(
+        PRODUCTION_TABLE_MATRIX_ROWS,
+        PRODUCTION_TABLE_COLUMN_BITS,
+        EntryRange::new(PRODUCTION_TABLE_RANGE_LO, PRODUCTION_TABLE_RANGE_HI)?,
+        EntryRangeLimits {
+            max_table_log: PRODUCTION_TABLE_MAX_TABLE_LOG,
+            max_bit_entries: PRODUCTION_TABLE_MAX_BIT_ENTRIES,
+        },
+    )
+}
+
 /// The dimensions a declaration implies, before any limit applies. A caller
 /// that reports an infeasible declaration uses this to say how large it would
 /// be.
@@ -1362,6 +1393,29 @@ mod key_range_config_tests {
         assert_ne!(low_config.digest(), shifted_config.digest());
         assert_eq!(low_config.validate(&shifted), Err(Error::StatementMismatch));
         assert_eq!(shifted_config.validate(&low), Err(Error::StatementMismatch));
+    }
+
+    #[test]
+    fn the_public_production_range_derives_the_frozen_geometry() {
+        let plan = production_table_range().expect("the public configuration derives");
+        assert_eq!(plan.range.lo(), PRODUCTION_TABLE_RANGE_LO);
+        assert_eq!(plan.range.hi(), PRODUCTION_TABLE_RANGE_HI);
+        assert_eq!(plan.table_log, 18);
+        assert_eq!(plan.mu, 5);
+        assert_eq!(plan.key_bits, 20);
+        assert_eq!(plan.bit_entries, 1 << 23);
+        assert_eq!(plan.offset, Fp3::from_u64(131_072));
+        // A wider table than the admitted resource limit is refused.
+        let wider = derive_entry_range(
+            PRODUCTION_TABLE_MATRIX_ROWS,
+            PRODUCTION_TABLE_COLUMN_BITS,
+            EntryRange::new(-(1 << 19), (1 << 19) - 1).unwrap(),
+            EntryRangeLimits {
+                max_table_log: PRODUCTION_TABLE_MAX_TABLE_LOG,
+                max_bit_entries: PRODUCTION_TABLE_MAX_BIT_ENTRIES,
+            },
+        );
+        assert!(wider.is_err());
     }
 
     #[test]
