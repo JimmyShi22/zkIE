@@ -278,17 +278,17 @@ fn execute_shared(
     progress: &dyn ProgressSink,
 ) -> Result<SharedTrace> {
     match config.model.as_str() {
-        "gpt2" => gpt2::execute_shared_with_progress(
+        "gpt2" => gpt2::execute_shared_with_progress_public(
             commitment,
             &config.tokens.iter().map(|value| *value as i64).collect::<Vec<_>>(),
             Some(progress),
         ),
-        "gemma3" => gemma3::execute_shared_with_progress(
+        "gemma3" => gemma3::execute_shared_with_progress_public(
             commitment,
             &config.tokens.iter().map(|value| *value as i64).collect::<Vec<_>>(),
             Some(progress),
         ),
-        "timesfm" => timesfm::execute_shared_with_progress(
+        "timesfm" => timesfm::execute_shared_with_progress_public(
             commitment,
             &config.input.iter().map(|value| *value as i64).collect::<Vec<_>>(),
             Some(progress),

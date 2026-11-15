@@ -445,6 +445,11 @@ fn public_tables() -> Vec<(String, zkie_ops::proof::plan::PublicTable)> {
     ]
 }
 
+/// The migrated public table paths of this model.
+pub fn public_table_paths() -> &'static [&'static str] {
+    &[EXP, RSQRT, GELU]
+}
+
 /// The production plan: the four migrated tables are trusted public files,
 /// not traced assets. Component tests keep `trace_plan`.
 pub fn trace_plan_public(m: usize) -> Result<TracePlan> {

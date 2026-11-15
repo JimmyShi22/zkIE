@@ -757,3 +757,275 @@ fn negative_external_opening_must_cover_the_full_asset() {
     width.trace.assets[0].rows[0].values.pop();
     assert_eq!(rejection_code(&width), "shape_mismatch");
 }
+
+// ---- trusted public table sources ----
+
+#[derive(Clone)]
+struct PublicTableFixture {
+    public: ModelCommitmentPublic,
+    trace: SharedTrace,
+    tokens: Vec<u32>,
+    plan: TracePlan,
+    root: PathBuf,
+    opening: Vec<zkie_ops::proof::model_commitment::AssetOpening>,
+}
+
+fn public_table_plan(table: zkie_ops::proof::plan::PublicTable) -> TracePlan {
+    let mut builder = PlanBuilder::new();
+    let embed = builder.step(
+        OpCode::EmbeddingIndex,
+        config(vec![1, 4]),
+        vec![PlanSource::Constant(PlanConstant::Tokens)],
+        1,
+    );
+    let lookup = builder.step(
+        OpCode::TableLookup,
+        config(Vec::new()),
+        vec![
+            PlanSource::public_table(table),
+            PlanSource::prev(embed, 0),
+        ],
+        1,
+    );
+    let argmax = builder.step(
+        OpCode::Argmax,
+        config(Vec::new()),
+        vec![PlanSource::prev(lookup, 0)],
+        1,
+    );
+    builder.argmax_step(argmax);
+    builder.finish()
+}
+
+fn public_table_identity(
+    root: &PathBuf,
+    locator: &str,
+    entries: u64,
+    digest: Digest,
+) -> zkie_ops::proof::plan::PublicTable {
+    zkie_ops::proof::plan::PublicTable {
+        locator: locator.into(),
+        digest,
+        entries,
+        encoding: zkie_ops::proof::plan::PublicTableEncoding::I32LeSigned,
+    }
+}
+
+/// The production form: the trace carries no opening for the table; the
+/// relation inputs are proved directly and the verifier materializes the
+/// table from the trusted public root.
+fn public_table_fixture(proof_values: &[i32], file_values: &[i32]) -> PublicTableFixture {
+    public_table_fixture_at(proof_values, file_values, 2)
+}
+
+fn public_table_fixture_at(
+    proof_values: &[i32],
+    file_values: &[i32],
+    token: u32,
+) -> PublicTableFixture {
+    let root = temp_dir();
+    write_i32(&root.join("table_i32.bin"), file_values);
+    let bytes = fs::read(root.join("table_i32.bin")).unwrap();
+    let table = public_table_identity(
+        &root,
+        "table_i32.bin",
+        file_values.len() as u64,
+        zkie_core::artifact::digest_bytes(&bytes),
+    );
+    let specs = vec![ModelAssetSpec {
+        asset_id: 0,
+        path: "table_i32.bin".into(),
+        element_count: file_values.len() as u64,
+        row_width: file_values.len(),
+        encoding: "i32-le".into(),
+    }];
+    let commitment = commit_assets(&root, Digest([5; 32]), Digest([6; 32]), &specs).unwrap();
+    let public = ModelCommitmentPublic::from_commitment(&commitment);
+    let opening = AssetStore::open(&commitment).unwrap().open_all().unwrap();
+    let tokens = vec![token];
+    let token_values: Vec<i64> = tokens.iter().map(|value| *value as i64).collect();
+    let (embed_step, embed_out) = make_step(
+        &EmbeddingIndexOp {
+            hidden: 1,
+            vocab: 4,
+        },
+        &[token_values],
+        &[1, 4],
+        &[],
+        vec![None],
+        vec![None],
+    );
+    let lookup_values: Vec<i64> = proof_values.iter().map(|value| *value as i64).collect();
+    let (lookup_step, lookup_out) = make_step(
+        &TableLookupOp,
+        &[lookup_values, embed_out[0].clone()],
+        &[],
+        &[],
+        vec![None, None],
+        vec![None, Some((0, 0))],
+    );
+    let (argmax_step, argmax_out) = make_step(
+        &ArgmaxOp,
+        &[lookup_out[0].clone()],
+        &[],
+        &[],
+        vec![None],
+        vec![Some((1, 0))],
+    );
+    let plan = public_table_plan(table);
+    let trace = SharedTrace {
+        tokens: tokens.clone(),
+        assets: Vec::new(),
+        steps: vec![embed_step, lookup_step, argmax_step],
+        argmax: vec![argmax_out[0][0] as u32],
+        output: Vec::new(),
+    };
+    PublicTableFixture {
+        public,
+        trace,
+        tokens,
+        plan,
+        root,
+        opening,
+    }
+}
+
+fn verify_public_trace(
+    fixture: &PublicTableFixture,
+    plan: &TracePlan,
+    root: Option<&std::path::Path>,
+) -> Result<Vec<u32>, zkie_core::error::Error> {
+    let bytes = bincode::serialize(&fixture.trace).unwrap();
+    let trace: SharedTrace = bincode::deserialize(&bytes).unwrap();
+    zkie_ops::proof::model_commitment::verify_shared_trace(
+        &fixture.public,
+        &trace,
+        &fixture.tokens,
+        plan,
+        root,
+    )
+}
+
+#[test]
+fn public_table_source_verifies_from_the_trusted_file() {
+    let fixture = public_table_fixture(&[10, 20, 30, 40], &[10, 20, 30, 40]);
+    assert!(fixture.trace.assets.is_empty(), "no table opening is carried");
+    let argmax = verify_public_trace(&fixture, &fixture.plan, Some(&fixture.root)).unwrap();
+    assert_eq!(argmax, vec![0]);
+    // The same proof verifies twice: the read cache is per verification run.
+    let argmax = verify_public_trace(&fixture, &fixture.plan, Some(&fixture.root)).unwrap();
+    assert_eq!(argmax, vec![0]);
+}
+
+#[test]
+fn public_table_without_a_trusted_root_is_rejected() {
+    let fixture = public_table_fixture(&[10, 20, 30, 40], &[10, 20, 30, 40]);
+    assert!(verify_public_trace(&fixture, &fixture.plan, None).is_err());
+}
+
+#[test]
+fn public_table_file_swap_is_rejected() {
+    let fixture = public_table_fixture(&[10, 20, 30, 40], &[10, 20, 30, 40]);
+    let bytes: Vec<u8> = [11i32, 21, 31, 41]
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    fs::write(fixture.root.join("table_i32.bin"), bytes).unwrap();
+    assert!(verify_public_trace(&fixture, &fixture.plan, Some(&fixture.root)).is_err());
+}
+
+#[test]
+fn public_table_truncated_or_padded_file_is_rejected() {
+    let truncated = public_table_fixture(&[10, 20, 30, 40], &[10, 20, 30, 40]);
+    let bytes = fs::read(truncated.root.join("table_i32.bin")).unwrap();
+    fs::write(truncated.root.join("table_i32.bin"), &bytes[..bytes.len() - 1]).unwrap();
+    assert!(verify_public_trace(&truncated, &truncated.plan, Some(&truncated.root)).is_err());
+
+    let padded = public_table_fixture(&[10, 20, 30, 40], &[10, 20, 30, 40]);
+    let mut bytes = fs::read(padded.root.join("table_i32.bin")).unwrap();
+    bytes.push(0);
+    fs::write(padded.root.join("table_i32.bin"), bytes).unwrap();
+    assert!(verify_public_trace(&padded, &padded.plan, Some(&padded.root)).is_err());
+}
+
+#[test]
+fn public_table_missing_file_is_rejected() {
+    let fixture = public_table_fixture(&[10, 20, 30, 40], &[10, 20, 30, 40]);
+    fs::remove_file(fixture.root.join("table_i32.bin")).unwrap();
+    assert!(verify_public_trace(&fixture, &fixture.plan, Some(&fixture.root)).is_err());
+}
+
+#[test]
+fn public_table_wrong_fixed_identity_is_rejected() {
+    let fixture = public_table_fixture(&[10, 20, 30, 40], &[10, 20, 30, 40]);
+    let bytes = fs::read(fixture.root.join("table_i32.bin")).unwrap();
+    let real = zkie_core::artifact::digest_bytes(&bytes);
+
+    // A fixed entry count that does not match the file length.
+    let plan = public_table_plan(public_table_identity(
+        &fixture.root,
+        "table_i32.bin",
+        3,
+        real,
+    ));
+    assert!(verify_public_trace(&fixture, &plan, Some(&fixture.root)).is_err());
+
+    // A fixed digest that is not the file digest.
+    let plan = public_table_plan(public_table_identity(
+        &fixture.root,
+        "table_i32.bin",
+        4,
+        Digest([9; 32]),
+    ));
+    assert!(verify_public_trace(&fixture, &plan, Some(&fixture.root)).is_err());
+}
+
+#[test]
+fn public_table_value_mismatch_is_rejected() {
+    // The file digest is trusted, but the entry the plan reads differs from
+    // the value the relation was proved over.
+    let fixture = public_table_fixture(&[10, 20, 30, 40], &[10, 20, 31, 40]);
+    let code = verify_public_trace(&fixture, &fixture.plan, Some(&fixture.root))
+        .err()
+        .expect("expected rejection")
+        .code()
+        .to_owned();
+    assert_eq!(code, "invalid_proof");
+}
+
+#[test]
+fn prover_supplied_table_opening_is_rejected() {
+    let mut fixture = public_table_fixture(&[10, 20, 30, 40], &[10, 20, 30, 40]);
+    fixture.trace.assets = fixture.opening.clone();
+    fixture.trace.steps[1].external[0] = Some(0);
+    let code = verify_public_trace(&fixture, &fixture.plan, Some(&fixture.root))
+        .err()
+        .expect("expected rejection")
+        .code()
+        .to_owned();
+    assert_eq!(code, "statement_mismatch");
+}
+
+#[test]
+fn public_table_short_table_rejects_index_past_the_end() {
+    // The proof reads entry 3 of a four-entry table; the trusted file holds
+    // three entries with its own fixed digest. The verifier must reject the
+    // length change instead of clamping the index.
+    let fixture = public_table_fixture_at(&[10, 20, 30, 40], &[10, 20, 30, 40], 3);
+    write_i32(&fixture.root.join("table_i32.bin"), &[10, 20, 30]);
+    let bytes = fs::read(fixture.root.join("table_i32.bin")).unwrap();
+    let plan = public_table_plan(public_table_identity(
+        &fixture.root,
+        "table_i32.bin",
+        3,
+        zkie_core::artifact::digest_bytes(&bytes),
+    ));
+    assert!(verify_public_trace(&fixture, &plan, Some(&fixture.root)).is_err());
+}
+
+#[test]
+fn public_table_wrong_output_is_rejected() {
+    let mut fixture = public_table_fixture(&[10, 20, 30, 40], &[10, 20, 30, 40]);
+    fixture.trace.argmax[0] ^= 1;
+    assert!(verify_public_trace(&fixture, &fixture.plan, Some(&fixture.root)).is_err());
+}

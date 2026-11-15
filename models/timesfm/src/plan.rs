@@ -556,6 +556,11 @@ pub fn model_commitment(tokens: &[u32]) -> Result<Digest> {
     transcript_digest(15, &bytes)
 }
 
+/// The migrated public table paths of this model.
+pub fn public_table_paths() -> &'static [&'static str] {
+    &[EXP, RSQRT, "models/timesfm/weights/silu_table_i32.bin"]
+}
+
 fn public_tables() -> Vec<(String, zkie_ops::proof::plan::PublicTable)> {
     use zkie_core::artifact::digest_from_hex;
     use zkie_ops::proof::plan::{PublicTable, PublicTableEncoding};

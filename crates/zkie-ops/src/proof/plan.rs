@@ -919,6 +919,7 @@ pub(crate) struct AssetView<'a> {
     cache_keys: AssetCacheKeys,
     full_cache: RefCell<BTreeMap<AssetCacheKey, Rc<Vec<i64>>>>,
     slice_cache: RefCell<BTreeMap<(AssetCacheKey, PlanLayout), Rc<Vec<i64>>>>,
+    public_cache: RefCell<BTreeMap<(Digest, u64), Rc<Vec<i64>>>>,
 }
 
 impl<'a> AssetView<'a> {
@@ -939,6 +940,7 @@ impl<'a> AssetView<'a> {
             cache_keys: cache_keys(plan),
             full_cache: RefCell::new(BTreeMap::new()),
             slice_cache: RefCell::new(BTreeMap::new()),
+            public_cache: RefCell::new(BTreeMap::new()),
         }
     }
 
@@ -1047,6 +1049,31 @@ impl<'a> AssetView<'a> {
         Ok(values)
     }
 
+    /// Reads one trusted public table at most once per verification run. The
+    /// key is the trusted identity from the plan, never a proof value; the
+    /// first read byte-checks the file against the fixed digest and entry
+    /// count, and every later input reuses those checked values.
+    fn public_values(&self, table: &PublicTable, layout: &PlanLayout) -> Result<Rc<Vec<i64>>> {
+        let key = (table.digest, table.entries);
+        let cached = self.public_cache.borrow().get(&key).cloned();
+        let full = match cached {
+            Some(values) => values,
+            None => {
+                let root = self.public_root.ok_or(Error::InvalidConfig)?;
+                let values = Rc::new(read_public_table(root, table)?);
+                self.public_cache
+                    .borrow_mut()
+                    .insert(key, Rc::clone(&values));
+                values
+            }
+        };
+        if matches!(layout, PlanLayout::Flat) {
+            Ok(full)
+        } else {
+            Ok(Rc::new(layout.apply(&full)?))
+        }
+    }
+
     fn asset_id(&self, path: &str) -> Result<u64> {
         Ok(self.meta(path)?.asset_id)
     }
@@ -1113,15 +1140,9 @@ fn materialize<'a>(
         PlanSource::Asset { path, layout } => {
             Ok(Materialized::Owned(assets.source_values(path, layout)?))
         }
-        PlanSource::PublicTable { table, layout } => {
-            let root = assets.public_root.ok_or(Error::InvalidConfig)?;
-            let values = read_public_table(root, table)?;
-            if matches!(layout, PlanLayout::Flat) {
-                Ok(Materialized::Owned(Rc::new(values)))
-            } else {
-                Ok(Materialized::Owned(Rc::new(layout.apply(&values)?)))
-            }
-        }
+        PlanSource::PublicTable { table, layout } => Ok(Materialized::Owned(
+            assets.public_values(table, layout)?,
+        )),
         PlanSource::Constant(constant) => Ok(Materialized::Owned(Rc::new(
             constant.materialize(tokens)?,
         ))),

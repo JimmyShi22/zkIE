@@ -108,15 +108,29 @@ pub fn asset_specs() -> Vec<ModelAssetSpec> {
 }
 
 struct Assets<'a> {
+    commitment: &'a ModelCommitment,
     store: AssetStore<'a>,
     trace_assets: Vec<AssetOpening>,
+    public_tables: bool,
 }
 
 impl<'a> Assets<'a> {
-    fn load(commitment: &'a ModelCommitment) -> Result<Self> {
+    fn load(commitment: &'a ModelCommitment, public_tables: bool) -> Result<Self> {
         let store = AssetStore::open(commitment)?;
-        let trace_assets = store.open_all()?;
-        Ok(Self { store, trace_assets })
+        let public_paths = crate::plan::public_table_paths();
+        let mut trace_assets = Vec::with_capacity(commitment.assets.len());
+        for (index, asset) in commitment.assets.iter().enumerate() {
+            if public_tables && public_paths.contains(&asset.path.as_str()) {
+                continue;
+            }
+            trace_assets.push(store.open_asset(index)?);
+        }
+        Ok(Self {
+            commitment,
+            store,
+            trace_assets,
+            public_tables,
+        })
     }
 
     fn value(&self, path: &str) -> Result<Vec<i64>> {
@@ -136,7 +150,25 @@ impl<'a> Assets<'a> {
     }
 
     fn pool(&self, path: &str) -> Result<usize> {
-        self.store.pool(path)
+        let asset_id = self
+            .commitment
+            .assets
+            .iter()
+            .find(|asset| asset.path == path)
+            .map(|asset| asset.asset_id)
+            .ok_or(Error::AssetMismatch)?;
+        self.trace_assets
+            .iter()
+            .position(|opening| opening.asset_id == asset_id)
+            .ok_or(Error::AssetMismatch)
+    }
+
+    fn public_pool(&self, path: &str) -> Result<Option<usize>> {
+        if self.public_tables && crate::plan::public_table_paths().contains(&path) {
+            Ok(None)
+        } else {
+            Ok(Some(self.pool(path)?))
+        }
     }
 }
 
@@ -244,7 +276,7 @@ fn rms(
     x_step: usize,
     weight: Vec<i64>,
     base: Vec<i64>,
-    base_pool: usize,
+    base_pool: Option<usize>,
     extension: Vec<i64>,
     extension_pool: usize,
     rows: usize,
@@ -261,7 +293,7 @@ fn rms(
     let inputs = vec![
         (x, None),
         (broadcast(&weight, rows), None),
-        (base, Some(base_pool)),
+        (base, base_pool),
         (extension, Some(extension_pool)),
     ];
     let (outputs, step) = builder.step(&op, inputs, vec![Some((x_step, 0)), None, None, None])?;
@@ -286,7 +318,7 @@ fn rope(
 }
 
 pub fn execute_shared(commitment: &ModelCommitment, tokens: &[i64]) -> Result<SharedTrace> {
-    execute_shared_with_progress(commitment, tokens, None)
+    execute_shared_inner(commitment, tokens, None, false)
 }
 
 pub fn execute_shared_with_progress(
@@ -294,12 +326,32 @@ pub fn execute_shared_with_progress(
     tokens: &[i64],
     progress: Option<&dyn ProgressSink>,
 ) -> Result<SharedTrace> {
+    execute_shared_inner(commitment, tokens, progress, false)
+}
+
+/// The production trace: the shared public tables are not carried as trace
+/// assets and their inputs take no external pool; the rsqrt extension keeps
+/// its own asset and pool.
+pub fn execute_shared_with_progress_public(
+    commitment: &ModelCommitment,
+    tokens: &[i64],
+    progress: Option<&dyn ProgressSink>,
+) -> Result<SharedTrace> {
+    execute_shared_inner(commitment, tokens, progress, true)
+}
+
+fn execute_shared_inner(
+    commitment: &ModelCommitment,
+    tokens: &[i64],
+    progress: Option<&dyn ProgressSink>,
+    public_tables: bool,
+) -> Result<SharedTrace> {
     if tokens.is_empty() || tokens.len() > 512 {
         return Err(Error::InvalidConfig);
     }
     let m = tokens.len();
     let planned_total = if m > 16 { 1506 } else { 2090 };
-    let assets = Assets::load(commitment)?;
+    let assets = Assets::load(commitment, public_tables)?;
     let mut builder = Builder {
         steps: Vec::new(),
         progress,
@@ -308,16 +360,17 @@ pub fn execute_shared_with_progress(
     };
     let weight = |name: &str| assets.value(name);
     let pool = |name: &str| assets.pool(name);
+    let public_pool = |name: &str| assets.public_pool(name);
 
     let base_path = format!("{SHARED_DIR}/rsqrt_table_i32.bin");
     let exp_path = format!("{SHARED_DIR}/exp_table_i32.bin");
     let gelu_path = format!("{SHARED_DIR}/gelu_table_i32.bin");
     let base = weight(&base_path)?;
-    let base_pool = pool(&base_path)?;
+    let base_pool = public_pool(&base_path)?;
     let extension = weight(EXTENSION_PATH)?;
     let extension_pool = pool(EXTENSION_PATH)?;
     let exp_table = weight(&exp_path)?;
-    let exp_pool = pool(&exp_path)?;
+    let exp_pool = public_pool(&exp_path)?;
 
     let embed_path = format!("{WEIGHT_DIR}/embed_tokens_i32.bin");
     let (embed_idx, embed_idx_step) = builder.step(
@@ -421,7 +474,7 @@ pub fn execute_shared_with_progress(
                     &SoftmaxRowsOp { rows: m, cols: m, shift: 16 },
                     vec![
                         (masked[0].clone(), None),
-                        (exp_table.clone(), Some(exp_pool)),
+                        (exp_table.clone(), exp_pool),
                     ],
                     vec![Some((masked_step, 0)), None],
                 )?;
@@ -432,7 +485,7 @@ pub fn execute_shared_with_progress(
                     let row_values = masked[0][row * m..(row + 1) * m].to_vec();
                     let (row_probs, _) = builder.step(
                         &SoftmaxOp { shift: 16 },
-                        vec![(row_values, None), (exp_table.clone(), Some(exp_pool))],
+                        vec![(row_values, None), (exp_table.clone(), exp_pool)],
                         vec![None, None],
                     )?;
                     probs.extend_from_slice(&row_probs[0]);
@@ -491,7 +544,7 @@ pub fn execute_shared_with_progress(
         let (gelu, gelu_step) = builder.step(
             &TableLookupOp,
             vec![
-                (weight(&gelu_path)?, Some(pool(&gelu_path)?)),
+                (weight(&gelu_path)?, public_pool(&gelu_path)?),
                 (idx[0].clone(), None),
             ],
             vec![None, Some((idx_step, 0))],

@@ -443,6 +443,15 @@ pub fn model_commitment(tokens: &[u32]) -> Result<Digest> {
     transcript_digest(15, &bytes)
 }
 
+/// The migrated shared public table paths of this model.
+pub fn public_table_paths() -> &'static [&'static str] {
+    &[
+        "models/gpt2/weights/exp_table_i32.bin",
+        "models/gpt2/weights/rsqrt_table_i32.bin",
+        "models/gpt2/weights/gelu_table_i32.bin",
+    ]
+}
+
 fn public_tables() -> Vec<(String, zkie_ops::proof::plan::PublicTable)> {
     use zkie_core::artifact::digest_from_hex;
     use zkie_ops::proof::plan::{PublicTable, PublicTableEncoding};

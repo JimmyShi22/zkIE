@@ -92,15 +92,29 @@ pub fn asset_specs() -> Vec<ModelAssetSpec> {
 }
 
 struct Assets<'a> {
+    commitment: &'a ModelCommitment,
     store: AssetStore<'a>,
     trace_assets: Vec<AssetOpening>,
+    public_tables: bool,
 }
 
 impl<'a> Assets<'a> {
-    fn load(commitment: &'a ModelCommitment) -> Result<Self> {
+    fn load(commitment: &'a ModelCommitment, public_tables: bool) -> Result<Self> {
         let store = AssetStore::open(commitment)?;
-        let trace_assets = store.open_all()?;
-        Ok(Self { store, trace_assets })
+        let public_paths = crate::plan::public_table_paths();
+        let mut trace_assets = Vec::with_capacity(commitment.assets.len());
+        for (index, asset) in commitment.assets.iter().enumerate() {
+            if public_tables && public_paths.contains(&asset.path.as_str()) {
+                continue;
+            }
+            trace_assets.push(store.open_asset(index)?);
+        }
+        Ok(Self {
+            commitment,
+            store,
+            trace_assets,
+            public_tables,
+        })
     }
 
     fn value(&self, path: &str) -> Result<Vec<i64>> {
@@ -119,8 +133,31 @@ impl<'a> Assets<'a> {
         self.store.rows(path, cols, r0, r1)
     }
 
+    /// The trace pool index of one asset: its position in the trace asset list,
+    /// which is filtered in the public mode. A proof never names a pool from
+    /// the unfiltered store order.
     fn pool(&self, path: &str) -> Result<usize> {
-        self.store.pool(path)
+        let asset_id = self
+            .commitment
+            .assets
+            .iter()
+            .find(|asset| asset.path == path)
+            .map(|asset| asset.asset_id)
+            .ok_or(Error::AssetMismatch)?;
+        self.trace_assets
+            .iter()
+            .position(|opening| opening.asset_id == asset_id)
+            .ok_or(Error::AssetMismatch)
+    }
+
+    /// The pool of one input: a migrated public table has no pool in the
+    /// production trace; every other asset keeps its measured pool.
+    fn public_pool(&self, path: &str) -> Result<Option<usize>> {
+        if self.public_tables && crate::plan::public_table_paths().contains(&path) {
+            Ok(None)
+        } else {
+            Ok(Some(self.pool(path)?))
+        }
     }
 }
 
@@ -255,7 +292,7 @@ fn ln(
 }
 
 pub fn execute_shared(commitment: &ModelCommitment, tokens: &[i64]) -> Result<SharedTrace> {
-    execute_shared_with_progress(commitment, tokens, None)
+    execute_shared_inner(commitment, tokens, None, false)
 }
 
 pub fn execute_shared_with_progress(
@@ -263,12 +300,31 @@ pub fn execute_shared_with_progress(
     tokens: &[i64],
     progress: Option<&dyn ProgressSink>,
 ) -> Result<SharedTrace> {
+    execute_shared_inner(commitment, tokens, progress, false)
+}
+
+/// The production trace: the migrated public tables are not carried as trace
+/// assets and their inputs take no external pool.
+pub fn execute_shared_with_progress_public(
+    commitment: &ModelCommitment,
+    tokens: &[i64],
+    progress: Option<&dyn ProgressSink>,
+) -> Result<SharedTrace> {
+    execute_shared_inner(commitment, tokens, progress, true)
+}
+
+fn execute_shared_inner(
+    commitment: &ModelCommitment,
+    tokens: &[i64],
+    progress: Option<&dyn ProgressSink>,
+    public_tables: bool,
+) -> Result<SharedTrace> {
     if tokens.is_empty() || tokens.len() > 512 {
         return Err(Error::InvalidConfig);
     }
     let m = tokens.len();
     let planned_total = if m > 16 { 2798 } else { 4462 };
-    let assets = Assets::load(commitment)?;
+    let assets = Assets::load(commitment, public_tables)?;
     let mut builder = Builder {
         steps: Vec::new(),
         progress,
@@ -277,6 +333,7 @@ pub fn execute_shared_with_progress(
     };
     let weight = |name: &str| assets.value(name);
     let pool = |name: &str| assets.pool(name);
+    let public_pool = |name: &str| assets.public_pool(name);
 
     let (embed_idx, embed_idx_step) = builder.step(
         &EmbeddingIndexOp { hidden: HIDDEN, vocab: VOCAB },
@@ -328,7 +385,7 @@ pub fn execute_shared_with_progress(
         let exp_table = weight("gpt2/weights/exp_table_i32.bin")?;
         let gelu_table = weight("gpt2/weights/gelu_table_i32.bin")?;
 
-        let (h, h_step) = ln(&mut builder, current.clone(), x_step, ln1_w, ln1_b, rsqrt.clone(), Some(pool("gpt2/weights/rsqrt_table_i32.bin")?), m)?;
+        let (h, h_step) = ln(&mut builder, current.clone(), x_step, ln1_w, ln1_b, rsqrt.clone(), public_pool("gpt2/weights/rsqrt_table_i32.bin")?, m)?;
         let mut head_acc: Option<(Vec<i64>, usize)> = None;
         for head in 0..HEADS {
             let qw = assets.columns(&path("q_w"), HIDDEN, head * HEAD_DIM, (head + 1) * HEAD_DIM)?;
@@ -366,7 +423,7 @@ pub fn execute_shared_with_progress(
                     &SoftmaxRowsOp { rows: m, cols: m, shift: 16 },
                     vec![
                         (masked[0].clone(), None),
-                        (exp_table.clone(), Some(pool("gpt2/weights/exp_table_i32.bin")?)),
+                        (exp_table.clone(), public_pool("gpt2/weights/exp_table_i32.bin")?),
                     ],
                     vec![Some((masked_step, 0)), None],
                 )?;
@@ -377,7 +434,7 @@ pub fn execute_shared_with_progress(
                     let row_values = masked[0][row * m..(row + 1) * m].to_vec();
                     let (row_probs, _) = builder.step(
                         &SoftmaxOp { shift: 16 },
-                        vec![(row_values, None), (exp_table.clone(), Some(pool("gpt2/weights/exp_table_i32.bin")?))],
+                        vec![(row_values, None), (exp_table.clone(), public_pool("gpt2/weights/exp_table_i32.bin")?)],
                         vec![None, None],
                     )?;
                     probs.extend_from_slice(&row_probs[0]);
@@ -417,7 +474,7 @@ pub fn execute_shared_with_progress(
             vec![Some((x_step, 0)), Some((attn_step, 0))],
         )?;
         let x2 = x2[0].clone();
-        let (h2, h2_step) = ln(&mut builder, x2.clone(), x2_step, ln2_w, ln2_b, rsqrt.clone(), Some(pool("gpt2/weights/rsqrt_table_i32.bin")?), m)?;
+        let (h2, h2_step) = ln(&mut builder, x2.clone(), x2_step, ln2_w, ln2_b, rsqrt.clone(), public_pool("gpt2/weights/rsqrt_table_i32.bin")?, m)?;
         let (fc, fc_step) = project(&mut builder, h2, h2_step, fc_w, broadcast(&fc_b, m), m, FFN, HIDDEN, 16)?;
         let (idx, idx_step) = builder.step(
             &TableIndexOp { offset: 1 << 23, table_len: 1 << 24 },
@@ -427,7 +484,7 @@ pub fn execute_shared_with_progress(
         let act = {
             let (out, step) = builder.step(
                 &TableLookupOp,
-                vec![(gelu_table, Some(pool("gpt2/weights/gelu_table_i32.bin")?)), (idx[0].clone(), None)],
+                vec![(gelu_table, public_pool("gpt2/weights/gelu_table_i32.bin")?), (idx[0].clone(), None)],
                 vec![None, Some((idx_step, 0))],
             )?;
             (out[0].clone(), step)
@@ -449,7 +506,7 @@ pub fn execute_shared_with_progress(
         weight("gpt2/weights/ln_f_w_i32.bin")?,
         weight("gpt2/weights/ln_f_b_i32.bin")?,
         weight("gpt2/weights/rsqrt_table_i32.bin")?,
-        Some(pool("gpt2/weights/rsqrt_table_i32.bin")?),
+        public_pool("gpt2/weights/rsqrt_table_i32.bin")?,
         m,
     )?;
     let (logits, logits_step) = builder.step(
