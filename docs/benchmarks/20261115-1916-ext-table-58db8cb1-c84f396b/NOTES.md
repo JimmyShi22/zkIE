@@ -3,7 +3,8 @@
 - Scheme: `ext-table`, the gemma3 rsqrt extension table moved to the existing
   trusted public-file channel. The file is a fixed public file; its identity
   is fixed in the model plan code and the runtime directory only locates it.
-- Code: `58db8cb1`; previous commit `c84f396b`; branch `refactor/v2`.
+- Code: `58db8cb1`; follow-up negative completion commit `45c4d6ed`;
+  previous commit `c84f396b`; branch `refactor/v2`.
 - Baseline binary: the before side was built from `062c1520`. Between
   `062c1520` and `c84f396b` only the diagnostic test file changed, so the
   before binary is production-code equivalent to the previous commit.
@@ -76,14 +77,30 @@ runs and are not a stability claim.
 - The gpt2 and timesfm pairs are controls: identical proof bytes, identical
   digests and unchanged asset counts.
 
-## Negatives
+## Valid examples and negatives
 
-The extension public source is covered through the full verification path
-after a serialize round trip: the base boundary entry (index 3) and the
-extension entry (index 4); swapped, missing, truncated and padded extension
-file; wrong fixed entry count; wrong fixed digest; and a prover-supplied
-opening with an external port. All are rejected; there is no plaintext
-fallback.
+Valid examples (accepted through the full verification path after a serialize
+round trip):
+- the base boundary: an activation whose derived index is 3 consumes the last
+  base-table entry;
+- the extension entry: an activation whose derived index equals the base
+  length consumes the first extension entry.
+
+Negatives (rejected through the same path; there is no plaintext fallback):
+- swapped, missing, truncated and padded extension file;
+- wrong fixed entry count and wrong fixed digest;
+- a prover-supplied opening with an external port on the extension input;
+- an activation whose derived index passes the extension end while the file
+  identity and the input lengths stay legal. The legal boundary instance in
+  the same test verifies first, and the past-end instance is rejected in the
+  consumption relation check, not by a length check;
+- a tampered norm output, raw product, mean-square declaration or rstd
+  opening. The outer opening material is not merely left broken: the
+  relation check rejects the value;
+- the existing full-path asset-reference negatives are reused:
+  `negative_external_and_missing_ports` and
+  `prover_supplied_table_opening_is_rejected` in the same plan_check suite;
+  their lines are in `extension-negatives.log`.
 
 ## Boundaries
 
@@ -94,6 +111,9 @@ fallback.
   regenerated.
 - The 45,080 B gate object is untouched. The workspace suite is green
   (1156 passed / 0 failed / 20 ignored). Not pushed.
-- Logs: the ten `before-*`/`after-*` run logs in this directory; per-stage
-  `result.json` and `progress.jsonl` under each run directory; proof binaries
-  stay on disk and are gitignored.
+- Logs and scripts: the ten `before-*`/`after-*` run logs; the workspace
+  suite log `workspace.log`; the release build log `release-build.log`; the
+  run script `run-script.sh`; the targeted negative suite log
+  `extension-negatives.log`. Per-stage `result.json` and `progress.jsonl`
+  stay under each run directory; proof binaries stay on disk and are
+  gitignored.
