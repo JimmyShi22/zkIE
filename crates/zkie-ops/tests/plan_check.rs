@@ -2,7 +2,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use zkie_core::types::Digest;
+use zkie_core::types::{Digest, TensorSpec};
 use zkie_ops::argmax::ArgmaxOp;
 use zkie_ops::index_gen::EmbeddingIndexOp;
 use zkie_ops::op::OpCode;
@@ -15,7 +15,7 @@ use zkie_ops::proof::relations::{
     proof_output_values, prove_op_relation_shared, prove_op_relation_with_inputs,
     RelationReceiptMessage,
 };
-use zkie_ops::registry::PureForward;
+use zkie_ops::registry::{KernelRecord, PureForward};
 use zkie_ops::table_lookup::TableLookupOp;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -1059,6 +1059,62 @@ fn rms_public_fixture(
     plan_ext_entries: Option<u64>,
     plan_ext_digest: Option<Digest>,
 ) -> RmsPublicFixture {
+    rms_public_fixture_with(x, base_values, ext_values, plan_ext_entries, plan_ext_digest, None)
+}
+
+#[derive(Clone, Copy)]
+enum RmsTamper {
+    MeanSquare,
+    Rstd,
+    Raw,
+    Output,
+}
+
+struct TamperedRmsNorm {
+    inner: zkie_ops::profile_rms::ProfileRmsNormOp,
+    target: RmsTamper,
+}
+
+impl PureForward for TamperedRmsNorm {
+    fn opcode(&self) -> OpCode {
+        self.inner.opcode()
+    }
+
+    fn infer_specs(
+        &self,
+        inputs: &[TensorSpec],
+    ) -> Result<Vec<TensorSpec>, zkie_core::error::Error> {
+        self.inner.infer_specs(inputs)
+    }
+
+    fn forward_values(
+        &self,
+        inputs: &[Vec<i64>],
+    ) -> Result<KernelRecord, zkie_core::error::Error> {
+        // The relation prover commits exactly this record. Altering one
+        // declared value before the record is returned makes the prover
+        // rebuild every commitment, root and opening over the alteration,
+        // so the opening checks describe the altered declaration rather
+        // than a broken one.
+        let mut record = self.inner.forward_values(inputs)?;
+        match self.target {
+            RmsTamper::MeanSquare => record.auxiliaries[0][0] ^= 1,
+            RmsTamper::Rstd => record.auxiliaries[1][0] ^= 1,
+            RmsTamper::Raw => record.raw_accumulators[0][0] ^= 1,
+            RmsTamper::Output => record.outputs[0][0] ^= 1,
+        }
+        Ok(record)
+    }
+}
+
+fn rms_public_fixture_with(
+    x: i32,
+    base_values: &[i32],
+    ext_values: &[i32],
+    plan_ext_entries: Option<u64>,
+    plan_ext_digest: Option<Digest>,
+    tamper: Option<RmsTamper>,
+) -> RmsPublicFixture {
     let root = temp_dir();
     write_i32(&root.join("base_i32.bin"), base_values);
     write_i32(&root.join("ext_i32.bin"), ext_values);
@@ -1084,17 +1140,25 @@ fn rms_public_fixture(
     let public = ModelCommitmentPublic::from_commitment(&commitment);
     let opening = AssetStore::open(&commitment).unwrap().open_all().unwrap();
 
-    let op = zkie_ops::profile_rms::ProfileRmsNormOp {
+    let honest = zkie_ops::profile_rms::ProfileRmsNormOp {
         rows: 1,
         cols: 1,
         valid_cols: 1,
         output_shift: 0,
         clamp: None,
     };
+    let tampered = tamper.map(|target| TamperedRmsNorm {
+        inner: honest,
+        target,
+    });
+    let op: &dyn PureForward = match &tampered {
+        Some(wrapper) => wrapper,
+        None => &honest,
+    };
     let rms_config = vec![1, 1, 1, 0, 0, 0, 0];
     let inputs = vec![vec![x as i64], vec![1], base_values.iter().map(|v| *v as i64).collect(), ext_values.iter().map(|v| *v as i64).collect()];
     let (rms_step, rms_out) = make_step(
-        &op,
+        op,
         &inputs,
         &rms_config,
         &[],
@@ -1264,23 +1328,71 @@ fn rms_extension_index_past_the_end_is_rejected() {
     assert_eq!(code, "invalid_proof");
 }
 
+/// Re-verifies every committed declaration group of the step against the
+/// roots carried in the message, using the same Merkle verification routine
+/// as the production opening check. The fixture commits every group as a
+/// single row, so one opening covers its root.
+fn committed_openings_authenticate(
+    step: &SharedTraceStep,
+) -> Result<(), zkie_core::error::Error> {
+    let mut registry = zkie_ops::proof::binding::OracleRegistry::new();
+    for (root, start, count) in &step.message.roots {
+        registry.insert(*root, *start, *count)?;
+    }
+    let groups = step
+        .message
+        .proof
+        .outputs
+        .iter()
+        .chain(&step.message.proof.raw)
+        .chain(&step.message.proof.quotients)
+        .chain(&step.message.proof.helpers)
+        .chain(&step.message.proof.aux);
+    for group in groups {
+        for opening in group {
+            let count = registry
+                .get(opening.oracle)
+                .ok_or(zkie_core::error::Error::ProverStateMissing)?
+                .count;
+            assert_eq!(
+                count, 1,
+                "the fixture commits single-row declaration groups"
+            );
+            zkie_ops::proof::binding::verify_opening(&registry, opening, count)?;
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn rms_extension_consumption_tamper_is_rejected() {
-    let base = || rms_public_fixture(1024, &[100, 200, 300, 400], &[500, 600, 700, 800], None, None);
-
-    let mut tampered = base();
-    tampered.trace.steps[0].message.proof.outputs[0][0].values[0] ^= 1;
-    assert!(verify_rms_public(&tampered).is_err(), "norm output tamper");
-
-    let mut tampered = base();
-    tampered.trace.steps[0].message.proof.raw[0][0].values[0] ^= 1;
-    assert!(verify_rms_public(&tampered).is_err(), "raw product tamper");
-
-    let mut tampered = base();
-    tampered.trace.steps[0].message.proof.aux[0][0].values[0] ^= 1;
-    assert!(verify_rms_public(&tampered).is_err(), "mean-square tamper");
-
-    let mut tampered = base();
-    tampered.trace.steps[0].message.proof.aux[1][0].values[0] ^= 1;
-    assert!(verify_rms_public(&tampered).is_err(), "rstd tamper");
+    // Each instance is proved over a record whose declared value was altered
+    // before the relation prover committed it: the message roots are the
+    // roots of the altered declarations, so the opening checks accept the
+    // material. The full verification then rejects because the ProfileRmsNorm
+    // relation recomputes the declaration from the trusted inputs and
+    // compares it with the committed value (mean square, rstd, raw product,
+    // norm output in that check order).
+    let base = [100, 200, 300, 400];
+    let ext = [500, 600, 700, 800];
+    for (target, label) in [
+        (RmsTamper::MeanSquare, "mean-square"),
+        (RmsTamper::Rstd, "rstd"),
+        (RmsTamper::Raw, "raw"),
+        (RmsTamper::Output, "norm output"),
+    ] {
+        let fixture =
+            rms_public_fixture_with(1024, &base, &ext, None, None, Some(target));
+        committed_openings_authenticate(&fixture.trace.steps[0]).unwrap_or_else(|error| {
+            panic!("{label} declaration: the committed material is authenticated: {error:?}")
+        });
+        eprintln!("{label} declaration: authentication accepts the committed value");
+        let code = verify_rms_public(&fixture)
+            .err()
+            .unwrap_or_else(|| panic!("{label} declaration: the altered value is rejected"))
+            .code()
+            .to_owned();
+        eprintln!("{label} declaration: full verification rejects with {code}");
+        assert_eq!(code, "invalid_proof");
+    }
 }

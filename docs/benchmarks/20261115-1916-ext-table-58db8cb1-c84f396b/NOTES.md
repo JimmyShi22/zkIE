@@ -4,7 +4,8 @@
   trusted public-file channel. The file is a fixed public file; its identity
   is fixed in the model plan code and the runtime directory only locates it.
 - Code: `58db8cb1`; follow-up negative completion commit `45c4d6ed`;
-  previous commit `c84f396b`; branch `refactor/v2`.
+  consumption-negative rework on top of `45c4d6ed`; previous commit
+  `c84f396b`; branch `refactor/v2`.
 - Baseline binary: the before side was built from `062c1520`. Between
   `062c1520` and `c84f396b` only the diagnostic test file changed, so the
   before binary is production-code equivalent to the previous commit.
@@ -94,9 +95,17 @@ Negatives (rejected through the same path; there is no plaintext fallback):
   identity and the input lengths stay legal. The legal boundary instance in
   the same test verifies first, and the past-end instance is rejected in the
   consumption relation check, not by a length check;
-- a tampered norm output, raw product, mean-square declaration or rstd
-  opening. The outer opening material is not merely left broken: the
-  relation check rejects the value;
+- a committed record whose norm output, raw product, mean-square or rstd
+  declaration is altered before the relation proof is produced. The prover
+  commits the altered record through the existing relation path, so the
+  message roots are the roots of the altered declarations and the opening
+  checks accept the material: the test first re-verifies every committed
+  group against the registered root with the production opening routine.
+  The full verification then rejects the declaration at the ProfileRmsNorm
+  numerical relation. The verifier checks mean square, rstd, raw product
+  and norm output in that order, and each case alters exactly one of those
+  fields, so the rejection is forced at that field's constraint. The honest
+  instance built through the same path verifies;
 - the existing full-path asset-reference negatives are reused:
   `negative_external_and_missing_ports` and
   `prover_supplied_table_opening_is_rejected` in the same plan_check suite;
@@ -114,6 +123,9 @@ Negatives (rejected through the same path; there is no plaintext fallback):
 - Logs and scripts: the ten `before-*`/`after-*` run logs; the workspace
   suite log `workspace.log`; the release build log `release-build.log`; the
   run script `run-script.sh`; the targeted negative suite log
-  `extension-negatives.log`. Per-stage `result.json` and `progress.jsonl`
-  stay under each run directory; proof binaries stay on disk and are
-  gitignored.
+  `extension-negatives.log`; the consumption-negative rework log
+  `extension-consumption-tamper.log` (targeted `rms_extension` filter after
+  the rework: 6 passed / 0 failed, with the four
+  authentication-accepted/relation-rejected lines). Per-stage `result.json`
+  and `progress.jsonl` stay under each run directory; proof binaries stay
+  on disk and are gitignored.
