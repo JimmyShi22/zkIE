@@ -2291,7 +2291,6 @@ fn the_registered_instance_feeds_the_local_table_check_prefix() {
     // The closed consumer pieces (pending claim, index mask, dot map) are not
     // part of the legal local prefix; the task's closure is the table stage.
     hidden_plan.send.member = None;
-    hidden_plan.send.index_mask = None;
     hidden_plan.send.dot = None;
     hidden_plan.proximity.own_mask_tree.mask_rows =
         zkie_ops::proof::hidden_norm_psc::norm_own_mask_rows(index_rows, 0)
