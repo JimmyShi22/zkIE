@@ -11941,6 +11941,11 @@ fn verify_first(
     let _profile = zkie_engine::profile::Scope::new("verify.first");
     plan.validate()?;
     take_mask_slots(plan)?;
+    // The verifier's reader must be the plan's table: the same shape and the
+    // same table identity the prover committed. Without this check a reader
+    // from another table could feed the shared column openings while the plan
+    // names a different asset.
+    check_table(&plan.send, reader)?;
     // A fixture may pin the reduced roots as a negative-test expectation. The
     // hidden-input entry leaves them unpinned: the roots are proof values
     // absorbed into the first chain and checked through the openings below.
@@ -12861,6 +12866,18 @@ fn prove_shared(
     let (folded, folded_tail) = fold_table(table, reader.shape, &gamma)?;
     drop(_profile_fold_table);
     let gu = plan.proximity.gu.clone();
+    // The fold shape and the table reader are one parameter set: the folded
+    // message, the generator rows and the opened columns use the same code,
+    // row count, answers, salt and sampling distances.
+    if gu.index != reader.shape {
+        return Err(Error::StatementMismatch);
+    }
+    if plan.proximity.column_draws == 0
+        || plan.proximity.column_draws > plan.proximity.column_budget
+        || plan.proximity.column_budget as u64 > reader.shape.code.r
+    {
+        return Err(Error::InvalidConfig);
+    }
     let mut gu_coins = ByteMaskCoins::new(derive_run_seed(seed, 2, 0)?)?;
     let gu_pads = draw_values(&mut gu_coins, gu.u.answers as usize)?;
     let gu_tails = {
@@ -12930,6 +12947,11 @@ fn prove_shared(
         None,
     )?;
     let unique = unique_sorted(&positions);
+    if positions.len() != plan.proximity.column_draws
+        || unique.len() > plan.proximity.column_budget
+    {
+        return Err(Error::ShapeMismatch);
+    }
     let _profile_open_columns = zkie_engine::profile::Scope::new("shared.table_open_columns");
     let gu_openings = table.open_columns(&unique)?;
     drop(_profile_open_columns);
@@ -13321,6 +13343,17 @@ fn verify_shared(
     let gamma = psi[plan.send.k_lo as usize..].to_vec();
     let eq_gamma = foldeq_weights(&gamma, reader.shape.v)?;
     let gu = plan.proximity.gu.clone();
+    // The fold shape and the verifier's reader are one parameter set; the
+    // table identity is checked at the first part.
+    if gu.index != reader.shape {
+        return Err(Error::StatementMismatch);
+    }
+    if plan.proximity.column_draws == 0
+        || plan.proximity.column_draws > plan.proximity.column_budget
+        || plan.proximity.column_budget as u64 > reader.shape.code.r
+    {
+        return Err(Error::InvalidConfig);
+    }
     absorb_root_round(&mut chain, &messages.gu_root)?;
     let gu_bits = gu.sample_bits()?;
     let gu_seeds = draw_seed_set(&mut chain, gu_bits, gu.u.answers)?;
@@ -13342,6 +13375,11 @@ fn verify_shared(
         return Err(Error::InvalidProof);
     }
     let unique = unique_sorted(&positions);
+    if positions.len() != plan.proximity.column_draws
+        || unique.len() > plan.proximity.column_budget
+    {
+        return Err(Error::ShapeMismatch);
+    }
     let _profile_columns = zkie_engine::profile::Scope::new("verify.shared.columns");
     let column_map = table_column_map(reader, &positions, &messages.column_openings)?;
     drop(_profile_columns);
@@ -29984,6 +30022,73 @@ mod merged_tests {
                 .unwrap();
         assert_eq!(left[0][0], Fp3::from_base(messages_table[0][0]));
         assert_eq!(right[0][0], Fp3::from_base(messages_table[1][1]));
+    }
+
+    /// The shared fold and the table reader are one parameter set, and the
+    /// opened columns are authenticated against that reader: a fold shape
+    /// with another distance or salt, a reader from another table, a changed
+    /// column position, nonce, path, salt or symbol, and an empty or
+    /// over-budget column list are all refused by the formal verifier.
+    #[test]
+    fn the_shared_columns_are_bound_to_the_reader() {
+        let (plan, messages, _) = member_run();
+        let table = table();
+        verify_hidden_lin_hidden(&plan, &table.reader, &messages).unwrap();
+
+        // The fold shape is bound by the first statement; a plan whose fold
+        // shape names other sampling distances or another salt no longer
+        // matches the prover's first chain.
+        let mut changed = plan.clone();
+        changed.proximity.gu.index.distances.radius += 1;
+        assert!(changed.validate().is_ok());
+        assert!(verify_hidden_lin_hidden(&changed, &table.reader, &messages).is_err());
+        let mut changed = plan.clone();
+        changed.proximity.gu.index.salt_bytes += 1;
+        assert!(changed.validate().is_err());
+
+        // The verifier's reader must be the plan's table: another sampling
+        // distance, shape or root is refused by the same-parameter check.
+        let mut other = table.reader.clone();
+        other.shape.distances.radius += 1;
+        assert!(matches!(
+            verify_hidden_lin_hidden(&plan, &other, &messages),
+            Err(Error::StatementMismatch)
+        ));
+        let mut other = table.reader.clone();
+        other.shape.salt_bytes += 1;
+        assert!(verify_hidden_lin_hidden(&plan, &other, &messages).is_err());
+        let mut other = table.reader.clone();
+        other.root.0[0] ^= 1;
+        assert!(verify_hidden_lin_hidden(&plan, &other, &messages).is_err());
+
+        // A changed column position, nonce, path, salt or symbol breaks the
+        // drawn list or the stored-column opening.
+        let mut changed = messages.clone();
+        changed.shared.column_positions[0] ^= 1;
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &changed).is_err());
+        let mut changed = messages.clone();
+        changed.shared.column_nonce ^= 1;
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &changed).is_err());
+        let mut changed = messages.clone();
+        changed.shared.column_openings[0].path[0].0[0] ^= 1;
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &changed).is_err());
+        let mut changed = messages.clone();
+        changed.shared.column_openings[0].salt[0] ^= 1;
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &changed).is_err());
+        let mut changed = messages.clone();
+        changed.shared.column_openings[0].symbols[0] = Fp::from_u64(0xDEAD);
+        assert!(verify_hidden_lin_hidden(&plan, &table.reader, &changed).is_err());
+
+        // The drawn list and the budget come from the same plan.
+        let mut changed = plan.clone();
+        changed.proximity.column_draws = 0;
+        assert!(changed.validate().is_err());
+        let mut changed = plan.clone();
+        changed.proximity.column_draws = changed.proximity.column_budget + 1;
+        assert!(changed.validate().is_err());
+        let mut changed = plan.clone();
+        changed.proximity.column_budget = changed.send.table_shape.code.r as usize + 1;
+        assert!(changed.validate().is_err());
     }
 
     #[test]
