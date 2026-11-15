@@ -18225,7 +18225,8 @@ fn digit_lookup_mask_sample_row(
 }
 
 /// The BAT rows of one digit lookup: the key claim registered on the committed
-/// digit message, the multiplicity row on the multiplicity-bit message, the
+/// digit message, the multiplicity row on the multiplicity-bit message, every
+/// remaining relation of the tie, key-level and table-level sumchecks, the
 /// leaf kept-map row, the bit summand's hiding/shown rows and its end row.
 fn digit_lookup_rows(
     plan: &HiddenSendPlan,
@@ -18299,6 +18300,42 @@ fn digit_lookup_rows(
     let bits_index = leaf_index.checked_add(1).ok_or(Error::ResourceLimit)?;
     if claims.rows.len() != bits_index + 1 {
         return Err(Error::ShapeMismatch);
+    }
+    // Every remaining relation the lookup sumchecks leave: the tie rows and
+    // the key-level and table-level rows. Each output lands on the committed
+    // lookup mask member by its own hiding slots, its claim masks and its
+    // target; a skipped row would leave that relation unchecked.
+    for index in 0..leaf_index {
+        let output = &claims.rows[index];
+        if !output.row_maps.is_empty() {
+            return Err(Error::UnsupportedPrimitive);
+        }
+        let hiding = claims
+            .hiding_slots
+            .get(index)
+            .ok_or(Error::ShapeMismatch)?;
+        if hiding.len() != output.hiding_form.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut row = BatRow::new(BatRowKind::Plain);
+        for (slot, coefficient) in hiding.iter().zip(&output.hiding_form) {
+            row.add_unit(
+                mask_member.bat_oracle,
+                BatPart::Mask,
+                lookup_mask_virtual_index(commit, *slot)?,
+                *coefficient,
+            );
+        }
+        for term in &output.claim_masks {
+            row.add_unit(
+                mask_member.bat_oracle,
+                BatPart::Mask,
+                lookup_mask_virtual_index(commit, term.slot)?,
+                term.coefficient,
+            );
+        }
+        row.target = output.row_target;
+        rows.push(row);
     }
     let leaf = &claims.rows[leaf_index];
     if leaf.row_maps.len() != 1 {
@@ -28867,6 +28904,228 @@ mod merged_tests {
             table,
             source: RefCell::new(source),
             reader,
+        }
+    }
+
+    /// The remaining lookup relations are checked against the committed mask
+    /// member, not only the outer lookup fields: a proof whose sumchecks use
+    /// different mask values than the committed table still verifies as a
+    /// lookup, and only the remaining relation rows catch the mismatch.
+    #[test]
+    fn digit_lookup_remaining_rows_bind_the_committed_mask_member() {
+        use crate::proof::lookup::{
+            mask_count, prove_lookup_with_key_values, verify_lookup, LookupOutcome,
+            LookupWitness,
+        };
+        use crate::proof::lookup_messages::{
+            commit_lookup, LookupMessages, LookupRandomSource, LookupRoots,
+        };
+        use zkie_engine::pcs::request::bat::{BatPart, BatRow};
+
+        let activation = activation();
+        let (mut plan, _) = member_plan_for(&activation);
+        let range = range_plan();
+        plan.send.range = Some(range.clone());
+        for plane in 0u64..2 {
+        let lookup_plan = crate::proof::digit_lookup::digit_lookup_plan(
+            &range,
+            plane as u32,
+            &digit_lookup_params(plane),
+        )
+        .unwrap();
+        let table: &dyn crate::proof::lookup::LookupTable = if plane == 0 {
+            &crate::proof::digit_lookup::LowDigitTable
+        } else {
+            &crate::proof::lookup::ByteTable
+        };
+        let values = (0..lookup_plan.real_keys())
+            .map(|index| {
+                Fp3::from_u64((index % lookup_plan.lookup.table_rows().unwrap()) as u64)
+            })
+            .collect::<Vec<_>>();
+        let bits = crate::proof::digit_lookup::digit_multiplicity_bits(&lookup_plan, &values)
+            .unwrap();
+        let mask_entries = mask_count(&lookup_plan.lookup).unwrap();
+        let mut source = LookupRandomSource::new(7);
+        let messages = commit_lookup(&lookup_plan.commit, &bits, mask_entries, &mut source)
+            .unwrap();
+        let keys = lookup_plan.pad_keys(values).unwrap();
+        let prove = |messages: &LookupMessages| {
+            let mut chain = zkie_engine::pcs::request::chain::Chain::begin(
+                zkie_engine::pcs::request::chain::KIND_SEED as u64,
+                &Digest::ZERO,
+                &[],
+                &Digest::ZERO.0,
+                None,
+            )
+            .unwrap();
+            prove_lookup_with_key_values(
+                &lookup_plan.lookup,
+                &lookup_plan.commit,
+                &lookup_plan.key,
+                &keys,
+                &LookupWitness { bits: bits.clone() },
+                messages,
+                table,
+                &mut chain,
+            )
+            .unwrap()
+        };
+        let (proof, claims) = prove(&messages);
+        let planes = lookup_plan.lookup.planes().unwrap();
+        let leaf_index = (planes - 1)
+            + lookup_plan.lookup.key_bits as usize
+            + lookup_plan.lookup.table_log as usize;
+        assert_eq!(claims.rows.len(), leaf_index + 2);
+
+        // The first intermediate output with a nonzero hiding coefficient.
+        let (row_index, slot) = (0..leaf_index)
+            .find_map(|index| {
+                let slots = claims.hiding_slots.get(index)?;
+                let form = &claims.rows[index].hiding_form;
+                slots
+                    .iter()
+                    .zip(form)
+                    .find(|(_, coefficient)| !coefficient.is_zero())
+                    .map(|(slot, _)| (index, *slot))
+            })
+            .expect("an intermediate relation carries a hiding entry");
+        let mut altered = messages.clone();
+        let ell = usize::try_from(lookup_plan.commit.mask_code.ell).unwrap();
+        let entry = &mut altered.mask_rows[slot / ell][slot % ell];
+        *entry = entry.add(&Fp3::ONE);
+        let (altered_proof, altered_claims) = prove(&altered);
+        assert_ne!(claims.rows[row_index], altered_claims.rows[row_index]);
+
+        // The outer lookup verification accepts the altered proof: the mask
+        // values are private hiding entries, and the roots are those of the
+        // committed table.
+        let roots = LookupRoots {
+            bits: messages.bits_root(),
+            mask: messages.mask_root,
+        };
+        let mut verify_chain = zkie_engine::pcs::request::chain::Chain::begin(
+            zkie_engine::pcs::request::chain::KIND_SEED as u64,
+            &Digest::ZERO,
+            &[],
+            &Digest::ZERO.0,
+            None,
+        )
+        .unwrap();
+        let verified = verify_lookup(
+            &lookup_plan.lookup,
+            &lookup_plan.commit,
+            &lookup_plan.key,
+            &roots,
+            &altered_proof,
+            table,
+            &mut verify_chain,
+        )
+        .unwrap();
+        assert_eq!(verified, altered_claims);
+
+        let commit = &lookup_plan.commit;
+        let members = vec![
+            ProximityMember {
+                bat_oracle: 0,
+                source_oracle: commit.bits_oracle,
+                main_code: commit.bits_shape.code,
+                mask_code: commit.mask_code,
+                main_rows: commit.bits_shape.main_rows,
+                mask_rows: 0,
+                answers: commit.bits_shape.answers,
+                root: messages.bits_root(),
+                tree_plan: commit.bits_shape.tree_plan(0).unwrap(),
+                message: Vec::new(),
+                tails: Vec::new(),
+                mask_message: Vec::new(),
+                mask_tails: Vec::new(),
+            },
+            ProximityMember {
+                bat_oracle: 1,
+                source_oracle: commit.mask_oracle,
+                main_code: commit.mask_code,
+                mask_code: commit.mask_code,
+                main_rows: 0,
+                mask_rows: commit.mask_rows,
+                answers: 1,
+                root: messages.mask_root,
+                tree_plan: commit.mask_tree.clone(),
+                message: Vec::new(),
+                tails: Vec::new(),
+                mask_message: Vec::new(),
+                mask_tails: Vec::new(),
+            },
+            ProximityMember {
+                bat_oracle: 2,
+                source_oracle: range.digit_oracle,
+                main_code: range.digit_shape.code,
+                mask_code: commit.mask_code,
+                main_rows: range.digit_shape.main_rows,
+                mask_rows: 0,
+                answers: range.digit_shape.answers,
+                root: Digest([0x56; 32]),
+                tree_plan: range.digit_shape.tree_plan(0).unwrap(),
+                message: Vec::new(),
+                tails: Vec::new(),
+                mask_message: Vec::new(),
+                mask_tails: Vec::new(),
+            },
+        ];
+        let message_of = |claims: &LookupOutcome, proof: &crate::proof::lookup::LookupProof| {
+            DigitLookupMessages {
+                bits_root: messages.bits_root(),
+                bits_sample: SendSamples {
+                    seed: Vec::new(),
+                    answers: Vec::new(),
+                },
+                mask_tree: commit.mask_tree.clone(),
+                mask_root: messages.mask_root,
+                mask_sample: SendSamples {
+                    seed: Vec::new(),
+                    answers: Vec::new(),
+                },
+                mask_positions: Vec::new(),
+                mask_opening: zkie_engine::pcs::request::runtime_tree::RuntimeTreeOpening {
+                    positions: Vec::new(),
+                    columns: Vec::new(),
+                    given: Vec::new(),
+                },
+                proof: proof.clone(),
+                claims: claims.clone(),
+            }
+        };
+        let honest_rows =
+            digit_lookup_rows(&plan.send, &lookup_plan, &message_of(&claims, &proof), &members)
+                .unwrap();
+        let altered_rows = digit_lookup_rows(
+            &plan.send,
+            &lookup_plan,
+            &message_of(&altered_claims, &altered_proof),
+            &members,
+        )
+        .unwrap();
+        assert_eq!(honest_rows.len(), leaf_index + 5);
+        assert_eq!(altered_rows.len(), leaf_index + 5);
+        let row_bits = 64 - (commit.mask_rows - 1).leading_zeros();
+        let value_at = |virtual_index: u64| {
+            let row = usize::try_from(virtual_index & ((1u64 << row_bits) - 1)).unwrap();
+            let place = usize::try_from(virtual_index >> row_bits).unwrap();
+            messages.mask_rows[row][place]
+        };
+        let claim_of = |row: &BatRow| {
+            row.units.iter().fold(Fp3::ZERO, |sum, unit| {
+                if unit.part == BatPart::Mask && unit.oracle == 1 {
+                    sum.add(&unit.coefficient.mul(&value_at(unit.index)))
+                } else {
+                    sum
+                }
+            })
+        };
+        let honest = &honest_rows[2 + row_index];
+        let altered = &altered_rows[2 + row_index];
+        assert_eq!(claim_of(honest), honest.target);
+        assert_ne!(claim_of(altered), altered.target);
         }
     }
 
