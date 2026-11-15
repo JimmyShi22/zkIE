@@ -8621,6 +8621,15 @@ impl PartialEq for ReadLedgerCell {
 
 impl Eq for ReadLedgerCell {}
 
+/// The trusted work parameters of the shared linear stage's error-bound
+/// check. A plan that carries it is checked against its table's one-time
+/// distance and its actual column count; fixture plans leave it absent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedLinCheck {
+    pub point_work_bits: u8,
+    pub zeta_work_bits: u8,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HiddenProximityPlan {
     /// The folded table message of the shared stage.
@@ -8654,6 +8663,9 @@ pub struct HiddenProximityPlan {
     /// When true, the own two-stage list is re-derived by the trusted planner
     /// and must match this plan. The toy fixtures leave it false.
     pub planner_checked: bool,
+    /// The shared linear stage's error-bound check, when the plan carries the
+    /// trusted work parameters. Fixtures leave it absent.
+    pub lin_check: Option<SharedLinCheck>,
 }
 
 impl HiddenProximityPlan {
@@ -9478,7 +9490,32 @@ impl HiddenLinPlan {
             parameters.check(self.send.member.as_ref().ok_or(Error::InvalidConfig)?)?;
             let _layout = parameters.freeze_layout(self)?;
         }
+        self.check_shared_lin()?;
         Ok(())
+    }
+
+    /// The shared linear stage's plan check: the table's one-time distance, the
+    /// actual column draws and the point, column and comparison-point error
+    /// terms must all come from this plan and meet the targets. One request is
+    /// one instance; the plan carries no instance count.
+    fn check_shared_lin(&self) -> Result<()> {
+        let Some(check) = self.proximity.lin_check else {
+            return Ok(());
+        };
+        let fault = crate::proof::proximity_planner::SharedLinPlanFault {
+            v: self.send.table_shape.v,
+            k_lo: self.proximity.omega.k_lo,
+            rows_log: self.proximity.omega.matrix_rows.trailing_zeros(),
+            m: self.send.table_shape.distances.m_once,
+            column_draws: self.proximity.column_draws as u64,
+            point_work_bits: check.point_work_bits as u32,
+            column_work_bits: self.proximity.column_work_bits as u32,
+            zeta_work_bits: check.zeta_work_bits as u32,
+        };
+        crate::proof::proximity_planner::shared_lin_plan_fault(
+            fault,
+            self.send.table_shape.code,
+        )
     }
 
     fn parameters_digest(&self) -> Digest {
@@ -9610,6 +9647,15 @@ pub struct HiddenSharedMessages {
     /// loop proof whose final segment is the LastBase artifact.
     pub tail: ProximityTail,
     pub seal: Digest,
+}
+
+impl HiddenSharedMessages {
+    /// The shared stage's canonical message bytes, for measurement and tests.
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = CanonicalWriter::new();
+        put_shared(&mut writer, self);
+        Ok(writer.into_bytes())
+    }
 }
 
 /// The messages of the second stage. The adopted `Omega` root and its samples
@@ -22334,6 +22380,75 @@ pub fn prove_hidden_lin_hidden(
     prove_hidden_lin_inner(plan, Some(activation), table, None, seed, true, None, None, None, None)
 }
 
+/// Prover prefix of the hidden-input mode: the first part and the shared
+/// stage up to their seals. The table is the caller's keeper; the second stage
+/// is outside this entry.
+pub fn prove_hidden_lin_hidden_shared_seal(
+    plan: &HiddenLinPlan,
+    activation: &CommittedActivation,
+    table: &mut dyn HiddenTableProver,
+    seed: Digest,
+    chain_inputs: Option<&crate::proof::request_chain::ChainInputs>,
+) -> Result<(HiddenSendMessages, HiddenSharedMessages)> {
+    plan.validate()?;
+    if plan.send.request_chain.is_some() != chain_inputs.is_some() || seed == Digest::ZERO {
+        return Err(Error::InvalidConfig);
+    }
+    let reader = table.reader().clone();
+    let mut coins = ByteMaskCoins::new(derive_run_seed(&seed, 1, 0)?)?;
+    let randomness =
+        WCommitRandomness::from_coins(&mut coins, &plan.send, plan.closure.as_ref())?;
+    let (first, first_seal, send_witness, _, _) = prove_first(
+        plan,
+        Some(activation),
+        table,
+        None,
+        &randomness,
+        None,
+        &seed,
+        None,
+        chain_inputs,
+        true,
+    )?;
+    let shared = prove_shared(
+        plan,
+        &reader,
+        table,
+        &first,
+        &first_seal,
+        &seed,
+        None,
+        send_witness.fold_charge.as_ref(),
+    )?;
+    Ok((first, shared.messages))
+}
+
+/// Verifier prefix of the hidden-input mode: the first part and the shared
+/// stage up to their seals.
+pub fn verify_hidden_lin_hidden_shared_seal(
+    plan: &HiddenLinPlan,
+    reader: &IndexReader,
+    first: &HiddenSendMessages,
+    shared: &HiddenSharedMessages,
+    chain_inputs: Option<&crate::proof::request_chain::ChainInputs>,
+) -> Result<Digest> {
+    plan.validate()?;
+    if plan.send.request_chain.is_some() != chain_inputs.is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    let (_eval_rows, first_seal, _closure_r, _chain_rows) =
+        verify_first(plan, reader, None, first, chain_inputs)?;
+    if first_seal != first.chain_value {
+        return Err(Error::InvalidProof);
+    }
+    let (shared_seal, _claims, _points, _base) =
+        verify_shared(plan, reader, first, &first_seal, shared)?;
+    if shared_seal != shared.seal {
+        return Err(Error::InvalidProof);
+    }
+    Ok(shared_seal)
+}
+
 /// Prover entry of the hidden-input mode over the production asset table
 /// keeper. The concrete keeper type makes the table's durable column budget
 /// part of the entry: a keeper without one cannot be passed here. The
@@ -25330,6 +25445,7 @@ mod merged_tests {
                 shared_stages: Vec::new(),
                 own_stages: Vec::new(),
                 planner_checked: false,
+                lin_check: None,
             },
             output_relation: None,
             closure: None,

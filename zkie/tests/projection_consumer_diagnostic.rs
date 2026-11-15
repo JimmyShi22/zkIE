@@ -31,11 +31,12 @@ use zkie_ops::proof::hidden_send_session::{
     derive_chain_pending, diagnostic_chain_stack, diagnostic_hiding_entries,
     diagnostic_randomness,
     prove_first_part_segment_evidence, prove_hidden_lin, prove_hidden_lin_hidden,
-    prove_hidden_lin_hidden_with_chain_segment,
+    prove_hidden_lin_hidden_shared_seal, prove_hidden_lin_hidden_with_chain_segment,
     verify_first_part_segment_evidence, verify_hidden_lin, verify_hidden_lin_hidden,
-    verify_hidden_lin_hidden_with_chain_segment, ActivationShape, CommittedActivation,
-    DotMapPlan, HiddenLinPlan, HiddenOutputShape, HiddenProximityPlan,
-    HiddenSendMessages, HiddenSendPlan, HiddenTableProver, IndexMaskPlan, IoppStagePlan,
+    verify_hidden_lin_hidden_shared_seal, verify_hidden_lin_hidden_with_chain_segment,
+    ActivationShape, CommittedActivation, DotMapPlan, HiddenLinPlan, HiddenOutputShape,
+    HiddenProximityPlan, HiddenSendMessages, HiddenSendPlan, HiddenSharedMessages,
+    HiddenTableProver, IndexMaskPlan, IoppStagePlan,
     MaskEntryAllocation, MemberPlan, WShape,
 };
 use zkie_ops::proof::psc::Weight;
@@ -70,11 +71,8 @@ const MATRIX_ROWS: u64 = 1024;
 const K_LO: u32 = 0;
 const COLUMNS: u64 = 1024;
 const TABLE_LOG_N: u32 = 12;
-/// The hidden plan's shared column draws; the table budget counts one batch of
-/// exactly this many columns per proof.
-const DIAGNOSTIC_COLUMN_DRAWS: u64 = 2;
 const TABLE_ELL: u64 = 2048;
-const TABLE_R: u64 = 8;
+const TABLE_R: u64 = 128;
 const CODE_LOG_N: u32 = 14;
 const CODE_ELL: u64 = 8192;
 const CODE_R: u64 = 4;
@@ -169,7 +167,33 @@ fn code() -> CodeParams {
     build_code_plan(CODE_LOG_N, CODE_ELL, CODE_R).unwrap()
 }
 
+/// The table's one-time distance, derived from its code and the plan's point
+/// variables. The plan carries this frozen value and the verifier checks it.
+fn table_distance() -> u64 {
+    zkie_ops::proof::proximity_planner::recorded_table_distance(table_code(), 10, 1, 10, 1, 0)
+        .expect("the table distance")
+}
+
+/// The shared linear stage's column draws, derived from the table's distance,
+/// the plan's point variables and the comparison point's variables.
+fn shared_lin_columns() -> u64 {
+    zkie_ops::proof::proximity_planner::shared_lin_columns(
+        zkie_ops::proof::proximity_planner::SharedLinShape {
+            v: 10,
+            k_lo: K_LO,
+            instances: 1,
+            rows_log: MATRIX_ROWS.trailing_zeros(),
+        },
+        table_code(),
+        table_distance(),
+        0,
+        0,
+    )
+    .expect("the shared column count")
+}
+
 fn table_shape() -> IndexShape {
+    let distance = table_distance();
     IndexShape {
         code: table_code(),
         v: 10,
@@ -178,8 +202,8 @@ fn table_shape() -> IndexShape {
         distances: TableDistances {
             radius: 0,
             later_radius: 0,
-            m_once: 0,
-            m_later: 0,
+            m_once: distance,
+            m_later: distance,
         },
     }
 }
@@ -354,11 +378,12 @@ fn diagnostic_table(weights: &[i64]) -> Table {
         count.clone(),
     )
     .unwrap();
+    let columns = shared_lin_columns();
     let budget = zkie_engine::pcs::request::read::DurableColumnBudget::open(
         ledger_dir,
         count,
-        DIAGNOSTIC_COLUMN_DRAWS,
-        64,
+        columns,
+        columns * 4,
     )
     .unwrap();
     Table {
@@ -367,7 +392,7 @@ fn diagnostic_table(weights: &[i64]) -> Table {
         hiding: zkie_engine::pcs::request::read::HidingState::new(
             reader.root,
             1,
-            reader.shape.code.r as u64,
+            columns * 4,
         ),
         budget,
         reader,
@@ -387,6 +412,18 @@ fn tensor_limbs(rows: &[Vec<i64>]) -> u32 {
         })
         .max()
         .unwrap_or(1)
+}
+
+/// The diagnostic plan's shared linear values are derived, and the column
+/// count fits the table's random tail.
+#[test]
+fn the_diagnostic_plan_values_are_derived() {
+    let distance = table_distance();
+    let columns = shared_lin_columns();
+    eprintln!("diagnostic plan values: distance={distance} columns={columns}");
+    assert!(distance >= 3);
+    assert!(columns > 0);
+    assert!(columns <= table_code().r);
 }
 
 #[test]
@@ -759,6 +796,7 @@ fn plan_for(
             shared_stages: Vec::new(),
             own_stages: Vec::new(),
             planner_checked: false,
+            lin_check: None,
         },
         output_relation: None,
         closure: None,
@@ -1040,9 +1078,11 @@ fn hidden_plan_for(
             own_mask_tree: mask_tree(201, mask_code.log_n, 1u64 << assembled.own[0].h),
             shared_fresh: 90,
             own_fresh: 91,
-            column_draws: 2,
-            column_budget: 4,
-            ledger: zkie_ops::proof::hidden_send_session::ReadLedgerCell::new(4 as u64),
+            column_draws: shared_lin_columns() as usize,
+            column_budget: shared_lin_columns() as usize,
+            ledger: zkie_ops::proof::hidden_send_session::ReadLedgerCell::new(
+                shared_lin_columns(),
+            ),
             column_work_bits: 0,
             shared_base_positions: assembled.shared.last().unwrap().positions as usize,
             own_base_positions: assembled.own.last().unwrap().positions as usize,
@@ -1053,6 +1093,13 @@ fn hidden_plan_for(
             // the stage lists above are still the assembly's derivation of the
             // same members, and the request parameters are frozen separately.
             planner_checked: false,
+            // The shared linear stage's plan check: the table's one-time
+            // distance, the derived column draws and the point, column and
+            // comparison-point error terms come from this plan.
+            lin_check: Some(zkie_ops::proof::hidden_send_session::SharedLinCheck {
+                point_work_bits: 0,
+                zeta_work_bits: 0,
+            }),
         },
         output_relation: None,
         closure: None,
@@ -1498,6 +1545,98 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
             .expect("pending discovery");
     let discovery = _discovery.elapsed();
     hidden_plan.validate().expect("hidden plan");
+
+    if std::env::var("ZKIE_SHARED_SEAL_EVIDENCE").is_ok() {
+        // The plan check runs at the actual entry: a plan below the derived
+        // column count and a plan without the one-time distance are refused.
+        let mut under_met = hidden_plan.clone();
+        under_met.proximity.column_draws = under_met.proximity.column_draws.saturating_sub(1);
+        assert!(under_met.validate().is_err(), "the under-met column plan is refused");
+        let mut no_distance = hidden_plan.clone();
+        no_distance.send.table_shape.distances.m_once = 0;
+        no_distance.proximity.gu.index.distances.m_once = 0;
+        assert!(no_distance.validate().is_err(), "the plan without a distance is refused");
+        // The first two chains (the first part and the shared stage) up to
+        // their seals, on the real plan and table with the plan's derived
+        // column draws and one-time distance. The second stage is outside
+        // this path.
+        let seal_prove_start = std::time::Instant::now();
+        let (seal_first, seal_shared) = prove_hidden_lin_hidden_shared_seal(
+            &hidden_plan,
+            &activation,
+            &mut session_table,
+            SEED,
+            Some(&inputs),
+        )
+        .expect("shared seal prove");
+        let seal_prove_time = seal_prove_start.elapsed();
+        let seal_bytes = seal_first.encode().expect("first bytes").len()
+            + seal_shared.encode().expect("shared bytes").len();
+        let seal_verify_start = std::time::Instant::now();
+        verify_hidden_lin_hidden_shared_seal(
+            &hidden_plan,
+            session_table.reader(),
+            &seal_first,
+            &seal_shared,
+            Some(&inputs),
+        )
+        .expect("shared seal verify");
+        let seal_verify_time = seal_verify_start.elapsed();
+
+        let mut attempted = 0u32;
+        let mut rejected = 0u32;
+        let mut check =
+            |label: &str, first: HiddenSendMessages, shared: HiddenSharedMessages| {
+                attempted += 1;
+                match verify_hidden_lin_hidden_shared_seal(
+                    &hidden_plan,
+                    session_table.reader(),
+                    &first,
+                    &shared,
+                    Some(&inputs),
+                ) {
+                    Ok(_) => eprintln!("SHARED SEAL EVIDENCE negative accepted: {label}"),
+                    Err(_) => rejected += 1,
+                }
+            };
+        let mut changed = seal_shared.clone();
+        changed.column_openings[0].symbols[0] = Fp::from_u64(0xDEAD_BEEF);
+        check("changed column opening", seal_first.clone(), changed);
+        let mut changed = seal_shared.clone();
+        changed.fold_rounds[0].0 = changed.fold_rounds[0].0.add(&Fp3::ONE);
+        check("changed fold round", seal_first.clone(), changed);
+        let mut changed = seal_shared.clone();
+        changed.omega_answers[0] = changed.omega_answers[0].add(&Fp3::ONE);
+        check("changed Omega answer", seal_first.clone(), changed);
+        let mut changed = seal_shared.clone();
+        changed.seal.0[0] ^= 1;
+        check("changed shared seal", seal_first.clone(), changed);
+        let mut changed = seal_first.clone();
+        changed.chain_value.0[0] ^= 1;
+        check("changed first seal", changed, seal_shared.clone());
+        assert_eq!(rejected, attempted, "every shared seal negative is rejected");
+        let hwm = fs::read_to_string("/proc/self/status")
+            .ok()
+            .and_then(|status| {
+                status
+                    .lines()
+                    .find(|line| line.starts_with("VmHWM:"))
+                    .map(|line| line.trim().to_string())
+            })
+            .unwrap_or_else(|| "VmHWM unavailable".to_string());
+        eprintln!(
+            "SHARED SEAL EVIDENCE (local first+shared chains, not R5): limbs={} discovery={:?} seal_bytes={} seal_prove={:?} seal_verify={:?} negatives={}/{} {}",
+            limbs,
+            discovery,
+            seal_bytes,
+            seal_prove_time,
+            seal_verify_time,
+            rejected,
+            attempted,
+            hwm,
+        );
+        return;
+    }
 
     if std::env::var("ZKIE_SEGMENT_EVIDENCE").is_ok() {
         // Local segment evidence, not the full request session and not R5:

@@ -2040,6 +2040,7 @@ mod tests {
             shared_stages: Vec::new(),
             own_stages: Vec::new(),
             planner_checked: false,
+            lin_check: None,
         }
     }
 

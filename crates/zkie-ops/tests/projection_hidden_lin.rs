@@ -333,6 +333,7 @@ fn plan(activation: &CommittedActivation, table: &Table) -> HiddenLinPlan {
             shared_stages: Vec::new(),
             own_stages: Vec::new(),
             planner_checked: false,
+            lin_check: None,
         },
         output_relation: None,
         closure: None,

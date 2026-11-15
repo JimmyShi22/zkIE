@@ -842,6 +842,7 @@ fn selected_gpt2_output_head_request_session() {
             stages
         },
         planner_checked: env::var_os("ZKIE_SESSION_THREE_STAGE").is_none(),
+        lin_check: None,
     };
     let activation_salts: Vec<Vec<u8>> = (0..OUTPUT_HEAD_POSITIONS)
         .map(|position| vec![(position as u8).wrapping_mul(11) ^ 0x3C; SALT])

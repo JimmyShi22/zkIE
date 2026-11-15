@@ -540,6 +540,14 @@ pub struct SharedLinBounds {
     pub zeta: Bound,
 }
 
+fn table_fold_error(v: u32, proximity_error: &Bound, list: &Big) -> Bound {
+    let mut error = Bound::from_u64(0);
+    for _ in 1..=v {
+        error = error.add(proximity_error);
+    }
+    error.add(&Bound::from_big(list.clone()).mul(&field_error(u64::from(v))))
+}
+
 /// Derives a shared linear stage's column query count and error terms from the
 /// table's tested distance. `agree` is the distance's agreement, `list` its
 /// list size and `proximity_error` its per-variable proximity error; the
@@ -558,13 +566,7 @@ pub fn shared_lin_bounds(
     if shape.v == 0 || shape.instances == 0 || shape.rows_log == 0 {
         return Err(Error::InvalidConfig);
     }
-    let mut fold = Bound::from_u64(0);
-    for _ in 1..=shape.v {
-        fold = fold.add(proximity_error);
-    }
-    let fold = fold.add(
-        &Bound::from_big(list.clone()).mul(&field_error(u64::from(shape.v))),
-    );
+    let fold = table_fold_error(shape.v, proximity_error, list);
     let point = Bound::from_u64(shape.instances)
         .mul(&field_error(u64::from(shape.v) + u64::from(shape.k_lo)))
         .add(&fold);
@@ -585,6 +587,157 @@ pub fn shared_lin_bounds(
         column_error,
         zeta: field_error(u64::from(shape.rows_log)),
     })
+}
+
+/// The trusted parameters of one shared linear stage's bound check. The
+/// instance count is not carried: one request is one instance, and the check
+/// does not accept a caller's instance count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SharedLinPlanFault {
+    pub v: u32,
+    pub k_lo: u32,
+    pub rows_log: u32,
+    pub m: u64,
+    pub column_draws: u64,
+    pub point_work_bits: u32,
+    pub column_work_bits: u32,
+    pub zeta_work_bits: u32,
+}
+
+fn table_proximity(code: CodeParams, m: u64) -> Result<Proximity> {
+    if code.log_n >= 64 || m < 3 {
+        return Err(Error::InvalidConfig);
+    }
+    let word = Word {
+        log_n: code.log_n,
+        ell: code.ell,
+        k: code.r,
+    };
+    let at = johnson(&word, m)?;
+    if at.bad() {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(at)
+}
+
+/// The smallest number of table columns whose agreement power meets the query
+/// target at the given one-time distance and work bits.
+pub fn shared_lin_columns(
+    shape: SharedLinShape,
+    code: CodeParams,
+    m: u64,
+    point_work_bits: u32,
+    column_work_bits: u32,
+) -> Result<u64> {
+    let at = table_proximity(code, m)?;
+    let bounds = shared_lin_bounds(
+        shape,
+        &at.agree,
+        &at.list,
+        &mca_error(&at),
+        point_work_bits,
+        column_work_bits,
+    )?;
+    Ok(bounds.columns)
+}
+
+/// Checks a frozen shared linear plan: the table's one-time distance must
+/// exist, the plan's actual column count must be at least the derived minimum
+/// (a larger, more conservative count is accepted), and the actual column and
+/// comparison-point errors must meet the targets with the plan's work bits.
+pub fn shared_lin_plan_fault(fault: SharedLinPlanFault, code: CodeParams) -> Result<()> {
+    if fault.v == 0 || fault.rows_log == 0 || fault.column_draws == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let at = table_proximity(code, fault.m)?;
+    let shape = SharedLinShape {
+        v: fault.v,
+        k_lo: fault.k_lo,
+        instances: 1,
+        rows_log: fault.rows_log,
+    };
+    let bounds = shared_lin_bounds(
+        shape,
+        &at.agree,
+        &at.list,
+        &mca_error(&at),
+        fault.point_work_bits,
+        fault.column_work_bits,
+    )?;
+    if fault.column_draws < bounds.columns {
+        return Err(Error::InvalidConfig);
+    }
+    let column_error = at.agree.pow(fault.column_draws);
+    if !surely_le(&column_error, &goal(fault.column_work_bits)) {
+        return Err(Error::InvalidConfig);
+    }
+    let zeta = field_error(u64::from(fault.rows_log));
+    if !surely_le(&zeta, &goal(fault.zeta_work_bits)) {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(())
+}
+
+/// The largest table distance (multiplicity) whose one-time fold point and
+/// record sample meet the target, with the given sharing and point variables.
+/// Only the table distance is derived; the fold round count and the hiding
+/// polynomial are not.
+pub fn recorded_table_distance(
+    code: CodeParams,
+    v: u32,
+    answers: u32,
+    point_variables: u32,
+    sharing: u64,
+    work_bits: u32,
+) -> Result<u64> {
+    if v == 0 || answers == 0 || sharing == 0 || point_variables == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let word = Word {
+        log_n: code.log_n,
+        ell: code.ell,
+        k: code.r,
+    };
+    let cube_bits = ceil_log2(code.ell);
+    let good = |m: u64| -> bool {
+        let Ok(at) = johnson(&word, m) else {
+            return false;
+        };
+        if at.bad() {
+            return false;
+        }
+        let point = Bound::from_u64(sharing)
+            .mul(&field_error(u64::from(point_variables)))
+            .add(&Bound::from_u64(2).mul(&table_fold_error(v, &mca_error(&at), &at.list)));
+        let point_ok = surely_le(&Bound::from_real(point.error()), &goal(work_bits));
+        let sample = sample_error(&at.list, cube_bits, answers);
+        let sample_ok = surely_le(&Bound::from_real(sample.error()), &goal(0));
+        point_ok && sample_ok
+    };
+    if !good(3) {
+        return Err(Error::InvalidConfig);
+    }
+    let mut low = 3u64;
+    let mut high = 6u64;
+    while high <= MAX_M && good(high) {
+        low = high;
+        high = high.saturating_mul(2);
+    }
+    if high > MAX_M {
+        if good(MAX_M) {
+            return Ok(MAX_M);
+        }
+        high = MAX_M;
+    }
+    while high - low > 1 {
+        let middle = low + (high - low) / 2;
+        if good(middle) {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    Ok(low)
 }
 
 fn stage_cube_bits(group: &GroupShape) -> u32 {
@@ -2649,6 +2802,44 @@ mod tests {
         let mut bad = shape;
         bad.v = 0;
         assert!(shared_lin_bounds(bad, &at.agree, &at.list, &proximity, 0, 0).is_err());
+    }
+
+    /// The plan check derives a column count from a realistic table distance
+    /// and refuses a plan that draws fewer columns or carries no distance; a
+    /// more conservative count is accepted.
+    #[test]
+    fn the_shared_lin_plan_check_rejects_under_met_candidates() {
+        let code = build_code_plan(12, 2048, 128).unwrap();
+        let m = recorded_table_distance(code, 10, 1, 10, 1, 0).unwrap();
+        assert!(m >= 3);
+        let shape = SharedLinShape {
+            v: 10,
+            k_lo: 0,
+            instances: 1,
+            rows_log: 10,
+        };
+        let columns = shared_lin_columns(shape, code, m, 0, 0).unwrap();
+        assert!(columns > 0);
+        let fault = SharedLinPlanFault {
+            v: 10,
+            k_lo: 0,
+            rows_log: 10,
+            m,
+            column_draws: columns,
+            point_work_bits: 0,
+            column_work_bits: 0,
+            zeta_work_bits: 0,
+        };
+        shared_lin_plan_fault(fault, code).unwrap();
+        let mut conservative = fault;
+        conservative.column_draws = columns + 1;
+        shared_lin_plan_fault(conservative, code).unwrap();
+        let mut fewer = fault;
+        fewer.column_draws = columns - 1;
+        assert!(shared_lin_plan_fault(fewer, code).is_err());
+        let mut no_distance = fault;
+        no_distance.m = 0;
+        assert!(shared_lin_plan_fault(no_distance, code).is_err());
     }
 
     #[test]
