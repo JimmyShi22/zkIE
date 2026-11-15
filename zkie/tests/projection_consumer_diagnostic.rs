@@ -2614,14 +2614,39 @@ fn the_registered_instance_feeds_the_local_table_check_prefix() {
     bad_meta.identity = Digest([0x66; 32]);
     assert!(verify_asset_table_meta(&bad_meta, plan.table_model_identity, spec, &plan.params).is_err());
     // The table root is bound by the reader identity the plan carries: the
-    // same proof against a reader with another root is rejected.
+    // same proof against a reader with another root is rejected. Each tamper
+    // check runs on a plan clone, whose read ledger starts fresh, so the
+    // rejection is the tamper and not an exhausted verifier ledger.
     let mut bad_reader = trusted_reader.clone();
     bad_reader.root = Digest([0x67; 32]);
+    let reader_plan = hidden_plan.clone();
     assert!(verify_hidden_lin_hidden_shared_seal(
-        &hidden_plan,
+        &reader_plan,
         &bad_reader,
         &first,
         &shared,
+        None
+    )
+    .is_err());
+    let chain_plan = hidden_plan.clone();
+    let mut changed_chain = first.clone();
+    changed_chain.chain_value.0[0] ^= 1;
+    assert!(verify_hidden_lin_hidden_shared_seal(
+        &chain_plan,
+        &trusted_reader,
+        &changed_chain,
+        &shared,
+        None
+    )
+    .is_err());
+    let column_plan = hidden_plan.clone();
+    let mut changed_column = shared.clone();
+    changed_column.column_openings[0].symbols[0] = Fp::from_u64(0xDEAD_BEEF);
+    assert!(verify_hidden_lin_hidden_shared_seal(
+        &column_plan,
+        &trusted_reader,
+        &first,
+        &changed_column,
         None
     )
     .is_err());
