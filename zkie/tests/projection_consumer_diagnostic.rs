@@ -2261,7 +2261,7 @@ fn the_registered_instance_feeds_the_local_table_check_prefix() {
 
     let mut keeper = make_table(&messages);
     let activation = activation(&activation_rows, positions);
-    let hidden_plan = hidden_plan_with_table(
+    let mut hidden_plan = hidden_plan_with_table(
         &activation,
         positions,
         tensor_limbs(&activation_rows),
@@ -2269,6 +2269,44 @@ fn the_registered_instance_feeds_the_local_table_check_prefix() {
         table_identity,
         plan.total_columns,
     );
+    // The legal local prefix mode carries no request chain: the chain-only
+    // objects are absent rather than filled with placeholders, and the own
+    // mask capacity no longer includes the chain mask block.
+    hidden_plan.send.request_chain = None;
+    hidden_plan.send.chain_mask = None;
+    hidden_plan.send.source_data = None;
+    hidden_plan.send.segment_mask_tree = None;
+    hidden_plan.send.range = None;
+    hidden_plan.send.request_reads = None;
+    hidden_plan.send.request_w = None;
+    hidden_plan.send.digit_lookups.clear();
+    hidden_plan.send.expected_roots = None;
+    let index_rows = hidden_plan
+        .send
+        .index_mask
+        .as_ref()
+        .expect("the local prefix keeps its index mask")
+        .tree_rows()
+        .expect("index mask rows");
+    hidden_plan.proximity.own_mask_tree.mask_rows =
+        zkie_ops::proof::hidden_norm_psc::norm_own_mask_rows(index_rows, 0)
+            .expect("own mask rows");
+    eprintln!(
+        "plan fields: shape={:?} identity={} draws={} budget={} lin={:?} stages={}/{} code={:?} mask={:?}",
+        hidden_plan.send.table_shape,
+        digest_to_hex(&hidden_plan.send.table_identity),
+        hidden_plan.proximity.column_draws,
+        hidden_plan.proximity.column_budget,
+        hidden_plan.proximity.lin_check,
+        hidden_plan.proximity.shared_stages.len(),
+        hidden_plan.proximity.own_stages.len(),
+        hidden_plan.proximity.code,
+        hidden_plan.proximity.mask_code
+    );
+    match hidden_plan.validate() {
+        Ok(()) => eprintln!("plan validate ok"),
+        Err(error) => panic!("plan validate failed: {:?}", error),
+    }
     let (first, shared) =
         prove_hidden_lin_hidden_shared_seal(&hidden_plan, &activation, &mut keeper, SEED, None)
             .unwrap();
