@@ -10407,6 +10407,236 @@ impl ProximityTreeSource<'_> {
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// The key group's proximity test
+// ---------------------------------------------------------------------------
+
+/// One message sample recorded by the key chain: its seed and its answer.
+pub(crate) type KeySample = (zkie_engine::pcs::request::table::SampleSeed, Fp3);
+
+/// The inputs of the key group's proximity test. The lookup messages are the
+/// group's members; the key chain records their samples before the lookup
+/// runs, and both the lookup and this test use them.
+pub(crate) struct TableKeyGroup<'a> {
+    pub lookup: &'a crate::proof::lookup::LookupPlan,
+    pub commit: &'a crate::proof::lookup_messages::LookupCommitPlan,
+    pub claims: &'a crate::proof::lookup::LookupOutcome,
+    pub messages: &'a crate::proof::lookup_messages::LookupMessages,
+    pub first_main: CodeParams,
+    pub first_mask: CodeParams,
+    pub stages: &'a [IoppStagePlan],
+    pub base_positions: usize,
+    pub mask_tree: MaskTreePlan,
+    pub fresh: u64,
+    pub group_id: u64,
+    pub bits_bat: u64,
+    pub mask_bat: u64,
+    pub bits_samples: &'a [KeySample],
+    pub mask_samples: &'a [KeySample],
+    pub bound: &'a crate::proof::proximity_iopp::IoppBoundIds,
+}
+
+fn table_key_members(group: &TableKeyGroup<'_>, prover: bool) -> Result<Vec<ProximityMember>> {
+    let shape = group.commit.bits_shape;
+    if group.bits_samples.len() != 1 || group.mask_samples.len() != 1 {
+        return Err(Error::ShapeMismatch);
+    }
+    let bits_root = group
+        .messages
+        .bits
+        .roots
+        .first()
+        .copied()
+        .ok_or(Error::ShapeMismatch)?;
+    let bits = ProximityMember {
+        bat_oracle: group.bits_bat,
+        source_oracle: group.commit.bits_oracle,
+        main_code: shape.code,
+        mask_code: group.commit.mask_code,
+        main_rows: shape.main_rows,
+        mask_rows: 0,
+        answers: 1,
+        root: bits_root,
+        tree_plan: shape.tree_plan(0)?,
+        message: if prover {
+            group
+                .messages
+                .bits
+                .messages
+                .first()
+                .cloned()
+                .ok_or(Error::ShapeMismatch)?
+        } else {
+            Vec::new()
+        },
+        tails: if prover {
+            vec![group.messages.bits_tails.clone()]
+        } else {
+            Vec::new()
+        },
+        mask_message: Vec::new(),
+        mask_tails: Vec::new(),
+    };
+    let mask = ProximityMember {
+        bat_oracle: group.mask_bat,
+        source_oracle: group.commit.mask_oracle,
+        main_code: group.first_main,
+        mask_code: group.commit.mask_code,
+        main_rows: 0,
+        mask_rows: group.commit.mask_rows,
+        answers: 1,
+        root: group.messages.mask_root,
+        tree_plan: group.commit.mask_tree.clone(),
+        message: Vec::new(),
+        tails: Vec::new(),
+        mask_message: if prover {
+            group.messages.mask_rows.clone()
+        } else {
+            Vec::new()
+        },
+        mask_tails: if prover {
+            group.messages.mask_tails.clone()
+        } else {
+            Vec::new()
+        },
+    };
+    Ok(vec![bits, mask])
+}
+
+fn table_key_sample_rows(
+    group: &TableKeyGroup<'_>,
+    members: &[ProximityMember],
+) -> Result<Vec<Vec<GuRelationRow>>> {
+    let oracle_shape = group.commit.bits_shape.oracle_shape();
+    let mut bits = Vec::with_capacity(group.bits_samples.len());
+    for (seed, answer) in group.bits_samples {
+        bits.push(oracle_sample_row(
+            group.commit.bits_oracle,
+            group.group_id,
+            &oracle_shape,
+            std::slice::from_ref(seed),
+            0,
+            *answer,
+        )?);
+    }
+    let mut mask = Vec::with_capacity(group.mask_samples.len());
+    for (seed, answer) in group.mask_samples {
+        mask.push(digit_lookup_mask_sample_row(
+            group.commit,
+            group.commit.mask_oracle,
+            group.group_id,
+            seed,
+            *answer,
+        )?);
+    }
+    let rows = vec![bits, mask];
+    for (index, member) in members.iter().enumerate() {
+        if rows[index].len() != member.answers as usize {
+            return Err(Error::ShapeMismatch);
+        }
+    }
+    Ok(rows)
+}
+
+fn table_key_plain_rows(group: &TableKeyGroup<'_>) -> Result<Vec<BatRow>> {
+    let mut rows =
+        lookup_remaining_rows(group.lookup, group.commit, group.claims, group.mask_bat)?;
+    rows.extend(lookup_group_rows(
+        group.lookup,
+        group.commit,
+        group.claims,
+        group.bits_bat,
+        group.mask_bat,
+    )?);
+    Ok(rows)
+}
+
+fn table_key_fold(
+    group: &TableKeyGroup<'_>,
+    members: &[ProximityMember],
+) -> Result<FoldShape> {
+    member_fold_shape(
+        group.first_main,
+        group.first_mask,
+        members,
+        group.mask_tree.leaf_class,
+    )
+}
+
+fn table_key_iopp(
+    group: &TableKeyGroup<'_>,
+) -> Result<crate::proof::proximity_iopp::ProximityIoppPlan> {
+    crate::proof::proximity_iopp::derive_proximity_iopp(
+        group.stages,
+        crate::proof::proximity_iopp::ProximityGroupRole::Own,
+        &group.mask_tree,
+        group.group_id,
+        group.fresh,
+        group.base_positions,
+        group.bound,
+    )
+}
+
+/// Proves the key group's proximity test: the BAT rows on the lookup messages,
+/// the FOLD rounds with a fresh mask and the derived multi-stage tail. The
+/// member rows never leave the prover.
+pub(crate) fn table_key_group_prove(
+    chain: Chain,
+    group: &TableKeyGroup<'_>,
+    trees: Vec<(u64, Arc<RuntimeTree>)>,
+    run_seed: Digest,
+) -> Result<ProximityProof> {
+    let members = table_key_members(group, true)?;
+    let sample_rows = table_key_sample_rows(group, &members)?;
+    let plain_rows = table_key_plain_rows(group)?;
+    let fold = table_key_fold(group, &members)?;
+    let iopp = table_key_iopp(group)?;
+    proximity_prove(
+        chain,
+        fold,
+        members,
+        ProximityTreeSource::Ready {
+            trees,
+            omega: None,
+        },
+        &sample_rows,
+        plain_rows,
+        group.fresh,
+        group.mask_tree,
+        run_seed,
+        group.base_positions,
+        Some(&iopp),
+    )
+}
+
+/// Verifies the key group's proximity test from the same built rows and the
+/// proof messages.
+pub(crate) fn table_key_group_verify(
+    chain: Chain,
+    group: &TableKeyGroup<'_>,
+    messages: &ProximityMessages,
+) -> Result<Digest> {
+    let members = table_key_members(group, false)?;
+    let sample_rows = table_key_sample_rows(group, &members)?;
+    let plain_rows = table_key_plain_rows(group)?;
+    let fold = table_key_fold(group, &members)?;
+    let iopp = table_key_iopp(group)?;
+    let verification = proximity_verify(
+        chain,
+        fold,
+        &members,
+        &sample_rows,
+        plain_rows,
+        messages,
+        group.fresh,
+        group.mask_tree,
+        group.base_positions,
+        Some(&iopp),
+    )?;
+    Ok(verification.seal)
+}
+
 /// The prover side of one proximity test: BAT over the registered claims,
 /// FOLD rounds with a fresh mask, then BASE on the same chain. Every value the
 /// verifier needs is in the returned messages; the member rows never leave the
