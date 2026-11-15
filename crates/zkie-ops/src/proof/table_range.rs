@@ -658,6 +658,135 @@ pub fn derive_range_lookup_message(
     })
 }
 
+// ---------------------------------------------------------------------------
+// The public declaration of one table's entry range
+// ---------------------------------------------------------------------------
+
+use zkie_core::common::codec::DecodeLimits;
+use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
+
+/// Version of the range declaration.
+pub const TABLE_KEY_RANGE_VERSION: u64 = 1;
+
+/// The public declaration of one table's entry range: the integers the table
+/// is to satisfy, the matrix geometry the lookup covers, and the message
+/// counts the plan takes. It is separate from the range table's identity: the
+/// same table serves any offset, so this declaration binds the bounds, the
+/// offset and the geometry beside the table identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableKeyRangeConfig {
+    pub version: u64,
+    pub lo: i64,
+    pub hi: i64,
+    pub matrix_rows: u64,
+    pub column_bits: u32,
+    pub place_bits: u32,
+    pub table_log: u32,
+    pub mu: u32,
+    pub key_bits: u32,
+    pub offset: Fp3,
+    pub digit_weight: Fp3,
+    pub stride: u64,
+    pub range_table: Digest,
+    pub pending_rows: usize,
+    pub index_mask_entries: usize,
+    pub batt_rounds: usize,
+}
+
+/// The declaration of one derived plan.
+pub fn table_key_range_config(plan: &EntryRangePlan) -> TableKeyRangeConfig {
+    TableKeyRangeConfig {
+        version: TABLE_KEY_RANGE_VERSION,
+        lo: plan.range.lo(),
+        hi: plan.range.hi(),
+        matrix_rows: plan.matrix_rows,
+        column_bits: plan.column_bits,
+        place_bits: plan.place_bits,
+        table_log: plan.table_log,
+        mu: plan.mu,
+        key_bits: plan.key_bits,
+        offset: plan.offset,
+        digit_weight: plan.digit_weight,
+        stride: plan.stride,
+        range_table: plan.identity,
+        pending_rows: plan.pending_rows,
+        index_mask_entries: plan.index_mask_entries,
+        batt_rounds: plan.batt_rounds,
+    }
+}
+
+impl TableKeyRangeConfig {
+    /// The canonical bytes of the declaration.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut writer = CanonicalWriter::new();
+        writer.put_u64(self.version);
+        writer.put_u64(self.lo as u64);
+        writer.put_u64(self.hi as u64);
+        writer.put_u64(self.matrix_rows);
+        writer.put_u64(self.column_bits as u64);
+        writer.put_u64(self.place_bits as u64);
+        writer.put_u64(self.table_log as u64);
+        writer.put_u64(self.mu as u64);
+        writer.put_u64(self.key_bits as u64);
+        writer.put_fp3(&self.offset);
+        writer.put_fp3(&self.digit_weight);
+        writer.put_u64(self.stride);
+        writer.put_digest(&self.range_table);
+        writer.put_u64(self.pending_rows as u64);
+        writer.put_u64(self.index_mask_entries as u64);
+        writer.put_u64(self.batt_rounds as u64);
+        writer.into_bytes()
+    }
+
+    pub fn digest(&self) -> Digest {
+        digest_bytes(&self.encode())
+    }
+
+    /// Decodes the canonical bytes strictly: the version must match, and
+    /// truncation and trailing bytes are rejected.
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        let limits = DecodeLimits {
+            max_bytes: 1 << 20,
+            max_elements: 1 << 12,
+        };
+        let mut reader = CanonicalReader::new(bytes, limits);
+        let version = reader.get_u64()?;
+        if version != TABLE_KEY_RANGE_VERSION {
+            return Err(Error::InvalidEncoding);
+        }
+        let config = Self {
+            version,
+            lo: reader.get_u64()? as i64,
+            hi: reader.get_u64()? as i64,
+            matrix_rows: reader.get_u64()?,
+            column_bits: u32::try_from(reader.get_u64()?).map_err(|_| Error::InvalidEncoding)?,
+            place_bits: u32::try_from(reader.get_u64()?).map_err(|_| Error::InvalidEncoding)?,
+            table_log: u32::try_from(reader.get_u64()?).map_err(|_| Error::InvalidEncoding)?,
+            mu: u32::try_from(reader.get_u64()?).map_err(|_| Error::InvalidEncoding)?,
+            key_bits: u32::try_from(reader.get_u64()?).map_err(|_| Error::InvalidEncoding)?,
+            offset: reader.get_fp3()?,
+            digit_weight: reader.get_fp3()?,
+            stride: reader.get_u64()?,
+            range_table: reader.get_digest()?,
+            pending_rows: usize::try_from(reader.get_u64()?).map_err(|_| Error::InvalidEncoding)?,
+            index_mask_entries: usize::try_from(reader.get_u64()?)
+                .map_err(|_| Error::InvalidEncoding)?,
+            batt_rounds: usize::try_from(reader.get_u64()?).map_err(|_| Error::InvalidEncoding)?,
+        };
+        reader.finish()?;
+        Ok(config)
+    }
+
+    /// The declaration must be the one the plan derives: same bounds, same
+    /// geometry, same table identity and the same message counts.
+    pub fn validate(&self, plan: &EntryRangePlan) -> Result<()> {
+        if *self != table_key_range_config(plan) {
+            return Err(Error::StatementMismatch);
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1152,5 +1281,68 @@ mod range_message_tests {
         assert_eq!(smallest_mask_rows(256, 256).unwrap(), 2);
         assert_eq!(smallest_mask_rows(0, 256), Err(Error::InvalidConfig));
         assert_eq!(smallest_mask_rows(3, 0), Err(Error::InvalidConfig));
+    }
+}
+
+#[cfg(test)]
+mod key_range_config_tests {
+    use super::*;
+
+    fn plan(lo: i64, hi: i64) -> EntryRangePlan {
+        derive_entry_range(
+            1024,
+            10,
+            EntryRange::new(lo, hi).unwrap(),
+            EntryRangeLimits {
+                max_table_log: 19,
+                max_bit_entries: 1 << 24,
+            },
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn the_declaration_round_trips_and_matches_its_plan() {
+        let plan = plan(-131072, 131071);
+        let config = table_key_range_config(&plan);
+        config.validate(&plan).unwrap();
+        let bytes = config.encode();
+        assert_eq!(TableKeyRangeConfig::decode(&bytes).unwrap(), config);
+        assert_eq!(config.digest(), digest_bytes(&bytes));
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(TableKeyRangeConfig::decode(&trailing).is_err());
+        let mut short = bytes;
+        short.pop();
+        assert!(TableKeyRangeConfig::decode(&short).is_err());
+    }
+
+    #[test]
+    fn the_same_table_serves_another_offset() {
+        let low = plan(-131072, 131071);
+        let shifted = plan(-131071, 131072);
+        assert_eq!(low.table_log, shifted.table_log);
+        assert_eq!(low.identity, shifted.identity);
+        assert_ne!(low.offset, shifted.offset);
+        let low_config = table_key_range_config(&low);
+        let shifted_config = table_key_range_config(&shifted);
+        assert_ne!(low_config.digest(), shifted_config.digest());
+        assert_eq!(low_config.validate(&shifted), Err(Error::StatementMismatch));
+        assert_eq!(shifted_config.validate(&low), Err(Error::StatementMismatch));
+    }
+
+    #[test]
+    fn another_geometry_is_refused() {
+        let plan = plan(-131072, 131071);
+        let config = table_key_range_config(&plan);
+        let mut other = config.clone();
+        other.column_bits += 1;
+        assert_eq!(other.validate(&plan), Err(Error::StatementMismatch));
+        let mut other = config.clone();
+        other.pending_rows = 2;
+        assert_eq!(other.validate(&plan), Err(Error::StatementMismatch));
+        let mut other = config;
+        other.version = TABLE_KEY_RANGE_VERSION + 1;
+        assert!(TableKeyRangeConfig::decode(&other.encode()).is_err());
     }
 }
