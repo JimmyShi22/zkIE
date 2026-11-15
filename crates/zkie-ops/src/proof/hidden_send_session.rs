@@ -14214,6 +14214,36 @@ fn shared_start_chain(
     Ok(chain)
 }
 
+/// Starts a shared chain from a verified binding root. The root and its place
+/// count are the chain's binding object from the start: both are mixed into
+/// the chain parameters and its first round, so another root leads to another
+/// shared chain. The shared chain has no random bytes of its own.
+pub(crate) fn shared_start_chain_from_binding(
+    parameters: &Digest,
+    statement_input: &[u8],
+    shape_v: u64,
+    k_lo: u32,
+    record: &[u8],
+    binding_root: &crate::proof::lin_binding::LinBindingRoot,
+) -> Result<Chain> {
+    if binding_root.fault().is_some() || *parameters == Digest::ZERO {
+        return Err(Error::InvalidConfig);
+    }
+    let mut input = Vec::with_capacity(statement_input.len() + 40);
+    input.extend_from_slice(&binding_root.digest.0);
+    input.extend_from_slice(&binding_root.places.to_le_bytes());
+    input.extend_from_slice(statement_input);
+    let statement_digest = hash_labeled(tag_word(PARAMETERS, 4), 1, None, &input)?;
+    let mut chain = Chain::begin(SHARED_CHAIN_LABEL, parameters, statement_input, record, None)?;
+    absorb_digest_round(
+        &mut chain,
+        2,
+        &[binding_root.digest, *parameters, statement_digest],
+        &[binding_root.places, shape_v, k_lo as u64],
+    )?;
+    Ok(chain)
+}
+
 fn shared_point_bits(plan: &HiddenLinPlan) -> Result<u32> {
     let k_col = plan.send.columns.trailing_zeros();
     if plan
@@ -37196,6 +37226,34 @@ mod key_first_flow_tests {
         )
         .unwrap();
         (plan, reader, table, messages, seal, witness, binding_root)
+    }
+
+    #[test]
+    fn the_shared_chain_starts_from_the_verified_binding_root() {
+        let (plan, reader, table, messages, _seal, _witness, root) = flow_run();
+        let (_verified_seal, verified) = key_first_verify(&plan, &reader, &table, &messages)
+            .expect("the key first part verifies");
+        assert_eq!(verified, root);
+        let record = reader.name();
+        let start = |binding: &crate::proof::lin_binding::LinBindingRoot| {
+            shared_start_chain_from_binding(
+                &plan.statement_digest(),
+                &plan.range.encode(),
+                2,
+                0,
+                &record,
+                binding,
+            )
+            .map(|chain| *chain.value())
+            .unwrap()
+        };
+        let first = start(&verified);
+        assert_eq!(first, start(&verified));
+        let other = start(&crate::proof::lin_binding::LinBindingRoot {
+            digest: Digest([0x55; 32]),
+            places: 1,
+        });
+        assert_ne!(first, other);
     }
 
     #[test]
