@@ -3003,21 +3003,27 @@ fn absorb_request_w_root(chain: &mut Chain, shape: &WShape, root: Digest) -> Res
 
 /// Derives the request-level W = g^T M: one entry per column, from the same
 /// table stream the witness uses. The row weights are public.
-fn derive_request_w(
-    plan: &HiddenSendPlan,
+/// Derives `W = g^T M` from the table stream: one value for each column of
+/// the matrix, from the weights over the matrix's rows. The caller supplies
+/// the public geometry; a request plan and the key plan both call this.
+pub(crate) fn derive_w_values(
+    table_shape: &IndexShape,
+    matrix_rows: u64,
+    k_lo: u32,
+    columns: u64,
     weights: &[Fp3],
     source: &mut dyn TableRowSource,
 ) -> Result<Vec<Fp3>> {
-    let matrix_rows = usize::try_from(plan.matrix_rows).map_err(|_| Error::ResourceLimit)?;
-    let columns = usize::try_from(plan.columns).map_err(|_| Error::ResourceLimit)?;
+    let matrix_rows = usize::try_from(matrix_rows).map_err(|_| Error::ResourceLimit)?;
+    let columns = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
     if weights.len() != matrix_rows {
         return Err(Error::ShapeMismatch);
     }
-    let ell = usize::try_from(plan.table_shape.code.ell).map_err(|_| Error::ResourceLimit)?;
-    let tail_len = usize::try_from(plan.table_shape.code.r).map_err(|_| Error::ResourceLimit)?;
-    let table_rows = usize::try_from(plan.table_shape.rows()).map_err(|_| Error::ResourceLimit)?;
-    let factor = 1usize << plan.k_lo;
-    if columns != matrix_rows << plan.k_lo || source.rows() != table_rows as u64 {
+    let ell = usize::try_from(table_shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let tail_len = usize::try_from(table_shape.code.r).map_err(|_| Error::ResourceLimit)?;
+    let table_rows = usize::try_from(table_shape.rows()).map_err(|_| Error::ResourceLimit)?;
+    let factor = 1usize << k_lo;
+    if columns != matrix_rows << k_lo || source.rows() != table_rows as u64 {
         return Err(Error::ShapeMismatch);
     }
     let mut message = vec![Fp::ZERO; ell];
@@ -3027,14 +3033,14 @@ fn derive_request_w(
     // `low + y * 2^k_lo`, with low = column mod 2^k_lo. One pass over the rows.
     for table_row in 0..table_rows {
         source.row(table_row as u64, &mut message, &mut tail)?;
-        let base = table_row << plan.k_lo;
+        let base = table_row << k_lo;
         if base + factor > columns {
             return Err(Error::ShapeMismatch);
         }
         for low in 0..factor {
             let mut sum = Fp3::ZERO;
             for (row, weight) in weights.iter().enumerate() {
-                let entry = low + (row << plan.k_lo);
+                let entry = low + (row << k_lo);
                 let value = *message.get(entry).ok_or(Error::ShapeMismatch)?;
                 if !weight.is_zero() {
                     sum = sum.add(&weight.mul(&Fp3::from_base(value)));
@@ -3044,6 +3050,21 @@ fn derive_request_w(
         }
     }
     Ok(w)
+}
+
+fn derive_request_w(
+    plan: &HiddenSendPlan,
+    weights: &[Fp3],
+    source: &mut dyn TableRowSource,
+) -> Result<Vec<Fp3>> {
+    derive_w_values(
+        &plan.table_shape,
+        plan.matrix_rows,
+        plan.k_lo,
+        plan.columns,
+        weights,
+        source,
+    )
 }
 
 fn derive_w_rows_from_weights(
