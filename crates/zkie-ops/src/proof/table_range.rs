@@ -37,9 +37,25 @@ pub const ENTRY_RANGE_PLAN_VERSION: u64 = 1;
 /// Domain separation of the public range table's identity.
 const RANGE_TABLE_DOMAIN: &[u8] = b"zkie/entry-range-table/v1";
 
+/// The canonical row encoding of the range table, bound into its identity by
+/// its semantics so that another encoding of the same width cannot share it.
+const RANGE_TABLE_ENCODING: &[u8] = b"i32-le";
+
 /// The largest table the canonical row encoding admits: the rows are the
-/// integers `0 .. 2^table_log - 1`, written as signed 32-bit values.
-const RANGE_TABLE_MAX_LOG: u32 = 30;
+/// integers `0 .. 2^table_log - 1`, written as signed 32-bit values, so the
+/// last row is at most `2^31 - 1`. This is the encoding's own bound; the
+/// resource limit a caller passes may be smaller.
+const RANGE_TABLE_MAX_LOG: u32 = 31;
+
+/// The base field's bit width. A key is a field element whose integer form
+/// must stay inside the field, so the range table's rows and the
+/// multiplicity planes together stay below it.
+const FIELD_BITS: u32 = 64;
+
+/// The admitted number of multiplicity bit positions: at least two and at
+/// most 62, so that every multiplicity fits a plane count the field admits.
+const PLANES_MIN: u32 = 2;
+const PLANES_MAX: u32 = 62;
 
 /// A declared range of an entry: `lo` up to and including `hi`. The width
 /// `hi - lo + 1` must be a power of two (`2^d`, `d >= 1`), and both bounds must
@@ -158,17 +174,18 @@ fn matrix_bits(rows: u64, k_col: u32) -> Result<(u32, u64)> {
 /// The multiplicity planes: the smallest `mu` with `keys < 2^(2^mu)`, so that
 /// one bit plane per multiplicity is enough for every key.
 fn multiplicity_planes(keys: u64) -> Result<u32> {
-    let mut mu = 1u32;
-    loop {
+    // The smallest plane count whose bits can hold a multiplicity of every
+    // key. A key count that no admitted plane count holds is refused here,
+    // before any resource limit is consulted.
+    for mu in 1u32..=6 {
         let planes = 1u64 << mu;
-        if planes >= 63 {
-            return Err(Error::ResourceLimit);
-        }
-        if keys < (1u64 << planes) {
+        // A plane count of 64 holds every key; the shift by 64 below is why
+        // this case is taken first.
+        if planes >= 64 || keys < (1u64 << planes) {
             return Ok(mu);
         }
-        mu = mu.checked_add(1).ok_or(Error::ResourceLimit)?;
     }
+    Err(Error::InvalidConfig)
 }
 
 /// The dimensions a declaration implies, with the range table and the
@@ -184,11 +201,11 @@ pub fn entry_range_dimensions(
         return Err(Error::InvalidConfig);
     }
     let mu = multiplicity_planes(keys)?;
-    let place_bits = table_log.checked_add(mu).ok_or(Error::ResourceLimit)?;
-    if place_bits >= 63 {
+    let bit_bits = table_log.checked_add(mu).ok_or(Error::ResourceLimit)?;
+    if bit_bits >= FIELD_BITS {
         return Err(Error::ResourceLimit);
     }
-    let bit_entries = 1u64 << place_bits;
+    let bit_entries = 1u64 << bit_bits;
     let place_bits = rows.trailing_zeros();
     Ok(EntryRangeDimensions {
         table_log,
@@ -210,7 +227,7 @@ pub fn entry_range_table_identity(table_log: u32) -> Result<Digest> {
     bytes.extend_from_slice(RANGE_TABLE_DOMAIN);
     bytes.extend_from_slice(&ENTRY_RANGE_PLAN_VERSION.to_le_bytes());
     bytes.extend_from_slice(&table_log.to_le_bytes());
-    bytes.extend_from_slice(&(TableEncoding::I32Le.width() as u64).to_le_bytes());
+    bytes.extend_from_slice(RANGE_TABLE_ENCODING);
     Ok(digest_bytes(&bytes))
 }
 
@@ -242,6 +259,24 @@ pub fn derive_entry_range(
     limits: EntryRangeLimits,
 ) -> Result<EntryRangePlan> {
     let dimensions = entry_range_dimensions(rows, k_col, range)?;
+    let planes = 1u32 << dimensions.mu;
+    // The lookup's own domain, from its declared range plan: the planes are
+    // between two and 62, the table has at least one row, a key number stays
+    // below the plane count (a part has at most as many keys as a
+    // multiplicity can count), and the table rows plus the planes stay inside
+    // the base field. Sizes alone, from entry_range_dimensions(), grant
+    // nothing.
+    if planes < PLANES_MIN
+        || planes > PLANES_MAX
+        || dimensions.table_log < 1
+        || dimensions.key_bits >= planes
+        || dimensions
+            .table_log
+            .checked_add(planes)
+            .map_or(true, |bits| bits >= FIELD_BITS)
+    {
+        return Err(Error::InvalidConfig);
+    }
     if dimensions.table_log > RANGE_TABLE_MAX_LOG {
         // The range table's rows are the integers of the canonical 32-bit row
         // encoding; a wider table cannot be one.
@@ -607,9 +642,10 @@ mod tests {
             derive_entry_range(ROWS, K_COL, full, LIMITS),
             Err(Error::InvalidConfig)
         );
-        // A wider limit does not admit it: the canonical range table's rows
-        // are signed 32-bit values, so the table itself is limited to 2^30
-        // rows. The dimensions above still report what the declaration implies.
+        // A wider limit does not admit it: 32 table rows and 32 planes are not
+        // below the 64-bit field, and the canonical row encoding only admits
+        // the integers 0 .. 2^31 - 1. The dimensions above still report what
+        // the declaration would imply.
         let wide = EntryRangeLimits {
             max_table_log: 32,
             max_bit_entries: 1 << 37,
@@ -644,6 +680,56 @@ mod tests {
     }
 
     #[test]
+    fn a_key_count_beyond_the_admitted_planes_is_refused() {
+        let range = signed(3);
+        // Sizing still reports what the declaration implies: 2^32 keys need
+        // six planes (64 bit positions).
+        let dimensions = entry_range_dimensions(1u64 << 32, 0, range).unwrap();
+        assert_eq!(dimensions.mu, 6);
+        // The plan refuses it: the lookup admits at most 62 planes.
+        assert_eq!(
+            derive_entry_range(
+                1u64 << 32,
+                0,
+                range,
+                EntryRangeLimits {
+                    max_table_log: 19,
+                    max_bit_entries: 1 << 24,
+                }
+            ),
+            Err(Error::InvalidConfig)
+        );
+    }
+
+    #[test]
+    fn the_frozen_candidate_derives_its_declared_geometry() {
+        // The candidate the public configuration declares: the integers
+        // -131072 ..= 131071, one key per matrix entry of 1024 by 1024.
+        let range = EntryRange::new(-131072, 131071).unwrap();
+        let plan = derive_entry_range(
+            ROWS,
+            K_COL,
+            range,
+            EntryRangeLimits {
+                max_table_log: 19,
+                max_bit_entries: 1 << 24,
+            },
+        )
+        .unwrap();
+        assert_eq!(plan.table_log, 18);
+        assert_eq!(plan.mu, 5);
+        assert_eq!(plan.key_bits, 20);
+        assert_eq!(plan.place_bits, 10);
+        assert_eq!(plan.bit_entries, 1 << 23);
+        assert_eq!(plan.pending_rows, 1);
+        assert_eq!(plan.index_mask_entries, 2);
+        assert_eq!(plan.identity, entry_range_table_identity(18).unwrap());
+        assert_eq!(plan.entry_key(-131072), Fp3::ZERO);
+        assert_eq!(plan.entry_key(131071).c[0].as_canonical_u64(), 262143);
+        assert!(!plan.is_table_key(&plan.entry_key(131072)));
+    }
+
+    #[test]
     fn the_range_table_content_root_is_stable_and_bounded() {
         let root = entry_range_content_root(8, 1 << 10).unwrap();
         assert_eq!(root, entry_range_content_root(8, 1 << 10).unwrap());
@@ -653,7 +739,11 @@ mod tests {
             Err(Error::ResourceLimit)
         );
         assert_eq!(
-            entry_range_content_root(31, 1 << 40),
+            entry_range_content_root(31, 1 << 30),
+            Err(Error::ResourceLimit)
+        );
+        assert_eq!(
+            entry_range_content_root(32, 1 << 40),
             Err(Error::InvalidConfig)
         );
     }
