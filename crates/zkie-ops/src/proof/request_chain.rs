@@ -312,6 +312,49 @@ pub struct RangePlan {
     pub digit_shape: crate::proof::hidden_send_session::WShape,
 }
 
+/// The digit object's real entry count: `combinations` rows over
+/// `2 * cell_rows` columns.
+pub fn range_digit_values(combinations: u32, cell_rows: u64) -> Result<u64> {
+    (combinations as u64)
+        .checked_mul(2)
+        .and_then(|value| value.checked_mul(cell_rows))
+        .ok_or(Error::ResourceLimit)
+}
+
+/// The digit message's committed width: the real entry count padded to a
+/// power of two, like every other value message of the session.
+pub fn range_digit_columns(combinations: u32, cell_rows: u64) -> Result<u64> {
+    range_digit_values(combinations, cell_rows)?
+        .checked_next_power_of_two()
+        .ok_or(Error::ResourceLimit)
+}
+
+/// The digit message's derived row count for a committed width, a code length
+/// and a sample-answer count: the smallest power of two whose places stay off
+/// the sample pad (`(width - 1) / rows < ell - answers`) and whose capacity
+/// covers the width.
+pub fn range_digit_rows(width: u64, ell: u64, answers: u32) -> Result<u64> {
+    if width == 0 || !width.is_power_of_two() {
+        return Err(Error::InvalidConfig);
+    }
+    let answers = answers as u64;
+    if ell == 0 || answers >= ell {
+        return Err(Error::InvalidConfig);
+    }
+    let span = ell - answers;
+    let needed = width
+        .checked_add(span - 1)
+        .ok_or(Error::ResourceLimit)?
+        / span;
+    let rows = needed
+        .checked_next_power_of_two()
+        .ok_or(Error::ResourceLimit)?;
+    if rows.checked_mul(ell).ok_or(Error::ResourceLimit)? < width {
+        return Err(Error::ResourceLimit);
+    }
+    Ok(rows)
+}
+
 impl RangePlan {
     /// The number of limb matrices.
     pub fn limbs(&self) -> u64 {
@@ -370,13 +413,26 @@ impl RangePlan {
             .ok_or(Error::ResourceLimit)
     }
 
-    /// The number of columns of the digit object: `combinations` rows over
+    /// The digit object's real entry count: `combinations` rows over
     /// `2 * cell_rows()` columns.
+    pub fn digit_values(&self) -> Result<u64> {
+        range_digit_values(self.combinations, self.cell_rows()?)
+    }
+
+    /// The digit message's committed width: the real entries padded to a
+    /// power of two, like every other value message of the session.
     pub fn digit_columns(&self) -> Result<u64> {
-        (self.combinations as u64)
-            .checked_mul(2)
-            .and_then(|value| value.checked_mul(self.cell_rows().ok()?))
-            .ok_or(Error::ResourceLimit)
+        range_digit_columns(self.combinations, self.cell_rows()?)
+    }
+
+    /// The digit message's derived row count: the smallest power of two whose
+    /// places stay off the sample pad and whose capacity covers the width.
+    pub fn digit_rows(&self) -> Result<u64> {
+        range_digit_rows(
+            self.digit_columns()?,
+            self.digit_shape.code.ell,
+            self.digit_shape.answers,
+        )
     }
 
     /// The digit object's stored column of a plane and a cell row. The index
@@ -388,8 +444,9 @@ impl RangePlan {
         self.combination.zz_column(plane as u64, index)
     }
 
-    /// The dense value-vector index of a digit entry: the row is the
-    /// combination and the place is the stored column.
+    /// The dense value-vector index of a digit entry: place times the
+    /// combination count plus the combination, the order the key vectors
+    /// follow.
     pub fn digit_dense(&self, plane: u32, index: u64, combination: u32) -> Result<u64> {
         if combination >= self.combinations {
             return Err(Error::InvalidIndex);
@@ -400,18 +457,11 @@ impl RangePlan {
             .ok_or(Error::ResourceLimit)
     }
 
-    /// The BAT virtual index of a digit entry: its row is the combination, its
-    /// place the stored column.
+    /// The BAT virtual index of a digit entry: its dense index read through
+    /// the digit message's own row count.
     pub fn digit_virtual(&self, plane: u32, index: u64, combination: u32) -> Result<u64> {
-        let place = self.digit_place(plane, index)?;
-        let row_bits = 32 - (self.combinations - 1).leading_zeros();
-        (combination as u64)
-            .checked_add(
-                place
-                    .checked_shl(row_bits)
-                    .ok_or(Error::ResourceLimit)?,
-            )
-            .ok_or(Error::ResourceLimit)
+        let dense = self.digit_dense(plane, index, combination)?;
+        Self::message_virtual(&self.digit_shape, dense)
     }
 
     /// The BAT virtual index of a dense entry of one value message.
@@ -504,9 +554,11 @@ impl RangePlan {
             Ok(columns) => columns,
             Err(_) => return Some("the digit object size overflows"),
         };
-        if !digit_columns.is_power_of_two()
-            || self.digit_shape.main_rows != self.combinations as u64
-        {
+        let digit_rows = match self.digit_rows() {
+            Ok(rows) => rows,
+            Err(_) => return Some("the digit message row count overflows"),
+        };
+        if self.digit_shape.main_rows != digit_rows {
             return Some("the digit message does not carry its rows");
         }
         if self.digit_shape.fault(digit_columns, 1).is_some() {
@@ -972,11 +1024,13 @@ pub fn prove_request_chain(
             inputs.token_shown_claim,
             inputs.token_masks,
             &mut recorder,
-        )?;
+        )
+        ?;
         let epsilon = recorder.epsilon()?;
         (proof, output, epsilon)
     };
-    let start = start_form(&token_output, epsilon, inputs)?;
+    let start = start_form(&token_output, epsilon, inputs)
+        ?;
     let terms = start_terms(&start);
     let (stack, stack_output) = prove_stack_group(
         inputs.reduction,
@@ -988,20 +1042,23 @@ pub fn prove_request_chain(
         start.constant,
         inputs.stack_masks,
         challenges,
-    )?;
+    )
+    ?;
     let (group, values, _beta) = group_from_ends(
         &stack_output,
         inputs.stack_masks,
         inputs.end_slots,
         inputs.mask_value,
-    )?;
+    )
+    ?;
     inputs.reduction.group_bases(
         inputs.stack_left,
         inputs.stack_right,
         inputs.om,
         &stack_output.point,
         &group,
-    )?;
+    )
+    ?;
     let outcome = prove_merge(
         inputs.layout,
         inputs.claims,
@@ -1010,7 +1067,8 @@ pub fn prove_request_chain(
         inputs.mask_value,
         inputs.merge_masks,
         challenges,
-    )?;
+    )
+    ?;
     RowForm::from_output(&stack_output).check(
         &inputs.stack_masks.hiding,
         inputs.mask_value,
@@ -1032,7 +1090,8 @@ pub fn prove_request_chain(
         end.value,
         inputs.index_oracle,
         inputs.index_slot,
-    )?;
+    )
+    ?;
     let proof = ChainProof {
         token,
         stack,

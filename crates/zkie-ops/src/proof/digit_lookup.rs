@@ -269,14 +269,25 @@ fn digit_lookup_sizing(range: &RangePlan, plane: u32) -> Result<(LookupPlan, Loo
         .checked_mul(rows_cell)
         .ok_or(Error::ResourceLimit)?;
     let mut sources = Vec::with_capacity(real);
+    let digit_rows = range.digit_shape.main_rows;
     for place in first_place..first_place.checked_add(rows_cell).ok_or(Error::ResourceLimit)? {
         for combination in 0..combinations {
+            // The source address is the dense entry read through the digit
+            // message's own row count, the same convention as every value
+            // message.
+            let dense = (place as u64)
+                .checked_mul(combinations as u64)
+                .and_then(|value| value.checked_add(combination as u64))
+                .ok_or(Error::ResourceLimit)?;
+            let row = u32::try_from(dense % digit_rows).map_err(|_| Error::ResourceLimit)?;
+            let column_place =
+                u32::try_from(dense / digit_rows).map_err(|_| Error::ResourceLimit)?;
             sources.push(LookupKeySource {
                 column: 0,
                 oracle: range.digit_oracle,
                 position: 0,
-                row: combination,
-                place,
+                row,
+                place: column_place,
                 coefficient: Fp3::ONE,
                 offset: Fp3::ZERO,
             });

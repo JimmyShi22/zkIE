@@ -4507,6 +4507,271 @@ pub fn prove_hidden_send(
     Ok((messages, witness))
 }
 
+/// The diagnostic's private randomness stream for a plan and seed: the same
+/// derivation the session uses, so a diagnostic can read the committed mask
+/// entries it must freeze.
+pub fn diagnostic_randomness(
+    plan: &HiddenSendPlan,
+    seed: &Digest,
+) -> Result<WCommitRandomness> {
+    let mut coins = ByteMaskCoins::new(derive_run_seed(seed, 1, 0)?)?;
+    WCommitRandomness::from_coins(&mut coins, plan, None)
+}
+
+/// The number of hiding entries of a general summand's variable list.
+pub fn diagnostic_hiding_entries(variables: &[crate::proof::psc::Weight]) -> Result<usize> {
+    hp_entries(variables)
+}
+
+/// Runs the session's first part up to the seal and returns the request
+/// section's derived pending claim without binding it to the plan. The
+/// diagnostic freezes its member row from the segment's own output before the
+/// full run; the production verifier derives the same claim inside the segment.
+pub fn derive_chain_pending(
+    plan: &HiddenLinPlan,
+    activation: &CommittedActivation,
+    table: &mut dyn HiddenTableProver,
+    seed: &Digest,
+    inputs: &crate::proof::request_chain::ChainInputs,
+) -> Result<crate::proof::hidden_member::PendingRow> {
+    let mut coins = ByteMaskCoins::new(derive_run_seed(seed, 1, 0)?)?;
+    let randomness = WCommitRandomness::from_coins(&mut coins, &plan.send, None)?;
+    let (_, _, _, _, outputs) = prove_first(
+        plan,
+        Some(activation),
+        table,
+        None,
+        &randomness,
+        None,
+        seed,
+        None,
+        Some(inputs),
+        false,
+    )?;
+    Ok(outputs.ok_or(Error::InvalidConfig)?.pending)
+}
+
+/// The first chain's state up to the request segment: the same absorbs the
+/// session runs before its sub-proofs. The chain's own mask table and the
+/// range arrays are replayed here, so a dry run sees the session's state.
+fn segment_chain_prefix(
+    plan: &HiddenLinPlan,
+    activation: &CommittedActivation,
+    reader: &IndexReader,
+    messages: &HiddenSendMessages,
+    inputs: &crate::proof::request_chain::ChainInputs,
+    seed: Digest,
+) -> Result<Chain> {
+    let mut chain = first_chain(plan, reader)?;
+    absorb_group(&mut chain, &messages.group)?;
+    absorb_claim(&mut chain, plan)?;
+    if plan.send.range.is_none() {
+        match (&plan.send.member, &messages.reduction_root) {
+            (Some(member), Some(root)) => absorb_reduction_root(&mut chain, member, root)?,
+            (None, None) => {}
+            _ => return Err(Error::InvalidConfig),
+        }
+    }
+    // The at_start index-mask root is fixed before the segment's
+    // challenges, then the segment's own mask table.
+    if let (Some(index), Some(message)) = (&plan.send.index_mask, &messages.index_mask) {
+        absorb_index_mask_root(&mut chain, index, &message.root)?;
+    }
+    if let Some(chain_plan) = &plan.send.chain_mask {
+        let witness = commit_chain_mask(chain_plan, inputs, &seed)?;
+        absorb_chain_mask_root(&mut chain, chain_plan, &witness.root)?;
+        let seeds = draw_seed_set(&mut chain, chain_plan.sample_bits()?, 1)?;
+        let answer = chain_plan.answer(&witness.rows, &seeds[0])?;
+        absorb_chain_mask_answer(&mut chain, answer)?;
+        let positions = draw_chain_mask_positions(&mut chain, chain_plan)?;
+        let _opening = witness.tree.open(&positions)?;
+    }
+    if let Some(range_plan) = &plan.send.range {
+        // The packed symbol arrays are the original computation matrix's
+        // messages, derived from the same activation the session reads.
+        let values = range_symbol_values(&plan.send, activation)?;
+        for (object, limb_values) in range_plan.objects.iter().zip(&values) {
+            let (witness, mut message) = commit_range_message(
+                range_plan,
+                &object.array_shape,
+                object.array_oracle,
+                limb_values,
+                &seed,
+                7,
+            )?;
+            absorb_range_root(
+                &mut chain,
+                28,
+                range_plan,
+                &object.array_shape,
+                object.array_oracle,
+                &message.root,
+            )?;
+            let seeds = draw_seed_set(
+                &mut chain,
+                object.array_shape.sample_bits()?,
+                object.array_shape.answers,
+            )?;
+            let answers = range_sample_answers(
+                &object.array_shape,
+                object.array_oracle,
+                range_plan.group,
+                &witness.committed,
+                &seeds,
+            )?;
+            absorb_range_answers(&mut chain, 29, &answers)?;
+            message.sample = SendSamples { seed: seeds, answers };
+        }
+    }
+    Ok(chain)
+}
+
+/// Records the draws a dry run makes on the segment's chain, so the first
+/// token draw is the same one the full request proof will use.
+struct SegmentDraws<'a> {
+    inner: &'a mut dyn crate::proof::psc_general::GeneralChallenges,
+    draws: Vec<Fp3>,
+}
+
+impl crate::proof::psc_general::GeneralChallenges for SegmentDraws<'_> {
+    fn draw(&mut self) -> Result<Fp3> {
+        let value = self.inner.draw()?;
+        self.draws.push(value);
+        Ok(value)
+    }
+
+    fn draw_nonzero(&mut self) -> Result<Fp3> {
+        let value = self.inner.draw_nonzero()?;
+        self.draws.push(value);
+        Ok(value)
+    }
+
+    fn send_hiding_sum(&mut self, value: Fp3) -> Result<()> {
+        self.inner.send_hiding_sum(value)
+    }
+
+    fn send_round(&mut self, index: usize, round: &crate::proof::psc::PscRound) -> Result<()> {
+        self.inner.send_round(index, round)
+    }
+
+    fn send_end_values(&mut self, values: &[Fp3]) -> Result<()> {
+        self.inner.send_end_values(values)
+    }
+}
+
+/// Diagnostic only: derives the request stack cells the chain's start equation
+/// needs from the plan's own transcript. A real request carries its stack
+/// reads; the diagnostic reconstructs them from the token claim's start form
+/// and the mask source, so the segment's algebra holds on real data before the
+/// full run binds the member row.
+pub fn diagnostic_chain_stack(
+    plan: &HiddenLinPlan,
+    activation: &CommittedActivation,
+    table: &mut dyn HiddenTableProver,
+    seed: &Digest,
+    inputs: &crate::proof::request_chain::ChainInputs,
+) -> Result<(Vec<Vec<Fp3>>, Vec<Vec<Fp3>>)> {
+    // The pre-segment messages: the first part without the request section.
+    // Only the chain section is switched off: the pre-segment messages are
+    // the same commits the full run derives, and the request-level shapes
+    // stay consistent with the member row.
+    let mut setup = plan.clone();
+    setup.send.request_chain = None;
+    let mut coins = ByteMaskCoins::new(derive_run_seed(seed, 1, 0)?)?;
+    let randomness = WCommitRandomness::from_coins(&mut coins, &setup.send, None)
+        ?;
+    let (setup_messages, _, _, _, _) = prove_first(
+        &setup,
+        Some(activation),
+        table,
+        None,
+        &randomness,
+        None,
+        seed,
+        None,
+        None,
+        true,
+    )
+    ?;
+    let mut chain = segment_chain_prefix(
+        plan,
+        activation,
+        table.reader(),
+        &setup_messages,
+        inputs,
+        *seed,
+    )
+    ?;
+    // The token sub-proof's first draw is the start form's epsilon: the same
+    // chain state and the same challenge source as the full request proof.
+    let (token_output, epsilon) = {
+        let mut challenges = ChainSegmentChallenges { chain: &mut chain };
+        let mut recorder = SegmentDraws {
+            inner: &mut challenges,
+            draws: Vec::new(),
+        };
+        let (_, output) = crate::proof::request_reduction::prove_token_kept(
+            inputs.token_point,
+            inputs.token_shown,
+            inputs.token_kept,
+            inputs.token_claim_masks,
+            inputs.mask_value,
+            inputs.token_shown_claim,
+            inputs.token_masks,
+            &mut recorder,
+        )
+        ?;
+        let epsilon = *recorder
+            .draws
+            .first()
+            .ok_or(Error::InvalidConfig)
+            ?;
+        (output, epsilon)
+    };
+    let factor = inputs
+        .token_claim_masks
+        .first()
+        .ok_or(Error::InvalidConfig)
+        ?
+        .coefficient;
+    let batch = *inputs
+        .om
+        .first()
+        .ok_or(Error::InvalidConfig)
+        ?;
+    let start = crate::proof::request_start::token_start(
+        &token_output,
+        epsilon,
+        inputs.token_claim_slot,
+        inputs.token_shown_claim,
+        factor,
+        batch,
+    )
+    ?;
+    let mut hidden_start = start.constant;
+    for term in &start.claims {
+        hidden_start = hidden_start.sub(&term.coefficient.mul(&(inputs.mask_value)(term.slot)?));
+    }
+    for (index, coefficient) in start.hiding.iter().enumerate() {
+        hidden_start = hidden_start.sub(
+            &coefficient.mul(
+                &(inputs.mask_value)(crate::proof::request_chain::START_HIDING_SLOT + index)?,
+            ),
+        );
+    }
+    let read_cell = hidden_start.mul(
+        &batch
+            .inverse()
+            ?,
+    );
+    // The read panel carries the start constant on its first side; the weight
+    // panel's first side is one and its second side zero, so the start value
+    // stays on the read panel's product.
+    let stack_left = vec![vec![read_cell], vec![Fp3::ONE]];
+    let stack_right = vec![vec![Fp3::ONE], vec![Fp3::ZERO]];
+    Ok((stack_left, stack_right))
+}
+
 /// Verifier entry with the unit's auxiliary committed witness. The proof bytes
 /// never carry the witness; the check evaluates the same sample and Eval linear
 /// forms and therefore rejects a changed answer or Eval target here. The
@@ -6205,7 +6470,7 @@ fn prove_first_chain_segment(
         let activation = activation.ok_or(Error::InvalidConfig)?;
         let values = range_symbol_values(&plan.send, activation)?;
         if values.len() != range_plan.objects.len() {
-            return Err(Error::ShapeMismatch);
+                        return Err(Error::ShapeMismatch);
         }
         let mut arrays = Vec::with_capacity(values.len());
         for (object, limb_values) in range_plan.objects.iter().zip(&values) {
@@ -6392,9 +6657,11 @@ fn prove_first_chain_segment(
             let combinations = range_plan.combinations as usize;
             for (plane, lookup_plan) in plan.send.digit_lookups.iter().enumerate() {
                 let mut plane_values = Vec::with_capacity(lookup_plan.key.sources.len());
+                let digit_rows = usize::try_from(range_plan.digit_shape.main_rows)
+                    .map_err(|_| Error::ResourceLimit)?;
                 for source in &lookup_plan.key.sources {
                     let dense = (source.place as usize)
-                        .checked_mul(combinations)
+                        .checked_mul(digit_rows)
                         .and_then(|value| value.checked_add(source.row as usize))
                         .ok_or(Error::ResourceLimit)?;
                     plane_values.push(*digits.get(dense).ok_or(Error::ShapeMismatch)?);
@@ -6646,7 +6913,7 @@ fn bind_chain_pending(
 ) -> Result<()> {
     let member = plan.send.member.as_ref().ok_or(Error::InvalidConfig)?;
     if &member.pending != pending {
-        return Err(Error::StatementMismatch);
+                                        return Err(Error::StatementMismatch);
     }
     Ok(())
 }
@@ -10941,7 +11208,7 @@ fn take_mask_slots(plan: &HiddenLinPlan) -> Result<()> {
     let mut taken = std::collections::BTreeSet::new();
     let mut take = |slot: usize| -> Result<()> {
         if !taken.insert(slot) {
-            return Err(Error::StatementMismatch);
+                        return Err(Error::StatementMismatch);
         }
         Ok(())
     };
@@ -10955,7 +11222,7 @@ fn take_mask_slots(plan: &HiddenLinPlan) -> Result<()> {
         for term in &member.pending.masks {
             let slot = usize::try_from(term.slot).map_err(|_| Error::ResourceLimit)?;
             if slot < total || slot >= free {
-                return Err(Error::StatementMismatch);
+                                return Err(Error::StatementMismatch);
             }
             take(slot)?;
         }
@@ -10973,7 +11240,14 @@ fn prove_first(
     seed: &Digest,
     param_tables: Option<&mut dyn NormParamTableProver>,
     chain_inputs: Option<&crate::proof::request_chain::ChainInputs>,
-) -> Result<(HiddenSendMessages, Digest, HiddenSendWitness, Vec<BatRow>)> {
+    bind_pending: bool,
+) -> Result<(
+    HiddenSendMessages,
+    Digest,
+    HiddenSendWitness,
+    Vec<BatRow>,
+    Option<crate::proof::request_chain::ChainOutputs>,
+)> {
     let _profile_first = zkie_engine::profile::Scope::new("first.prove_first");
     plan.validate()?;
     take_mask_slots(plan)?;
@@ -11149,6 +11423,7 @@ fn prove_first(
     let mut segment_proximity = None;
     let mut chain_rows = Vec::new();
     let mut range_messages_out = None;
+    let mut section_outputs = None;
     let mut digit_lookups_out: Vec<DigitLookupMessages> = Vec::new();
     let request_section = match (&plan.send.request_chain, chain_inputs) {
         (Some(_), Some(inputs)) => {
@@ -11169,7 +11444,10 @@ fn prove_first(
                 digit_lookup_messages,
             ) = prove_first_chain_segment(chain, plan, activation, inputs, seed)?;
             chain = next_chain;
-            bind_chain_pending(plan, &outputs.pending)?;
+            if bind_pending {
+                bind_chain_pending(plan, &outputs.pending)?;
+            }
+            section_outputs = Some(outputs);
             chain_mask_message = mask_message;
             chain_mask_witness = mask_witness;
             source_data_message = source_message;
@@ -11650,7 +11928,7 @@ fn prove_first(
     witness.request_w = request_w_commit;
     witness.chain_mask = chain_mask_witness;
     witness.source_data = source_data_witness;
-    Ok((messages, first_seal, witness, chain_rows))
+    Ok((messages, first_seal, witness, chain_rows, section_outputs))
 }
 
 fn verify_first(
@@ -21215,8 +21493,6 @@ fn prove_second(
         plan.norm.as_ref(),
         ProximityGroupRole::Own,
     )?;
-    for (i, m) in members.iter().enumerate() {
-    }
     let _profile_proximity = zkie_engine::profile::Scope::new("second.proximity");
     let proximity = proximity_prove(
         chain,
@@ -21489,7 +21765,7 @@ fn witness_tree_for(
     }
     let position = (member.source_oracle - plan.send.oracle_base) as usize;
     if position >= plan.send.positions() as usize {
-        return Err(Error::StatementMismatch);
+                return Err(Error::StatementMismatch);
     }
     retained_member_tree(&witness.trees, position, member)
 }
@@ -21501,7 +21777,7 @@ fn retained_member_tree(
 ) -> Result<Arc<RuntimeTree>> {
     let tree = trees.get(position).ok_or(Error::ShapeMismatch)?;
     if tree.plan() != &member.tree_plan {
-        return Err(Error::StatementMismatch);
+                return Err(Error::StatementMismatch);
     }
     Ok(Arc::clone(tree))
 }
@@ -21709,7 +21985,7 @@ fn prove_hidden_lin_inner(
         plan.closure.as_ref(),
     )?;
     drop(_profile_randomness);
-    let (first, first_seal, send_witness, chain_rows) =
+    let (first, first_seal, send_witness, chain_rows, _section_outputs) =
         prove_first(
             plan,
             activation,
@@ -21720,7 +21996,9 @@ fn prove_hidden_lin_inner(
             &seed,
             param_tables,
             chain_inputs,
-        )?;
+            true,
+        )
+        ?;
     let first_query = *first_chain(plan, &reader)?.value();
     let shared = prove_shared(
         plan,
@@ -21730,7 +22008,8 @@ fn prove_hidden_lin_inner(
         &first_seal,
         &seed,
         send_witness.norm.as_ref(),
-    )?;
+    )
+    ?;
     let own = prove_second(
         plan,
         &reader,
@@ -21744,7 +22023,8 @@ fn prove_hidden_lin_inner(
         bind_residual,
         rstd_table,
         &chain_rows,
-    )?;
+    )
+    ?;
     let messages = HiddenLinMessages {
         first: first.clone(),
         first_seal,
@@ -27505,6 +27785,12 @@ mod merged_tests {
             }
         };
         let unit = shape(500, 2, Digest([0x68; 32]), 1);
+        let digit_rows = crate::proof::request_chain::range_digit_rows(
+            crate::proof::request_chain::range_digit_columns(32, HIDDEN as u64).unwrap(),
+            code().ell,
+            1,
+        )
+        .unwrap();
         crate::proof::request_chain::RangePlan {
             objects: vec![object(
                 ORACLE_BASE + 1_100,
@@ -27523,7 +27809,7 @@ mod merged_tests {
             unit_oracle: ORACLE_BASE + 1_101,
             unit_shape: unit,
             digit_oracle: ORACLE_BASE + 1_102,
-            digit_shape: shape(911, 6, Digest([0x6A; 32]), 32),
+            digit_shape: shape(911, 6, Digest([0x6A; 32]), digit_rows),
         }
     }
 
@@ -27822,6 +28108,12 @@ mod merged_tests {
             2,
             10,
             0,
+        )
+        .unwrap();
+        plan.digit_shape.main_rows = crate::proof::request_chain::range_digit_rows(
+            crate::proof::request_chain::range_digit_columns(32, 2 * HIDDEN as u64).unwrap(),
+            plan.digit_shape.code.ell,
+            1,
         )
         .unwrap();
         plan
@@ -28498,68 +28790,7 @@ mod merged_tests {
         inputs: &crate::proof::request_chain::ChainInputs,
         seed: Digest,
     ) -> Result<Chain> {
-        let mut chain = first_chain(plan, reader)?;
-        absorb_group(&mut chain, &messages.group)?;
-        absorb_claim(&mut chain, plan)?;
-        if plan.send.range.is_none() {
-            match (&plan.send.member, &messages.reduction_root) {
-                (Some(member), Some(root)) => absorb_reduction_root(&mut chain, member, root)?,
-                (None, None) => {}
-                _ => return Err(Error::InvalidConfig),
-            }
-        }
-        // The at_start index-mask root is fixed before the segment's
-        // challenges, then the segment's own mask table.
-        if let (Some(index), Some(message)) = (&plan.send.index_mask, &messages.index_mask) {
-            super::absorb_index_mask_root(&mut chain, index, &message.root)?;
-        }
-        if let Some(chain_plan) = &plan.send.chain_mask {
-            let witness = super::commit_chain_mask(chain_plan, inputs, &seed)?;
-            super::absorb_chain_mask_root(&mut chain, chain_plan, &witness.root)?;
-            let seeds = super::draw_seed_set(&mut chain, chain_plan.sample_bits()?, 1)?;
-            let answer = chain_plan.answer(&witness.rows, &seeds[0])?;
-            super::absorb_chain_mask_answer(&mut chain, answer)?;
-            let positions = super::draw_chain_mask_positions(&mut chain, chain_plan)?;
-            let _opening = witness.tree.open(&positions)?;
-        }
-        if let Some(range_plan) = &plan.send.range {
-            // The packed symbol arrays are the original computation matrix's
-            // messages, derived from the same activation the session reads.
-            let values = super::range_symbol_values(&plan.send, activation)?;
-            for (object, limb_values) in range_plan.objects.iter().zip(&values) {
-                let (witness, mut message) = super::commit_range_message(
-                    range_plan,
-                    &object.array_shape,
-                    object.array_oracle,
-                    limb_values,
-                    &seed,
-                    7,
-                )?;
-                super::absorb_range_root(
-                    &mut chain,
-                    28,
-                    range_plan,
-                    &object.array_shape,
-                    object.array_oracle,
-                    &message.root,
-                )?;
-                let seeds = super::draw_seed_set(
-                    &mut chain,
-                    object.array_shape.sample_bits()?,
-                    object.array_shape.answers,
-                )?;
-                let answers = super::range_sample_answers(
-                    &object.array_shape,
-                    object.array_oracle,
-                    range_plan.group,
-                    &witness.committed,
-                    &seeds,
-                )?;
-                super::absorb_range_answers(&mut chain, 29, &answers)?;
-                message.sample = super::SendSamples { seed: seeds, answers };
-            }
-        }
-        Ok(chain)
+        super::segment_chain_prefix(plan, activation, reader, messages, inputs, seed)
     }
 
     /// The table with zero matrix cells: the request W is the zero vector and
@@ -28628,7 +28859,7 @@ mod merged_tests {
             ByteMaskCoins::new(derive_run_seed(&seed, 1, 0).unwrap()).unwrap();
         let setup_randomness =
             WCommitRandomness::from_coins(&mut setup_coins, &setup_plan.send, None).unwrap();
-        let (setup_messages, _, _, _) = super::prove_first(
+        let (setup_messages, _, _, _, _) = super::prove_first(
             &setup_plan,
             Some(&activation),
             &mut setup_table,
@@ -28638,6 +28869,7 @@ mod merged_tests {
             &seed,
             None,
             None,
+            true,
         )
         .unwrap();
         let table = zero_table();

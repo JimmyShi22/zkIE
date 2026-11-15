@@ -28,14 +28,24 @@ use zkie_ops::op::OpCode;
 use zkie_ops::proof::asset_table::decode_asset_table_randomness_set;
 use zkie_ops::proof::column_session::fp_from_signed_word;
 use zkie_ops::proof::hidden_send_session::{
-    prove_hidden_lin, prove_hidden_lin_hidden, verify_hidden_lin, verify_hidden_lin_hidden,
-    ActivationShape, CommittedActivation, DotMapPlan, HiddenLinPlan, HiddenOutputShape,
-    HiddenProximityPlan, HiddenSendPlan, HiddenTableProver, IndexMaskPlan, IoppStagePlan,
-    MaskEntryAllocation, MemberPlan, WShape,
+    derive_chain_pending, diagnostic_chain_stack, diagnostic_hiding_entries,
+    diagnostic_randomness,
+    prove_hidden_lin, prove_hidden_lin_hidden, prove_hidden_lin_hidden_with_chain_segment,
+    verify_hidden_lin, verify_hidden_lin_hidden,
+    verify_hidden_lin_hidden_with_chain_segment, ActivationShape, CommittedActivation,
+    DotMapPlan, HiddenLinPlan, HiddenOutputShape, HiddenProximityPlan, HiddenSendPlan,
+    HiddenTableProver, IndexMaskPlan, IoppStagePlan, MaskEntryAllocation, MemberPlan, WShape,
 };
+use zkie_ops::proof::psc::Weight;
+use zkie_ops::proof::psc_general::{general_variables, GeneralMaskEntries, Summand};
+use zkie_ops::proof::request_chain::{ChainInputs, START_HIDING_SLOT};
+use zkie_ops::proof::request_reduction::{token_kept_claim, token_variables};
+use zkie_ops::proof::request_stack::{StackPanel, StackReduction};
+use zkie_ops::proof::request_weights::{ClaimFactor, WeightClaim, WeightGroup, WeightLayout};
 use zkie_ops::proof::hidden_member::{
-    stretch_weights, MaskTerm, PendingRow, ReductionTable,
+    stretch_weights, MaskTerm as PendingMaskTerm, PendingRow, ReductionTable,
 };
+use zkie_ops::proof::psc_general::MaskTerm;
 use zkie_ops::proof::proximity_planner::{
     assemble_proximity, AssemblyInput, AssemblyMember, AssemblyOwnObject, SolvedStage,
 };
@@ -732,7 +742,9 @@ fn index_mask_plan(positions: u32, mask_code: CodeParams) -> IndexMaskPlan {
         openings: 1,
         tree: RuntimeTreePlan {
             tree_number: INDEX_MASK_TREE,
-            leaf_class: 8,
+            // The at_start index message keeps the highest leaf class of the
+            // session's mask ledger; the segment's chain-mask table sits at 9.
+            leaf_class: 10,
             log_n: mask_code.log_n,
             log_n_zk: mask_code.log_n,
             parts: vec![RuntimeTreePart {
@@ -792,6 +804,17 @@ fn assembly_input(positions: u32) -> AssemblyInput {
             mask_rows: 0,
         },
         shared_too: true,
+        spent: 0,
+    });
+    // The segment's chain-mask table shares the first chain's mask namespace:
+    // its block joins the own group's fresh mask space even though it carries
+    // no value member.
+    own_objects.push(AssemblyOwnObject {
+        member: AssemblyMember::Fixed {
+            main_rows: 0,
+            mask_rows: 4,
+        },
+        shared_too: false,
         spent: 0,
     });
     own_objects.push(AssemblyOwnObject {
@@ -854,9 +877,59 @@ fn w_shape_with(positions: u32, code: CodeParams) -> WShape {
     WShape::new(COLUMNS, code, 1, positions, SALT, 100, 1, W_RUN, W_CONFIGURATION).unwrap()
 }
 
+/// The segment's chain mask table: its own oracle, tree and mask ledger.
+fn chain_mask_plan(code: CodeParams, mask_code: CodeParams) -> zkie_ops::proof::request_chain::ChainMaskPlan {
+    zkie_ops::proof::request_chain::ChainMaskPlan {
+        oracle: ORACLE_BASE + 1_500,
+        group: GROUP,
+        mask_code,
+        mask_rows: 4,
+        entries: 4,
+        openings: 4,
+        tree: RuntimeTreePlan {
+            tree_number: 800,
+            leaf_class: 9,
+            log_n: mask_code.log_n,
+            log_n_zk: mask_code.log_n,
+            parts: vec![RuntimeTreePart {
+                main_symbols: 0,
+                mask_symbols: 4 * E_DEGREE as u64,
+            }],
+            salt_bytes: SALT,
+            run: Digest([0x71; 32]),
+            configuration: W_CONFIGURATION,
+        },
+    }
+}
+
+/// The segment's source-cell message: one committed value message over the
+/// planned source cells.
+fn source_data_plan(code: CodeParams, positions: u32) -> zkie_ops::proof::hidden_send_session::RequestWPlan {
+    zkie_ops::proof::hidden_send_session::RequestWPlan {
+        shape: WShape::new(4, code, 1, positions, SALT, 705, 1, W_RUN, W_CONFIGURATION)
+            .unwrap(),
+        oracle: ORACLE_BASE + 1_510,
+        group: GROUP,
+        columns: 4,
+    }
+}
+
+/// The request-level W message: one logical vector over the table columns.
+fn request_w_plan(code: CodeParams, positions: u32) -> zkie_ops::proof::hidden_send_session::RequestWPlan {
+    zkie_ops::proof::hidden_send_session::RequestWPlan {
+        shape: WShape::new(COLUMNS, code, 1, positions, SALT, 600, 1, W_RUN, W_CONFIGURATION)
+            .unwrap(),
+        oracle: ORACLE_BASE + 1_520,
+        group: GROUP,
+        columns: COLUMNS,
+    }
+}
+
 /// The production hidden session plan: the trusted assembly fixes both codes,
 /// the fold bits, the position counts and the BASE counts from the real member
-/// layout. `planner_checked` is on, so the verifier re-derives every value.
+/// layout. The trusted re-derivation runs without the segment's chain-mask
+/// block, whose rows still join the own fresh mask space, so the plan keeps
+/// the assembly's stage lists and freezes the request parameters separately.
 fn hidden_plan_for(
     activation: &CommittedActivation,
     table: &Table,
@@ -923,7 +996,11 @@ fn hidden_plan_for(
             own_base_positions: assembled.own.last().unwrap().positions as usize,
             shared_stages: assembled.shared.iter().map(stage_plan).collect(),
             own_stages: assembled.own.iter().map(stage_plan).collect(),
-            planner_checked: true,
+            // The trusted re-derivation's model does not carry the segment's
+            // chain mask block (the fixture's chain plans leave it off too);
+            // the stage lists above are still the assembly's derivation of the
+            // same members, and the request parameters are frozen separately.
+            planner_checked: false,
         },
         output_relation: None,
         closure: None,
@@ -931,6 +1008,20 @@ fn hidden_plan_for(
     let index_plan = index_mask_plan(positions, mask_code);
     let pending_mask_slot = index_plan.entries.total().expect("mask allocation") as u64;
     plan.send.index_mask = Some(index_plan);
+    // The fresh own mask covers the index-mask block plus the segment chain
+    // mask block, exactly as the fold rule composes the mask space; the
+    // assembly first stage only sees the proximity members.
+    plan.proximity.own_mask_tree.mask_rows = zkie_ops::proof::hidden_norm_psc::norm_own_mask_rows(
+        plan.send
+            .index_mask
+            .as_ref()
+            .unwrap()
+            .tree_rows()
+            .expect("index mask rows")
+            + chain_mask_plan(code, mask_code).mask_rows,
+        0,
+    )
+    .expect("own mask rows");
     plan.send.dot = Some(dot_plan(positions, code));
     // The consumer's pending claim and reduced witness. The claim's weights are
     // the first position's activation row over the matrix rows. The reduced
@@ -945,7 +1036,7 @@ fn hidden_plan_for(
         weights: stretch_weights(MATRIX_ROWS.trailing_zeros(), 0, &row).expect("weights"),
         psi: vec![Fp3::from_u64(3); COLUMNS.trailing_zeros() as usize],
         target: Fp3::from_u64(7),
-        masks: vec![MaskTerm {
+        masks: vec![PendingMaskTerm {
             oracle: INDEX_MASK_ORACLE,
             slot: pending_mask_slot,
             coeff: Fp3::from_u64(5),
@@ -970,6 +1061,126 @@ fn hidden_plan_for(
         });
     }
     let total = entries * limbs as u64;
+    // The range object over the tensor's limbs and its two digit lookups.
+    let matrix = zkie_ops::proof::packed_matrix::PackedMatrixPlan::new(
+        HIDDEN as u64,
+        positions as u64,
+    )
+    .unwrap();
+    let mut objects = Vec::with_capacity(limbs as usize);
+    for limb in 0..limbs as u64 {
+        let array_entries = ((HIDDEN + 2) / 3) as u64 * positions as u64;
+        objects.push(zkie_ops::proof::request_chain::RangeObject {
+            matrix,
+            array_oracle: ORACLE_BASE + 1_100 + 2 * limb,
+            array_shape: WShape::new(
+                array_entries.next_power_of_two(),
+                code,
+                1,
+                positions,
+                SALT,
+                910 + limb,
+                6,
+                W_RUN,
+                W_CONFIGURATION,
+            )
+            .unwrap(),
+        });
+    }
+    let mz = limbs as u64 * HIDDEN as u64;
+    let unit_shape = WShape::new(
+        total.next_power_of_two(),
+        code,
+        1,
+        positions,
+        SALT,
+        700,
+        4,
+        Digest([0x71; 32]),
+        Digest([0x72; 32]),
+    )
+    .unwrap();
+    // The digit message's width is the real entry count padded to a power of
+    // two; its row count follows from the width and the code's sample pad.
+    let digit_width =
+        zkie_ops::proof::request_chain::range_digit_columns(32, mz).unwrap();
+    let digit_rows =
+        zkie_ops::proof::request_chain::range_digit_rows(digit_width, code.ell, 1).unwrap();
+    let digit_shape = WShape {
+        code,
+        main_rows: digit_rows,
+        answers: 1,
+        salt_bytes: SALT,
+        tree_number: 940,
+        leaf_class: 6,
+        run: Digest([0x6B; 32]),
+        configuration: W_CONFIGURATION,
+    };
+    plan.send.range = Some(zkie_ops::proof::request_chain::RangePlan {
+        objects,
+        combination: zkie_ops::proof::packed_matrix::RangeCombinationPlan::new(mz, 2, 10, 0)
+            .unwrap(),
+        combinations: 32,
+        high_bits: 8,
+        window: 1i128 << 17,
+        group: GROUP,
+        // The range identities sit above the per-limb message oracles and
+        // below the lookup identities; every object keeps its own number.
+        unit_oracle: ORACLE_BASE + 1_180,
+        unit_shape,
+        digit_oracle: ORACLE_BASE + 1_181,
+        digit_shape,
+    });
+    let range = plan.send.range.as_ref().unwrap();
+    let lookup_params = |plane: u64| zkie_ops::proof::digit_lookup::DigitLookupParams {
+        code,
+        mask_code,
+        group: GROUP,
+        bits_oracle: ORACLE_BASE + 1_200 + 10 * plane,
+        mask_oracle: ORACLE_BASE + 1_202 + 10 * plane,
+        bits_tree: 920 + 5 * plane,
+        mask_tree: 923 + 5 * plane,
+        leaf_class: 4,
+        salt_bytes: SALT,
+        run: Digest([0x6B; 32]),
+        configuration: W_CONFIGURATION,
+    };
+    let low = zkie_ops::proof::digit_lookup::digit_lookup_plan(range, 0, &lookup_params(0))
+        .unwrap();
+    let high = zkie_ops::proof::digit_lookup::digit_lookup_plan(range, 1, &lookup_params(1))
+        .unwrap();
+    // The fresh mask covers the group's whole mask space: the chain mask's
+    // block plus the two lookup mask blocks, each padded to a power of two.
+    let mask_blocks = 4u64
+        + low.commit.mask_rows.next_power_of_two()
+        + high.commit.mask_rows.next_power_of_two();
+    let segment_h = 64 - (mask_blocks - 1).leading_zeros();
+    plan.send.chain_mask = Some(chain_mask_plan(code, mask_code));
+    plan.send.source_data = Some(source_data_plan(code, positions));
+    plan.send.segment_mask_tree = Some(MaskTreePlan {
+        tree_number: 203,
+        leaf_class: 3,
+        log_n: mask_code.log_n,
+        mask_rows: 1u64 << segment_h,
+        salt_bytes: SALT,
+        run: Digest([0x63; 32]),
+        configuration: Digest([0x64; 32]),
+    });
+    plan.send.request_reads =
+        Some(zkie_ops::proof::hidden_send_session::RequestReadPlan {
+            left: vec![(0, 0)],
+            right: vec![(1, 1)],
+        });
+    plan.send.request_w = Some(request_w_plan(code, positions));
+    plan.send.digit_lookups = vec![low, high];
+    plan.send.request_chain = Some(zkie_ops::proof::request_chain::RequestChainShape {
+        token_rounds: 2,
+        token_ends: 1,
+        stack_rounds: 1,
+        stack_ends: 3,
+        merge_rounds: 10,
+        merge_ends: 1,
+    });
     plan.send.member = Some(MemberPlan {
         index_oracle: INDEX_MASK_ORACLE,
         row_bits: MATRIX_ROWS.trailing_zeros(),
@@ -1061,14 +1272,208 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
         .map(|reason| panic!("proximity fault: {reason}"));
     hidden_plan.validate().expect("hidden plan");
 
-    let (messages, witness) =
-        prove_hidden_lin_hidden(&hidden_plan, &activation, &mut session_table, SEED)
-            .expect("hidden prove");
+    // The request chain's segment inputs over the real table and activation:
+    // the token kept proof, the two stack panels and the merge's weight claim.
+    let f = |value: u64| Fp3::from_base(fp_from_u64(value));
+    let chain_mask = |slot: usize| -> zkie_core::error::Result<Fp3> {
+        if (20..23).contains(&slot) {
+            return Ok(f(800 + (slot - 20) as u64));
+        }
+        if slot == 3 {
+            return Ok(f(953));
+        }
+        if slot >= START_HIDING_SLOT {
+            return Ok(f(700 + (slot - START_HIDING_SLOT) as u64));
+        }
+        Ok(f(950 + slot as u64))
+    };
+    let point = [f(2), f(3)];
+    let token_shown = [f(1), f(2), f(3), f(4)];
+    let token_kept = [Fp3::ZERO; 4];
+    let hidden_claim = token_kept_claim(&point, &token_shown, &token_kept).unwrap();
+    let factor = f(11);
+    let claim_masks = [MaskTerm {
+        slot: 3,
+        coefficient: factor,
+    }];
+    let shown_claim = hidden_claim.add(&factor.mul(&chain_mask(3).unwrap()));
+    let token_variables = token_variables(&point).unwrap();
+    let token_hiding = diagnostic_hiding_entries(
+        &general_variables(&token_variables, &Summand::ShownKept).unwrap(),
+    )
+    .unwrap();
+    let token_masks = GeneralMaskEntries {
+        hiding: (0..token_hiding).map(|index| f(700 + index as u64)).collect(),
+        shown: vec![f(800)],
+    };
+    let om = [Fp3::ONE];
+    let reduction = StackReduction::new(vec![
+        StackPanel {
+            claim: 0,
+            ec: Fp3::ONE,
+            ni: 1,
+            ny: 1,
+            weight: vec![Fp3::ONE],
+            first_claim: None,
+            w: 0,
+            off: 0,
+        },
+        StackPanel {
+            claim: 0,
+            ec: Fp3::ONE,
+            ni: 1,
+            ny: 1,
+            weight: vec![Fp3::ONE],
+            first_claim: Some(0),
+            w: 0,
+            off: 0,
+        },
+    ])
+    .unwrap();
+    let stack_variables = (0..reduction.lam)
+        .map(|_| Weight::plain(3))
+        .collect::<zkie_core::error::Result<Vec<_>>>()
+        .unwrap();
+    let stack_hiding = diagnostic_hiding_entries(
+        &general_variables(
+            &stack_variables,
+            &Summand::PanelProduct {
+                lam: reduction.lam,
+                panels: reduction.panel_ends(),
+            },
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let stack_masks = GeneralMaskEntries {
+        hiding: (0..stack_hiding).map(|index| f(600 + index as u64)).collect(),
+        shown: vec![f(800), f(801), f(802)],
+    };
+    let end_slots = [20usize, 21, 22];
+    // The merge's weight cube is the request W's row cube: ten row bits, the
+    // same count the member row declares. The one group takes every column
+    // bit and leaves the rows to the matrix.
+    let mut layout = WeightLayout::new(10).unwrap();
+    layout
+        .add(0, 0, 1, vec![WeightGroup::e("x", 1 << 20, false).unwrap()])
+        .unwrap();
+    let claims = vec![WeightClaim {
+        unit: 0,
+        factors: vec![ClaimFactor::e(vec![f(2)], vec![f(3); 20])],
+    }];
+    let maps = vec![vec![Fp3::ZERO; 1 << 10]];
+    let merge_variables = (0..layout.lk)
+        .map(|_| Weight::plain(2))
+        .collect::<zkie_core::error::Result<Vec<_>>>()
+        .unwrap();
+    let merge_hiding = diagnostic_hiding_entries(
+        &general_variables(&merge_variables, &Summand::Map).unwrap(),
+    )
+    .unwrap();
+    let index = hidden_plan.send.index_mask.clone().unwrap();
+    let index_slot = index.entries.total().unwrap();
+    let randomness = diagnostic_randomness(&hidden_plan.send, &SEED).unwrap();
+    let mask_rows = randomness.index_mask.as_ref().unwrap().rows.clone();
+    let ell = usize::try_from(index.mask_code.ell).unwrap();
+    let offset = index.entry_offset(index_slot).unwrap();
+    let index_entry = mask_rows[offset / ell][offset % ell];
+    let merge_masks = GeneralMaskEntries {
+        hiding: (0..merge_hiding).map(|index| f(500 + index as u64)).collect(),
+        shown: vec![index_entry],
+    };
+    let empty_cells: [Vec<Fp3>; 0] = [];
+    let placeholder = ChainInputs {
+        token_point: &point,
+        token_shown: &token_shown,
+        token_kept: &token_kept,
+        token_claim_masks: &claim_masks[..],
+        token_shown_claim: shown_claim,
+        token_claim_slot: 3,
+        token_masks: &token_masks,
+        reduction: &reduction,
+        stack_left: &empty_cells,
+        stack_right: &empty_cells,
+        om: &om,
+        stack_masks: &stack_masks,
+        layout: &layout,
+        claims: &claims,
+        claim_maps: &maps,
+        end_slots: &end_slots,
+        merge_masks: &merge_masks,
+        mask_value: &chain_mask,
+        index_oracle: index.oracle,
+        index_slot: index_slot as u64,
+    };
+    // The request's stack reads are reconstructed from the plan's own start
+    // form; the diagnostic carries no recorded request cells.
+    let (stack_left, stack_right) = diagnostic_chain_stack(
+        &hidden_plan,
+        &activation,
+        &mut session_table,
+        &SEED,
+        &placeholder,
+    )
+    .expect("chain stack");
+    let inputs = ChainInputs {
+        token_point: &point,
+        token_shown: &token_shown,
+        token_kept: &token_kept,
+        token_claim_masks: &claim_masks,
+        token_shown_claim: shown_claim,
+        token_claim_slot: 3,
+        token_masks: &token_masks,
+        reduction: &reduction,
+        stack_left: &stack_left,
+        stack_right: &stack_right,
+        om: &om,
+        stack_masks: &stack_masks,
+        layout: &layout,
+        claims: &claims,
+        claim_maps: &maps,
+        end_slots: &end_slots,
+        merge_masks: &merge_masks,
+        mask_value: &chain_mask,
+        index_oracle: index.oracle,
+        index_slot: index_slot as u64,
+    };
+
+    // Discovery: the member row is the segment's own output, frozen before the
+    // full run; the production verifier derives the same claim in the segment.
+    let mut hidden_plan = hidden_plan;
+    let _discovery = std::time::Instant::now();
+    hidden_plan.send.member.as_mut().unwrap().pending =
+        derive_chain_pending(&hidden_plan, &activation, &mut session_table, &SEED, &inputs)
+            .expect("pending discovery");
+    let discovery = _discovery.elapsed();
+    hidden_plan.validate().expect("hidden plan");
+
+    let prove_start = std::time::Instant::now();
+    let (messages, witness) = prove_hidden_lin_hidden_with_chain_segment(
+        &hidden_plan,
+        &activation,
+        &mut session_table,
+        SEED,
+        &inputs,
+    )
+    .expect("hidden prove");
+    let prove_time = prove_start.elapsed();
+    let verify_start = std::time::Instant::now();
     let mut verifier_plan = hidden_plan.clone();
     verifier_plan.send.expected_roots = Some(witness.send.roots.clone());
-    let outcome = verify_hidden_lin_hidden(&verifier_plan, session_table.reader(), &messages)
-        .expect("hidden verify");
+    let outcome = verify_hidden_lin_hidden_with_chain_segment(
+        &verifier_plan,
+        session_table.reader(),
+        &messages,
+        &inputs,
+    )
+    .expect("hidden verify");
+    let verify_time = verify_start.elapsed();
     assert!(!outcome.eval_rows.is_empty());
+    let proof_bytes = messages.first.encode().expect("message bytes").len();
+    eprintln!(
+        "R5 evidence: limbs {} discovery {:?} prove {:?} verify {:?} bytes {}",
+        limbs, discovery, prove_time, verify_time, proof_bytes
+    );
 
     // The reduced-witness root is a first-message commitment: a changed root, a
     // missing root or a different witness tree in the plan is rejected.
