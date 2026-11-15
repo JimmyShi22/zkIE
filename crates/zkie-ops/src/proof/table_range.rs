@@ -202,13 +202,16 @@ pub fn entry_range_dimensions(
 /// The public range table's identity. The table is the integers
 /// `0 .. 2^table_log - 1` in the canonical row encoding, so the identity binds
 /// the width and that encoding, never a caller's choice of entries.
-pub fn entry_range_table_identity(table_log: u32) -> Digest {
+pub fn entry_range_table_identity(table_log: u32) -> Result<Digest> {
+    if table_log == 0 || table_log > RANGE_TABLE_MAX_LOG {
+        return Err(Error::InvalidConfig);
+    }
     let mut bytes = Vec::with_capacity(RANGE_TABLE_DOMAIN.len() + 20);
     bytes.extend_from_slice(RANGE_TABLE_DOMAIN);
     bytes.extend_from_slice(&ENTRY_RANGE_PLAN_VERSION.to_le_bytes());
     bytes.extend_from_slice(&table_log.to_le_bytes());
     bytes.extend_from_slice(&(TableEncoding::I32Le.width() as u64).to_le_bytes());
-    digest_bytes(&bytes)
+    Ok(digest_bytes(&bytes))
 }
 
 /// The canonical content root of the range table: the digest of the
@@ -239,6 +242,11 @@ pub fn derive_entry_range(
     limits: EntryRangeLimits,
 ) -> Result<EntryRangePlan> {
     let dimensions = entry_range_dimensions(rows, k_col, range)?;
+    if dimensions.table_log > RANGE_TABLE_MAX_LOG {
+        // The range table's rows are the integers of the canonical 32-bit row
+        // encoding; a wider table cannot be one.
+        return Err(Error::InvalidConfig);
+    }
     if dimensions.table_log > limits.max_table_log {
         return Err(Error::ResourceLimit);
     }
@@ -265,7 +273,7 @@ pub fn derive_entry_range(
         // The index-mask message carries two entries for the one part.
         index_mask_entries: 2,
         batt_rounds: 0,
-        identity: entry_range_table_identity(dimensions.table_log),
+        identity: entry_range_table_identity(dimensions.table_log)?,
     })
 }
 
@@ -352,8 +360,8 @@ mod tests {
         assert_ne!(small.table_log, large.table_log);
         assert_ne!(small.identity, large.identity);
         assert_ne!(
-            entry_range_table_identity(16),
-            entry_range_table_identity(17)
+            entry_range_table_identity(16).unwrap(),
+            entry_range_table_identity(17).unwrap()
         );
     }
 
@@ -382,14 +390,19 @@ mod tests {
         assert_eq!(dimensions.bit_entries, 1 << 37);
         assert_eq!(
             derive_entry_range(ROWS, K_COL, full, LIMITS),
-            Err(Error::ResourceLimit)
+            Err(Error::InvalidConfig)
         );
+        // A wider limit does not admit it: the canonical range table's rows
+        // are signed 32-bit values, so the table itself is limited to 2^30
+        // rows. The dimensions above still report what the declaration implies.
         let wide = EntryRangeLimits {
             max_table_log: 32,
             max_bit_entries: 1 << 37,
         };
-        let plan = derive_entry_range(ROWS, K_COL, full, wide).unwrap();
-        assert_eq!(plan.table_log, 32);
+        assert_eq!(
+            derive_entry_range(ROWS, K_COL, full, wide),
+            Err(Error::InvalidConfig)
+        );
     }
 
     #[test]
