@@ -61,6 +61,7 @@
 //! proof. Hiding and single-shot semantics are not connected. The production
 //! verify entry is unchanged.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use zkie_core::common::field::PrimeCharacteristicRing;
@@ -77,13 +78,16 @@ use zkie_engine::pcs::request::fold::{
     VerifiedGroup, VerifiedGroups, VerifiedStatement,
 };
 use crate::proof::fold_handoff::FoldHandoffAnchor;
+use crate::proof::hidden_send_session::HiddenTableProver;
 use zkie_engine::pcs::request::foldeq::{
     reader_table_identity, FoldeqBinder, FoldeqBinding, FoldeqEdgeBinding, FoldeqPlan, FoldeqSession,
     GammaPath,
 };
 use zkie_engine::pcs::request::gu::{GuOracleShape, GuShape};
 use zkie_engine::pcs::request::params::{RequestParams, LEAF_SALT_MIN_BYTES, REQUEST_CHAIN_LABEL};
-use zkie_engine::pcs::request::read::{unique_sorted, HidingState, ReadLedger};
+use zkie_engine::pcs::request::read::{
+    unique_sorted, DurableColumnBudget, HidingState, ReadLedger,
+};
 use zkie_engine::pcs::request::relation::{foldeq_weights, GuRelationRow};
 #[cfg(test)]
 use zkie_engine::pcs::request::relation::GuRelationKind;
@@ -92,8 +96,7 @@ use std::cell::RefCell;
 
 use zkie_engine::pcs::request::table::{
     commit_table_streaming, ColumnOpening, IndexReader, IndexShape, SampleSeed, StreamingTable,
-    VecTableSource,
-    TableDistances,
+    TableDistances, TableRowSource, VecTableSource,
 };
 
 use crate::proof::model_commitment::{
@@ -432,6 +435,118 @@ pub fn open_columns_for_queries(
         openings.push(opening);
     }
     Ok(openings)
+}
+
+/// The ledger directory of one table identity below the asset directory. The
+/// directory holds only new ledger files; the asset bodies are never written.
+pub fn column_ledger_dir(asset_dir: &Path, table_root: Digest) -> PathBuf {
+    asset_dir
+        .join(".zkie-column-ledger")
+        .join(zkie_core::artifact::digest_to_hex(&table_root))
+}
+
+/// The production table keeper: the authenticated encoding table plus the
+/// durable table-life column budget. The ledger is derived from the real asset
+/// directory and the built table root (`column_ledger_dir`); a new keeper over
+/// the same ledger continues the count, an exhausted ledger refuses the next
+/// reservation before any use, and there is no refund. `columns` is the fixed
+/// batch size and `max_columns` the table-life limit; both are trusted plan
+/// values.
+pub struct AssetTableKeeper {
+    table: AssetEncodingTable,
+    hiding: HidingState,
+    budget: DurableColumnBudget,
+}
+
+impl AssetTableKeeper {
+    /// Wraps a built table with a durable budget over `ledger_dir`. The caller
+    /// owns the ledger location; the production constructor below derives it
+    /// from the asset directory and the table root.
+    pub fn open(
+        table: AssetEncodingTable,
+        ledger_dir: impl Into<PathBuf>,
+        columns: u64,
+        max_columns: u64,
+    ) -> Result<Self> {
+        let ledger_dir = ledger_dir.into();
+        std::fs::create_dir_all(&ledger_dir).map_err(|_| Error::Io)?;
+        let root = table.reader.root;
+        let budget = DurableColumnBudget::new(
+            ledger_dir.clone(),
+            ledger_dir.join("columns.count"),
+            columns,
+            max_columns,
+        )?;
+        let hiding = HidingState::new(root, 1, max_columns);
+        Ok(Self {
+            table,
+            hiding,
+            budget,
+        })
+    }
+
+    pub fn table(&self) -> &AssetEncodingTable {
+        &self.table
+    }
+
+    /// The persisted table-life column count.
+    pub fn count(&self) -> Result<u64> {
+        self.budget.count()
+    }
+}
+
+impl TableRowSource for AssetTableKeeper {
+    fn rows(&self) -> u64 {
+        self.table.source.borrow().rows()
+    }
+
+    fn row(&mut self, index: u64, message: &mut [Fp], tail: &mut [Fp]) -> Result<()> {
+        self.table.source.borrow_mut().row(index, message, tail)
+    }
+}
+
+impl HiddenTableProver for AssetTableKeeper {
+    fn reader(&self) -> &IndexReader {
+        &self.table.reader
+    }
+
+    fn open_columns(&mut self, positions: &[u64]) -> Result<Vec<ColumnOpening>> {
+        let mut source = self.table.source.borrow_mut();
+        self.table.table.open_columns(&mut *source, positions)
+    }
+
+    fn hiding_state(&mut self) -> Option<&mut HidingState> {
+        Some(&mut self.hiding)
+    }
+
+    fn durable_column_budget(&mut self) -> Option<&mut DurableColumnBudget> {
+        Some(&mut self.budget)
+    }
+}
+
+/// Builds the authenticated table from the real asset opening and opens the
+/// production keeper. The ledger directory is derived from `asset_dir` and the
+/// built table root; the asset file itself is only read through the opening.
+/// `configuration` is the session's candidate parameters digest.
+pub fn open_asset_table_keeper(
+    public: &ModelCommitmentPublic,
+    trusted: &TrustedModel<'_>,
+    asset_path: &str,
+    opening: &AssetOpening,
+    configuration: Digest,
+    asset_dir: &Path,
+    columns: u64,
+    max_columns: u64,
+) -> Result<AssetTableKeeper> {
+    let table = build_authenticated_encoding_table_with_configuration(
+        public,
+        trusted,
+        asset_path,
+        opening,
+        configuration,
+    )?;
+    let ledger_dir = column_ledger_dir(asset_dir, table.reader.root);
+    AssetTableKeeper::open(table, ledger_dir, columns, max_columns)
 }
 
 /// Re-encodes every row and compares every opened cell with the expected
@@ -1007,7 +1122,9 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use zkie_engine::pcs::request::gu::{GuMembership, GuNotice, GuRegistry};
-    use zkie_engine::pcs::request::table::verify_columns;
+    use zkie_engine::pcs::request::table::{verify_columns, TableRowSource};
+
+    use crate::proof::hidden_send_session::HiddenTableProver;
 
     use crate::proof::model_commitment::{commit_assets, AssetStore, ModelAssetSpec};
 
@@ -1103,6 +1220,73 @@ mod tests {
             fixture.input.parameters.digest().unwrap(),
         )
         .unwrap()
+    }
+
+    /// The ledger lives in a new directory below the real asset directory,
+    /// keyed by the table root; the path never names an asset body.
+    #[test]
+    fn the_column_ledger_lives_under_the_asset_directory_by_table_root() {
+        let asset_dir = Path::new("/assets/models");
+        let root = Digest([0xAB; 32]);
+        let ledger = column_ledger_dir(asset_dir, root);
+        assert_eq!(
+            ledger,
+            asset_dir
+                .join(".zkie-column-ledger")
+                .join(zkie_core::artifact::digest_to_hex(&root))
+        );
+        let name = ledger.file_name().unwrap().to_string_lossy();
+        assert_eq!(name.len(), 64);
+        assert!(name.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// The production keeper counts under the fixture's real asset directory:
+    /// two owners over one ledger cannot double-spend a batch, the table-life
+    /// limit refuses the next reservation, and the asset body is untouched.
+    #[test]
+    fn the_production_keeper_counts_under_the_asset_directory() {
+        let fixture = fixture();
+        let columns = 2u64;
+        let max_columns = 4u64;
+        let body = fixture.root.join("table_i32.bin");
+        let before = fs::read(&body).unwrap();
+        let trusted = trusted(&fixture);
+        let open = || {
+            open_asset_table_keeper(
+                &fixture.public,
+                &trusted,
+                "table_i32.bin",
+                &fixture.opening,
+                fixture.input.parameters.digest().unwrap(),
+                &fixture.root,
+                columns,
+                max_columns,
+            )
+            .unwrap()
+        };
+        let mut keeper = open();
+        let ledger = column_ledger_dir(&fixture.root, keeper.table().reader.root);
+        assert!(ledger.is_dir(), "the ledger directory is derived and created");
+        assert_eq!(keeper.count().unwrap(), 0);
+        assert_eq!(keeper.rows(), keeper.table().shape.rows());
+        let mut message = vec![Fp::ZERO; keeper.table().shape.code.ell as usize];
+        let mut tail = vec![Fp::ZERO; keeper.table().shape.code.r as usize];
+        keeper.row(0, &mut message, &mut tail).unwrap();
+        assert_eq!(message[0], fp_from_signed_word(1));
+        let openings = keeper.open_columns(&[0, 1]).unwrap();
+        assert_eq!(openings.len(), 2);
+        assert_eq!(openings[0].position, 0);
+        assert_eq!(openings[1].position, 1);
+
+        let mut second = open();
+        keeper.durable_column_budget().unwrap().reserve().unwrap();
+        second.durable_column_budget().unwrap().reserve().unwrap();
+        assert_eq!(second.count().unwrap(), 2 * columns);
+        assert!(keeper.durable_column_budget().unwrap().reserve().is_err());
+        assert_eq!(keeper.count().unwrap(), 2 * columns);
+
+        let after = fs::read(&body).unwrap();
+        assert_eq!(before, after);
     }
 
     fn verify(fixture: &Fixture) -> Result<ColumnSessionOutcome> {

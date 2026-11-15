@@ -54,6 +54,15 @@ pub struct ProviderConfig {
     pub expected_output: Vec<i32>,
 }
 
+impl ProviderConfig {
+    /// The ledger directory of one column table identity under this provider's
+    /// asset directory. The ledger is a new directory; the asset bodies are
+    /// never touched.
+    pub fn column_ledger_dir(&self, table_root: Digest) -> PathBuf {
+        zkie_ops::proof::column_session::column_ledger_dir(Path::new(&self.asset_root), table_root)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct StatementData {
     pub case_id: String,
@@ -620,6 +629,31 @@ pub fn production_provider() -> ProductionProvider {
 mod tests {
     use super::*;
     use std::io::{self, Cursor, Read, Seek, SeekFrom};
+
+    /// The CLI provider resolves one table identity's ledger below its real
+    /// asset root, through the single ledger derivation.
+    #[test]
+    fn the_provider_derives_the_column_ledger_under_the_asset_root() {
+        let config = ProviderConfig {
+            asset_root: "/srv/zkie/assets".into(),
+            case_root: String::new(),
+            case_id: String::new(),
+            model: "gpt2".into(),
+            seq_tokens: 16,
+            tokens: Vec::new(),
+            input: Vec::new(),
+            expected_argmax: Vec::new(),
+            expected_output: Vec::new(),
+        };
+        let root = Digest([0xCD; 32]);
+        assert_eq!(
+            config.column_ledger_dir(root),
+            zkie_ops::proof::column_session::column_ledger_dir(
+                Path::new("/srv/zkie/assets"),
+                root
+            )
+        );
+    }
 
     fn trace() -> SharedTrace {
         SharedTrace {

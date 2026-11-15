@@ -29510,59 +29510,78 @@ mod merged_tests {
         assert!(verify_hidden_lin_hidden(&plan, &table.reader, &changed).is_err());
     }
 
-    /// The asset-table budget is durable: one batch is counted and synced
-    /// before use, a failed proof keeps its reservation, and a new owner over
-    /// the same files (a restart) continues from the count and refuses an
-    /// exhausted budget.
+    /// The same committed table as `table()`, in the encoding-table form the
+    /// production keeper wraps.
+    fn asset_encoding_table() -> crate::proof::column_session::AssetEncodingTable {
+        let messages = table_messages();
+        let tails = table_tails();
+        let mut source = VecTableSource::new(messages.clone(), tails.clone()).unwrap();
+        let salts: Vec<Vec<u8>> = (0..table_code().n())
+            .map(|position| vec![(position as u8) ^ 0x5A; SALT])
+            .collect();
+        let table = commit_table_streaming(
+            &mut source,
+            table_shape(),
+            TABLE_CONFIGURATION,
+            &salts,
+            64,
+            u64::MAX,
+        )
+        .unwrap();
+        let reader = table.reader.clone();
+        let asset_root = reader.root;
+        crate::proof::column_session::AssetEncodingTable {
+            table,
+            source: RefCell::new(source),
+            reader,
+            asset_root,
+            shape: table_shape(),
+            messages,
+            tails,
+        }
+    }
+
+    /// The production keeper counts its columns durably under the table
+    /// identity: one batch is reserved and synced before use, a failed proof
+    /// keeps its reservation, and a new keeper over the same ledger (a
+    /// restart) continues from the count and refuses an exhausted budget.
     #[test]
-    fn the_asset_budget_survives_a_restart_and_is_not_refunded() {
+    fn the_production_keeper_counts_durably_and_survives_a_restart() {
         let dir = std::env::temp_dir().join(format!(
-            "zkie-asset-budget-{}-{}",
+            "zkie-production-keeper-{}-{}",
             std::process::id(),
             17
         ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let count = dir.join("count.bin");
+        let _ = std::fs::remove_dir_all(&dir);
         let activation = activation();
         let (mut plan, seed) = member_plan_for(&activation);
         let columns = plan.proximity.column_draws as u64;
         let max = 2 * columns;
         let open = || {
-            zkie_engine::pcs::request::read::DurableColumnBudget::new(
+            crate::proof::column_session::AssetTableKeeper::open(
+                asset_encoding_table(),
                 dir.clone(),
-                count.clone(),
                 columns,
                 max,
             )
             .unwrap()
         };
-        let mut keeper = table();
-        keeper.budget = Some(open());
+        let mut keeper = open();
         let _ = prove_hidden_lin_hidden(&plan, &activation, &mut keeper, seed).unwrap();
-        assert_eq!(keeper.budget.as_ref().unwrap().count().unwrap(), columns);
+        assert_eq!(keeper.count().unwrap(), columns);
 
         // A proof that fails after the reservation does not get it back.
         let positions = plan.send.activation.positions as usize;
         plan.send.expected_roots = Some(vec![Digest([0xEE; 32]); positions]);
         assert!(prove_hidden_lin_hidden(&plan, &activation, &mut keeper, seed).is_err());
-        assert_eq!(
-            keeper.budget.as_ref().unwrap().count().unwrap(),
-            2 * columns
-        );
+        assert_eq!(keeper.count().unwrap(), 2 * columns);
 
-        // A new owner over the same files continues from the count.
-        let mut restarted = table();
-        restarted.budget = Some(open());
-        assert_eq!(
-            restarted.budget.as_ref().unwrap().count().unwrap(),
-            2 * columns
-        );
+        // A new keeper over the same ledger continues from the count.
+        let mut restarted = open();
+        assert_eq!(restarted.count().unwrap(), 2 * columns);
         plan.send.expected_roots = None;
         assert!(prove_hidden_lin_hidden(&plan, &activation, &mut restarted, seed).is_err());
-        assert_eq!(
-            restarted.budget.as_ref().unwrap().count().unwrap(),
-            2 * columns
-        );
+        assert_eq!(restarted.count().unwrap(), 2 * columns);
         std::fs::remove_dir_all(&dir).ok();
     }
 
