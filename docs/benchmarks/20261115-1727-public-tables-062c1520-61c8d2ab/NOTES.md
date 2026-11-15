@@ -18,11 +18,14 @@
   every other asset keeps its own opening and pool. The component entries
   keep the unfiltered trace.
 - The provider prove path uses the public executor entries; the verify path
-  already uses the public plans and reads the asset root from the public
-  case config.
+  already uses the public plans and takes the asset root from the public case
+  config. That root only locates the files; the expected digest and entry
+  count are fixed constants in the model plan code, never read from the
+  bundle, the proof, or a freshly opened file.
 - Verifier: one public table is read from `root/locator` once per
   verification run. The byte length must equal `entries * 4`, the SHA-256
-  must equal the fixed digest, and the bytes are decoded as signed i32. The
+  must equal the digest fixed in the model plan code, and the bytes are
+  decoded as signed i32. The
   cache key is the trusted identity `(digest, entries)`, never a proof value.
   The decoded values enter the relation check as materialized plan inputs,
   the same way the other non-external plan inputs do.
@@ -63,8 +66,11 @@ path:
 
 ## Measurement
 
-Same machine, release builds; both sides use the same registered commit, the
-same case file, the same parameters (`profile = "case"`), input and policy.
+These are single before/after measurements on this machine; the percentage
+ratios describe these single runs and are not a claim of a stable
+improvement rate. Same machine, release builds; both sides use the same
+registered commit, the same case file, the same parameters
+(`profile = "case"`), input and policy.
 Only the binary differs: the baseline worktree at `61c8d2ab` versus the
 `062c1520` build. The gpt2 registered commit from the registration trace is
 reused by both sides; for gemma3 and timesfm (no random table instance) the
@@ -116,9 +122,12 @@ Net bytes per migrated table (serialized values, eight bytes per entry):
 - Carried trace assets read from the bincode header: gpt2 199 -> 196,
   gemma3 245 -> 242, timesfm 241 -> 238 (`proof-assets.txt`).
 - First preparation cost: each table is read and SHA-256 checked once per
-  verification run. Raw read+SHA-256 of the three gpt2 tables measured 0.07 s
-  on this machine with a warm page cache; decoding to i64 is inside the
-  verify wall. Every later input reuses the checked values.
+  verification run. A raw read+SHA-256 of the three gpt2 tables measured
+  0.07 s with a warm page cache; that is only the raw read and hash, not the
+  full first materialization. The full first materialization (open, digest
+  check, signed decode to i64, optional layout) is not separately timed and
+  is included in the single verify wall numbers above. Every later input
+  reuses the checked values.
 
 ## Evidence
 
