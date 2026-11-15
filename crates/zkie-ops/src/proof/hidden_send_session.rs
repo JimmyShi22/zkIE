@@ -37199,6 +37199,43 @@ mod key_first_flow_tests {
     }
 
     #[test]
+    fn a_pending_mask_outside_the_index_class_is_refused() {
+        let (plan, _keys, _bits) = flow_plan();
+        let class = plan.index.entries.end_range().unwrap();
+        let psi = vec![Fp3::ZERO; plan.columns as usize];
+        let w_values = vec![Fp3::ZERO; plan.columns as usize];
+        let lookup_space = crate::proof::hidden_member::PendingRow {
+            weights: Vec::new(),
+            psi: psi.clone(),
+            target: Fp3::ZERO,
+            masks: vec![crate::proof::hidden_member::MaskTerm {
+                oracle: plan.commit.mask_oracle,
+                slot: class.start as u64,
+                coeff: Fp3::ONE,
+            }],
+        };
+        let empty = IndexMaskWitness {
+            rows: Vec::new(),
+            tails: Vec::new(),
+            salts: Vec::new(),
+            root: Digest::ZERO,
+        };
+        assert!(key_mask_units(&plan, &lookup_space).is_err());
+        assert!(key_eval_target(&plan, &empty, &lookup_space, &w_values, &psi).is_err());
+        let out_of_class = crate::proof::hidden_member::PendingRow {
+            weights: Vec::new(),
+            psi: psi.clone(),
+            target: Fp3::ZERO,
+            masks: vec![crate::proof::hidden_member::MaskTerm {
+                oracle: plan.index.oracle,
+                slot: class.end as u64,
+                coeff: Fp3::ONE,
+            }],
+        };
+        assert!(key_eval_target(&plan, &empty, &out_of_class, &w_values, &psi).is_err());
+    }
+
+    #[test]
     fn the_key_first_part_proves_and_verifies() {
         let (plan, reader, table, messages, seal, _witness, binding_root) = flow_run();
         let (verified, read_root) = key_first_verify(&plan, &reader, &table, &messages).unwrap();
@@ -37219,6 +37256,13 @@ mod key_first_flow_tests {
             .first_mut()
             .expect("the key group has a fold round to tamper");
         first.0 = first.0.add(&Fp3::ONE);
+        assert!(key_first_verify(&plan, &reader, &table, &changed).is_err());
+        // The index-mask objects are bound into the chain.
+        let mut changed = messages.clone();
+        changed.index_root = Digest([0x79; 32]);
+        assert!(key_first_verify(&plan, &reader, &table, &changed).is_err());
+        let mut changed = messages.clone();
+        changed.index_answer = changed.index_answer.add(&Fp3::ONE);
         assert!(key_first_verify(&plan, &reader, &table, &changed).is_err());
         // A place outside the one-leaf tree is refused.
         let mut changed = messages.clone();
