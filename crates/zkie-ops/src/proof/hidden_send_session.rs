@@ -10408,6 +10408,139 @@ impl ProximityTreeSource<'_> {
 }
 
 
+
+// ---------------------------------------------------------------------------
+// The key chain's lookup
+// ---------------------------------------------------------------------------
+
+const KEY_BITS_ROOT_TAG: u64 = 61;
+const KEY_BITS_ANSWER_TAG: u64 = 62;
+const KEY_MASK_ROOT_TAG: u64 = 63;
+const KEY_MASK_ANSWER_TAG: u64 = 64;
+
+/// The messages the key chain sends for its lookup: the two message roots, the
+/// two sampled answers and the lookup proof. The sample seeds are drawn from
+/// the chain and never sent.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeyLookupMessages {
+    pub bits_root: Digest,
+    pub mask_root: Digest,
+    pub bits_answer: Fp3,
+    pub mask_answer: Fp3,
+    pub proof: crate::proof::lookup::LookupProof,
+}
+
+/// What the prover keeps of the key lookup.
+pub(crate) struct KeyLookupProof {
+    pub messages: KeyLookupMessages,
+    pub commit_messages: crate::proof::lookup_messages::LookupMessages,
+    pub samples: [KeySample; 2],
+    pub claims: crate::proof::lookup::LookupOutcome,
+    pub mask_tree: Arc<RuntimeTree>,
+}
+
+/// Commits the key lookup's messages, sends and samples them on the key chain,
+/// and proves the lookup on the same chain. The samples are recorded for the
+/// group test.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn table_key_lookup_prove(
+    plan: &crate::proof::lookup::LookupPlan,
+    commit: &crate::proof::lookup_messages::LookupCommitPlan,
+    key_plan: &crate::proof::lookup::LookupKeyPlan,
+    key_values: &[Fp3],
+    witness: &crate::proof::lookup::LookupWitness,
+    table: &dyn crate::proof::lookup::LookupTable,
+    seed: u64,
+    chain: &mut Chain,
+) -> Result<KeyLookupProof> {
+    let mask_entries = crate::proof::lookup::mask_count(plan)?;
+    let mut source =
+        crate::proof::lookup_messages::LookupRandomSource::new(seed ^ 0x4B45_594C);
+    let messages = crate::proof::lookup_messages::commit_lookup(
+        commit,
+        &witness.bits,
+        mask_entries,
+        &mut source,
+    )?;
+    let bits_root = messages.bits_root();
+    absorb_digit_lookup_bits_root(chain, KEY_BITS_ROOT_TAG, commit, &bits_root)?;
+    let bits_seeds = draw_seed_set(chain, commit.bits_shape.sample_bits()?, 1)?;
+    let bits_answers = range_sample_answers(
+        &commit.bits_shape,
+        commit.bits_oracle,
+        commit.group,
+        &messages.bits,
+        &bits_seeds,
+    )?;
+    if bits_answers.len() != 1 {
+        return Err(Error::ShapeMismatch);
+    }
+    absorb_digit_lookup_answer(chain, KEY_BITS_ANSWER_TAG, bits_answers[0])?;
+    let mask_tree = digit_lookup_mask_tree(commit, &messages)?;
+    absorb_digit_lookup_mask_root(chain, KEY_MASK_ROOT_TAG, commit, &messages.mask_root)?;
+    let mask_seeds = draw_seed_set(chain, lookup_mask_sample_bits(commit)?, 1)?;
+    let mask_answer = lookup_mask_answer(commit, &messages.mask_rows, &mask_seeds[0])?;
+    absorb_digit_lookup_answer(chain, KEY_MASK_ANSWER_TAG, mask_answer)?;
+    let (proof, claims) = crate::proof::lookup::prove_lookup_with_key_values(
+        plan, commit, key_plan, key_values, witness, &messages, table, chain,
+    )?;
+    Ok(KeyLookupProof {
+        messages: KeyLookupMessages {
+            bits_root,
+            mask_root: messages.mask_root,
+            bits_answer: bits_answers[0],
+            mask_answer,
+            proof,
+        },
+        commit_messages: messages,
+        samples: [
+            (bits_seeds[0].clone(), bits_answers[0]),
+            (mask_seeds[0].clone(), mask_answer),
+        ],
+        claims,
+        mask_tree: Arc::new(mask_tree),
+    })
+}
+
+/// Reads the key lookup's messages on the key chain and verifies the lookup.
+/// The seeds are drawn exactly as the prover drew them; the answers come from
+/// the messages and are checked by the group test's sample rows.
+pub(crate) fn table_key_lookup_verify(
+    plan: &crate::proof::lookup::LookupPlan,
+    commit: &crate::proof::lookup_messages::LookupCommitPlan,
+    key_plan: &crate::proof::lookup::LookupKeyPlan,
+    messages: &KeyLookupMessages,
+    table: &dyn crate::proof::lookup::LookupTable,
+    chain: &mut Chain,
+) -> Result<(crate::proof::lookup::LookupOutcome, [KeySample; 2])> {
+    absorb_digit_lookup_bits_root(chain, KEY_BITS_ROOT_TAG, commit, &messages.bits_root)?;
+    let bits_seeds = draw_seed_set(chain, commit.bits_shape.sample_bits()?, 1)?;
+    absorb_digit_lookup_answer(chain, KEY_BITS_ANSWER_TAG, messages.bits_answer)?;
+    absorb_digit_lookup_mask_root(chain, KEY_MASK_ROOT_TAG, commit, &messages.mask_root)?;
+    let mask_seeds = draw_seed_set(chain, lookup_mask_sample_bits(commit)?, 1)?;
+    absorb_digit_lookup_answer(chain, KEY_MASK_ANSWER_TAG, messages.mask_answer)?;
+    let roots = crate::proof::lookup_messages::LookupRoots {
+        bits: messages.bits_root,
+        mask: messages.mask_root,
+    };
+    let claims = crate::proof::lookup::verify_lookup(
+        plan,
+        commit,
+        key_plan,
+        &roots,
+        &messages.proof,
+        table,
+        chain,
+    )?;
+    Ok((
+        claims,
+        [
+            (bits_seeds[0].clone(), messages.bits_answer),
+            (mask_seeds[0].clone(), messages.mask_answer),
+        ],
+    ))
+}
+
 // ---------------------------------------------------------------------------
 // The key group's proximity test
 // ---------------------------------------------------------------------------
