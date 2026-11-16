@@ -9874,22 +9874,22 @@ pub trait NormParamTableProver {
 
 /// One committed member of a proximity group.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct ProximityMember {
-    bat_oracle: u64,
-    source_oracle: u64,
-    main_code: CodeParams,
-    mask_code: CodeParams,
-    main_rows: u64,
-    mask_rows: u64,
-    answers: u32,
-    root: Digest,
-    tree_plan: RuntimeTreePlan,
+pub(crate) struct ProximityMember {
+    pub(crate) bat_oracle: u64,
+    pub(crate) source_oracle: u64,
+    pub(crate) main_code: CodeParams,
+    pub(crate) mask_code: CodeParams,
+    pub(crate) main_rows: u64,
+    pub(crate) mask_rows: u64,
+    pub(crate) answers: u32,
+    pub(crate) root: Digest,
+    pub(crate) tree_plan: RuntimeTreePlan,
     /// Prover side only: the message rows and the encoding tails.
-    message: Vec<Vec<Fp3>>,
-    tails: Vec<Vec<Fp3>>,
+    pub(crate) message: Vec<Vec<Fp3>>,
+    pub(crate) tails: Vec<Vec<Fp3>>,
     /// Prover side only: the mask-table rows and their encoding tails.
-    mask_message: Vec<Vec<Fp3>>,
-    mask_tails: Vec<Vec<Fp3>>,
+    pub(crate) mask_message: Vec<Vec<Fp3>>,
+    pub(crate) mask_tails: Vec<Vec<Fp3>>,
 }
 
 /// A committed proximity member built by the prover.
@@ -9924,7 +9924,7 @@ impl ProximityMemberProver {
 
 /// The public messages of one proximity test.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ProximityMessages {
+pub(crate) pub(crate) struct ProximityMessages {
     fold_start: FoldStartMessage,
     fold_rounds: Vec<(Fp3, Fp3)>,
     tail: ProximityTail,
@@ -9948,12 +9948,12 @@ pub enum ProximityTail {
 }
 
 /// The verifier-side result of one proximity test.
-struct ProximityVerification {
-    seal: Digest,
-    base: ProximityBaseOutcome,
+pub(crate) struct ProximityVerification {
+    pub(crate) seal: Digest,
+    pub(crate) base: ProximityBaseOutcome,
     /// The advanced chain after the proximity test; the caller continues the
     /// same transcript from it.
-    chain: Chain,
+    pub(crate) chain: Chain,
 }
 
 /// The verified end of one proximity group. `Single` carries the single-stage
@@ -9989,16 +9989,16 @@ impl ProximityBaseOutcome {
 }
 
 /// The prover-side result of one proximity test.
-struct ProximityProof {
-    messages: ProximityMessages,
-    seal: Digest,
+pub(crate) struct ProximityProof {
+    pub(crate) messages: ProximityMessages,
+    pub(crate) seal: Digest,
     /// The advanced chain after the proximity test. The check value is the
     /// current check-state summary, not a terminal chain seal; the caller
     /// continues the same transcript from this chain.
-    chain: Chain,
+    pub(crate) chain: Chain,
 }
 
-fn member_fold_shape(
+pub(crate) fn member_fold_shape(
     code: CodeParams,
     mask_code: CodeParams,
     members: &[ProximityMember],
@@ -10445,7 +10445,7 @@ fn mask_rows_of_draft(draft: &MaskDraft, shape: &FoldShape) -> Result<(Vec<Vec<F
 /// value groups and W retain the trees built by their commits, so the retained
 /// source returns a shared handle without rebuilding; the mask, index-mask and
 /// Dot trees are built from their witnesses when they are first needed.
-enum ProximityTreeSource<'a> {
+pub(crate) enum ProximityTreeSource<'a> {
     Ready {
         trees: Vec<(u64, Arc<RuntimeTree>)>,
         /// The Omega tree's owner-held opening count, when this source has it.
@@ -13821,7 +13821,7 @@ pub(crate) fn table_key_group_verify(
 /// verifier needs is in the returned messages; the member rows never leave the
 /// prover.
 #[allow(clippy::too_many_arguments)]
-fn proximity_prove(
+pub(crate) fn proximity_prove(
     chain: Chain,
     fold: FoldShape,
     members: Vec<ProximityMember>,
@@ -14168,7 +14168,7 @@ fn proximity_prove(
 /// FOLD start and rounds, and runs BASE against its own member roots. It never
 /// reads a member message row.
 #[allow(clippy::too_many_arguments)]
-fn proximity_verify(
+pub(crate) fn proximity_verify(
     chain: Chain,
     fold: FoldShape,
     members: &[ProximityMember],
@@ -26994,6 +26994,44 @@ fn put_tail(writer: &mut CanonicalWriter, tail: &ProximityTail) {
             writer.put_bytes(&proof.encode());
         }
     }
+}
+
+/// Encodes one proximity message set with the same wire layout the session
+/// messages use: the fold start, the fold rounds, then the group end.
+pub(crate) fn encode_proximity_messages(message: &ProximityMessages) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    put_fold_start(&mut writer, &message.fold_start);
+    writer.put_u64(message.fold_rounds.len() as u64);
+    for (c0, c2) in &message.fold_rounds {
+        writer.put_fp3(c0);
+        writer.put_fp3(c2);
+    }
+    put_tail(&mut writer, &message.tail);
+    Ok(writer.into_bytes())
+}
+
+/// Decodes a proximity message set against the trusted plan-derived chain.
+pub(crate) fn decode_proximity_messages(
+    iopp: Option<&ProximityIoppPlan>,
+    bytes: &[u8],
+) -> Result<ProximityMessages> {
+    let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+    let fold_start = get_fold_start(&mut reader)?;
+    let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+    if count > 64 {
+        return Err(Error::ResourceLimit);
+    }
+    let mut fold_rounds = Vec::with_capacity(count);
+    for _ in 0..count {
+        fold_rounds.push((reader.get_fp3()?, reader.get_fp3()?));
+    }
+    let tail = get_tail(&mut reader, iopp)?;
+    reader.finish()?;
+    Ok(ProximityMessages {
+        fold_start,
+        fold_rounds,
+        tail,
+    })
 }
 
 /// Decodes the group's end against the trusted plan. A group with an empty
