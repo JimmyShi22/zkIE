@@ -225,7 +225,6 @@ pub struct ConsumerRequestAssembly {
     pub request: ConsumerRequestPlan,
     pub raw: ConsumerRawShape,
     pub mask: ConsumerMaskSource,
-    pub eval_slot: u64,
     pub raw_hiding_base: u64,
     pub entries: ConsumerGroupEntries,
     pub run: Digest,
@@ -379,8 +378,7 @@ pub fn derive_consumer_request_assembly(
         hiding_base: CONSUMER_PSC_HIDING_BASE,
         shown_slot: CONSUMER_PSC_HIDING_BASE + hiding_entries as u64,
     };
-    let eval_slot = mask.shown_slot + 1;
-    let raw_hiding_base = eval_slot + 1;
+    let raw_hiding_base = mask.shown_slot + 1;
     let consumer_table = table.consumer_table();
     let mut obligations = Vec::with_capacity(registered.len());
     for step in &registered {
@@ -444,7 +442,6 @@ pub fn derive_consumer_request_assembly(
     raw.fault()
         .map_or(Ok(()), |_| Err(Error::InvalidConfig))?;
     let mask_entries = consumer_raw_mask_entries(&raw, raw_hiding_base)?
-        .max(eval_slot + 1)
         .max(mask.shown_slot + 1)
         .max(mask.hiding_base + hiding_entries as u64);
     let entries = ConsumerGroupEntries {
@@ -453,14 +450,13 @@ pub fn derive_consumer_request_assembly(
         bits_columns,
         w_columns: request.shape.places,
         mask_entries,
-        rows: 6 * u64::from(heads) + 4,
+        rows: 6 * u64::from(heads) + 5,
     };
     let base = request.statement_digest();
     Ok(ConsumerRequestAssembly {
         request,
         raw,
         mask,
-        eval_slot,
         raw_hiding_base,
         entries,
         run: plan_domain(b"consumer-group-run", &base),
@@ -541,7 +537,6 @@ pub fn consumer_first_plan(
         matrix_rows: assembly.request.shape.places,
         k_lo: 0,
         columns: assembly.request.shape.places,
-        eval_units: vec![(CONSUMER_MASK_ORACLE, assembly.eval_slot, Fp3::ONE)],
     };
     draft.check()?;
     let heads = assembly.request.heads();
@@ -982,7 +977,6 @@ pub fn prove_consumer_request(
         let value = draw_nonzero(&mut mask_coins)?;
         raw_masks.insert(space.shown, value);
     }
-    let eval_value = draw_nonzero(&mut mask_coins)?;
     let mask_total = usize::try_from(shapes.mask_message_entries()?).map_err(|_| Error::ResourceLimit)?;
     let mask_ell = usize::try_from(shapes.first_mask.ell).map_err(|_| Error::ResourceLimit)?;
     if mask_ell == 0 || mask_total % mask_ell != 0 {
@@ -996,7 +990,6 @@ pub fn prove_consumer_request(
         mask[assembly.mask.hiding_base as usize + index] = *value;
     }
     mask[assembly.mask.shown_slot as usize] = shown;
-    mask[assembly.eval_slot as usize] = eval_value;
     for space in &spaces {
         for slot in &space.hiding {
             mask[*slot as usize] = raw_masks.entry(*slot)?;
@@ -1042,7 +1035,6 @@ pub fn prove_consumer_request(
         matrix_rows: assembly.request.shape.places,
         k_lo: 0,
         columns: assembly.request.shape.places,
-        eval_units: vec![(CONSUMER_MASK_ORACLE, assembly.eval_slot, Fp3::ONE)],
     };
     draft.check()?;
     let mut matrix = ConsumerAssetMatrix::new(
@@ -1114,13 +1106,6 @@ pub fn prove_consumer_request(
         usize::try_from(assembly.request.shape.places).map_err(|_| Error::ResourceLimit)?,
         assembly.request.shape.records,
     )?)?;
-    let eval_mask = |oracle: u64, slot: u64| -> Result<Fp3> {
-        if oracle == CONSUMER_MASK_ORACLE && slot == assembly.eval_slot {
-            Ok(eval_value)
-        } else {
-            Err(Error::ShapeMismatch)
-        }
-    };
     let (messages, _obligations) = prove_consumer_first(
         &first_plan,
         &activation,
@@ -1133,7 +1118,6 @@ pub fn prove_consumer_request(
         &mut matrix,
         &mut table_source,
         &w_randomness,
-        &eval_mask,
         Some(&group_witness),
     )?;
     let salts = binding_salts(&seed)?;

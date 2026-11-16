@@ -92,7 +92,6 @@ pub struct ConsumerFirstDraft {
     pub matrix_rows: u64,
     pub k_lo: u32,
     pub columns: u64,
-    pub eval_units: Vec<(u64, u64, Fp3)>,
 }
 
 impl ConsumerFirstDraft {
@@ -186,12 +185,6 @@ impl ConsumerFirstDraft {
         writer.put_u64(self.matrix_rows);
         writer.put_u64(u64::from(self.k_lo));
         writer.put_u64(self.columns);
-        writer.put_u64(self.eval_units.len() as u64);
-        for (oracle, index, coefficient) in &self.eval_units {
-            writer.put_u64(*oracle);
-            writer.put_u64(*index);
-            writer.put_fp3(coefficient);
-        }
         writer.into_bytes()
     }
 
@@ -607,15 +600,40 @@ fn remap_group_rows(
     Ok(out)
 }
 
+/// The claim row of the reduction that starts the product sumcheck: the
+/// request coefficients on the committed raw messages of every head must equal
+/// the same target the PSC fixed. The verifier builds it from the chain claim
+/// and the plan, never from the proof, so a self-consistent raw/rounding chain
+/// with a different weighted PSC target is refused by this row.
+fn raw_claim_row(
+    plan: &ConsumerFirstPlan,
+    claim: &crate::proof::consumer_request::ConsumerRequestClaim,
+) -> Result<BatRow> {
+    let layout = TableLayout::of(&plan.draft.raw.raw.shape);
+    let mut row = BatRow::new(BatRowKind::Plain);
+    for (head, coefficients) in claim.alpha_rows()?.into_iter().enumerate() {
+        let table = layout.scatter(plan.draft.raw.raw.columns, &coefficients)?;
+        row.add_term(
+            plan.draft.raw.raw.oracle_base + head as u64,
+            BatPart::Main,
+            table,
+        );
+    }
+    row.target = plan.target;
+    Ok(row)
+}
+
 fn group_rows(
     plan: &ConsumerFirstPlan,
     eval_row: &BatRow,
     mask_row: &ConsumerMaskRow,
+    raw_claim: &BatRow,
     raw_rows: &[ConsumerRawObligation],
 ) -> Result<Vec<BatRow>> {
-    let mut rows = Vec::with_capacity(2 + raw_rows.len() * 2);
+    let mut rows = Vec::with_capacity(3 + raw_rows.len() * 2);
     rows.push(eval_row.clone());
     rows.push(consumer_mask_row_bat(plan, mask_row)?);
+    rows.push(raw_claim.clone());
     for obligation in raw_rows {
         rows.extend(raw_obligation_bats(plan, obligation)?);
     }
@@ -765,7 +783,7 @@ impl ConsumerFirstMessages {
         if self.w_root == Digest::ZERO || self.stage_seal == Digest::ZERO {
             return Err(Error::InvalidProof);
         }
-        if self.psi != plan.member.psi {
+        if self.psi != plan.member.psi || self.eval_target != plan.member.target {
             return Err(Error::StatementMismatch);
         }
         match (&plan.group, &self.group) {
@@ -873,7 +891,6 @@ pub fn prove_consumer_first(
     matrix_places: &dyn ConsumerMatrixColumns,
     table_source: &mut dyn TableRowSource,
     w_randomness: &ConsumerWCommitRandomness,
-    eval_mask: &dyn Fn(u64, u64) -> Result<Fp3>,
     group_witness: Option<&ConsumerFirstGroupWitness<'_>>,
 ) -> Result<(ConsumerFirstMessages, ConsumerFirstObligations)> {
     check_bindings(plan, activation, outputs)?;
@@ -928,21 +945,27 @@ pub fn prove_consumer_first(
     )?;
     let w_root = *w_commit.roots.first().ok_or(Error::ShapeMismatch)?;
     absorb_w_root(&mut chain, plan.draft.w_oracle, &w_root)?;
-    let mut eval_target = multilinear_eval(&w_values, &plan.member.psi)?;
-    for (oracle, index, coefficient) in &plan.draft.eval_units {
-        eval_target = eval_target.add(&coefficient.mul(&eval_mask(*oracle, *index)?));
-    }
-    absorb_eval_target(&mut chain, eval_target)?;
+    // The Eval row is the checked pending row itself: the same psi, target and
+    // mask units the product sumcheck left. It is not an independently chosen
+    // evaluation target.
+    let member_masks: Vec<(u64, u64, Fp3)> = plan
+        .member
+        .masks
+        .iter()
+        .map(|term| (term.oracle, term.slot, term.coeff))
+        .collect();
+    absorb_eval_target(&mut chain, plan.member.target)?;
     let eval_row = request_eval_row(
         TableLayout::of(&plan.draft.w_shape),
         plan.draft.columns,
         plan.draft.w_oracle,
         &plan.member.psi,
-        &plan.draft.eval_units,
-        eval_target,
+        &member_masks,
+        plan.member.target,
     )?;
+    let raw_claim = raw_claim_row(plan, &claim)?;
     let stage_seal = *chain.value();
-    let rows = group_rows(plan, &eval_row, &outcome.mask_row, &raw_rows)?;
+    let rows = group_rows(plan, &eval_row, &outcome.mask_row, &raw_claim, &raw_rows)?;
     let mut group = None;
     let mut first_seal = stage_seal;
     let mut chain = chain;
@@ -986,7 +1009,7 @@ pub fn prove_consumer_first(
         raw_second,
         psc,
         w_root,
-        eval_target,
+        eval_target: plan.member.target,
         psi: plan.member.psi.clone(),
         stage_seal,
         group,
@@ -1038,19 +1061,28 @@ pub fn verify_consumer_first(
     check_member_claim(&plan.member, &outcome.pending)?;
     absorb_member(&mut chain, plan)?;
     absorb_w_root(&mut chain, plan.draft.w_oracle, &messages.w_root)?;
-    absorb_eval_target(&mut chain, messages.eval_target)?;
+    // The Eval row is the checked pending row: plan member psi, target and
+    // mask units. The wire target must equal the plan member target.
+    absorb_eval_target(&mut chain, plan.member.target)?;
+    let member_masks: Vec<(u64, u64, Fp3)> = plan
+        .member
+        .masks
+        .iter()
+        .map(|term| (term.oracle, term.slot, term.coeff))
+        .collect();
     let eval_row = request_eval_row(
         TableLayout::of(&plan.draft.w_shape),
         plan.draft.columns,
         plan.draft.w_oracle,
         &plan.member.psi,
-        &plan.draft.eval_units,
-        messages.eval_target,
+        &member_masks,
+        plan.member.target,
     )?;
     if *chain.value() != messages.stage_seal {
         return Err(Error::InvalidProof);
     }
-    let rows = group_rows(plan, &eval_row, &outcome.mask_row, &raw_rows)?;
+    let raw_claim = raw_claim_row(plan, &claim)?;
+    let rows = group_rows(plan, &eval_row, &outcome.mask_row, &raw_claim, &raw_rows)?;
     let mut first_seal = messages.stage_seal;
     if let Some(group_plan) = &plan.group {
         let proof = messages.group.as_ref().ok_or(Error::InvalidProof)?;
@@ -1481,8 +1513,7 @@ mod tests {
             matrix_rows: PLACES as u64,
             k_lo: 0,
             columns: COLUMNS as u64,
-            eval_units: vec![(60, 5, fp(2))],
-        };
+            };
         draft.check().unwrap();
         // W randomness.
         let mut coins = ByteMaskCoins::new(Digest([0x78; 32])).unwrap();
@@ -1524,12 +1555,15 @@ mod tests {
         w_randomness.check(&draft.w_shape).unwrap();
         // Table source for W.
         let table_source = TableSource {
-            messages: matrix_words
-                .iter()
-                .map(|row| {
+            // The committed table stores one row per record: entry `place` of
+            // record `record` is M[place, record], the same matrix the PSC
+            // consumes.
+            messages: (0..RECORDS)
+                .map(|record| {
                     let mut message = vec![Fp::ZERO; ELL];
-                    for (place, value) in row.iter().enumerate() {
-                        message[place] = fp_from_signed_word(*value as u64);
+                    for place in 0..PLACES {
+                        message[place] =
+                            fp_from_signed_word(matrix_words[place][record] as u64);
                     }
                     message
                 })
@@ -1571,14 +1605,6 @@ mod tests {
         Fp3::from_base(fp_from_signed_word(value as u64))
     }
 
-    fn eval_mask(oracle: u64, index: u64) -> Result<Fp3> {
-        if oracle == 60 && index == 5 {
-            Ok(fp(3))
-        } else {
-            Err(Error::ShapeMismatch)
-        }
-    }
-
     fn prove(fixture: &mut Fixture) -> Result<(ConsumerFirstMessages, ConsumerFirstObligations)> {
         prove_consumer_first(
             &fixture.plan,
@@ -1592,7 +1618,6 @@ mod tests {
             &PlaceRows::new(&fixture.matrix),
             &mut fixture.table_source,
             &fixture.w_randomness,
-            &eval_mask,
             None,
         )
     }
@@ -1680,7 +1705,7 @@ mod tests {
         assert_eq!(proven, verified);
         // Every linear group row holds on the witness tables; the group test
         // checks the same rows against the commitments.
-        assert_eq!(proven.group_rows.len(), 2 + proven.raw_rows.len() * 2);
+        assert_eq!(proven.group_rows.len(), 3 + proven.raw_rows.len() * 2);
         let tables = witness_tables(&fixture);
         for row in &proven.group_rows {
             assert_eq!(evaluate_bat_row(row, &tables), row.target);
@@ -1689,24 +1714,9 @@ mod tests {
         assert_ne!(messages.stage_seal, Digest::ZERO);
         assert_ne!(messages.w_root, Digest::ZERO);
         assert_eq!(proven.eval_row.target, messages.eval_target);
-        // The Eval target is the W evaluation at the member's point plus the
-        // plan's mask units.
-        let weights =
-            pending_row_weights(&fixture.plan.member, fixture.plan.draft.matrix_rows).unwrap();
-        let mut source = FixtureSource(&fixture);
-        let w_values = derive_w_values(
-            &fixture.plan.draft.table_shape,
-            fixture.plan.draft.matrix_rows,
-            fixture.plan.draft.k_lo,
-            fixture.plan.draft.columns,
-            &weights,
-            &mut source,
-        )
-        .unwrap();
-        let expected = multilinear_eval(&w_values, &fixture.plan.member.psi)
-            .unwrap()
-            .add(&fp(2).mul(&fp(3)));
-        assert_eq!(messages.eval_target, expected);
+        assert_eq!(messages.eval_target, fixture.plan.member.target);
+        // The Eval row's numeric identity over the witness tables is checked
+        // by the group-row loop above; its target is the pending row's own.
         let decoded =
             ConsumerFirstMessages::decode(&fixture.plan, &messages.encode(&fixture.plan).unwrap())
                 .unwrap();
@@ -1769,7 +1779,6 @@ mod tests {
             &PlaceRows::new(&fixture.matrix),
             &mut fixture.table_source,
             &fixture.w_randomness,
-            &eval_mask,
             None,
         )
         .is_err());
@@ -1817,7 +1826,6 @@ mod tests {
             &PlaceRows::new(&fixture.matrix),
             &mut fixture.table_source,
             &fixture.w_randomness,
-            &eval_mask,
             None,
         )
         .is_err());
@@ -1833,7 +1841,7 @@ mod tests {
     }
     // The plan row count covers the ten relation rows and one sample row per
     // member (two raw, two bits, mask and W).
-    const GROUP_ROWS: u64 = 16;
+    const GROUP_ROWS: u64 = 17;
     const GROUP_RUN: Digest = Digest([0x61; 32]);
     const GROUP_CONFIGURATION: Digest = Digest([0x62; 32]);
 
@@ -2167,8 +2175,7 @@ mod tests {
             matrix_rows: PLACES as u64,
             k_lo: 0,
             columns: COLUMNS as u64,
-            eval_units: vec![(60, 5, fp(2))],
-        };
+            };
         draft.check().unwrap();
         let mut pads = vec![Fp3::ZERO; draft.w_shape.answers as usize];
         for pad in &mut pads {
@@ -2296,7 +2303,6 @@ mod tests {
             &PlaceRows::new(&fixture.matrix),
             &mut fixture.table_source,
             &fixture.w_randomness,
-            &eval_mask,
             Some(&witness),
         )
     }
@@ -2327,6 +2333,127 @@ mod tests {
             &decoded,
         )
         .unwrap();
+    }
+
+    /// Replays the verifier's pre-group prefix on the honest messages and
+    /// returns the chain, the PSC outcome, the claim and the raw rows.
+    fn replay_pre_group(
+        plan: &ConsumerFirstPlan,
+        fixture: &GroupFixture,
+        messages: &ConsumerFirstMessages,
+    ) -> Result<(
+        zkie_engine::pcs::request::chain::Chain,
+        crate::proof::consumer_psc::ConsumerPscOutcome,
+        crate::proof::consumer_request::ConsumerRequestClaim,
+        Vec<crate::proof::consumer_raw::ConsumerRawObligation>,
+    )> {
+        let mut chain = plan.begin_chain()?;
+        let claim = consumer_request_claim(&mut chain, &plan.draft.request)?;
+        let raw_rows = verify_consumer_raw(
+            &mut chain,
+            &plan.draft.raw,
+            &messages.raw_first,
+            &fixture.outputs,
+            &messages.raw_second,
+        )?;
+        let obligation = consumer_combined_obligation(&plan.draft.request)?;
+        let outcome = verify_consumer_psc_fixed(
+            &mut chain,
+            &obligation,
+            &fixture.activation,
+            &messages.psc,
+            &claim.position,
+            &claim.combined,
+            plan.target,
+        )?;
+        check_member_claim(&plan.member, &outcome.pending)?;
+        absorb_member(&mut chain, plan)?;
+        absorb_w_root(&mut chain, plan.draft.w_oracle, &messages.w_root)?;
+        absorb_eval_target(&mut chain, plan.member.target)?;
+        Ok((chain, outcome, claim, raw_rows))
+    }
+
+    #[test]
+    #[ignore = "release group run"]
+    fn a_pending_that_does_not_match_the_committed_w_is_refused() {
+        // R1: the Eval row is the checked pending row. If the verifier's row
+        // target is not the pending target the committed W satisfies, the
+        // group run refuses it; nothing else in the carrier is changed.
+        let mut fixture = group_fixture();
+        let (messages, _) = prove_group(&mut fixture).unwrap();
+        let group = fixture.plan.group.as_ref().unwrap();
+        let (chain, outcome, claim, raw_rows) =
+            replay_pre_group(&fixture.plan, &fixture, &messages).unwrap();
+        let member_masks: Vec<(u64, u64, Fp3)> = fixture
+            .plan
+            .member
+            .masks
+            .iter()
+            .map(|term| (term.oracle, term.slot, term.coeff))
+            .collect();
+        let honest = request_eval_row(
+            TableLayout::of(&fixture.plan.draft.w_shape),
+            fixture.plan.draft.columns,
+            fixture.plan.draft.w_oracle,
+            &fixture.plan.member.psi,
+            &member_masks,
+            fixture.plan.member.target,
+        )
+        .unwrap();
+        let mut changed = honest.clone();
+        changed.target = changed.target.add(&fp(1));
+        let raw_claim = raw_claim_row(&fixture.plan, &claim).unwrap();
+        let rows = group_rows(&fixture.plan, &changed, &outcome.mask_row, &raw_claim, &raw_rows)
+            .unwrap();
+        let bat_rows = remap_group_rows(&fixture.plan, group, &rows).unwrap();
+        assert!(verify_consumer_group(
+            chain,
+            group,
+            bat_rows,
+            messages.group.as_ref().unwrap()
+        )
+        .is_err());
+    }
+
+    #[test]
+    #[ignore = "release group run"]
+    fn another_weighted_raw_target_is_refused() {
+        // R2: the raw claim row binds the committed raw messages to the PSC
+        // start target under the request's coefficients. A row carrying
+        // another weighted target is refused by the same group run.
+        let mut fixture = group_fixture();
+        let (messages, _) = prove_group(&mut fixture).unwrap();
+        let group = fixture.plan.group.as_ref().unwrap();
+        let (chain, outcome, claim, raw_rows) =
+            replay_pre_group(&fixture.plan, &fixture, &messages).unwrap();
+        let member_masks: Vec<(u64, u64, Fp3)> = fixture
+            .plan
+            .member
+            .masks
+            .iter()
+            .map(|term| (term.oracle, term.slot, term.coeff))
+            .collect();
+        let eval_row = request_eval_row(
+            TableLayout::of(&fixture.plan.draft.w_shape),
+            fixture.plan.draft.columns,
+            fixture.plan.draft.w_oracle,
+            &fixture.plan.member.psi,
+            &member_masks,
+            fixture.plan.member.target,
+        )
+        .unwrap();
+        let mut raw_claim = raw_claim_row(&fixture.plan, &claim).unwrap();
+        raw_claim.target = raw_claim.target.add(&fp(1));
+        let rows = group_rows(&fixture.plan, &eval_row, &outcome.mask_row, &raw_claim, &raw_rows)
+            .unwrap();
+        let bat_rows = remap_group_rows(&fixture.plan, group, &rows).unwrap();
+        assert!(verify_consumer_group(
+            chain,
+            group,
+            bat_rows,
+            messages.group.as_ref().unwrap()
+        )
+        .is_err());
     }
 
     #[test]

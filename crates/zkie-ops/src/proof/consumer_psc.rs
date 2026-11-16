@@ -811,8 +811,11 @@ pub fn prove_consumer_psc_fixed(
         masks: Vec::new(),
         target,
     };
+    // The fixed target enters the canonical prefix before the first challenge:
+    // the first sumcheck challenge multiplies it, so it cannot be fixed later.
     let mut challenges =
         PositionPscChallenges::new(chain, CONSUMER_PSC_TAGS, u64::from(obligation.head));
+    challenges.send_claim(target)?;
     let (dot, output) = prove_dot_sumcheck(
         &reduction.shown,
         &columns,
@@ -881,8 +884,10 @@ pub fn verify_consumer_psc_fixed(
         masks: Vec::new(),
         target,
     };
+    // Both sides absorb the caller-fixed target before the first challenge.
     let mut challenges =
         PositionPscChallenges::new(chain, CONSUMER_PSC_TAGS, u64::from(obligation.head));
+    challenges.send_claim(target)?;
     let output = verify_psc_transcript(
         &claim,
         &entries,
