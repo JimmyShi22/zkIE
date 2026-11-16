@@ -10,7 +10,10 @@
   version and are not reused here.
 - Basis: the three seq16 cases run one cold plus three warm rounds each (warm
   medians into the ledger, cold excluded); the two seq512 cases run one
-  end-to-end round each. Every round provisions its own commit (the durable
+  end-to-end round each. In total this batch is 14 end-to-end rounds
+  (3 x 4 + 2 x 1) and 42 stage executions (commit, prove and verify per
+  round); the five-case group exits 0. Every round provisions its own commit
+  (the durable
   column budget is the key batch plus one request batch, so one table instance
   serves one request), the verifier policy is provisioned from that round's
   commit public bundle, `ZKIE_CASE_ID` is propagated to every stage, and the
@@ -25,9 +28,11 @@
 
 ## Results
 
-All five cases PASS. The seq16 cases ran one cold and three warm rounds; the
-table gives the cold value and the warm median (ms), with the warm-stage VmHWM
-medians (KiB). The seq512 cases ran one end-to-end round each.
+All five cases PASS across 14 end-to-end rounds (3 x 4 + 2 x 1) and 42 stage
+executions; the five-case group exit is 0. The seq16 cases ran one cold and
+three warm rounds; the table gives the cold value and the warm median (ms),
+with the warm-stage VmHWM medians (KiB). The seq512 cases ran one end-to-end
+round each.
 
 | case | proof artifact cold / warm median (B) | commit cold | commit warm med | prove cold | prove warm med | prove HWM warm med | verify cold | verify warm med | verify HWM warm med |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
