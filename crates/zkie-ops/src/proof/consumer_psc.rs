@@ -372,7 +372,7 @@ impl ConsumerPscMasks {
         }
     }
 
-    fn check(&self, shape: &ConsumerPscShape) -> Result<()> {
+    pub fn check(&self, shape: &ConsumerPscShape) -> Result<()> {
         if self.entries.hiding.len() != shape.hiding_entries()? {
             return Err(Error::ShapeMismatch);
         }
