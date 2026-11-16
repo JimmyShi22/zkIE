@@ -46,6 +46,12 @@
 //! check. The private map is masked by one committed one-time entry, and the
 //! pending row carries the entry as a mask term, so the row check consumes it
 //! instead of trusting the prover's number.
+//!
+//! The target is a caller-supplied relation value: this primitive proves the
+//! product sum equals it, never that it is the raw accumulator. A caller that
+//! sources the target from a public raw reading re-introduces exactly the
+//! exposure the asset-consume round removes; the request integration derives
+//! the target from a committed raw claim and lets the group check it.
 
 use zkie_core::common::codec::DecodeLimits;
 use zkie_core::error::{Error, Result};
