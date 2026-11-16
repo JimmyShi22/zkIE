@@ -31,6 +31,13 @@
 //! quantity of every head is this exact accumulator, never its requantized
 //! output. What the verifier learns is exactly the accumulator the op-level
 //! relation already carries; the table itself never leaves the prover.
+//!
+//! The request runs as three stages. The first stage commits the request
+//! statement together with the raw and output digests; the shared stage binds
+//! the authenticated table's later-mode parameters (the derived once and later
+//! distances, the once column count and the one declared later batch) and
+//! relays the first seal; the own stage consumes both seals and carries the
+//! coefficients, the batch step and the product sumcheck.
 
 use zkie_core::artifact::digest_bytes;
 use zkie_core::common::codec::DecodeLimits;
@@ -70,6 +77,69 @@ pub const CONSUMER_REQUEST_PSC_TAGS: PscTranscriptTags = PscTranscriptTags {
     claim: 91,
 };
 
+/// Chain labels of the request's three stages: the statement stage, the
+/// shared table stage in the later mode, and the own proof stage.
+pub const CONSUMER_FIRST_STAGE_LABEL: u64 = 93;
+pub const CONSUMER_SHARED_STAGE_LABEL: u64 = 94;
+pub const CONSUMER_SECOND_STAGE_LABEL: u64 = 95;
+/// Transcript tag of the shared stage's later-mode message.
+const CONSUMER_SHARED_TAG: u64 = 92;
+/// Transcript tag of the own stage's opening message.
+const CONSUMER_SECOND_TAG: u64 = 96;
+
+/// The shared stage's later-mode table parameters of one request: the
+/// authenticated table's once and later distances, the once column count, the
+/// one declared later batch's column count, and the table's hiding tail. The
+/// values are the derived public plan data; the shared chain carries them, so
+/// another table parameter set is another request chain.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConsumerSharedPlan {
+    pub m_once: u64,
+    pub m_later: u64,
+    pub one_time_columns: u64,
+    pub later_columns: u64,
+    pub declared_batches: u32,
+    pub table_tail: u64,
+}
+
+impl ConsumerSharedPlan {
+    pub fn fault(&self) -> Option<&'static str> {
+        if self.m_once == 0 || self.m_later == 0 || self.m_later > self.m_once {
+            return Some("the later distance is not bounded by the once distance");
+        }
+        if self.one_time_columns == 0 || self.later_columns == 0 {
+            return Some("the table column counts are empty");
+        }
+        if self.declared_batches != 1 {
+            return Some("one request declares exactly one later batch");
+        }
+        let total = match self.one_time_columns.checked_add(self.later_columns) {
+            Some(total) => total,
+            None => return Some("the declared table batch overflows"),
+        };
+        if total > self.table_tail {
+            return Some("the declared table batch does not fit the hiding tail");
+        }
+        None
+    }
+
+    pub fn check(&self) -> Result<()> {
+        self.fault().map_or(Ok(()), |_| Err(Error::InvalidConfig))
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut writer = CanonicalWriter::new();
+        writer.put_u64(CONSUMER_REQUEST_VERSION);
+        writer.put_u64(self.m_once);
+        writer.put_u64(self.m_later);
+        writer.put_u64(self.one_time_columns);
+        writer.put_u64(self.later_columns);
+        writer.put_u64(u64::from(self.declared_batches));
+        writer.put_u64(self.table_tail);
+        writer.into_bytes()
+    }
+}
+
 fn push_digest(message: &mut zkie_engine::pcs::request::chain::ChainMessage, digest: &Digest) {
     for word in digest.0.chunks_exact(8) {
         message.push_u64(u64::from_le_bytes(
@@ -88,6 +158,7 @@ pub struct ConsumerRequestPlan {
     pub shape: ConsumerPscShape,
     pub mask: ConsumerMaskSource,
     pub head_width: u64,
+    pub shared: ConsumerSharedPlan,
     pub obligations: Vec<ConsumerObligation>,
 }
 
@@ -100,8 +171,10 @@ impl ConsumerRequestPlan {
         request: u64,
         table: ConsumerTable,
         mask: ConsumerMaskSource,
+        shared: ConsumerSharedPlan,
         obligations: Vec<ConsumerObligation>,
     ) -> Result<Self> {
+        shared.check()?;
         if obligations.is_empty()
             || obligations.len() > u32::MAX as usize
             || obligations.len() > 4096
@@ -174,6 +247,7 @@ impl ConsumerRequestPlan {
             shape,
             mask,
             head_width,
+            shared,
             obligations,
         };
         plan.fault().map_or(Ok(()), |_| Err(Error::InvalidConfig))?;
@@ -204,6 +278,86 @@ impl ConsumerRequestPlan {
             return Some("a consumer request does not consume exactly its head slices");
         }
         None
+    }
+
+    fn statement_bytes(&self, raw_digest: &Digest, output_digest: &Digest) -> Vec<u8> {
+        let mut writer = CanonicalWriter::new();
+        writer.put_u64(CONSUMER_REQUEST_VERSION);
+        writer.put_u64(self.request);
+        writer.put_u64(u64::from(self.heads()));
+        writer.put_u64(self.head_width);
+        writer.put_u64(u64::from(self.shape.positions));
+        writer.put_u64(self.shape.places);
+        writer.put_u64(self.shape.records);
+        writer.put_u64(self.shape.slice.0);
+        writer.put_u64(self.shape.slice.1);
+        writer.put_u64(self.shift as u64);
+        writer.put_u64(self.table.oracle);
+        writer.put_digest(&self.table.root);
+        writer.put_digest(&self.table.identity);
+        writer.put_digest(&self.table.configuration);
+        writer.put_u64(self.mask.oracle);
+        writer.put_u64(self.mask.hiding_base);
+        writer.put_u64(self.mask.shown_slot);
+        writer.put_digest(raw_digest);
+        writer.put_digest(output_digest);
+        for obligation in &self.obligations {
+            writer.put_u64(u64::from(obligation.source_step));
+            writer.put_u64(u64::from(obligation.activation_step));
+            writer.put_u64(u64::from(obligation.head));
+        }
+        writer.into_bytes()
+    }
+
+    /// Absorbs the shared stage's later-mode table message: the once and
+    /// later distances, the once and one-batch column counts, the declared
+    /// batch count, the hiding tail and the table identity. The shared seal
+    /// binds the table object the request consumes.
+    fn absorb_shared(&self, chain: &mut Chain) -> Result<()> {
+        let mut message = chain.message();
+        message.push_u64(CONSUMER_REQUEST_VERSION);
+        message.push_u64(CONSUMER_SHARED_TAG);
+        message.push_u64(self.shared.m_once);
+        message.push_u64(self.shared.m_later);
+        message.push_u64(self.shared.one_time_columns);
+        message.push_u64(self.shared.later_columns);
+        message.push_u64(u64::from(self.shared.declared_batches));
+        message.push_u64(self.shared.table_tail);
+        message.push_u64(self.table.oracle);
+        push_digest(&mut message, &self.table.root);
+        push_digest(&mut message, &self.table.identity);
+        push_digest(&mut message, &self.table.configuration);
+        let prefix = message.prefix(zkie_engine::pcs::request::chain::KIND_ALGEBRAIC, 0)?;
+        if !chain.step(&prefix, 0)? {
+            return Err(Error::InvalidProof);
+        }
+        Ok(())
+    }
+
+    /// Opens the own stage: it fixes the first and shared seals, the request
+    /// and the raw and output digests in the own chain before any challenge.
+    fn absorb_second(
+        &self,
+        chain: &mut Chain,
+        first_seal: &Digest,
+        shared_seal: &Digest,
+        raw_digest: &Digest,
+        output_digest: &Digest,
+    ) -> Result<()> {
+        let mut message = chain.message();
+        message.push_u64(CONSUMER_REQUEST_VERSION);
+        message.push_u64(CONSUMER_SECOND_TAG);
+        message.push_u64(self.request);
+        message.push_u64(u64::from(self.heads()));
+        push_digest(&mut message, first_seal);
+        push_digest(&mut message, shared_seal);
+        push_digest(&mut message, raw_digest);
+        push_digest(&mut message, output_digest);
+        let prefix = message.prefix(zkie_engine::pcs::request::chain::KIND_ALGEBRAIC, 0)?;
+        if !chain.step(&prefix, 0)? {
+            return Err(Error::InvalidProof);
+        }
+        Ok(())
     }
 
     fn absorb(&self, chain: &mut Chain, raw_digest: &Digest, output_digest: &Digest) -> Result<()> {
@@ -606,6 +760,15 @@ impl ConsumerRawBatchObligation {
     }
 }
 
+/// The three stage seals of one request chain: the statement stage, the
+/// shared later-mode table stage and the own proof stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConsumerRequestSeals {
+    pub first: Digest,
+    pub shared: Digest,
+    pub second: Digest,
+}
+
 /// The checked outcome of one request: the sumcheck point, the one pending
 /// row over the matrix, the mask row and the closed raw obligation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -615,6 +778,7 @@ pub struct ConsumerRequestOutcome {
     pub mask_row: ConsumerMaskRow,
     pub raw: ConsumerRawBatchObligation,
     pub coefficients: ConsumerRequestCoefficients,
+    pub seals: ConsumerRequestSeals,
 }
 
 fn outcome(
@@ -625,6 +789,9 @@ fn outcome(
     output: &DotOutput,
     raw_digest: Digest,
     output_digest: Digest,
+    first_seal: Digest,
+    shared_seal: Digest,
+    second_seal: Digest,
 ) -> Result<ConsumerRequestOutcome> {
     let shape = &plan.shape;
     let variables = shape.variables()?;
@@ -682,7 +849,64 @@ fn outcome(
         mask_row,
         raw,
         coefficients: coefficients.clone(),
+        seals: ConsumerRequestSeals {
+            first: first_seal,
+            shared: shared_seal,
+            second: second_seal,
+        },
     })
+}
+
+/// Opens the request's three stages. The first stage commits the statement and
+/// the raw relation; the shared stage commits the later-mode table parameters
+/// the statement stage sealed; the own stage consumes both seals. The seed is
+/// verifier randomness fixed before the proof, so no coefficient depends on
+/// values the prover may still choose.
+fn begin_stages(
+    plan: &ConsumerRequestPlan,
+    raw_digest: &Digest,
+    output_digest: &Digest,
+    seed: &Digest,
+) -> Result<(Chain, Chain, Chain, Digest, Digest)> {
+    if *seed == Digest::ZERO {
+        return Err(Error::InvalidConfig);
+    }
+    let statement = plan.statement_bytes(raw_digest, output_digest);
+    let statement_digest = digest_bytes(&statement);
+    let mut first = Chain::begin(
+        CONSUMER_FIRST_STAGE_LABEL,
+        &statement_digest,
+        &statement,
+        &plan.table.identity.0,
+        Some(seed),
+    )?;
+    plan.absorb(&mut first, raw_digest, output_digest)?;
+    let first_seal = *first.value();
+    let later = plan.shared.encode();
+    let mut shared = Chain::begin(
+        CONSUMER_SHARED_STAGE_LABEL,
+        &first_seal,
+        &later,
+        &plan.table.root.0,
+        None,
+    )?;
+    plan.absorb_shared(&mut shared)?;
+    let shared_seal = *shared.value();
+    let mut second = Chain::begin(
+        CONSUMER_SECOND_STAGE_LABEL,
+        &shared_seal,
+        &first_seal.0,
+        &plan.table.identity.0,
+        None,
+    )?;
+    plan.absorb_second(
+        &mut second,
+        &first_seal,
+        &shared_seal,
+        raw_digest,
+        output_digest,
+    )?;
+    Ok((first, shared, second, first_seal, shared_seal))
 }
 
 fn derive_targets(
@@ -751,7 +975,7 @@ fn check_inputs(
 /// the head's public output and refuses a relation inconsistent with its own
 /// matrix.
 pub fn prove_consumer_request(
-    chain: &mut Chain,
+    seed: &Digest,
     plan: &ConsumerRequestPlan,
     activation: &[Fp3],
     raw: &[Vec<i64>],
@@ -771,9 +995,10 @@ pub fn prove_consumer_request(
     }
     let raw_digest = consumer_raw_digest(plan, raw)?;
     let output_digest = consumer_output_digest(plan, outputs)?;
-    plan.absorb(chain, &raw_digest, &output_digest)?;
-    let mut coefficients = draw_coefficients(chain, plan)?;
-    let (targets, target) = derive_targets(plan, &mut coefficients, chain, raw)?;
+    let (_first, _shared, mut second, first_seal, shared_seal) =
+        begin_stages(plan, &raw_digest, &output_digest, seed)?;
+    let mut coefficients = draw_coefficients(&mut second, plan)?;
+    let (targets, target) = derive_targets(plan, &mut coefficients, &mut second, raw)?;
     let combined = coefficients.combined()?;
     let combined_raw = combined_raw_rows(plan, raw)?;
     let reduction = consumer_reduction(
@@ -791,7 +1016,7 @@ pub fn prove_consumer_request(
         masks: Vec::new(),
         target,
     };
-    let mut challenges = PositionPscChallenges::new(chain, CONSUMER_REQUEST_PSC_TAGS, 0);
+    let mut challenges = PositionPscChallenges::new(&mut second, CONSUMER_REQUEST_PSC_TAGS, 0);
     let (dot, output) = prove_dot_sumcheck(
         &reduction.shown,
         &columns,
@@ -800,6 +1025,8 @@ pub fn prove_consumer_request(
         &mut challenges,
     )?;
     check_product_claims(&output, &claim, &masks.entries, &reduction.shown, &columns)?;
+    drop(challenges);
+    let second_seal = *second.value();
     let outcome = outcome(
         plan,
         &coefficients,
@@ -808,6 +1035,9 @@ pub fn prove_consumer_request(
         &output,
         raw_digest,
         output_digest,
+        first_seal,
+        shared_seal,
+        second_seal,
     )?;
     crate::proof::hidden_member::check_pending(
         &outcome.pending,
@@ -833,7 +1063,7 @@ pub fn prove_consumer_request(
 /// public activation map at its own point. It never sees the matrix or the
 /// mask entries, and no prover-supplied target enters the transcript.
 pub fn verify_consumer_request(
-    chain: &mut Chain,
+    seed: &Digest,
     plan: &ConsumerRequestPlan,
     activation: &[Fp3],
     raw: &[Vec<i64>],
@@ -844,9 +1074,10 @@ pub fn verify_consumer_request(
     proof.check(plan)?;
     let raw_digest = consumer_raw_digest(plan, raw)?;
     let output_digest = consumer_output_digest(plan, outputs)?;
-    plan.absorb(chain, &raw_digest, &output_digest)?;
-    let mut coefficients = draw_coefficients(chain, plan)?;
-    let (targets, target) = derive_targets(plan, &mut coefficients, chain, raw)?;
+    let (_first, _shared, mut second, first_seal, shared_seal) =
+        begin_stages(plan, &raw_digest, &output_digest, seed)?;
+    let mut coefficients = draw_coefficients(&mut second, plan)?;
+    let (targets, target) = derive_targets(plan, &mut coefficients, &mut second, raw)?;
     let entries = DotMaskEntries {
         hiding: vec![Fp3::ZERO; plan.shape.hiding_entries()?],
         shown: [Fp3::ZERO; SHOWN_MAPS],
@@ -855,7 +1086,7 @@ pub fn verify_consumer_request(
         masks: Vec::new(),
         target,
     };
-    let mut challenges = PositionPscChallenges::new(chain, CONSUMER_REQUEST_PSC_TAGS, 0);
+    let mut challenges = PositionPscChallenges::new(&mut second, CONSUMER_REQUEST_PSC_TAGS, 0);
     let output = verify_psc_transcript(
         &claim,
         &entries,
@@ -863,6 +1094,8 @@ pub fn verify_consumer_request(
         plan.shape.variables()?,
         &mut challenges,
     )?;
+    drop(challenges);
+    let second_seal = *second.value();
     if proof.point_values != [output.ends[0].value, output.ends[1].value] {
         return Err(Error::InvalidProof);
     }
@@ -883,6 +1116,9 @@ pub fn verify_consumer_request(
         &output,
         raw_digest,
         output_digest,
+        first_seal,
+        shared_seal,
+        second_seal,
     )
 }
 
@@ -915,6 +1151,22 @@ mod tests {
         }
     }
 
+    /// The fixture's shared later-mode parameters: the derived shape's once
+    /// and later distances and the one declared batch inside the tail.
+    fn shared() -> ConsumerSharedPlan {
+        ConsumerSharedPlan {
+            m_once: 8,
+            m_later: 8,
+            one_time_columns: 2,
+            later_columns: 2,
+            declared_batches: 1,
+            table_tail: 4,
+        }
+    }
+
+    /// Fixture verifier randomness; the evidence runs use private randomness.
+    const SEED: Digest = Digest([0x5A; 32]);
+
     fn obligation(head: u32, source_step: u32) -> ConsumerObligation {
         ConsumerObligation {
             request: 7,
@@ -939,6 +1191,7 @@ mod tests {
             7,
             table("weights/L0_k_w_i32.bin", [0x11; 32]),
             mask(),
+            shared(),
             obligations,
         )
         .unwrap()
@@ -1015,17 +1268,6 @@ mod tests {
         ConsumerPscMasks::new(hiding, value(200))
     }
 
-    fn chain() -> Chain {
-        Chain::begin(
-            92,
-            &Digest::ZERO,
-            b"consumer request",
-            b"request fixture",
-            None,
-        )
-        .unwrap()
-    }
-
     fn fixture(
         heads: u32,
     ) -> (
@@ -1061,19 +1303,11 @@ mod tests {
         ConsumerPscMasks,
     ) {
         let (plan, activation, matrix, raw, outputs, masks) = fixture(heads);
-        let (proof, proven) = prove_consumer_request(
-            &mut chain(),
-            &plan,
-            &activation,
-            &raw,
-            &outputs,
-            &matrix,
-            &masks,
-        )
-        .unwrap();
-        let verified =
-            verify_consumer_request(&mut chain(), &plan, &activation, &raw, &outputs, &proof)
+        let (proof, proven) =
+            prove_consumer_request(&SEED, &plan, &activation, &raw, &outputs, &matrix, &masks)
                 .unwrap();
+        let verified =
+            verify_consumer_request(&SEED, &plan, &activation, &raw, &outputs, &proof).unwrap();
         (
             plan, proof, proven, verified, activation, matrix, raw, outputs, masks,
         )
@@ -1128,8 +1362,7 @@ mod tests {
         let bytes = proof.encode(&plan).unwrap();
         let decoded = ConsumerRequestProof::decode(&plan, &bytes).unwrap();
         assert_eq!(decoded, proof);
-        verify_consumer_request(&mut chain(), &plan, &activation, &raw, &outputs, &decoded)
-            .unwrap();
+        verify_consumer_request(&SEED, &plan, &activation, &raw, &outputs, &decoded).unwrap();
     }
 
     #[test]
@@ -1164,7 +1397,7 @@ mod tests {
         let substituted: Vec<Vec<i64>> = outputs.clone();
         assert!(check_consumer_raw_rounding(&plan, &substituted, &outputs).is_err());
         assert!(prove_consumer_request(
-            &mut chain(),
+            &SEED,
             &plan,
             &activation,
             &substituted,
@@ -1177,15 +1410,10 @@ mod tests {
         let mut changed_outputs = outputs.clone();
         changed_outputs[0][0] += 1;
         assert!(check_consumer_raw_rounding(&plan, &raw, &changed_outputs).is_err());
-        assert!(verify_consumer_request(
-            &mut chain(),
-            &plan,
-            &activation,
-            &raw,
-            &changed_outputs,
-            &proof
-        )
-        .is_err());
+        assert!(
+            verify_consumer_request(&SEED, &plan, &activation, &raw, &changed_outputs, &proof)
+                .is_err()
+        );
     }
 
     #[test]
@@ -1205,7 +1433,7 @@ mod tests {
         moved[0][entry] += 1;
         assert!(check_consumer_raw_rounding(&plan, &moved, &outputs).is_ok());
         assert!(prove_consumer_request(
-            &mut chain(),
+            &SEED,
             &plan,
             &activation,
             &moved,
@@ -1215,25 +1443,12 @@ mod tests {
         )
         .is_err());
         // A proof made on the moved rows does not verify on the original rows.
-        let (proof, _outcome) = prove_consumer_request(
-            &mut chain(),
-            &plan,
-            &activation,
-            &raw,
-            &outputs,
-            &matrix,
-            &masks,
-        )
-        .unwrap();
-        assert!(verify_consumer_request(
-            &mut chain(),
-            &plan,
-            &activation,
-            &moved,
-            &outputs,
-            &proof
-        )
-        .is_err());
+        let (proof, _outcome) =
+            prove_consumer_request(&SEED, &plan, &activation, &raw, &outputs, &matrix, &masks)
+                .unwrap();
+        assert!(
+            verify_consumer_request(&SEED, &plan, &activation, &moved, &outputs, &proof).is_err()
+        );
     }
 
     #[test]
@@ -1242,46 +1457,70 @@ mod tests {
 
         let mut changed = proof.clone();
         changed.point_values[1] = changed.point_values[1].add(&value(1));
-        assert!(verify_consumer_request(
-            &mut chain(),
-            &plan,
-            &activation,
-            &raw,
-            &outputs,
-            &changed
-        )
-        .is_err());
+        assert!(
+            verify_consumer_request(&SEED, &plan, &activation, &raw, &outputs, &changed).is_err()
+        );
 
         let mut changed = proof.clone();
         changed.dot.rounds[0].coefficients[0] = value(7);
-        assert!(verify_consumer_request(
-            &mut chain(),
-            &plan,
-            &activation,
-            &raw,
-            &outputs,
-            &changed
-        )
-        .is_err());
+        assert!(
+            verify_consumer_request(&SEED, &plan, &activation, &raw, &outputs, &changed).is_err()
+        );
 
         // Another request source, another head source page or another table
         // changes the statement and the challenges.
         let mut other = plan.clone();
         other.obligations[0].source_step += 1;
         assert!(
-            verify_consumer_request(&mut chain(), &other, &activation, &raw, &outputs, &proof)
-                .is_err()
+            verify_consumer_request(&SEED, &other, &activation, &raw, &outputs, &proof).is_err()
         );
         let mut other = plan.clone();
         other.request += 1;
         assert!(
-            verify_consumer_request(&mut chain(), &other, &activation, &raw, &outputs, &proof)
-                .is_err()
+            verify_consumer_request(&SEED, &other, &activation, &raw, &outputs, &proof).is_err()
         );
         let mut other = plan;
         other.table.root = Digest([0x77; 32]);
         assert!(
-            verify_consumer_request(&mut chain(), &other, &activation, &raw, &outputs, &proof)
+            verify_consumer_request(&SEED, &other, &activation, &raw, &outputs, &proof).is_err()
+        );
+    }
+
+    #[test]
+    fn one_request_runs_first_shared_and_second_stages() {
+        let (plan, proof, proven, verified, activation, _matrix, raw, outputs, _masks) = run(2);
+        assert_eq!(proven, verified);
+        assert_eq!(proven.seals, verified.seals);
+        assert_ne!(proven.seals.first, proven.seals.shared);
+        assert_ne!(proven.seals.shared, proven.seals.second);
+        assert_ne!(proven.seals.first, proven.seals.second);
+        // The shared stage binds the later-mode table parameters: another
+        // later distance changes the shared seal and the own-stage
+        // challenges, so the old proof no longer verifies.
+        let mut changed = plan.clone();
+        changed.shared.m_later -= 1;
+        let other = ConsumerRequestPlan::new(
+            changed.request,
+            changed.table.clone(),
+            changed.mask,
+            changed.shared,
+            changed.obligations.clone(),
+        )
+        .unwrap();
+        assert!(
+            verify_consumer_request(&SEED, &other, &activation, &raw, &outputs, &proof).is_err()
+        );
+        // Another verifier seed changes every stage.
+        const OTHER_SEED: Digest = Digest([0x6B; 32]);
+        assert!(
+            verify_consumer_request(&OTHER_SEED, &plan, &activation, &raw, &outputs, &proof)
+                .is_err()
+        );
+        // A changed activation fails the public map check.
+        let mut changed_activation = activation.clone();
+        changed_activation[0] = changed_activation[0].add(&value(1));
+        assert!(
+            verify_consumer_request(&SEED, &plan, &changed_activation, &raw, &outputs, &proof)
                 .is_err()
         );
     }
@@ -1294,6 +1533,7 @@ mod tests {
             7,
             table("weights/L0_k_w_i32.bin", [0x11; 32]),
             mask(),
+            shared(),
             obligations
         )
         .is_err());
@@ -1305,6 +1545,7 @@ mod tests {
             7,
             table("weights/L0_k_w_i32.bin", [0x11; 32]),
             mask(),
+            shared(),
             vec![obligation(0, 20), other]
         )
         .is_err());
@@ -1316,6 +1557,7 @@ mod tests {
             7,
             table("weights/L0_k_w_i32.bin", [0x11; 32]),
             mask(),
+            shared(),
             vec![obligation(0, 20), other]
         )
         .is_err());
@@ -1327,6 +1569,7 @@ mod tests {
             7,
             table("weights/L0_k_w_i32.bin", [0x11; 32]),
             mask(),
+            shared(),
             vec![obligation(0, 20), other]
         )
         .is_err());
@@ -1340,6 +1583,14 @@ mod tests {
                 oracle: 41,
                 hiding_base: 400,
                 shown_slot: 900,
+            },
+            ConsumerSharedPlan {
+                m_once: 284,
+                m_later: 284,
+                one_time_columns: 52,
+                later_columns: 52,
+                declared_batches: 1,
+                table_tail: 128,
             },
             (0..12)
                 .map(|head| ConsumerObligation {
