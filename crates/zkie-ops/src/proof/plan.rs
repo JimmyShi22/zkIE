@@ -1401,6 +1401,10 @@ fn check_port_form(
             if edge.is_some() {
                 return Err(Error::StatementMismatch);
             }
+            // A proof-supplied pool must name the planned asset. Without a
+            // pool the flat asset is materialized from its own verified
+            // opening below, so only the pooled form carries the extra
+            // coverage check.
             if let Some(pool) = external {
                 let plan_asset = assets.asset_id(match source {
                     PlanSource::Asset { path, .. } => path,
@@ -1418,27 +1422,21 @@ fn check_port_form(
                 if opening.asset_id != plan_asset {
                     return Err(Error::StatementMismatch);
                 }
-            }
-            if let Some(path) = external_flat_path(source) {
-                let pool = external.ok_or(Error::StatementMismatch)?;
-                let meta = assets.meta(path)?;
-                // A flat external asset is supplied by the verified opening
-                // itself. Check the planned identity and full coverage; the
-                // values are materialized from the same opening below, so no
-                // prover-supplied copy enters.
-                if meta.row_width != 0 && meta.element_count % meta.row_width as u64 == 0 {
-                    let opening = assets
-                        .trace
-                        .assets
-                        .get(pool)
-                        .ok_or(Error::StatementMismatch)?;
-                    if opening.asset_id != meta.asset_id
-                        || opening.start != meta.start
-                        || opening.root != meta.root
-                        || opening.row_count != meta.rows
-                        || opening.rows.len() != meta.rows as usize
-                    {
-                        return Err(Error::IncompleteArtifact);
+                if let Some(path) = external_flat_path(source) {
+                    let meta = assets.meta(path)?;
+                    // A flat external asset is supplied by the verified opening
+                    // itself. Check the planned identity and full coverage; the
+                    // values are materialized from the same opening below, so no
+                    // prover-supplied copy enters.
+                    if meta.row_width != 0 && meta.element_count % meta.row_width as u64 == 0 {
+                        if opening.asset_id != meta.asset_id
+                            || opening.start != meta.start
+                            || opening.root != meta.root
+                            || opening.row_count != meta.rows
+                            || opening.rows.len() != meta.rows as usize
+                        {
+                            return Err(Error::IncompleteArtifact);
+                        }
                     }
                 }
             }

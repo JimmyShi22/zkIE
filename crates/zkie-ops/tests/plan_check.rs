@@ -2325,6 +2325,24 @@ fn consumer_asset_input_needs_no_trace_opening() {
 }
 
 #[test]
+fn a_flat_asset_input_without_a_pool_verifies_from_its_opening() {
+    // A flat weight that is not named by a proof pool is materialized from its
+    // own verified trace opening. This is the ordinary production form of
+    // every non-pooled flat asset and must keep verifying.
+    let mut fixture = one_asset_fixture(&[2], true);
+    fixture.trace.steps[1].external[0] = None;
+    let argmax = zkie_ops::proof::model_commitment::verify_shared_trace(
+        &fixture.public,
+        &fixture.trace,
+        &fixture.tokens,
+        &fixture.plan,
+        None,
+    )
+    .unwrap();
+    assert_eq!(argmax, fixture.trace.argmax);
+}
+
+#[test]
 fn residual_consumer_asset_opening_is_rejected() {
     let fixture = consumer_trace_fixture(
         OpCode::Projection,
