@@ -11456,6 +11456,9 @@ pub struct KeyPlanInputs {
     pub matrix_rows: u64,
     pub k_lo: u32,
     pub columns: u64,
+    /// The key stage's own column budget (the one-time test's columns). The
+    /// instance's total ledger covers the one-time budget and the declared
+    /// later batches; this plan binds only the key stage's part.
     pub total_columns: u64,
     pub lin_check: SharedLinCheck,
     pub range: crate::proof::table_range::EntryRangePlan,

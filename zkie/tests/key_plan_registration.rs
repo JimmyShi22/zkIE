@@ -28,7 +28,7 @@ fn planned_table() -> (
         matrix_rows,
         k_lo,
         columns,
-        total_columns: derived.total_columns,
+        total_columns: derived.one_time_columns,
         lin_check: derived.lin_check,
         range: production_table_range().unwrap(),
     };
@@ -50,7 +50,13 @@ fn the_key_plan_derives_from_the_public_configuration() {
     assert_eq!(summary.own_stages, 3);
     assert_eq!(summary.shared_base_positions, 66);
     assert_eq!(summary.own_base_positions, 53);
-    assert_eq!(summary.column_budget, derived.total_columns as usize);
+    assert_eq!(summary.column_budget, derived.one_time_columns as usize);
+    // The instance's total column budget covers the one-time test and the
+    // declared later batch; the key stage's own budget is the one-time part.
+    assert_eq!(derived.one_time_columns, 52);
+    assert_eq!(derived.later_batch_columns, 52);
+    assert_eq!(derived.declared_later_batches, 1);
+    assert_eq!(derived.total_columns, 104);
     assert_eq!(summary.lookup_bits_oracle, 21);
     assert_eq!(summary.lookup_mask_oracle, 22);
     assert_eq!(summary.group_fresh, 3);
@@ -102,7 +108,7 @@ fn the_registered_candidate_instance_matches_the_plan() {
         matrix_rows,
         k_lo,
         columns: matrix_rows << k_lo,
-        total_columns: derived.total_columns,
+        total_columns: derived.one_time_columns,
         lin_check: derived.lin_check,
         range: production_table_range().unwrap(),
     })

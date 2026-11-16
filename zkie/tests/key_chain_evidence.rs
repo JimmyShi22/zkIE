@@ -217,7 +217,7 @@ fn the_complete_key_chain_over_the_registered_instance() {
         matrix_rows: meta.shape.rows(),
         k_lo: TABLE_PLAN_CANDIDATE.k_lo,
         columns: meta.shape.rows() << TABLE_PLAN_CANDIDATE.k_lo,
-        total_columns: derived.total_columns,
+        total_columns: derived.one_time_columns,
         lin_check: derived.lin_check,
         range: range_plan.clone(),
     })
@@ -240,7 +240,7 @@ fn the_complete_key_chain_over_the_registered_instance() {
     .unwrap();
     let prove_ms = prove_start.elapsed().as_millis();
     let count_after = keeper.budget.count().unwrap();
-    assert_eq!(count_after, count_before + derived.total_columns);
+    assert_eq!(count_after, count_before + derived.one_time_columns);
 
     // The complete canonical bundle is kept on disk beside the trace; it is a
     // binary artifact and is not committed. The verification below reads the

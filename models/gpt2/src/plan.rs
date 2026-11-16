@@ -488,8 +488,9 @@ pub struct TablePlanCandidate {
 }
 
 /// The candidate declared for this round. The random tail carries the
-/// derived one-time query count and the declared later batches (none this
-/// round); the later distance capability is not derived or claimed.
+/// derived one-time query count and one declared later batch; the later
+/// distance and its columns are derived from the same public geometry and
+/// security targets as the one-time rule, never chosen here.
 pub const TABLE_PLAN_CANDIDATE: TablePlanCandidate = TablePlanCandidate {
     log_n: 12,
     ell: 2048,
@@ -500,7 +501,7 @@ pub const TABLE_PLAN_CANDIDATE: TablePlanCandidate = TablePlanCandidate {
     matrix_rows_log: 10,
     k_lo: 0,
     sharing: 1,
-    later_batches: 0,
+    later_batches: 1,
 };
 
 const FIRST_PROJECTION: &str = "gpt2/weights/L0_k_w_i32.bin";
@@ -543,17 +544,22 @@ pub struct DerivedTablePlan {
     pub table_model_identity: Digest,
     pub one_time_columns: u64,
     pub later_batch_columns: u64,
+    /// The later batches this candidate declares (one this round); the
+    /// derivation's capacity is reported separately and never implies more.
+    pub declared_later_batches: u64,
     pub total_columns: u64,
     pub lin_check: SharedLinCheck,
 }
 
 /// Derives and checks the table plan of one fixed candidate. The one-time
-/// distance comes from `recorded_table_distance`; the query count from
-/// `shared_lin_columns`; the plan is checked by `shared_lin_plan_fault`. The
-/// later distance is not derived this round and no later batch is accepted.
-/// The total declared column use must fit the real hiding positions.
+/// distance and columns come from the one-time rule; the later distance and
+/// columns come from the same public geometry and security targets with the
+/// record check removed, capped at the one-time distance. The declared later
+/// batch must fit both the derived capacity and the code's random tail; the
+/// total declared column use covers the one-time columns and the declared
+/// batches and must fit the real hiding positions.
 pub fn derive_table_plan(candidate: &TablePlanCandidate) -> Result<DerivedTablePlan> {
-    if candidate.later_batches != 0 {
+    if candidate.later_batches != 1 {
         return Err(Error::InvalidConfig);
     }
     let spec = asset_specs()
@@ -582,7 +588,32 @@ pub fn derive_table_plan(candidate: &TablePlanCandidate) -> Result<DerivedTableP
         rows_log,
     };
     let one_time_columns = shared_lin_columns(shape, code, one_time_distance, 0, 0)?;
-    let total_columns = one_time_columns;
+    // The later candidate is derived from the same public geometry and
+    // security target; it must agree with the one-time derivation, and the
+    // declared batch must fit both the derived capacity and the code's tail.
+    let later = zkie_ops::proof::proximity_planner::derive_production_later_candidate(
+        code,
+        candidate.v,
+        candidate.answers,
+        candidate.v,
+        rows_log,
+        candidate.k_lo,
+    )?;
+    if later.m_once != one_time_distance || later.one_time_columns != one_time_columns {
+        return Err(Error::InvalidConfig);
+    }
+    if later.capacity_batches < candidate.later_batches || later.later_columns == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let later_batch_columns = later.later_columns;
+    let total_columns = one_time_columns
+        .checked_add(
+            candidate
+                .later_batches
+                .checked_mul(later_batch_columns)
+                .ok_or(Error::ResourceLimit)?,
+        )
+        .ok_or(Error::ResourceLimit)?;
     if total_columns > code.r {
         return Err(Error::InvalidConfig);
     }
@@ -605,8 +636,8 @@ pub fn derive_table_plan(candidate: &TablePlanCandidate) -> Result<DerivedTableP
         distances: TableDistances {
             radius: 0,
             later_radius: 0,
-            m_once: one_time_distance,
-            m_later: 0,
+            m_once: later.m_once,
+            m_later: later.m_later,
         },
     };
     let pads = 3u64
@@ -647,7 +678,8 @@ pub fn derive_table_plan(candidate: &TablePlanCandidate) -> Result<DerivedTableP
         table_identity,
         table_model_identity,
         one_time_columns,
-        later_batch_columns: 0,
+        later_batch_columns,
+        declared_later_batches: candidate.later_batches,
         total_columns,
         lin_check,
     })
@@ -691,7 +723,7 @@ mod tests {
         assert_eq!(params.shape.code.ell, 2048);
         assert_eq!(params.shape.code.r, 128);
         assert!(params.shape.distances.m_once >= 3);
-        assert_eq!(params.shape.distances.m_later, 0);
+        assert_eq!(params.shape.distances.m_later, 284);
         assert_eq!(params.layout.tail_len, 128);
         assert_eq!(projection_table_params("gpt2/weights/L1_k_w_i32.bin"), None);
     }
@@ -705,9 +737,15 @@ mod tests {
         assert_eq!(plan.params.path, again.params.path);
         assert_eq!(plan.table_identity, again.table_identity);
         assert_eq!(plan.table_configuration, again.table_configuration);
-        assert!(plan.total_columns > 0);
+        assert_eq!(plan.one_time_columns, 52);
+        assert_eq!(plan.later_batch_columns, 52);
+        assert_eq!(plan.declared_later_batches, 1);
+        assert_eq!(plan.total_columns, 104);
+        assert_eq!(
+            plan.total_columns,
+            plan.one_time_columns + plan.declared_later_batches * plan.later_batch_columns
+        );
         assert!(plan.total_columns <= plan.params.shape.code.r);
-        assert_eq!(plan.one_time_columns, plan.total_columns);
         assert_eq!(plan.params.shape.distances.m_once, {
             let code = build_code_plan(
                 TABLE_PLAN_CANDIDATE.log_n,
@@ -725,6 +763,7 @@ mod tests {
             )
             .unwrap()
         });
+        assert_eq!(plan.params.shape.distances.m_later, plan.params.shape.distances.m_once);
     }
 
     #[test]
@@ -732,9 +771,12 @@ mod tests {
         let mut short = TABLE_PLAN_CANDIDATE;
         short.r = 8;
         assert!(derive_table_plan(&short).is_err());
-        let mut later = TABLE_PLAN_CANDIDATE;
-        later.later_batches = 1;
-        assert!(derive_table_plan(&later).is_err());
+        let mut more_batches = TABLE_PLAN_CANDIDATE;
+        more_batches.later_batches = 2;
+        assert!(derive_table_plan(&more_batches).is_err());
+        let mut no_batches = TABLE_PLAN_CANDIDATE;
+        no_batches.later_batches = 0;
+        assert!(derive_table_plan(&no_batches).is_err());
         let mut wider = TABLE_PLAN_CANDIDATE;
         wider.r = 256;
         let plan = derive_table_plan(&wider).unwrap();
