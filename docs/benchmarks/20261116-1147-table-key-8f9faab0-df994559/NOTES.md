@@ -123,3 +123,32 @@ ledger is refused and the prover's durable budget is unchanged.
 The run wrapper records the true `cargo test` status and propagates it as the
 command's exit status; the recorded EXIT above is the real status, not an
 outer wrapper's zero.
+
+## Round closure
+
+- The batch review answered YES for the two public semantics, the fixed R19
+  declaration, the three wiring fixes and the three evidence-entry reworks
+  (private run seed, on-disk bundle, JSON record). The earlier fixed-seed
+  trace stays as deterministic functional evidence and is not the delivery
+  evidence; this trace is the round's delivery evidence.
+- Commits of the round: `41090c52` (fixed R19 declaration), `c7b7795b`
+  (driver takes the public declaration), `d96fc2c1` (per-row bits tails),
+  `2545dcda` (matrix entry order), `acbf1f89` (reader identity), `16fd8e4d`
+  (diagnostic trace), `df994559` (fixed-seed trace), `9d87589c` (private
+  run-seed source), `f575c1ea` (bundle on disk and JSON record), `8f9faab0`
+  (verify resident-set delta), `01467a77` (fixed-seed traces marked as
+  functional evidence), `140d5984` (private-seed trace), and this closure
+  commit.
+- Memory numbers: the recorded `verify_hwm_delta_kib = 0` only says that the
+  verification stage did not raise the process high-water mark above the
+  level the run already reached; it does not mean the verifier used zero
+  memory. The `verify_rss_delta_kib` field is a non-negative growth amount
+  computed with a saturating subtraction, not a signed net change; the raw
+  resident-set numbers are 16,948,916 KiB before and 16,832,672 KiB after the
+  verification, a net change of -116,244 KiB. The resident-set numbers are
+  same-process measurements of the verifier stage, not an independent
+  verifier-process peak measurement; the only process-cumulative peak is
+  `vmhwm_process_kib` (35,431,832 KiB).
+- Ledger: the rework instance is charged 0 -> 52 once; the earlier instances
+  of the round stay spent and are not reset. The complete bundle
+  `key-proof.bin` stays on disk in this directory and is not committed.
