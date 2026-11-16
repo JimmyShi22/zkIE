@@ -11918,6 +11918,30 @@ impl KeySharedVerified {
     }
 }
 
+/// Charges one table column batch durably and begins the run's in-memory
+/// hiding count. The table key stage and the consumer shared stage share this
+/// one primitive; a plan whose fixed batch differs from the table's durable
+/// batch is refused before any read.
+pub(crate) fn shared_column_charge(
+    table: &mut dyn HiddenTableProver,
+    batch_columns: u64,
+    column_draws: usize,
+) -> Result<HidingCharge> {
+    if column_draws == 0 || batch_columns == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    if let Some(budget) = table.durable_column_budget() {
+        if budget.columns() != batch_columns {
+            return Err(Error::StatementMismatch);
+        }
+        let _receipt = budget.reserve()?;
+    }
+    let state = table.hiding_state().ok_or(Error::InvalidConfig)?;
+    let table_id = state.table();
+    let lifecycle = state.lifecycle();
+    state.begin_charge(table_id, lifecycle, column_draws)
+}
+
 /// Reserves the batch's table columns once, before the first part. The same
 /// token is consumed by the shared stage; a keeper with a durable budget is
 /// charged exactly one batch and its count is written before any read.
@@ -11929,16 +11953,11 @@ pub(crate) fn key_shared_charge(
     if table.reader().shape != plan.table_shape {
         return Err(Error::StatementMismatch);
     }
-    if let Some(budget) = table.durable_column_budget() {
-        if budget.columns() != plan.shared.column_draws as u64 {
-            return Err(Error::StatementMismatch);
-        }
-        let _receipt = budget.reserve()?;
-    }
-    let state = table.hiding_state().ok_or(Error::InvalidConfig)?;
-    let table_id = state.table();
-    let lifecycle = state.lifecycle();
-    state.begin_charge(table_id, lifecycle, plan.shared.column_draws)
+    shared_column_charge(
+        table,
+        plan.shared.column_draws as u64,
+        plan.shared.column_draws,
+    )
 }
 
 /// The prover's key shared stage. The chain starts from the verifier's own
