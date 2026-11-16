@@ -586,7 +586,21 @@ fn remap_group_rows(
             mapped.add_term(map(term.oracle)?, term.part, term.values.clone());
         }
         for unit in &row.units {
-            mapped.add_unit(map(unit.oracle)?, unit.part, unit.index, unit.coefficient);
+            let oracle = map(unit.oracle)?;
+            let index = if unit.part == BatPart::Mask {
+                let h = group.shapes.stages.first().ok_or(Error::InvalidConfig)?.h;
+                let ell = group.shapes.first_mask.ell;
+                if ell == 0 {
+                    return Err(Error::InvalidConfig);
+                }
+                let row = unit.index / ell;
+                let place = unit.index % ell;
+                row.checked_add(place.checked_shl(h).ok_or(Error::ResourceLimit)?)
+                    .ok_or(Error::ResourceLimit)?
+            } else {
+                unit.index
+            };
+            mapped.add_unit(oracle, unit.part, index, unit.coefficient);
         }
         out.push(mapped);
     }
@@ -1047,7 +1061,8 @@ mod tests {
 
     use crate::proof::column_session::fp_from_signed_word;
     use crate::proof::consumer_group::{
-        CommittedConsumerGroupMask, ConsumerGroupPlan, ConsumerGroupProof, ConsumerGroupWitness,
+        commit_consumer_group_mask, derive_consumer_group_shapes, CommittedConsumerGroupMask,
+        ConsumerGroupEntries, ConsumerGroupPlan, ConsumerGroupProof, ConsumerGroupWitness,
     };
     use crate::proof::consumer_psc::{
         ConsumerObligation, ConsumerPscMasks, ConsumerPscShape, ConsumerTable,
@@ -1785,6 +1800,536 @@ mod tests {
             &fixture.activation,
             &fixture.outputs,
             &messages
+        )
+        .is_err());
+    }
+    // The plan row count covers the ten relation rows and one sample row per
+    // member (two raw, two bits, mask and W).
+    const GROUP_ROWS: u64 = 16;
+    const GROUP_RUN: Digest = Digest([0x61; 32]);
+    const GROUP_CONFIGURATION: Digest = Digest([0x62; 32]);
+
+    struct GroupFixture {
+        plan: ConsumerFirstPlan,
+        activation: Vec<Fp3>,
+        raw: Vec<Vec<Fp3>>,
+        bits: Vec<Vec<Fp3>>,
+        outputs: Vec<Vec<i64>>,
+        raw_first: ConsumerRawFirst,
+        raw_masks: ConsumerRawMaskWitness,
+        psc_masks: ConsumerPscMasks,
+        matrix: Vec<Vec<Fp3>>,
+        table_source: TableSource,
+        w_randomness: ConsumerWCommitRandomness,
+        raw_group: CommittedValueGroup,
+        raw_tails: Vec<Vec<Fp3>>,
+        bits_group: CommittedValueGroup,
+        bits_tails: Vec<Vec<Fp3>>,
+        mask: CommittedConsumerGroupMask,
+        mask_rows: Vec<Vec<Fp3>>,
+        mask_tails: Vec<Vec<Fp3>>,
+        run_seed: Digest,
+    }
+
+    fn many_salts(coins: &mut ByteMaskCoins, count: u64, len: usize) -> Vec<Vec<u8>> {
+        (0..count)
+            .map(|_| {
+                let mut salt = Vec::new();
+                while salt.len() < len {
+                    let (value, _) = coins.draw().unwrap();
+                    for coefficient in value.c {
+                        salt.extend_from_slice(&coefficient.as_canonical_u64().to_le_bytes());
+                    }
+                }
+                salt.truncate(len);
+                salt
+            })
+            .collect()
+    }
+
+    fn commit_collect(
+        shape: &WShape,
+        oracle_base: u64,
+        group: u64,
+        values: &[Vec<Fp3>],
+        coins: &mut ByteMaskCoins,
+    ) -> (CommittedValueGroup, Vec<Vec<Fp3>>) {
+        let positions = values.len();
+        let mut pads = vec![Fp3::ZERO; positions * shape.answers as usize];
+        for pad in &mut pads {
+            while *pad == Fp3::ZERO {
+                *pad = coins.draw().unwrap().0;
+            }
+        }
+        let rows = shape.main_rows as usize;
+        let tail_len = shape.code.r as usize;
+        let tails: Vec<Vec<Fp3>> = (0..positions)
+            .map(|_| {
+                (0..rows * tail_len)
+                    .map(|_| coins.draw().unwrap().0)
+                    .collect()
+            })
+            .collect();
+        let salts: Vec<Vec<Vec<u8>>> = (0..positions)
+            .map(|_| many_salts(coins, shape.code.n(), shape.salt_bytes))
+            .collect();
+        let committed = commit_value_group(
+            shape,
+            values[0].len() as u64,
+            oracle_base,
+            group,
+            values,
+            &pads,
+            &tails,
+            &salts,
+            positions as u32,
+        )
+        .unwrap();
+        (committed, tails)
+    }
+
+    fn group_table_source(matrix_words: &[Vec<i64>]) -> TableSource {
+        TableSource {
+            messages: matrix_words
+                .iter()
+                .map(|row| {
+                    let mut message = vec![Fp::ZERO; ELL];
+                    for (place, value) in row.iter().enumerate() {
+                        message[place] = fp_from_signed_word(*value as u64);
+                    }
+                    message
+                })
+                .collect(),
+            tails: (0..PLACES)
+                .map(|_| (0..TABLE_R).map(|_| Fp::ZERO).collect())
+                .collect(),
+        }
+    }
+
+    fn group_fixture() -> GroupFixture {
+        let real = POSITIONS * WIDTH;
+        let activation_words: Vec<i64> = (0..POSITIONS * RECORDS)
+            .map(|index| ((index as i64 * 5 + 2) % 11) + 1)
+            .collect();
+        let matrix_words: Vec<Vec<i64>> = (0..PLACES)
+            .map(|place| {
+                (0..RECORDS)
+                    .map(|record| ((record as i64 * 7 + place as i64 * 3 + 1) % 17) + 1)
+                    .collect()
+            })
+            .collect();
+        let activation: Vec<Fp3> = activation_words
+            .iter()
+            .map(|value| Fp3::from_base(fp_from_signed_word(*value as u64)))
+            .collect();
+        let matrix: Vec<Vec<Fp3>> = matrix_words
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|value| Fp3::from_base(fp_from_signed_word(*value as u64)))
+                    .collect()
+            })
+            .collect();
+        let mut raw_int = vec![vec![0i64; real]; HEADS];
+        let mut outputs = vec![vec![0i64; real]; HEADS];
+        for head in 0..HEADS {
+            for position in 0..POSITIONS {
+                for index in 0..WIDTH {
+                    let place = head * WIDTH + index;
+                    let mut sum = 0i64;
+                    for record in 0..RECORDS {
+                        sum += activation_words[position * RECORDS + record]
+                            * matrix_words[place][record];
+                    }
+                    raw_int[head][position * WIDTH + index] = sum;
+                    outputs[head][position * WIDTH + index] =
+                        i64::try_from(crate::proof::relations::rq(i128::from(sum), SHIFT).unwrap())
+                            .unwrap();
+                }
+            }
+        }
+        let raw: Vec<Vec<Fp3>> = raw_int
+            .iter()
+            .map(|head| {
+                let mut values = vec![Fp3::ZERO; COLUMNS];
+                for (entry, value) in head.iter().enumerate() {
+                    values[entry] = signed(*value);
+                }
+                values
+            })
+            .collect();
+        let mut bits = vec![vec![Fp3::ZERO; COLUMNS * SHIFT as usize]; HEADS];
+        for head in 0..HEADS {
+            for entry in 0..real {
+                let remainder = raw_int[head][entry] + (1i64 << (SHIFT - 1))
+                    - outputs[head][entry] * (1i64 << SHIFT);
+                for bit in 0..SHIFT as usize {
+                    bits[head][entry * SHIFT as usize + bit] = fp(((remainder >> bit) & 1) as u64);
+                }
+            }
+        }
+        let mut request = ConsumerRequestPlan::new(
+            7,
+            table(),
+            mask_source(),
+            shared(),
+            ranges(),
+            Digest([0x41; 32]),
+            Digest([0x42; 32]),
+            vec![obligation(0, 20), obligation(1, 21)],
+        )
+        .unwrap();
+        let activation_digest = consumer_activation_digest(&activation);
+        let outputs_digest = consumer_outputs_digest(&request, &outputs).unwrap();
+        request = ConsumerRequestPlan::new(
+            7,
+            table(),
+            mask_source(),
+            shared(),
+            ranges(),
+            activation_digest,
+            outputs_digest,
+            vec![obligation(0, 20), obligation(1, 21)],
+        )
+        .unwrap();
+        let entries = ConsumerGroupEntries {
+            heads: HEADS as u32,
+            raw_columns: COLUMNS as u64,
+            bits_columns: (COLUMNS * SHIFT as usize) as u64,
+            w_columns: COLUMNS as u64,
+            mask_entries: 512,
+            rows: GROUP_ROWS,
+        };
+        let shapes =
+            derive_consumer_group_shapes(entries, GROUP_RUN, GROUP_CONFIGURATION, 100, 900)
+                .unwrap();
+        let mut coins = ByteMaskCoins::new(Digest([0x79; 32])).unwrap();
+        let (raw_group, raw_tails) = commit_collect(&shapes.raw_shape, 20, 41, &raw, &mut coins);
+        let (bits_group, bits_tails) =
+            commit_collect(&shapes.bits_shape, 30, 42, &bits, &mut coins);
+        let raw_plan = ConsumerRawPlan {
+            shape: raw_shape(),
+            raw: ConsumerRawGroup {
+                shape: shapes.raw_shape.clone(),
+                columns: COLUMNS as u64,
+                group: 41,
+                oracle_base: 20,
+                openings: 1,
+                roots: raw_group.roots.clone(),
+            },
+            bits: ConsumerRawGroup {
+                shape: shapes.bits_shape.clone(),
+                columns: (COLUMNS * SHIFT as usize) as u64,
+                group: 42,
+                oracle_base: 30,
+                openings: 1,
+                roots: bits_group.roots.clone(),
+            },
+            mask: ConsumerRawMaskPlan {
+                oracle: 60,
+                base_slot: 200,
+            },
+            outputs_digest,
+            bound: crate::proof::consumer_request::ConsumerIntegerBound::new(
+                RECORDS as u64,
+                ranges(),
+                SHIFT,
+            )
+            .unwrap(),
+        };
+        raw_plan.validate().unwrap();
+        let raw_first = ConsumerRawFirst::from_groups(&raw_group.group, &bits_group.group);
+        let spaces = raw_plan.mask_spaces().unwrap();
+        let mut raw_masks = ConsumerRawMaskWitness::default();
+        let mut counter = 1u64;
+        for space in &spaces {
+            for slot in &space.hiding {
+                raw_masks.insert(*slot, fp(counter));
+                counter += 1;
+            }
+            raw_masks.insert(space.shown, fp(counter));
+            counter += 1;
+        }
+        let psc_shape = request.shape;
+        let hiding = (0..psc_shape.hiding_entries().unwrap())
+            .map(|index| fp(300 + index as u64))
+            .collect();
+        let psc_masks = ConsumerPscMasks::new(hiding, fp(400));
+        let mask_ell = usize::try_from(shapes.first_mask.ell).unwrap();
+        let mask_total = usize::try_from(shapes.mask_rows).unwrap() * mask_ell;
+        let mut mask = vec![Fp3::ZERO; mask_total];
+        for (index, value) in psc_masks.entries.hiding.iter().enumerate() {
+            mask[request.mask.hiding_base as usize + index] = *value;
+        }
+        mask[request.mask.shown_slot as usize] = psc_masks.entries.shown[1];
+        for space in &spaces {
+            for slot in &space.hiding {
+                mask[*slot as usize] = raw_masks.entry(*slot).unwrap();
+            }
+            mask[space.shown as usize] = raw_masks.entry(space.shown).unwrap();
+        }
+        mask[5] = fp(3);
+        let mask_rows: Vec<Vec<Fp3>> = mask.chunks(mask_ell).map(|row| row.to_vec()).collect();
+        let mask_tails: Vec<Vec<Fp3>> = (0..mask_rows.len())
+            .map(|_| {
+                (0..shapes.first_mask.r as usize)
+                    .map(|_| coins.draw().unwrap().0)
+                    .collect()
+            })
+            .collect();
+        let mask_salts = many_salts(&mut coins, shapes.first_mask.n(), 40);
+        let placeholder = ConsumerGroupPlan {
+            shapes: shapes.clone(),
+            group_id: 41,
+            fresh: 51,
+            raw_oracle_base: 20,
+            bits_oracle_base: 30,
+            mask_oracle: 60,
+            w_oracle: 70,
+            raw_bat_base: 0,
+            bits_bat_base: HEADS as u64,
+            mask_bat: 2 * HEADS as u64,
+            w_bat: 2 * HEADS as u64 + 1,
+            mask_root: Digest::ZERO,
+            raw_roots: raw_group.roots.clone(),
+            bits_roots: bits_group.roots.clone(),
+            w_roots: vec![Digest([0x71; 32])],
+        };
+        let mask_commit = commit_consumer_group_mask(
+            &placeholder,
+            mask_rows.clone(),
+            mask_tails.clone(),
+            mask_salts,
+        )
+        .unwrap();
+        let draft = ConsumerFirstDraft {
+            request,
+            raw: raw_plan,
+            w_shape: shapes.w_shape.clone(),
+            w_oracle: 70,
+            w_group: 43,
+            table_shape: IndexShape {
+                code: code(),
+                v: 4,
+                answers: 1,
+                salt_bytes: SALT,
+                distances: TableDistances {
+                    radius: 0,
+                    later_radius: 0,
+                    m_once: 0,
+                    m_later: 0,
+                },
+            },
+            matrix_rows: PLACES as u64,
+            k_lo: 0,
+            columns: COLUMNS as u64,
+            eval_units: vec![(60, 5, fp(2))],
+        };
+        draft.check().unwrap();
+        let mut pads = vec![Fp3::ZERO; draft.w_shape.answers as usize];
+        for pad in &mut pads {
+            while *pad == Fp3::ZERO {
+                *pad = coins.draw().unwrap().0;
+            }
+        }
+        let rows: usize = draft.w_shape.main_rows as usize;
+        let tail_len: usize = draft.w_shape.code.r as usize;
+        let tails: Vec<Vec<Fp3>> = (0..1)
+            .map(|_| {
+                (0..rows * tail_len)
+                    .map(|_| coins.draw().unwrap().0)
+                    .collect()
+            })
+            .collect();
+        let salts: Vec<Vec<Vec<u8>>> = (0..1)
+            .map(|_| many_salts(&mut coins, draft.w_shape.code.n(), draft.w_shape.salt_bytes))
+            .collect();
+        let w_randomness = ConsumerWCommitRandomness { pads, tails, salts };
+        w_randomness.check(&draft.w_shape).unwrap();
+        let table_source = group_table_source(&matrix_words);
+        let (member, target) = derive_consumer_first_member(
+            &draft,
+            &activation,
+            &raw,
+            &bits,
+            &outputs,
+            &raw_first,
+            &raw_masks,
+            &matrix,
+            &psc_masks,
+        )
+        .unwrap();
+        let weights = pending_row_weights(&member, PLACES as u64).unwrap();
+        let mut source = group_table_source(&matrix_words);
+        let w_values = derive_w_values(
+            &draft.table_shape,
+            PLACES as u64,
+            0,
+            COLUMNS as u64,
+            &weights,
+            &mut source,
+        )
+        .unwrap();
+        let w_commit = commit_request_w(
+            &draft.w_shape,
+            70,
+            43,
+            &w_values,
+            &w_randomness.pads,
+            &w_randomness.tails,
+            &w_randomness.salts,
+        )
+        .unwrap();
+        let w_root = *w_commit.roots.first().unwrap();
+        let group = ConsumerGroupPlan {
+            shapes: shapes.clone(),
+            group_id: 41,
+            fresh: 51,
+            raw_oracle_base: 20,
+            bits_oracle_base: 30,
+            mask_oracle: 60,
+            w_oracle: 70,
+            raw_bat_base: 0,
+            bits_bat_base: HEADS as u64,
+            mask_bat: 2 * HEADS as u64,
+            w_bat: 2 * HEADS as u64 + 1,
+            mask_root: mask_commit.root,
+            raw_roots: raw_group.roots.clone(),
+            bits_roots: bits_group.roots.clone(),
+            w_roots: vec![w_root],
+        };
+        group.check().unwrap();
+        let plan = ConsumerFirstPlan::new(draft, member, target)
+            .unwrap()
+            .with_group(group)
+            .unwrap();
+        GroupFixture {
+            plan,
+            activation,
+            raw,
+            bits,
+            outputs,
+            raw_first,
+            raw_masks,
+            psc_masks,
+            matrix,
+            table_source,
+            w_randomness,
+            raw_group,
+            raw_tails,
+            bits_group,
+            bits_tails,
+            mask: mask_commit,
+            mask_rows,
+            mask_tails,
+            run_seed: Digest([0x33; 32]),
+        }
+    }
+
+    fn prove_group(
+        fixture: &mut GroupFixture,
+    ) -> Result<(ConsumerFirstMessages, ConsumerFirstObligations)> {
+        let witness = ConsumerFirstGroupWitness {
+            raw: &fixture.raw_group,
+            raw_tails: &fixture.raw_tails,
+            bits: &fixture.bits_group,
+            bits_tails: &fixture.bits_tails,
+            mask: &fixture.mask,
+            mask_rows: fixture.mask_rows.clone(),
+            mask_tails: fixture.mask_tails.clone(),
+            w_tails: &fixture.w_randomness.tails,
+            run_seed: fixture.run_seed,
+        };
+        prove_consumer_first(
+            &fixture.plan,
+            &fixture.activation,
+            &fixture.raw,
+            &fixture.bits,
+            &fixture.outputs,
+            &fixture.raw_first,
+            &fixture.raw_masks,
+            &fixture.psc_masks,
+            &fixture.matrix,
+            &mut fixture.table_source,
+            &fixture.w_randomness,
+            &eval_mask,
+            Some(&witness),
+        )
+    }
+
+    #[test]
+    #[ignore = "release group run"]
+    fn the_group_seal_is_the_first_stage_seal() {
+        let mut fixture = group_fixture();
+        let (messages, proven) = prove_group(&mut fixture).unwrap();
+        let group = messages.group.as_ref().expect("a group proof");
+        assert_eq!(group.group_seal, messages.first_seal);
+        assert_ne!(messages.first_seal, messages.stage_seal);
+        let verified = verify_consumer_first(
+            &fixture.plan,
+            &fixture.activation,
+            &fixture.outputs,
+            &messages,
+        )
+        .unwrap();
+        assert_eq!(proven, verified);
+        let encoded = messages.encode(&fixture.plan).unwrap();
+        let decoded = ConsumerFirstMessages::decode(&fixture.plan, &encoded).unwrap();
+        assert_eq!(decoded, messages);
+        verify_consumer_first(
+            &fixture.plan,
+            &fixture.activation,
+            &fixture.outputs,
+            &decoded,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    #[ignore = "release group run"]
+    fn a_changed_group_answer_or_seal_is_refused() {
+        let mut fixture = group_fixture();
+        let (messages, _) = prove_group(&mut fixture).unwrap();
+        // A changed sample answer no longer reproduces the group.
+        let mut changed = messages.clone();
+        let group = changed.group.as_mut().unwrap();
+        group.answers[0] = group.answers[0].add(&fp(1));
+        assert!(verify_consumer_first(
+            &fixture.plan,
+            &fixture.activation,
+            &fixture.outputs,
+            &changed
+        )
+        .is_err());
+        // A changed group seal is refused even before the proximity check.
+        let mut changed = messages.clone();
+        let group = changed.group.as_mut().unwrap();
+        group.group_seal = Digest([0x12; 32]);
+        assert!(verify_consumer_first(
+            &fixture.plan,
+            &fixture.activation,
+            &fixture.outputs,
+            &changed
+        )
+        .is_err());
+        // A proof without the group is not the stage's real first seal.
+        let mut changed = messages.clone();
+        changed.group = None;
+        assert!(verify_consumer_first(
+            &fixture.plan,
+            &fixture.activation,
+            &fixture.outputs,
+            &changed
+        )
+        .is_err());
+        // The plan member still binds: another first seal is refused.
+        let mut changed = messages;
+        changed.first_seal = Digest([0x13; 32]);
+        assert!(verify_consumer_first(
+            &fixture.plan,
+            &fixture.activation,
+            &fixture.outputs,
+            &changed
         )
         .is_err());
     }
