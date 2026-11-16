@@ -246,6 +246,109 @@ pub fn consumer_reduction(
     })
 }
 
+/// One consumed head slice of a projection consumer plan: the head index and
+/// the table columns `[start, end)` the head's projection reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConsumerSlice {
+    pub head: u32,
+    pub columns: (u64, u64),
+}
+
+/// The fixed coverage of one real request's projection consumers: every head
+/// slice in order, exactly the consumed columns, no overlap, and no stored
+/// padding column claimed as consumed. A table may store more columns than the
+/// request uses; the coverage never rounds the used region up to the stored
+/// width.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumerCoverage {
+    positions: u32,
+    head_dim: u64,
+    consumed_columns: u64,
+    table_columns: u64,
+    slices: Vec<ConsumerSlice>,
+}
+
+impl ConsumerCoverage {
+    /// Builds the coverage of `heads` head slices of `head_dim` columns each,
+    /// consuming exactly `hidden` columns of a table with `table_columns`
+    /// stored columns. `heads * head_dim` must equal `hidden`, and `hidden`
+    /// must not exceed the stored width.
+    pub fn new(
+        positions: u32,
+        head_dim: u64,
+        heads: u32,
+        hidden: u64,
+        table_columns: u64,
+    ) -> Result<Self> {
+        if positions == 0 || head_dim == 0 || heads == 0 || hidden == 0 || table_columns == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        let total = u64::from(heads)
+            .checked_mul(head_dim)
+            .ok_or(Error::ResourceLimit)?;
+        if total != hidden || hidden > table_columns {
+            return Err(Error::InvalidConfig);
+        }
+        let mut slices = Vec::with_capacity(heads as usize);
+        for head in 0..heads {
+            let start = u64::from(head)
+                .checked_mul(head_dim)
+                .ok_or(Error::ResourceLimit)?;
+            let end = start.checked_add(head_dim).ok_or(Error::ResourceLimit)?;
+            slices.push(ConsumerSlice {
+                head,
+                columns: (start, end),
+            });
+        }
+        Ok(Self {
+            positions,
+            head_dim,
+            consumed_columns: hidden,
+            table_columns,
+            slices,
+        })
+    }
+
+    pub fn slices(&self) -> &[ConsumerSlice] {
+        &self.slices
+    }
+
+    pub fn positions(&self) -> u32 {
+        self.positions
+    }
+
+    pub fn head_dim(&self) -> u64 {
+        self.head_dim
+    }
+
+    pub fn consumed_columns(&self) -> u64 {
+        self.consumed_columns
+    }
+
+    pub fn table_columns(&self) -> u64 {
+        self.table_columns
+    }
+
+    /// The stored columns the request does not consume; they are never
+    /// reported as used and no head slice covers them.
+    pub fn padding_columns(&self) -> u64 {
+        self.table_columns - self.consumed_columns
+    }
+
+    /// The number of real references of the request: one output entry per
+    /// position and consumed column.
+    pub fn references(&self) -> Result<u64> {
+        u64::from(self.positions)
+            .checked_mul(self.consumed_columns)
+            .ok_or(Error::ResourceLimit)
+    }
+
+    /// Whether a stored column is consumed by some head slice.
+    pub fn covers(&self, column: u64) -> bool {
+        column < self.consumed_columns
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -407,5 +510,37 @@ mod tests {
         assert!(consumer_reduction(4, 8, 16, (4, 8), &x, &y_raw, &a, &b).is_err());
         assert!(consumer_reduction(3, 8, 16, (4, 8), &x, &y_raw, &a[..2], &b).is_err());
         assert!(consumer_reduction(3, 8, 16, (4, 8), &x, &y_raw, &a, &b[..3]).is_err());
+    }
+
+    #[test]
+    fn the_production_coverage_does_not_claim_the_padding_columns() {
+        // The real GPT-2 hidden width is 768 over a 1024-column stored table;
+        // twelve 64-column head slices consume [0,768) and never [768,1024).
+        let coverage = ConsumerCoverage::new(512, 64, 12, 768, 1024).unwrap();
+        assert_eq!(coverage.slices().len(), 12);
+        assert_eq!(coverage.consumed_columns(), 768);
+        assert_eq!(coverage.padding_columns(), 256);
+        assert_eq!(coverage.references().unwrap(), 512 * 768);
+        assert!(coverage.covers(767));
+        assert!(!coverage.covers(768));
+        for (index, slice) in coverage.slices().iter().enumerate() {
+            assert_eq!(slice.head as usize, index);
+            assert_eq!(slice.columns, ((index as u64) * 64, (index as u64 + 1) * 64));
+        }
+        let sixteen = ConsumerCoverage::new(16, 64, 12, 768, 1024).unwrap();
+        assert_eq!(sixteen.references().unwrap(), 16 * 768);
+    }
+
+    #[test]
+    fn a_coverage_that_claims_padding_or_mismatches_is_refused() {
+        // Sixteen heads would claim the stored pad columns as consumed.
+        assert!(ConsumerCoverage::new(16, 64, 16, 768, 1024).is_err());
+        // The consumed width cannot exceed the stored width.
+        assert!(ConsumerCoverage::new(16, 64, 12, 768, 512).is_err());
+        assert!(ConsumerCoverage::new(0, 64, 12, 768, 1024).is_err());
+        assert!(ConsumerCoverage::new(16, 0, 12, 768, 1024).is_err());
+        assert!(ConsumerCoverage::new(16, 64, 0, 768, 1024).is_err());
+        assert!(ConsumerCoverage::new(16, 64, 12, 0, 1024).is_err());
+        assert!(ConsumerCoverage::new(16, 64, 12, 768, 0).is_err());
     }
 }
