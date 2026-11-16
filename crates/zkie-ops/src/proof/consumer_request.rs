@@ -406,7 +406,7 @@ impl ConsumerRequestPlan {
         None
     }
 
-    fn statement_bytes(&self) -> Vec<u8> {
+    pub(crate) fn statement_bytes(&self) -> Vec<u8> {
         let mut writer = CanonicalWriter::new();
         writer.put_u64(CONSUMER_REQUEST_VERSION);
         writer.put_u64(self.request);

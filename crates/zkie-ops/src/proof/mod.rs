@@ -10,6 +10,8 @@ pub mod consumer_raw;
 pub mod consumer_first;
 pub mod consumer_shared;
 pub mod consumer_second;
+pub mod consumer_plan;
+pub mod consumer_source;
 pub mod consumer_proof;
 pub mod consumer_group;
 pub mod consumer_request;
