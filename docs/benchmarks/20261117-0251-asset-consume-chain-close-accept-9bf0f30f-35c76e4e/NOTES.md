@@ -51,6 +51,18 @@ bundle. The seq16 numbers are single rounds on this machine (one cold plus
 three warm), not a stability claim; the seq512 cases are single end-to-end
 rounds with no warm median.
 
+## Hard gate
+
+The norm-free toy output-head proof was dumped from
+`merged_request_accepts_and_round_trips` on this protocol version:
+
+- bytes: 45,080
+- sha256: `7a5da6ebcbfdb61d5ee88ab60e67f45613906959b0c5de998cb870f5e1de4cfb`
+  (byte-identical to the established gate)
+
+`hard-gate.log` records the command and values; `hard-gate.bin` stays on disk
+in this directory and is gitignored like the other benchmark binaries.
+
 ## Tests
 
 Workspace: 55 suites, 1,292 passed, 0 failed, 31 ignored, EXIT 0 on the code
