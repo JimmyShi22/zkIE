@@ -2,16 +2,17 @@
 //! instance. Ignored by default; run explicitly with `ZKIE_KEY_EV` pointing at
 //! the round's evidence directory (the instance lives below it). The driver
 //! rebuilds the table keeper from the committed private randomness, derives
-//! the public key plan, proves first + shared + second, encodes the proof
-//! bytes, and verifies them through the independent public entry only.
+//! the public key plan, proves first + shared + second with a private run seed,
+//! writes the complete canonical bundle to disk, reads it back and verifies it
+//! through the independent public entry only.
 
 use std::cell::RefCell;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
+use zkie_core::artifact::{digest_bytes, digest_to_hex};
 use zkie_core::common::field::PrimeCharacteristicRing;
-use zkie_core::types::Digest;
 use zkie_engine::pcs::request::field::{Fp, Fp3};
 use zkie_engine::pcs::request::foldeq::reader_table_identity;
 use zkie_engine::pcs::request::read::{DurableColumnBudget, HidingState};
@@ -26,6 +27,7 @@ use zkie_ops::proof::asset_table::{decode_asset_table_randomness_set, AssetTable
 use zkie_ops::proof::column_session::{column_ledger_dir, fp_from_signed_word};
 use zkie_ops::proof::hidden_send_session::{
     prove_key, production_key_first_plan, verify_key, HiddenTableProver, KeyPlanInputs,
+    KeyRunRandomness,
 };
 use zkie_ops::proof::table_range::{
     production_table_range, range_bit_values, range_key_values, range_multiplicities,
@@ -65,19 +67,34 @@ impl HiddenTableProver for Table {
     }
 }
 
-fn vm_hwm_kib() -> u64 {
+#[derive(Clone, Copy, Debug, Default)]
+struct MemoryKib {
+    hwm: u64,
+    rss: u64,
+}
+
+fn parse_kib(text: &str) -> u64 {
+    text.trim()
+        .trim_end_matches(" kB")
+        .trim()
+        .parse()
+        .unwrap_or(0)
+}
+
+/// The process-wide high-water mark and the current resident set. The high
+/// water mark is cumulative over the process and never decreases; the resident
+/// set is the live memory at this point.
+fn process_memory_kib() -> MemoryKib {
     let text = fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let mut memory = MemoryKib::default();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("VmHWM:") {
-            return rest
-                .trim()
-                .trim_end_matches(" kB")
-                .trim()
-                .parse()
-                .unwrap_or(0);
+            memory.hwm = parse_kib(rest);
+        } else if let Some(rest) = line.strip_prefix("VmRSS:") {
+            memory.rss = parse_kib(rest);
         }
     }
-    0
+    memory
 }
 
 #[test]
@@ -206,7 +223,9 @@ fn the_complete_key_chain_over_the_registered_instance() {
     })
     .unwrap();
     let summary = plan.summary();
-    let seed = Digest([0x6B; 32]);
+    // The run seed comes from the operating system generator; it stays private
+    // and is never logged, written or returned beside the proof.
+    let seed = KeyRunRandomness::Private.seed().unwrap();
 
     let prove_start = Instant::now();
     let (bytes, parts) = prove_key(
@@ -220,47 +239,126 @@ fn the_complete_key_chain_over_the_registered_instance() {
     )
     .unwrap();
     let prove_ms = prove_start.elapsed().as_millis();
-    let hwm_prove = vm_hwm_kib();
     let count_after = keeper.budget.count().unwrap();
     assert_eq!(count_after, count_before + derived.total_columns);
 
+    // The complete canonical bundle is kept on disk beside the trace; it is a
+    // binary artifact and is not committed. The verification below reads the
+    // same bytes back and uses only the public plan, the reader, the range
+    // lookup table and the bundle.
+    let bundle_path = ev.join("key-proof.bin");
+    fs::write(&bundle_path, &bytes).unwrap();
+    let disk_bytes = fs::read(&bundle_path).unwrap();
+    assert_eq!(disk_bytes, bytes, "the disk bundle is the proved bundle");
+    let bundle_sha256 = digest_bytes(&disk_bytes);
+
+    let memory_before_verify = process_memory_kib();
     let verify_start = Instant::now();
     let verify_plan = plan.clone();
-    let accepted = verify_key(&verify_plan, &reader, &lookup_table, &bytes).unwrap();
+    let accepted = verify_key(&verify_plan, &reader, &lookup_table, &disk_bytes).unwrap();
     let verify_ms = verify_start.elapsed().as_millis();
-    let hwm_verify = vm_hwm_kib();
+    let memory_after_verify = process_memory_kib();
     assert_eq!(accepted.plan_digest(), plan.statement_digest());
     assert_eq!(accepted.table_root(), meta.root);
+    // The verification consumes the plan's read ledger once; the prover's
+    // durable column budget is not charged again.
+    assert_eq!(keeper.budget.count().unwrap(), count_after);
     // A repeated verification on the same plan finds the read budget spent.
-    assert!(verify_key(&verify_plan, &reader, &lookup_table, &bytes).is_err());
-    // Byte negatives on the real bundle.
-    let mut truncated = bytes.clone();
+    assert!(verify_key(&verify_plan, &reader, &lookup_table, &disk_bytes).is_err());
+    // Byte negatives on the real bundle read from disk.
+    let mut truncated = disk_bytes.clone();
     truncated.pop();
     assert!(verify_key(&plan.clone(), &reader, &lookup_table, &truncated).is_err());
-    let mut trailing = bytes.clone();
+    let mut trailing = disk_bytes.clone();
     trailing.push(0);
     assert!(verify_key(&plan.clone(), &reader, &lookup_table, &trailing).is_err());
-    let mut bad_version = bytes.clone();
+    let mut bad_version = disk_bytes.clone();
     bad_version[0] ^= 1;
     assert!(verify_key(&plan.clone(), &reader, &lookup_table, &bad_version).is_err());
 
-    let result = format!(
-        "{{\"plan_digest\":\"{}\",\"table_identity\":\"{}\",\"table_root\":\"{}\",\"proof_bytes\":{},\"first_bytes\":{},\"shared_bytes\":{},\"second_bytes\":{},\"prove_ms\":{},\"verify_ms\":{},\"vmhwm_prove_kib\":{},\"vmhwm_verify_kib\":{},\"ledger_before\":{},\"ledger_after\":{},\"summary\":{:?}}}",
-        zkie_core::artifact::digest_to_hex(&summary.plan_digest),
-        zkie_core::artifact::digest_to_hex(&summary.table_identity),
-        zkie_core::artifact::digest_to_hex(&meta.root),
-        bytes.len(),
-        parts.first,
-        parts.shared,
-        parts.second,
-        prove_ms,
-        verify_ms,
-        hwm_prove,
-        hwm_verify,
-        count_before,
-        count_after,
-        summary,
-    );
-    fs::write(ev.join("key-chain-evidence.json"), &result).unwrap();
-    eprintln!("KEY CHAIN EVIDENCE {result}");
+    let summary_json = serde_json::json!({
+        "plan_digest": digest_to_hex(&summary.plan_digest),
+        "table_identity": digest_to_hex(&summary.table_identity),
+        "table_configuration": digest_to_hex(&summary.table_configuration),
+        "matrix_rows": summary.matrix_rows,
+        "k_lo": summary.k_lo,
+        "columns": summary.columns,
+        "shared_code": {
+            "log_n": summary.shared_code.log_n,
+            "ell": summary.shared_code.ell,
+            "r": summary.shared_code.r,
+        },
+        "shared_mask_code": {
+            "log_n": summary.shared_mask_code.log_n,
+            "ell": summary.shared_mask_code.ell,
+            "r": summary.shared_mask_code.r,
+        },
+        "own_code": {
+            "log_n": summary.own_code.log_n,
+            "ell": summary.own_code.ell,
+            "r": summary.own_code.r,
+        },
+        "own_mask_code": {
+            "log_n": summary.own_mask_code.log_n,
+            "ell": summary.own_mask_code.ell,
+            "r": summary.own_mask_code.r,
+        },
+        "shared_stages": summary.shared_stages,
+        "own_stages": summary.own_stages,
+        "shared_base_positions": summary.shared_base_positions,
+        "own_base_positions": summary.own_base_positions,
+        "index_rows": summary.index_rows,
+        "lookup_bits_oracle": summary.lookup_bits_oracle,
+        "lookup_mask_oracle": summary.lookup_mask_oracle,
+        "w_oracle": summary.w_oracle,
+        "index_oracle": summary.index_oracle,
+        "group": summary.group,
+        "bits_bat": summary.bits_bat,
+        "mask_bat": summary.mask_bat,
+        "index_bat": summary.index_bat,
+        "group_fresh": summary.group_fresh,
+        "group_mask_tree": summary.group_mask_tree,
+        "shared_fresh": summary.shared_fresh,
+        "shared_mask_tree": summary.shared_mask_tree,
+        "own_fresh": summary.own_fresh,
+        "own_mask_tree": summary.own_mask_tree,
+        "gu_oracle": summary.gu_oracle,
+        "omega_oracle": summary.omega_oracle,
+        "column_draws": summary.column_draws,
+        "column_budget": summary.column_budget,
+    });
+    let result = serde_json::json!({
+        "plan_digest": digest_to_hex(&summary.plan_digest),
+        "table_identity": digest_to_hex(&summary.table_identity),
+        "table_configuration": digest_to_hex(&summary.table_configuration),
+        "table_root": digest_to_hex(&meta.root),
+        "record_len": meta.record.y.len(),
+        "proof_bytes": disk_bytes.len(),
+        "first_bytes": parts.first,
+        "shared_bytes": parts.shared,
+        "second_bytes": parts.second,
+        "prove_ms": prove_ms,
+        "verify_ms": verify_ms,
+        "vmhwm_process_kib": memory_after_verify.hwm,
+        "verify_vmhwm_before_kib": memory_before_verify.hwm,
+        "verify_vmhwm_after_kib": memory_after_verify.hwm,
+        "verify_hwm_delta_kib": memory_after_verify
+            .hwm
+            .saturating_sub(memory_before_verify.hwm),
+        "verify_vmrss_before_kib": memory_before_verify.rss,
+        "verify_vmrss_after_kib": memory_after_verify.rss,
+        "ledger_before": count_before,
+        "ledger_after": count_after,
+        "read_ledger_spent": true,
+        "seed_source": "operating system generator (private)",
+        "bundle": {
+            "path": bundle_path.display().to_string(),
+            "bytes": disk_bytes.len(),
+            "sha256": digest_to_hex(&bundle_sha256),
+        },
+        "summary": summary_json,
+    });
+    let json = serde_json::to_string_pretty(&result).unwrap();
+    fs::write(ev.join("key-chain-evidence.json"), &json).unwrap();
+    eprintln!("KEY CHAIN EVIDENCE {json}");
 }
