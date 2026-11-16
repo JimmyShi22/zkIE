@@ -133,6 +133,119 @@ pub fn check_projection_reduction(
     Ok(())
 }
 
+/// One projection consumer's reduction claim: the public activation rows are
+/// reduced by the challenge coefficients of the positions, the raw output
+/// columns of one head slice by the challenge coefficients of the columns.
+/// The claim is about the same matrix `M` the key authenticates: the matrix's
+/// rows are the table places and its columns are the table records
+/// (`M[place, record] = A[record, place]` for the weight file `A`).
+///
+/// The identity the product-sum proof closes is
+/// `Σ_p Σ_n a[p] b[n] Y[p,n] = Σ_k (Σ_p a[p] X[p,k]) · (Σ_n b[n] M[n,k])`,
+/// where `Y` is the raw integer accumulator of the production projection,
+/// not its requantized output. `b` is zero outside the consumed slice.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumerReduction {
+    /// `U[k] = Σ_p a[p] X[p,k]`: the shown side of the product sum, over the
+    /// contraction index (the matrix's columns).
+    pub shown: Vec<Fp3>,
+    /// The column coefficients `b` padded to the full table columns; entries
+    /// outside the consumed slice are zero.
+    pub weights: Vec<Fp3>,
+    /// `Σ_p Σ_n a[p] b[n] Y[p,n]` over the raw output.
+    pub target: Fp3,
+}
+
+impl ConsumerReduction {
+    /// The right side on a known matrix: `Σ_k shown[k] · Σ_n weights[n]
+    /// M[n,k]`. `matrix_places[n]` is the matrix's row `n` over the records.
+    pub fn identity_on(&self, matrix_places: &[Vec<Fp3>]) -> Result<Fp3> {
+        if matrix_places.len() != self.weights.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut total = Fp3::ZERO;
+        for k in 0..self.shown.len() {
+            let mut column = Fp3::ZERO;
+            for (n, row) in matrix_places.iter().enumerate() {
+                let value = row.get(k).ok_or(Error::ShapeMismatch)?;
+                if !self.weights[n].is_zero() {
+                    column = column.add(&self.weights[n].mul(value));
+                }
+            }
+            total = total.add(&self.shown[k].mul(&column));
+        }
+        Ok(total)
+    }
+}
+
+/// Builds one head slice's reduction claim from the public activation rows,
+/// the raw output and the challenge coefficients. The position count, the
+/// contraction length, the table columns and the consumed slice are the fixed
+/// public plan data; `b_slice` is the slice's challenge coefficients and the
+/// padded weights are zero outside it.
+#[allow(clippy::too_many_arguments)]
+pub fn consumer_reduction(
+    positions: usize,
+    matrix_rows: u64,
+    columns: u64,
+    slice: (u64, u64),
+    x: &[Fp3],
+    y_raw: &[Fp3],
+    a: &[Fp3],
+    b_slice: &[Fp3],
+) -> Result<ConsumerReduction> {
+    let contraction = usize::try_from(matrix_rows).map_err(|_| Error::ResourceLimit)?;
+    let full_columns = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    let (slice_start, slice_end) = slice;
+    if positions == 0 || contraction == 0 || full_columns == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    if slice_end <= slice_start || slice_end > columns {
+        return Err(Error::InvalidConfig);
+    }
+    let slice_len = usize::try_from(slice_end - slice_start).map_err(|_| Error::ResourceLimit)?;
+    let expected_x = positions
+        .checked_mul(contraction)
+        .ok_or(Error::ResourceLimit)?;
+    let expected_y = positions.checked_mul(slice_len).ok_or(Error::ResourceLimit)?;
+    if x.len() != expected_x || y_raw.len() != expected_y {
+        return Err(Error::ShapeMismatch);
+    }
+    if a.len() != positions || b_slice.len() != slice_len {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut shown = vec![Fp3::ZERO; contraction];
+    for position in 0..positions {
+        let coefficient = a[position];
+        if coefficient.is_zero() {
+            continue;
+        }
+        for k in 0..contraction {
+            shown[k] = shown[k].add(&coefficient.mul(&x[position * contraction + k]));
+        }
+    }
+    let mut weights = vec![Fp3::ZERO; full_columns];
+    let start = usize::try_from(slice_start).map_err(|_| Error::ResourceLimit)?;
+    weights[start..start + slice_len].copy_from_slice(b_slice);
+    let mut target = Fp3::ZERO;
+    for position in 0..positions {
+        let mut row = Fp3::ZERO;
+        for index in 0..slice_len {
+            let coefficient = b_slice[index];
+            if coefficient.is_zero() {
+                continue;
+            }
+            row = row.add(&coefficient.mul(&y_raw[position * slice_len + index]));
+        }
+        target = target.add(&a[position].mul(&row));
+    }
+    Ok(ConsumerReduction {
+        shown,
+        weights,
+        target,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,5 +332,80 @@ mod tests {
         let mut short_output = output.clone();
         short_output.pop();
         assert!(projection_claims(shape, &activation, &short_output).is_err());
+    }
+
+    fn consumer_fixture() -> (
+        Vec<Vec<Fp3>>,
+        Vec<Vec<Fp3>>,
+        Vec<Fp3>,
+        Vec<Fp3>,
+        Vec<Fp3>,
+        Vec<Fp3>,
+    ) {
+        let positions = 3usize;
+        let contraction = 8usize;
+        let columns = 16usize;
+        let (c0, c1) = (4usize, 8usize);
+        // A[record][place] as the committed records; M[place][record] is the
+        // plan's matrix the LIN claim is about.
+        let records: Vec<Vec<Fp3>> = (0..contraction)
+            .map(|record| {
+                (0..columns)
+                    .map(|place| value(((record * 7 + place * 3 + 1) % 19) as u64))
+                    .collect()
+            })
+            .collect();
+        let matrix: Vec<Vec<Fp3>> = (0..columns)
+            .map(|place| (0..contraction).map(|record| records[record][place]).collect())
+            .collect();
+        let x: Vec<Fp3> = (0..positions * contraction)
+            .map(|index| value(((index * 5 + 2) % 13) as u64))
+            .collect();
+        let mut y_raw = vec![Fp3::ZERO; positions * (c1 - c0)];
+        for position in 0..positions {
+            for place in c0..c1 {
+                let mut sum = Fp3::ZERO;
+                for record in 0..contraction {
+                    sum = sum.add(&x[position * contraction + record].mul(&records[record][place]));
+                }
+                y_raw[position * (c1 - c0) + (place - c0)] = sum;
+            }
+        }
+        let a: Vec<Fp3> = (0..positions).map(|index| value(index as u64 + 1)).collect();
+        let b: Vec<Fp3> = (0..c1 - c0).map(|index| value(index as u64 + 4)).collect();
+        (matrix, records, x, y_raw, a, b)
+    }
+
+    #[test]
+    fn the_consumer_reduction_identity_holds_on_the_raw_output() {
+        let (matrix, _records, x, y_raw, a, b) = consumer_fixture();
+        let reduction = consumer_reduction(3, 8, 16, (4, 8), &x, &y_raw, &a, &b).unwrap();
+        assert_eq!(reduction.weights.len(), 16);
+        assert!(reduction.weights[..4].iter().all(|weight| weight.is_zero()));
+        assert!(reduction.weights[8..].iter().all(|weight| weight.is_zero()));
+        assert_eq!(reduction.target, reduction.identity_on(&matrix).unwrap());
+    }
+
+    #[test]
+    fn the_requantized_output_does_not_satisfy_the_raw_identity() {
+        let (matrix, _records, x, mut y_raw, a, b) = consumer_fixture();
+        let honest = consumer_reduction(3, 8, 16, (4, 8), &x, &y_raw, &a, &b).unwrap();
+        assert_eq!(honest.target, honest.identity_on(&matrix).unwrap());
+        // A rounding or truncation change to one raw entry breaks the
+        // identity; the reduction is over the raw accumulator, never the
+        // requantized output.
+        y_raw[1] = y_raw[1].add(&value(1));
+        let changed = consumer_reduction(3, 8, 16, (4, 8), &x, &y_raw, &a, &b).unwrap();
+        assert_ne!(changed.target, changed.identity_on(&matrix).unwrap());
+    }
+
+    #[test]
+    fn a_consumer_reduction_fault_is_refused() {
+        let (_matrix, _records, x, y_raw, a, b) = consumer_fixture();
+        assert!(consumer_reduction(3, 8, 16, (8, 10), &x, &y_raw, &a, &b).is_err());
+        assert!(consumer_reduction(3, 8, 16, (4, 20), &x, &y_raw, &a, &b).is_err());
+        assert!(consumer_reduction(4, 8, 16, (4, 8), &x, &y_raw, &a, &b).is_err());
+        assert!(consumer_reduction(3, 8, 16, (4, 8), &x, &y_raw, &a[..2], &b).is_err());
+        assert!(consumer_reduction(3, 8, 16, (4, 8), &x, &y_raw, &a, &b[..3]).is_err());
     }
 }
