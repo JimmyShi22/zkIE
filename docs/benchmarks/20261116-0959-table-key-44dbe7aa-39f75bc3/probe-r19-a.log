@@ -1,0 +1,12 @@
+PROBE prove_key: charge ok
+test the_complete_key_chain_over_the_registered_instance has been running for over 60 seconds
+
+thread 'the_complete_key_chain_over_the_registered_instance' (1390229) panicked at zkie/tests/key_chain_evidence.rs:224:6:
+called `Result::unwrap()` on an `Err` value: ShapeMismatch
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 128.07s
+
+error: test failed, to rerun pass `-p zkie --test key_chain_evidence`
+
+[exited with code 0]

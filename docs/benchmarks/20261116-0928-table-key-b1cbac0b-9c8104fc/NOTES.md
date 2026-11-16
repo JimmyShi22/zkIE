@@ -98,3 +98,12 @@ binding place), changed shared answers, changed second-stage answers, swapped
 sections, a changed plan (group fresh), a different trusted reader root and a
 different reader configuration, and a range table with another identity. All
 are refused. The test log is `s6-tests.log` in this directory.
+
+## Ledger update after the real-instance attempt
+
+The registered candidate root `601d921c…` was used once with the diagnostic
+R19 declaration; that attempt charged the 52-column durable budget before
+failing in the key group proof. The ledger now records 52 and a retry on the
+same root is refused; the count is never refunded. The earlier R18 attempt
+stopped before the charge, so the ledger was 0 at registration. The final
+evidence run must use a fresh root under the confirmed declaration.

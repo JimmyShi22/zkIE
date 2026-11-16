@@ -1,0 +1,31 @@
+ok
+PROBE prove_key: charge ok
+PROBE first: index ok
+test the_complete_key_chain_over_the_registered_instance has been running for over 60 seconds
+PROBE first: lookup ok
+PROBE first: member ok
+PROBE first: w values ok
+PROBE first: w commit ok
+PROBE first: eval row ok
+PROBE first: group prover ok
+PROBE kg: members ok
+PROBE kg: samples ok
+PROBE kg: plain ok
+PROBE kg: fold ok
+PROBE kg: iopp ok
+PROBE kg: proximity start
+PROBE prox: bat setup ok
+PROBE prox: bat ok
+PROBE prox: tables ok
+PROBE prox: fold start ok
+PROBE prox: fold output ok
+
+thread 'the_complete_key_chain_over_the_registered_instance' (1390893) panicked at zkie/tests/key_chain_evidence.rs:224:6:
+called `Result::unwrap()` on an `Err` value: ShapeMismatch
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+--
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 129.90s
+
+error: test failed, to rerun pass `-p zkie --test key_chain_evidence`
+
+[exited with code 0]
