@@ -114,8 +114,11 @@ pub struct EntryRangeLimits {
 /// The declared integer interval of the first production weight table. The
 /// interval enters the table configuration and the key parameters; a value
 /// outside it is refused when the table is built and again by the lookup.
-pub const PRODUCTION_TABLE_RANGE_LO: i64 = -131_072;
-pub const PRODUCTION_TABLE_RANGE_HI: i64 = 131_071;
+/// The width is fixed by the public declaration: the measured entries of the
+/// first table stay inside it and the width is not chosen from the proof or
+/// from the private extremes of a run.
+pub const PRODUCTION_TABLE_RANGE_LO: i64 = -262_144;
+pub const PRODUCTION_TABLE_RANGE_HI: i64 = 262_143;
 /// The matrix geometry: 1024 rows by 1024 columns.
 pub const PRODUCTION_TABLE_MATRIX_ROWS: u64 = 1_024;
 pub const PRODUCTION_TABLE_COLUMN_BITS: u32 = 10;
@@ -1400,11 +1403,11 @@ mod key_range_config_tests {
         let plan = production_table_range().expect("the public configuration derives");
         assert_eq!(plan.range.lo(), PRODUCTION_TABLE_RANGE_LO);
         assert_eq!(plan.range.hi(), PRODUCTION_TABLE_RANGE_HI);
-        assert_eq!(plan.table_log, 18);
+        assert_eq!(plan.table_log, 19);
         assert_eq!(plan.mu, 5);
         assert_eq!(plan.key_bits, 20);
-        assert_eq!(plan.bit_entries, 1 << 23);
-        assert_eq!(plan.offset, Fp3::from_u64(131_072));
+        assert_eq!(plan.bit_entries, 1 << 24);
+        assert_eq!(plan.offset, Fp3::from_u64(262_144));
         // A wider table than the admitted resource limit is refused.
         let wider = derive_entry_range(
             PRODUCTION_TABLE_MATRIX_ROWS,
