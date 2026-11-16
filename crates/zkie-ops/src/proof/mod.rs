@@ -9,6 +9,7 @@ pub mod consumer_psc;
 pub mod consumer_raw;
 pub mod consumer_first;
 pub mod consumer_shared;
+pub mod consumer_second;
 pub mod consumer_group;
 pub mod consumer_request;
 pub mod cs_final_session;
