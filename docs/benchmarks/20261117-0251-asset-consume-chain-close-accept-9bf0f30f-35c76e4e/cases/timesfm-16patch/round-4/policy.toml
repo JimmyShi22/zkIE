@@ -1,0 +1,16 @@
+policy_version = 1
+model = "timesfm"
+model_version = 1
+
+[[case]]
+case_id = "timesfm-16patch"
+raw_input_length = 512
+patch_tokens = 16
+anchor_id = "359e03b223eed95bd9078049954c172909e0ce5d6c7f7a2c96e67c539c1d35b2"
+model_id = "c87a951844e832fcfc8022688ab86f6c7f634c86874a6b6758c1c88104460742"
+output_mode = "expected"
+expected_output_sha256 = "cc72805b7a845cb2b8505d6092dbb79477d083394a03c99cdac7f5665de56ba3"
+output_digest_algorithm = "sha256"
+output_type = "int_output"
+output_encoding = "i32-le"
+output_elements = 32768

@@ -1,0 +1,43 @@
+policy_version = 1
+model = "gpt2"
+model_version = 2
+
+[[case]]
+case_id = "gpt2-seq16"
+sequence_length = 16
+anchor_id = "9f72dc7c9caf22056e9de79e83dac450bcf905de731aae8941130c3286b8662b"
+model_id = "c2971c0179463bf12aecaefc3488417228008c1314e6905c49a55078242c1268"
+output_mode = "expected"
+expected_output_sha256 = "135c4d1c47aee4fd1985fa862afefbedde9d59beaf112bd2cf0dcfff03339280"
+output_digest_algorithm = "sha256"
+output_type = "argmax"
+output_encoding = "i32-le"
+output_elements = 16
+
+
+[case.limited_table_identity]
+version = 1
+model = "gpt2"
+model_version = 2
+case_id = "gpt2-seq16"
+anchor_id = "9f72dc7c9caf22056e9de79e83dac450bcf905de731aae8941130c3286b8662b"
+model_id = "c2971c0179463bf12aecaefc3488417228008c1314e6905c49a55078242c1268"
+asset_id = 2
+asset_table_identity = "7562efa1bfbd2fed9fa9373269cc3fb47d4752ffaf768404b883282faa191261"
+table_root = "7ae97e44fc6a7456c4f7f52c937ffaaa00280b4ff2f0880a839ad31e34930bae"
+table_record_digest = "524a6b56f996d5ab1fd702997d0329d9c60fff976e39440daa1e3874f2e5af44"
+table_configuration = "94dd0177b5a08d3e328a51222a4ab5aee7d6a982b91964b072eea7e75ae0e925"
+code_log_n = 12
+code_ell = 2048
+code_r = 128
+table_v = 10
+answers = 1
+salt_bytes = 40
+distance_radius = 0
+distance_later_radius = 0
+distance_m_once = 284
+distance_m_later = 284
+matrix_rows_log = 10
+k_lo = 0
+k_col = 10
+protocol_identity = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"

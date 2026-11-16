@@ -1,0 +1,16 @@
+policy_version = 1
+model = "gemma3"
+model_version = 1
+
+[[case]]
+case_id = "gemma3-seq16"
+sequence_length = 16
+anchor_id = "567b30e6712444a9060b5a13d0f011faf50406e15babb6b51a5bd45844d645d3"
+model_id = "39b607c9f6156a8df155ca1a97e1fa70f0adf74730cc670ec67b5c8fd6410e34"
+output_mode = "expected"
+expected_output_sha256 = "8683f5e22e51d1405fe3efcc7487a9a4df2e694c5d9f0bed64e921810d77c562"
+output_digest_algorithm = "sha256"
+output_type = "argmax"
+output_encoding = "i32-le"
+output_elements = 16
+
