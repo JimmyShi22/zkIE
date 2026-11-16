@@ -10497,9 +10497,9 @@ impl ProximityTreeSource<'_> {
 // The public plan of the key chain's first part
 // ---------------------------------------------------------------------------
 
-/// Version of the key first plan's canonical encoding. Version 2 adds the
-/// public geometry of the shared stage.
-pub(crate) const KEY_FIRST_PLAN_VERSION: u64 = 2;
+/// Version of the key first plan's canonical encoding. Version 3 adds the
+/// public geometry of the own second stage.
+pub(crate) const KEY_FIRST_PLAN_VERSION: u64 = 3;
 
 /// The public plan of the key chain's first part: the table's identity and
 /// configuration, the declared entry range, the lookup plan and its message
@@ -10535,6 +10535,9 @@ pub(crate) struct KeyFirstPlan {
     /// table column draws. Every value is public plan data, never prover
     /// choice.
     pub shared: KeySharedPlan,
+    /// The public geometry of the own second stage: its codes by role, the
+    /// fresh mask tree, the derived stage chain and the BASE position count.
+    pub own: KeyOwnPlan,
     /// The shape of the one-leaf binding tree over the first chain's seal.
     pub binding: crate::proof::lin_binding::LinBindingShape,
     /// The public parameters of the key group's derived chain.
@@ -10572,6 +10575,20 @@ pub(crate) struct KeySharedPlan {
     pub column_work_bits: u8,
     pub lin_check: Option<SharedLinCheck>,
     pub ledger: ReadLedgerCell,
+}
+
+/// The public geometry of the key chain's own second stage. The main code is
+/// the W message's code and the mask code is the index-mask message's code;
+/// both are checked by role against the first plan's objects. The stage chain
+/// and the BASE position count are public plan data.
+#[derive(Clone, Debug)]
+pub(crate) struct KeyOwnPlan {
+    pub code: CodeParams,
+    pub mask_code: CodeParams,
+    pub mask_tree: MaskTreePlan,
+    pub fresh: u64,
+    pub stages: Vec<IoppStagePlan>,
+    pub base_positions: usize,
 }
 
 fn key_first_put_code(w: &mut CanonicalWriter, code: &CodeParams) {
@@ -10689,6 +10706,18 @@ fn key_first_put_shared(w: &mut CanonicalWriter, shared: &KeySharedPlan) {
     }
 }
 
+fn key_first_put_own(w: &mut CanonicalWriter, own: &KeyOwnPlan) {
+    key_first_put_code(w, &own.code);
+    key_first_put_code(w, &own.mask_code);
+    key_first_put_mask_tree(w, &own.mask_tree);
+    w.put_u64(own.fresh);
+    w.put_u64(own.stages.len() as u64);
+    for stage in &own.stages {
+        key_first_put_stage(w, stage);
+    }
+    w.put_u64(own.base_positions as u64);
+}
+
 impl KeyFirstPlan {
     /// The canonical bytes of the public plan.
     pub fn encode(&self) -> Vec<u8> {
@@ -10746,6 +10775,7 @@ impl KeyFirstPlan {
         key_first_put_code(&mut w, &self.shared_code);
         key_first_put_code(&mut w, &self.shared_mask_code);
         key_first_put_shared(&mut w, &self.shared);
+        key_first_put_own(&mut w, &self.own);
         w.put_bytes(&self.binding.encode());
         w.put_u64(self.group_config.fresh);
         w.put_u64(self.group_config.mask_tree_number);
@@ -10794,7 +10824,11 @@ pub(crate) struct KeyFirstWitness {
     pub index: IndexMaskWitness,
     pub index_sample: KeySample,
     pub lookup: KeyLookupProof,
+    /// The committed W group, its flat encoding tail and the statement's
+    /// mask terms. The tail is private witness material; the second stage's
+    /// FOLD reuses it with the same retained tree.
     pub w: crate::proof::output_closure::CommittedValueGroup,
+    pub w_tail: Vec<Fp3>,
     pub member: crate::proof::hidden_member::PendingRow,
     pub eval_row: BatRow,
 }
@@ -11079,6 +11113,7 @@ pub(crate) fn key_first_prove(
             index,
             lookup,
             w,
+            w_tail: tail,
             member,
             eval_row,
         },
@@ -11175,7 +11210,7 @@ pub(crate) fn key_first_verify(
 /// Omega shapes and the stage list are plan data derived from the public
 /// configuration.
 fn key_shared_stage(plan: &KeyFirstPlan) -> Result<SharedStagePlan<'_>> {
-    key_shared_fault(plan)?;
+    key_plan_fault(plan)?;
     Ok(SharedStagePlan {
         gu: plan.shared.gu.clone(),
         omega: plan.shared.omega.clone(),
@@ -11199,7 +11234,7 @@ fn key_shared_stage(plan: &KeyFirstPlan) -> Result<SharedStagePlan<'_>> {
 /// the codes by role, the column draws and budget, the mask tree, the stage
 /// list and the distinct identifiers. A plan that fails here is a public
 /// configuration error, not a proof error.
-fn key_shared_fault(plan: &KeyFirstPlan) -> Result<()> {
+fn key_plan_fault(plan: &KeyFirstPlan) -> Result<()> {
     let shared = &plan.shared;
     if plan.columns == 0
         || !plan.columns.is_power_of_two()
@@ -11229,7 +11264,8 @@ fn key_shared_fault(plan: &KeyFirstPlan) -> Result<()> {
     {
         return Err(Error::InvalidConfig);
     }
-    if shared.mask_tree.log_n != plan.shared_mask_code.log_n
+    if plan.shared_mask_code.log_n != plan.shared_code.log_n
+        || shared.mask_tree.log_n != plan.shared_mask_code.log_n
         || shared.fresh == 0
         || shared.column_draws == 0
         || shared.column_draws > shared.column_budget
@@ -11270,6 +11306,32 @@ fn key_shared_fault(plan: &KeyFirstPlan) -> Result<()> {
     {
         return Err(Error::InvalidConfig);
     }
+    let own = &plan.own;
+    if plan.index.mask_rows == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let index_mask_rows = 1u64
+        .checked_shl(ceil_log2_u64(plan.index.mask_rows))
+        .ok_or(Error::ResourceLimit)?;
+    if own.code != plan.w.code
+        || own.code != plan.shared_code
+        || own.mask_code != plan.index.mask_code
+        || own.mask_code.log_n != own.code.log_n
+        || own.mask_tree.fault().is_some()
+        || own.mask_tree.log_n != own.mask_code.log_n
+        || own.mask_tree.mask_rows != index_mask_rows
+        || own.fresh == 0
+        || own.base_positions == 0
+        || own.base_positions as u64 > own.code.r
+        || own.base_positions as u64 > own.mask_code.r
+    {
+        return Err(Error::InvalidConfig);
+    }
+    if !own.stages.is_empty()
+        && iopp_stage_fault(&own.stages, own.code, own.mask_code, own.base_positions).is_some()
+    {
+        return Err(Error::InvalidConfig);
+    }
     let mut oracles = vec![
         0,
         plan.commit.bits_oracle,
@@ -11278,10 +11340,11 @@ fn key_shared_fault(plan: &KeyFirstPlan) -> Result<()> {
         plan.w_oracle,
         shared.gu.oracle,
         shared.omega.oracle,
+        own.fresh,
     ];
     oracles.sort_unstable();
     oracles.dedup();
-    if oracles.len() != 7 {
+    if oracles.len() != 8 {
         return Err(Error::InvalidConfig);
     }
     let mut trees = vec![
@@ -11293,10 +11356,11 @@ fn key_shared_fault(plan: &KeyFirstPlan) -> Result<()> {
         shared.gu.tree.tree_number,
         shared.omega.tree.tree_number,
         shared.mask_tree.tree_number,
+        own.mask_tree.tree_number,
     ];
     trees.sort_unstable();
     trees.dedup();
-    if trees.len() != 8 {
+    if trees.len() != 9 {
         return Err(Error::InvalidConfig);
     }
     Ok(())
@@ -11412,7 +11476,7 @@ pub(crate) fn key_shared_charge(
     plan: &KeyFirstPlan,
     table: &mut dyn HiddenTableProver,
 ) -> Result<HidingCharge> {
-    key_shared_fault(plan)?;
+    key_plan_fault(plan)?;
     if table.reader().shape != plan.table_shape {
         return Err(Error::StatementMismatch);
     }
@@ -11439,7 +11503,7 @@ pub(crate) fn key_shared_prove(
     seed: Digest,
     charge: &HidingCharge,
 ) -> Result<KeySharedProof> {
-    key_shared_fault(plan)?;
+    key_plan_fault(plan)?;
     if seed == Digest::ZERO
         || first.binding_root.fault().is_some()
         || first.binding_root.places != 1
@@ -11492,7 +11556,7 @@ pub(crate) fn key_shared_verify(
     first: &KeyFirstVerified,
     messages: &HiddenSharedMessages,
 ) -> Result<KeySharedVerified> {
-    key_shared_fault(plan)?;
+    key_plan_fault(plan)?;
     if first.binding_root.fault().is_some() || first.binding_root.places != 1 {
         return Err(Error::InvalidConfig);
     }
@@ -11534,6 +11598,622 @@ pub(crate) fn key_shared_verify(
         zeta: points.zeta,
         claims,
         base,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The key chain's second stage
+// ---------------------------------------------------------------------------
+
+const KEY_SECOND_W_ROOT_TAG: u64 = 140;
+const KEY_SECOND_W_ANSWER_TAG: u64 = 141;
+
+/// The messages of the key chain's second stage: the W sample drawn after the
+/// first seal and the own-group proximity transcript. The shared objects are
+/// not re-committed; their roots come from the verified shared state.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeySecondMessages {
+    pub w_seeds: Vec<SampleSeed>,
+    pub w_answers: Vec<Fp3>,
+    pub fold_start: FoldStartMessage,
+    pub fold_rounds: Vec<(Fp3, Fp3)>,
+    pub tail: ProximityTail,
+    pub seal: Digest,
+}
+
+/// The verifier's state after the own-group check: the own seal, the W sample
+/// it drew and the rebuilt relation claims.
+#[derive(Clone, Debug)]
+pub(crate) struct KeySecondVerified {
+    pub seal: Digest,
+    pub w_seeds: Vec<SampleSeed>,
+    pub w_answers: Vec<Fp3>,
+    pub claims: Vec<GuRelationRow>,
+    pub base: ProximityBaseOutcome,
+}
+
+fn absorb_key_second_answers(chain: &mut Chain, answers: &[Fp3]) -> Result<()> {
+    let mut message = chain.message();
+    message.push_u64(HIDDEN_SEND_SCHEMA_VERSION);
+    message.push_u64(KEY_SECOND_W_ANSWER_TAG);
+    message.push_u64(answers.len() as u64);
+    for answer in answers {
+        message.push_fp3(answer);
+    }
+    let prefix = message.prefix(KIND_EMPTY, 0)?;
+    if !chain.step(&prefix, 0)? {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
+/// The W sample answers of the committed message. The message, its root and
+/// its retained tree are checked against the first plan before evaluation.
+fn key_w_answers(
+    plan: &KeyFirstPlan,
+    witness: &KeyFirstWitness,
+    seeds: &[SampleSeed],
+) -> Result<Vec<Fp3>> {
+    let shape = plan.w.oracle_shape();
+    if seeds.len() != plan.w.answers as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    let entry = witness.w.group.entries.first().ok_or(Error::ShapeMismatch)?;
+    if entry.oracle != plan.w_oracle
+        || *witness.w.roots.first().ok_or(Error::ShapeMismatch)? != entry.root
+        || entry.tree != plan.w.tree_plan(0)?
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let message = witness.w.messages.first().ok_or(Error::ShapeMismatch)?;
+    let gu = GuWitness {
+        main: message.concat(),
+        mask: Vec::new(),
+    };
+    let mut answers = Vec::with_capacity(plan.w.answers as usize);
+    for answer in 0..plan.w.answers {
+        let row = oracle_sample_row(
+            plan.w_oracle,
+            plan.group,
+            &shape,
+            seeds,
+            answer,
+            Fp3::ZERO,
+        )?;
+        answers.push(row.evaluate(&gu)?);
+    }
+    Ok(answers)
+}
+
+/// The own group's members: W, the shared Omega and the first part's index
+/// mask. The prover supplies the committed material; the verifier carries only
+/// the roots, samples and messages it already verified. The member order is
+/// the BAT block order: larger main blocks first.
+fn key_own_members(
+    plan: &KeyFirstPlan,
+    first: &KeyFirstVerified,
+    witness: Option<(&KeyFirstWitness, &SharedWitness)>,
+    shared: &KeySharedVerified,
+) -> Result<Vec<ProximityMember>> {
+    let (w_message, w_tails) = match witness {
+        Some((first_witness, _)) => {
+            let entry = first_witness
+                .w
+                .group
+                .entries
+                .first()
+                .ok_or(Error::ShapeMismatch)?;
+            if entry.oracle != plan.w_oracle || entry.root != first.w_root {
+                return Err(Error::StatementMismatch);
+            }
+            let message = first_witness
+                .w
+                .messages
+                .first()
+                .ok_or(Error::ShapeMismatch)?
+                .clone();
+            let rows = usize::try_from(plan.w.main_rows).map_err(|_| Error::ResourceLimit)?;
+            let tail_len = usize::try_from(plan.w.code.r).map_err(|_| Error::ResourceLimit)?;
+            if first_witness.w_tail.len()
+                != rows.checked_mul(tail_len).ok_or(Error::ResourceLimit)?
+            {
+                return Err(Error::ShapeMismatch);
+            }
+            let mut tails = Vec::with_capacity(rows);
+            for row in 0..rows {
+                tails.push(
+                    first_witness.w_tail[row * tail_len..(row + 1) * tail_len].to_vec(),
+                );
+            }
+            (message, tails)
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    let omega = &plan.shared.omega;
+    let (omega_message, omega_tails) = match witness {
+        Some((_, shared_witness)) => {
+            let ell = usize::try_from(omega.u.code.ell).map_err(|_| Error::ResourceLimit)?;
+            let rows = usize::try_from(omega.u.main_rows).map_err(|_| Error::ResourceLimit)?;
+            if shared_witness.omega_message.len() != ell
+                || shared_witness.omega_tails.len() != rows
+            {
+                return Err(Error::ShapeMismatch);
+            }
+            let mut message_rows = Vec::with_capacity(rows);
+            for row in 0..rows {
+                message_rows.push(shared_witness.omega_message[row * ell..(row + 1) * ell].to_vec());
+            }
+            (message_rows, shared_witness.omega_tails.clone())
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    let (index_message, index_tails) = match witness {
+        Some((first_witness, _)) => {
+            (first_witness.index.rows.clone(), first_witness.index.tails.clone())
+        }
+        None => (Vec::new(), Vec::new()),
+    };
+    let mut members = vec![
+        ProximityMember {
+            bat_oracle: 0,
+            source_oracle: plan.w_oracle,
+            main_code: plan.w.code,
+            mask_code: plan.own.mask_code,
+            main_rows: plan.w.main_rows,
+            mask_rows: 0,
+            answers: plan.w.answers,
+            root: first.w_root,
+            tree_plan: plan.w.tree_plan(0)?,
+            message: w_message,
+            tails: w_tails,
+            mask_message: Vec::new(),
+            mask_tails: Vec::new(),
+        },
+        ProximityMember {
+            bat_oracle: 0,
+            source_oracle: omega.oracle,
+            main_code: omega.u.code,
+            mask_code: plan.own.mask_code,
+            main_rows: omega.u.main_rows,
+            mask_rows: 0,
+            answers: omega.u.answers,
+            root: shared.omega_root,
+            tree_plan: omega.tree.clone(),
+            message: omega_message,
+            tails: omega_tails,
+            mask_message: Vec::new(),
+            mask_tails: Vec::new(),
+        },
+        ProximityMember {
+            bat_oracle: 0,
+            source_oracle: plan.index.oracle,
+            main_code: plan.own.code,
+            mask_code: plan.index.mask_code,
+            main_rows: 0,
+            mask_rows: plan.index.mask_rows,
+            answers: plan.index.answers,
+            root: first.index_root,
+            tree_plan: plan.index.tree.clone(),
+            message: Vec::new(),
+            tails: Vec::new(),
+            mask_message: index_message,
+            mask_tails: index_tails,
+        },
+    ];
+    members.sort_by_key(|member| {
+        std::cmp::Reverse((member.main_rows, member.mask_rows, member.source_oracle))
+    });
+    for (index, member) in members.iter_mut().enumerate() {
+        member.bat_oracle = index as u64;
+    }
+    Ok(members)
+}
+
+fn key_own_sample_rows(
+    plan: &KeyFirstPlan,
+    members: &[ProximityMember],
+    first: &KeyFirstVerified,
+    shared: &KeySharedVerified,
+    w_seeds: &[SampleSeed],
+    w_answers: &[Fp3],
+) -> Result<Vec<Vec<GuRelationRow>>> {
+    let mut out = Vec::with_capacity(members.len());
+    for member in members {
+        let rows = if member.source_oracle == plan.w_oracle {
+            let mut rows = Vec::with_capacity(w_answers.len());
+            for (answer, target) in w_answers.iter().enumerate() {
+                rows.push(oracle_sample_row(
+                    plan.w_oracle,
+                    plan.group,
+                    &plan.w.oracle_shape(),
+                    w_seeds,
+                    answer as u32,
+                    *target,
+                )?);
+            }
+            rows
+        } else if member.source_oracle == plan.shared.omega.oracle {
+            let mut rows = Vec::with_capacity(shared.omega_answers.len());
+            for (answer, target) in shared.omega_answers.iter().enumerate() {
+                rows.push(oracle_sample_row(
+                    plan.shared.omega.oracle,
+                    plan.shared.omega.group,
+                    &plan.shared.omega.u,
+                    &shared.omega_seeds,
+                    answer as u32,
+                    *target,
+                )?);
+            }
+            rows
+        } else if member.source_oracle == plan.index.oracle {
+            vec![index_mask_sample_row_at(
+                &plan.index,
+                &first.index_sample.0,
+                first.index_sample.1,
+            )?]
+        } else {
+            return Err(Error::StatementMismatch);
+        };
+        if rows.len() != member.answers as usize {
+            return Err(Error::ShapeMismatch);
+        }
+        out.push(rows);
+    }
+    Ok(out)
+}
+
+/// The own group's plain rows: the member's Eval row at the first chain's
+/// point and target, and the Dot row tying W to Omega at the shared point with
+/// the pending claim's public weights.
+fn key_own_plain_rows(
+    plan: &KeyFirstPlan,
+    members: &[ProximityMember],
+    first: &KeyFirstVerified,
+    shared: &KeySharedVerified,
+) -> Result<Vec<BatRow>> {
+    let bat_oracle = |oracle: u64| -> Result<u64> {
+        members
+            .iter()
+            .find(|member| member.source_oracle == oracle)
+            .map(|member| member.bat_oracle)
+            .ok_or(Error::StatementMismatch)
+    };
+    let w_bat = bat_oracle(plan.w_oracle)?;
+    let omega_bat = bat_oracle(plan.shared.omega.oracle)?;
+    let index_bat = bat_oracle(plan.index.oracle)?;
+    let k_col = plan.columns.trailing_zeros() as usize;
+    let psi_star = shared
+        .psi
+        .get(..k_col)
+        .ok_or(Error::ShapeMismatch)?
+        .to_vec();
+    let class = plan.index.entries.end_range()?;
+    let mut masks = Vec::with_capacity(first.member.masks.len());
+    for term in &first.member.masks {
+        if term.oracle != plan.index.oracle {
+            return Err(Error::StatementMismatch);
+        }
+        let slot = usize::try_from(term.slot).map_err(|_| Error::ResourceLimit)?;
+        if !class.contains(&slot) {
+            return Err(Error::StatementMismatch);
+        }
+        masks.push((
+            index_bat,
+            plan.index.entry_virtual_index(slot)?,
+            term.coeff,
+        ));
+    }
+    let eval = request_eval_row(
+        TableLayout::of(&plan.w),
+        plan.columns,
+        w_bat,
+        &first.psi,
+        &masks,
+        first.eval_target,
+    )?;
+    let weights = pending_row_weights(&first.member, plan.matrix_rows)?;
+    let dot = request_dot_row(
+        TableLayout {
+            main_rows: plan.shared.omega.u.main_rows,
+            ell: plan.shared.omega.u.code.ell,
+        },
+        plan.matrix_rows,
+        omega_bat,
+        &weights,
+        TableLayout::of(&plan.w),
+        plan.columns,
+        w_bat,
+        &psi_star,
+    )?;
+    Ok(vec![eval, dot])
+}
+
+/// The own group's derived chain, when the public plan carries a stage list.
+/// The key group, the shared group and the static plan identifiers are all
+/// reserved first, so the own group never repeats one.
+fn key_own_iopp(
+    plan: &KeyFirstPlan,
+    first: &KeyFirstVerified,
+) -> Result<Option<crate::proof::proximity_iopp::ProximityIoppPlan>> {
+    if plan.own.stages.is_empty() {
+        return Ok(None);
+    }
+    let group_plan = key_group_plan_for(plan, &first.claims)?;
+    let key_bound = key_group_bound(plan, &group_plan)?;
+    let key_iopp = crate::proof::proximity_iopp::derive_proximity_iopp(
+        &group_plan.stages,
+        ProximityGroupRole::Own,
+        &group_plan.mask_tree,
+        0,
+        group_plan.fresh,
+        group_plan.base_positions,
+        &key_bound,
+    )?;
+    let mut oracles = key_bound.oracles.clone();
+    let mut trees = key_bound.trees.clone();
+    let mut reserve = |iopp: &crate::proof::proximity_iopp::ProximityIoppPlan| {
+        for ids in &iopp.chain.config.fold_ids {
+            oracles.extend([ids.group, ids.member, ids.fresh]);
+        }
+        trees.extend(&iopp.chain.config.switch_tree_numbers);
+        trees.extend(&iopp.chain.config.fold_tree_numbers);
+        trees.push(iopp.chain.config.base_star.tree_number);
+    };
+    reserve(&key_iopp);
+    if let Some(shared_iopp) = key_shared_iopp(plan, first)? {
+        reserve(&shared_iopp);
+    }
+    oracles.extend([
+        0,
+        plan.shared.gu.oracle,
+        plan.shared.omega.oracle,
+        plan.shared.fresh,
+        plan.own.fresh,
+    ]);
+    trees.extend([
+        plan.shared.gu.tree.tree_number,
+        plan.shared.omega.tree.tree_number,
+        plan.shared.mask_tree.tree_number,
+        plan.own.mask_tree.tree_number,
+    ]);
+    let bound = crate::proof::proximity_iopp::IoppBoundIds::new(oracles, trees);
+    crate::proof::proximity_iopp::derive_proximity_iopp(
+        &plan.own.stages,
+        ProximityGroupRole::Own,
+        &plan.own.mask_tree,
+        0,
+        plan.own.fresh,
+        plan.own.base_positions,
+        &bound,
+    )
+    .map(Some)
+}
+
+/// The prover's retained trees of the own members: W's first-chain tree, the
+/// shared Omega tree (rebuilt from the same salts, never re-committed) and the
+/// first part's index-mask tree.
+fn key_own_trees(
+    plan: &KeyFirstPlan,
+    members: &[ProximityMember],
+    first_witness: &KeyFirstWitness,
+    shared_witness: &SharedWitness,
+) -> Result<Vec<(u64, Arc<RuntimeTree>)>> {
+    let mut trees = Vec::with_capacity(members.len());
+    for member in members {
+        let tree = if member.source_oracle == plan.w_oracle {
+            retained_member_tree(&first_witness.w.trees, 0, member)?
+        } else if member.source_oracle == plan.shared.omega.oracle {
+            let ell = usize::try_from(plan.shared.omega.u.code.ell)
+                .map_err(|_| Error::ResourceLimit)?;
+            let rows = usize::try_from(plan.shared.omega.u.main_rows)
+                .map_err(|_| Error::ResourceLimit)?;
+            if shared_witness.omega_message.len() != ell
+                || shared_witness.omega_tails.len() != rows
+            {
+                return Err(Error::ShapeMismatch);
+            }
+            let mut message_rows = Vec::with_capacity(rows);
+            for row in 0..rows {
+                message_rows.push(
+                    shared_witness.omega_message[row * ell..(row + 1) * ell].to_vec(),
+                );
+            }
+            let tree = commit_rows_tree(
+                plan.shared.omega.tree.clone(),
+                plan.shared.omega.u.code,
+                &message_rows,
+                &shared_witness.omega_tails,
+                &shared_witness.omega_salts,
+            )?;
+            if *tree.root() != member.root {
+                return Err(Error::StatementMismatch);
+            }
+            Arc::new(tree)
+        } else if member.source_oracle == plan.index.oracle {
+            let tree = index_mask_tree(
+                &plan.index,
+                &first_witness.index.rows,
+                &first_witness.index.tails,
+                &first_witness.index.salts,
+            )?;
+            if *tree.root() != member.root {
+                return Err(Error::StatementMismatch);
+            }
+            Arc::new(tree)
+        } else {
+            return Err(Error::StatementMismatch);
+        };
+        trees.push((member.source_oracle, tree));
+    }
+    Ok(trees)
+}
+
+/// Proves the key chain's second stage. The chain starts from the verified
+/// first and shared states; W is sampled after the first seal, the shared
+/// Omega and the first part's index mask keep their original objects, and the
+/// own group checks the member's Eval and Dot rows.
+pub(crate) fn key_second_prove(
+    plan: &KeyFirstPlan,
+    reader: &IndexReader,
+    first: &KeyFirstVerified,
+    first_witness: &KeyFirstWitness,
+    shared: &KeySharedProof,
+    shared_verified: &KeySharedVerified,
+    seed: Digest,
+) -> Result<KeySecondMessages> {
+    key_plan_fault(plan)?;
+    if seed == Digest::ZERO {
+        return Err(Error::InvalidConfig);
+    }
+    if shared.messages.seal != shared_verified.seal
+        || shared.messages.omega_root != shared_verified.omega_root
+        || shared.messages.gu_root != shared_verified.gu_root
+        || shared.points.psi != shared_verified.psi
+        || shared.points.zeta != shared_verified.zeta
+    {
+        return Err(Error::StatementMismatch);
+    }
+    if reader.shape != plan.table_shape
+        || reader.configuration != plan.table_configuration
+        || reader_table_identity(reader)? != plan.table_identity
+    {
+        return Err(Error::StatementMismatch);
+    }
+    if first_witness.w.roots.first() != Some(&first.w_root)
+        || first_witness.index.root != first.index_root
+        || first_witness.index_sample != first.index_sample
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let mut chain = key_second_chain(plan, reader, first, &shared_verified.second_inputs())?;
+    absorb_digest_round(
+        &mut chain,
+        KEY_SECOND_W_ROOT_TAG,
+        &[first.w_root],
+        &[plan.w_oracle],
+    )?;
+    let bits = sample_cube_of(&plan.w.oracle_shape())?.bits;
+    let w_seeds = draw_seed_set(&mut chain, bits, plan.w.answers)?;
+    let w_answers = key_w_answers(plan, first_witness, &w_seeds)?;
+    absorb_key_second_answers(&mut chain, &w_answers)?;
+    let members = key_own_members(
+        plan,
+        first,
+        Some((first_witness, &shared.witness)),
+        shared_verified,
+    )?;
+    let sample_rows =
+        key_own_sample_rows(plan, &members, first, shared_verified, &w_seeds, &w_answers)?;
+    let plain_rows = key_own_plain_rows(plan, &members, first, shared_verified)?;
+    let fold = member_fold_shape(
+        plan.own.code,
+        plan.own.mask_code,
+        &members,
+        plan.own.mask_tree.leaf_class,
+    )?;
+    let iopp = key_own_iopp(plan, first)?;
+    let trees = key_own_trees(plan, &members, first_witness, &shared.witness)?;
+    let proximity = proximity_prove(
+        chain,
+        fold,
+        members,
+        ProximityTreeSource::Ready {
+            trees,
+            omega: Some(shared.witness.omega_opening.clone()),
+        },
+        &sample_rows,
+        plain_rows,
+        plan.own.fresh,
+        plan.own.mask_tree,
+        derive_run_seed(&seed, 6, 0)?,
+        plan.own.base_positions,
+        iopp.as_ref(),
+    )?;
+    Ok(KeySecondMessages {
+        w_seeds,
+        w_answers,
+        fold_start: proximity.messages.fold_start.clone(),
+        fold_rounds: proximity.messages.fold_rounds.clone(),
+        tail: proximity.messages.tail,
+        seal: proximity.seal,
+    })
+}
+
+/// Verifies the key chain's second stage from the verified first and shared
+/// states and the proof messages. It reads no private witness.
+pub(crate) fn key_second_verify(
+    plan: &KeyFirstPlan,
+    reader: &IndexReader,
+    first: &KeyFirstVerified,
+    shared: &KeySharedVerified,
+    messages: &KeySecondMessages,
+) -> Result<KeySecondVerified> {
+    key_plan_fault(plan)?;
+    if reader.shape != plan.table_shape
+        || reader.configuration != plan.table_configuration
+        || reader_table_identity(reader)? != plan.table_identity
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let mut chain = key_second_chain(plan, reader, first, &shared.second_inputs())?;
+    absorb_digest_round(
+        &mut chain,
+        KEY_SECOND_W_ROOT_TAG,
+        &[first.w_root],
+        &[plan.w_oracle],
+    )?;
+    let bits = sample_cube_of(&plan.w.oracle_shape())?.bits;
+    let w_seeds = draw_seed_set(&mut chain, bits, plan.w.answers)?;
+    if w_seeds != messages.w_seeds {
+        return Err(Error::InvalidProof);
+    }
+    if messages.w_answers.len() != plan.w.answers as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    absorb_key_second_answers(&mut chain, &messages.w_answers)?;
+    let members = key_own_members(plan, first, None, shared)?;
+    let sample_rows = key_own_sample_rows(
+        plan,
+        &members,
+        first,
+        shared,
+        &w_seeds,
+        &messages.w_answers,
+    )?;
+    let plain_rows = key_own_plain_rows(plan, &members, first, shared)?;
+    let fold = member_fold_shape(
+        plan.own.code,
+        plan.own.mask_code,
+        &members,
+        plan.own.mask_tree.leaf_class,
+    )?;
+    let iopp = key_own_iopp(plan, first)?;
+    let proximity = proximity_verify(
+        chain,
+        fold,
+        &members,
+        &sample_rows,
+        plain_rows,
+        &ProximityMessages {
+            fold_start: messages.fold_start.clone(),
+            fold_rounds: messages.fold_rounds.clone(),
+            tail: messages.tail.clone(),
+        },
+        plan.own.fresh,
+        plan.own.mask_tree,
+        plan.own.base_positions,
+        iopp.as_ref(),
+    )?;
+    if proximity.seal != messages.seal {
+        return Err(Error::InvalidProof);
+    }
+    let claims = sample_rows.into_iter().flatten().collect::<Vec<_>>();
+    Ok(KeySecondVerified {
+        seal: proximity.seal,
+        w_seeds,
+        w_answers: messages.w_answers.clone(),
+        claims,
+        base: proximity.base,
     })
 }
 
@@ -37638,6 +38318,25 @@ mod key_first_plan_tests {
         }
     }
 
+    fn sample_own(code: CodeParams) -> KeyOwnPlan {
+        KeyOwnPlan {
+            code,
+            mask_code: code,
+            mask_tree: MaskTreePlan {
+                tree_number: 403,
+                leaf_class: 4,
+                log_n: code.log_n,
+                mask_rows: 1,
+                salt_bytes: 40,
+                run: Digest([0x79; 32]),
+                configuration: Digest([0x7A; 32]),
+            },
+            fresh: 97,
+            stages: Vec::new(),
+            base_positions: 1,
+        }
+    }
+
     fn sample_plan() -> KeyFirstPlan {
         let code = CodeParams {
             log_n: 10,
@@ -37733,6 +38432,7 @@ mod key_first_plan_tests {
             shared_code: code,
             shared_mask_code: code,
             shared: sample_shared(code, table_shape),
+            own: sample_own(code),
             binding: crate::proof::lin_binding::LinBindingShape {
                 log_leaves: 0,
                 salt_bytes: 40,
@@ -37787,7 +38487,11 @@ mod key_first_flow_tests {
     /// The public shared geometry of the flow fixture: Gu over two rows and
     /// Omega over one row of the same code as the table, an empty stage list
     /// (single-stage BASE) and one drawn table column.
-    fn flow_shared_plan(table_shape: IndexShape, code: CodeParams) -> KeySharedPlan {
+    fn flow_shared_plan(
+        table_shape: IndexShape,
+        code: CodeParams,
+        mask_code: CodeParams,
+    ) -> KeySharedPlan {
         let tree = |tree_number: u64, main_symbols: u64, run: u8, configuration: u8| RuntimeTreePlan {
             tree_number,
             leaf_class: 2,
@@ -37831,7 +38535,7 @@ mod key_first_flow_tests {
             mask_tree: MaskTreePlan {
                 tree_number: 402,
                 leaf_class: 4,
-                log_n: code.log_n,
+                log_n: mask_code.log_n,
                 mask_rows: 1,
                 salt_bytes: 40,
                 run: Digest([0x77; 32]),
@@ -37845,6 +38549,25 @@ mod key_first_flow_tests {
             column_work_bits: 0,
             lin_check: None,
             ledger: ReadLedgerCell::new(1),
+        }
+    }
+
+    fn flow_own(code: CodeParams, mask_code: CodeParams) -> KeyOwnPlan {
+        KeyOwnPlan {
+            code,
+            mask_code,
+            mask_tree: MaskTreePlan {
+                tree_number: 403,
+                leaf_class: 4,
+                log_n: mask_code.log_n,
+                mask_rows: 1,
+                salt_bytes: 40,
+                run: Digest([0x79; 32]),
+                configuration: Digest([0x7A; 32]),
+            },
+            fresh: 97,
+            stages: Vec::new(),
+            base_positions: 1,
         }
     }
 
@@ -37918,6 +38641,14 @@ mod key_first_flow_tests {
             run: Digest([0x42; 32]),
             configuration: Digest([0x52; 32]),
         };
+        // The shared and own main codes must share the index-mask mask code's
+        // depth; the table code itself is only the folded message's code.
+        let shared_code = zkie_engine::pcs::request::code::build_code_plan(
+            index_code.log_n,
+            code.ell,
+            2,
+        )
+        .unwrap();
         let table_shape = zkie_engine::pcs::request::table::IndexShape {
             code,
             v: 2,
@@ -37974,7 +38705,7 @@ mod key_first_flow_tests {
             },
             w: WShape::new(
                 4,
-                code,
+                shared_code,
                 1,
                 1,
                 40,
@@ -37989,9 +38720,10 @@ mod key_first_flow_tests {
             bits_bat: 0,
             mask_bat: 1,
             index_bat: 2,
-            shared_code: code,
-            shared_mask_code: code,
-            shared: flow_shared_plan(table_shape, code),
+            shared_code,
+            shared_mask_code: shared_code,
+            shared: flow_shared_plan(table_shape, shared_code, shared_code),
+            own: flow_own(shared_code, index_code),
             binding: crate::proof::lin_binding::LinBindingShape {
                 log_leaves: 0,
                 salt_bytes: 40,
@@ -38105,7 +38837,8 @@ mod key_first_flow_tests {
         KeyFirstPlan,
         IndexReader,
         KeyFirstVerified,
-        HiddenSharedMessages,
+        KeyFirstWitness,
+        KeySharedProof,
         KeySharedVerified,
     ) {
         let (mut plan, keys, bits) = flow_plan();
@@ -38155,7 +38888,7 @@ mod key_first_flow_tests {
         let index_randomness = IndexMaskRandomness::from_coins(&mut coins, &plan.index).unwrap();
         let charge = key_shared_charge(&plan, &mut keeper).unwrap();
         let seed = Digest([7; 32]);
-        let (messages, seal, binding_root, _witness) = key_first_prove(
+        let (messages, seal, binding_root, first_witness) = key_first_prove(
             &plan,
             &reader,
             &mut keeper,
@@ -38171,12 +38904,13 @@ mod key_first_flow_tests {
         assert_eq!(verified.binding_root, binding_root);
         let proof = key_shared_prove(&plan, &reader, &mut keeper, &verified, seed, &charge).unwrap();
         let shared = key_shared_verify(&plan, &reader, &verified, &proof.messages).unwrap();
-        (plan, reader, verified, proof.messages, shared)
+        (plan, reader, verified, first_witness, proof, shared)
     }
 
     #[test]
     fn the_key_shared_stage_proves_and_verifies() {
-        let (plan, reader, verified, messages, shared) = shared_run();
+        let (plan, reader, verified, _witness, proof, shared) = shared_run();
+        let messages = &proof.messages;
         assert_eq!(shared.seal, messages.seal);
         assert_eq!(shared.gu_root, messages.gu_root);
         assert_eq!(shared.omega_root, messages.omega_root);
@@ -38207,7 +38941,8 @@ mod key_first_flow_tests {
 
     #[test]
     fn tampered_shared_roots_samples_and_claims_are_refused() {
-        let (plan, reader, verified, messages, _shared) = shared_run();
+        let (plan, reader, verified, _witness, proof, _shared) = shared_run();
+        let messages = proof.messages.clone();
         // Every rejection is checked on a plan clone, which starts a fresh
         // verifier read ledger at the same maximum; an exhausted ledger would
         // otherwise reject for the wrong reason.
@@ -38265,6 +39000,120 @@ mod key_first_flow_tests {
         let mut bad_reader = reader.clone();
         bad_reader.root = Digest([0x94; 32]);
         assert!(key_shared_verify(&plan.clone(), &bad_reader, &verified, &messages).is_err());
+    }
+
+    #[test]
+    fn the_key_second_stage_proves_and_verifies() {
+        let (plan, reader, verified, first_witness, proof, shared) = shared_run();
+        let seed = Digest([7; 32]);
+        let second = key_second_prove(
+            &plan,
+            &reader,
+            &verified,
+            &first_witness,
+            &proof,
+            &shared,
+            seed,
+        )
+        .expect("the key second stage proves");
+        let checked = key_second_verify(&plan, &reader, &verified, &shared, &second)
+            .expect("the key second stage verifies");
+        assert_eq!(checked.seal, second.seal);
+        assert_eq!(checked.w_seeds, second.w_seeds);
+        assert_eq!(checked.w_answers, second.w_answers);
+        assert!(!checked.claims.is_empty());
+    }
+
+    #[test]
+    fn tampered_second_transcripts_and_objects_are_refused() {
+        let (plan, reader, verified, mut first_witness, proof, shared) = shared_run();
+        let seed = Digest([7; 32]);
+        let messages = key_second_prove(
+            &plan,
+            &reader,
+            &verified,
+            &first_witness,
+            &proof,
+            &shared,
+            seed,
+        )
+        .unwrap();
+        let check = |changed: &KeySecondMessages| {
+            key_second_verify(&plan, &reader, &verified, &shared, changed).is_err()
+        };
+        let mut changed = messages.clone();
+        changed.w_seeds[0].z[0] = changed.w_seeds[0].z[0].add(&Fp3::ONE);
+        assert!(check(&changed));
+        let mut changed = messages.clone();
+        changed.w_answers[0] = changed.w_answers[0].add(&Fp3::ONE);
+        assert!(check(&changed));
+        let mut changed = messages.clone();
+        let round = changed
+            .fold_rounds
+            .first_mut()
+            .expect("the own fold has a round to tamper");
+        round.0 = round.0.add(&Fp3::ONE);
+        assert!(check(&changed));
+        let mut changed = messages.clone();
+        changed.seal = Digest([0x95; 32]);
+        assert!(check(&changed));
+        // A changed W message no longer matches its retained tree.
+        let honest = first_witness.w.messages[0][0][0];
+        first_witness.w.messages[0][0][0] = honest.add(&Fp3::ONE);
+        if let Ok(forged) = key_second_prove(
+            &plan,
+            &reader,
+            &verified,
+            &first_witness,
+            &proof,
+            &shared,
+            seed,
+        ) {
+            assert!(key_second_verify(&plan, &reader, &verified, &shared, &forged).is_err());
+        }
+        first_witness.w.messages[0][0][0] = honest;
+        // A changed index-mask row no longer matches its committed root.
+        let honest = first_witness.index.rows[0][0];
+        first_witness.index.rows[0][0] = honest.add(&Fp3::ONE);
+        assert!(key_second_prove(
+            &plan,
+            &reader,
+            &verified,
+            &first_witness,
+            &proof,
+            &shared,
+            seed,
+        )
+        .is_err());
+        first_witness.index.rows[0][0] = honest;
+        // A changed Omega message no longer matches the shared root.
+        let mut forged_witness = SharedWitness {
+            gu_message: proof.witness.gu_message.clone(),
+            gu_tails: proof.witness.gu_tails.clone(),
+            omega_message: proof.witness.omega_message.clone(),
+            omega_tails: proof.witness.omega_tails.clone(),
+            omega_salts: proof.witness.omega_salts.clone(),
+            omega_opening: proof.witness.omega_opening.clone(),
+        };
+        forged_witness.omega_message[0] = forged_witness.omega_message[0].add(&Fp3::ONE);
+        let forged_shared = KeySharedProof {
+            messages: proof.messages.clone(),
+            witness: forged_witness,
+            points: SharedPoints {
+                psi: shared.psi.clone(),
+                zeta: shared.zeta.clone(),
+            },
+        };
+        assert!(key_second_prove(
+            &plan,
+            &reader,
+            &verified,
+            &first_witness,
+            &forged_shared,
+            &shared,
+            seed,
+        )
+        .is_err());
     }
 
     #[test]
