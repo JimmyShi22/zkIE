@@ -165,10 +165,12 @@ fn the_complete_key_chain_over_the_registered_instance() {
     let ledger = column_ledger_dir(Path::new(&config.asset_root), meta.root);
     let count_path = ledger.join("columns.count");
     assert!(count_path.exists(), "the commit initialized the ledger");
+    // The batch size is this key stage's one-time columns; the life limit is
+    // the instance's total (one-time plus the declared later batch).
     let budget = DurableColumnBudget::open(
         ledger.clone(),
         count_path.clone(),
-        derived.total_columns,
+        derived.one_time_columns,
         derived.total_columns,
     )
     .unwrap();
