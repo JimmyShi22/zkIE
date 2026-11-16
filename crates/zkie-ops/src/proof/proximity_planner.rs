@@ -868,6 +868,53 @@ pub fn derive_later_table_candidate(
     })
 }
 
+/// The production later-parameter derivation. Every input is fixed public
+/// geometry; the once distance and columns are derived here instead of being
+/// supplied, the table tail is the code's own random tail, the request count
+/// is one, and the work bits are zero. The derived later stage must also pass
+/// the ordinary plan fault over its point, columns and comparison point.
+pub fn derive_production_later_candidate(
+    code: CodeParams,
+    v: u32,
+    answers: u32,
+    point_variables: u32,
+    rows_log: u32,
+    k_lo: u32,
+) -> Result<LaterTableCandidate> {
+    let shape = SharedLinShape {
+        v,
+        k_lo,
+        instances: 1,
+        rows_log,
+    };
+    let m_once = recorded_table_distance(code, v, answers, point_variables, 1, 0)?;
+    let one_time_columns = shared_lin_columns(shape, code, m_once, 0, 0)?;
+    let candidate = derive_later_table_candidate(
+        shape,
+        code,
+        answers,
+        point_variables,
+        m_once,
+        one_time_columns,
+        code.r,
+        0,
+    )?;
+    shared_lin_plan_fault(
+        SharedLinPlanFault {
+            v,
+            k_lo,
+            rows_log,
+            m: candidate.m_later,
+            column_draws: candidate.later_columns,
+            point_work_bits: 0,
+            column_work_bits: 0,
+            zeta_work_bits: 0,
+        },
+        code,
+    )?;
+    Ok(candidate)
+}
+
 fn stage_cube_bits(group: &GroupShape) -> u32 {
     let main = group.k + ceil_log2(group.main.ell);
     let mask = group.h + ceil_log2(group.mask.ell);
@@ -4207,5 +4254,31 @@ mod single_group_stage_tests {
         assert_eq!(candidate.spent, one_time_columns);
         assert!(candidate.total_columns_one_batch <= 128);
         assert!(candidate.capacity_batches >= 1);
+    }
+
+    #[test]
+    fn the_production_later_candidate_is_derived_and_fault_checked() {
+        let code = build_code_plan(12, 2048, 128).unwrap();
+        let candidate = derive_production_later_candidate(code, 10, 1, 10, 10, 0).unwrap();
+        eprintln!("production later-table candidate: {:?}", candidate);
+        assert_eq!(candidate.m_once, 284);
+        assert_eq!(candidate.m_later, 284);
+        assert_eq!(candidate.one_time_columns, 52);
+        assert_eq!(candidate.later_columns, 52);
+        assert_eq!(candidate.total_columns_one_batch, 104);
+        assert_eq!(candidate.capacity_batches, 1);
+        // The ordinary later plan fault rejects a smaller column draw than the
+        // derived one; the production wrapper itself runs the same fault.
+        let fault = SharedLinPlanFault {
+            v: 10,
+            k_lo: 0,
+            rows_log: 10,
+            m: candidate.m_later,
+            column_draws: candidate.later_columns - 1,
+            point_work_bits: 0,
+            column_work_bits: 0,
+            zeta_work_bits: 0,
+        };
+        assert!(shared_lin_plan_fault(fault, code).is_err());
     }
 }
