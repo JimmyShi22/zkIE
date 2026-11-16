@@ -1,0 +1,83 @@
+{
+  "bundle": {
+    "bytes": 4551024,
+    "path": "/data/zkIE/docs/benchmarks/20261116-1230-asset-consume-a007b064-092689b6/key-proof.bin",
+    "sha256": "442784857be8b1e5bfbe140f12cd57d6bf29e884b201f5a5807b5a8f36889ff3"
+  },
+  "declared_later_batches": 1,
+  "first_bytes": 3554128,
+  "instance_total_columns": 104,
+  "later_batch_columns": 52,
+  "ledger_after": 52,
+  "ledger_before": 0,
+  "plan_digest": "93911f51206503acfd4aa7ec160b904d3648bd681aa39445d7fe6d401f20d4b9",
+  "proof_bytes": 4551024,
+  "prove_ms": 188662,
+  "read_ledger_spent": true,
+  "record_len": 1024,
+  "second_bytes": 282928,
+  "seed_source": "operating system generator (private)",
+  "shared_bytes": 713936,
+  "summary": {
+    "bits_bat": 0,
+    "column_budget": 52,
+    "column_draws": 52,
+    "columns": 1024,
+    "group": 7,
+    "group_fresh": 3,
+    "group_mask_tree": 204,
+    "gu_oracle": 10,
+    "index_bat": 2,
+    "index_oracle": 60,
+    "index_rows": 1,
+    "k_lo": 0,
+    "lookup_bits_oracle": 21,
+    "lookup_mask_oracle": 22,
+    "mask_bat": 1,
+    "matrix_rows": 1024,
+    "omega_oracle": 11,
+    "own_base_positions": 53,
+    "own_code": {
+      "ell": 16384,
+      "log_n": 18,
+      "r": 130
+    },
+    "own_fresh": 8,
+    "own_mask_code": {
+      "ell": 256,
+      "log_n": 18,
+      "r": 66
+    },
+    "own_mask_tree": 201,
+    "own_stages": 3,
+    "plan_digest": "93911f51206503acfd4aa7ec160b904d3648bd681aa39445d7fe6d401f20d4b9",
+    "shared_base_positions": 66,
+    "shared_code": {
+      "ell": 16384,
+      "log_n": 18,
+      "r": 130
+    },
+    "shared_fresh": 2,
+    "shared_mask_code": {
+      "ell": 256,
+      "log_n": 18,
+      "r": 66
+    },
+    "shared_mask_tree": 200,
+    "shared_stages": 3,
+    "table_configuration": "94dd0177b5a08d3e328a51222a4ab5aee7d6a982b91964b072eea7e75ae0e925",
+    "table_identity": "a5d1308603383b2813b0ef5868c47bbbb400a966e60107e894c0cffe00a4e3af",
+    "w_oracle": 20
+  },
+  "table_configuration": "94dd0177b5a08d3e328a51222a4ab5aee7d6a982b91964b072eea7e75ae0e925",
+  "table_identity": "a5d1308603383b2813b0ef5868c47bbbb400a966e60107e894c0cffe00a4e3af",
+  "table_root": "5a7cd31bf2bfe82fa56b48d538cc66cac3f7091e85004967330dafeb1f7839e4",
+  "verify_hwm_delta_kib": 0,
+  "verify_ms": 59168,
+  "verify_rss_delta_kib": 212,
+  "verify_vmhwm_after_kib": 35432628,
+  "verify_vmhwm_before_kib": 35432628,
+  "verify_vmrss_after_kib": 16884388,
+  "verify_vmrss_before_kib": 16884176,
+  "vmhwm_process_kib": 35432628
+}

@@ -1,0 +1,449 @@
+warning: unused variable: `number`
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1513:9
+     |
+1513 |         number: u32,
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_number`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:881:5
+    |
+881 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: field `target` is never read
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1118:5
+     |
+1112 | struct FoldOutputMeta {
+     |        -------------- field in this struct
+...
+1118 |     target: Fp3,
+     |     ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-engine` (lib) generated 4 warnings (run `cargo fix --lib -p zkie-engine` to apply 3 suggestions)
+warning: unused import: `MODULUS`
+   --> crates/zkie-ops/src/proof/bat_fold_session.rs:147:59
+    |
+147 | use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE, MODULUS};
+    |                                                           ^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `verify_last_base_proof_with_positions`
+  --> crates/zkie-ops/src/proof/multi_stage_iopp.rs:47:29
+   |
+47 |     encode_last_base_proof, verify_last_base_proof_with_positions, verify_last_base_proof_with_positions_and_chain, LastBaseProver,
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `PrimeCharacteristicRing`
+  --> crates/zkie-ops/src/proof/table_range.rs:26:32
+   |
+26 | use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+   |                                ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:603:13
+    |
+603 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reader`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:3073:5
+     |
+3073 |     reader: &IndexReader,
+     |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_reader`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `combinations`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:6736:17
+     |
+6736 |             let combinations = range_plan.combinations as usize;
+     |                 ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_combinations`
+
+warning: variable does not need to be mutable
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:11161:9
+      |
+11161 |     let mut chain = group_proof.chain;
+      |         ----^^^^^
+      |         |
+      |         help: remove this `mut`
+
+warning: unused variable: `plan`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:12715:5
+      |
+12715 |     plan: &KeyFirstPlan,
+      |     ^^^^ help: if this is intentional, prefix it with an underscore: `_plan`
+
+warning: unused variable: `bits_columns`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:21970:9
+      |
+21970 |     let bits_columns = planes
+      |         ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_bits_columns`
+
+warning: unused variable: `first`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:23510:5
+      |
+23510 |     first: &HiddenSendMessages,
+      |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_first`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:24316:9
+      |
+24316 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:24416:9
+      |
+24416 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: unused variable: `n`
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:218:9
+    |
+218 |     let n = word_n(word)?;
+    |         ^ help: if this is intentional, prefix it with an underscore: `_n`
+
+warning: value assigned to `serves_folded` is never read
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:2295:29
+     |
+2295 |     let mut serves_folded = false;
+     |                             ^^^^^ this value is reassigned later and never used
+...
+2334 |         serves_folded = folded_step.1;
+     |         ----------------------------- `serves_folded` is overwritten here before the previous value is read
+     |
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `serves_omega` is never read
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:2296:28
+     |
+2296 |     let mut serves_omega = false;
+     |                            ^^^^^ this value is reassigned later and never used
+...
+2335 |         serves_omega = omega_step.map_or(false, |step| step.1);
+     |         ------------------------------------------------------ `serves_omega` is overwritten here before the previous value is read
+
+warning: value assigned to `serves_own` is never read
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:2297:26
+     |
+2297 |     let mut serves_own = false;
+     |                          ^^^^^ this value is reassigned later and never used
+...
+2336 |         serves_own = own_step.1;
+     |         ----------------------- `serves_own` is overwritten here before the previous value is read
+
+warning: type `KeyFirstMessages` is more private than the item `encode_key_proof`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:12854:1
+      |
+12854 | / pub fn encode_key_proof(
+12855 | |     plan: &KeyFirstPlan,
+12856 | |     first: &KeyFirstMessages,
+12857 | |     shared: &HiddenSharedMessages,
+12858 | |     second: &KeySecondMessages,
+12859 | | ) -> Result<Vec<u8>> {
+      | |____________________^ function `encode_key_proof` is reachable at visibility `pub`
+      |
+note: but type `KeyFirstMessages` is only usable at visibility `pub(crate)`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:10886:1
+      |
+10886 | pub(crate) struct KeyFirstMessages {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `KeySecondMessages` is more private than the item `encode_key_proof`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:12854:1
+      |
+12854 | / pub fn encode_key_proof(
+12855 | |     plan: &KeyFirstPlan,
+12856 | |     first: &KeyFirstMessages,
+12857 | |     shared: &HiddenSharedMessages,
+12858 | |     second: &KeySecondMessages,
+12859 | | ) -> Result<Vec<u8>> {
+      | |____________________^ function `encode_key_proof` is reachable at visibility `pub`
+      |
+note: but type `KeySecondMessages` is only usable at visibility `pub(crate)`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:12064:1
+      |
+12064 | pub(crate) struct KeySecondMessages {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ProximityProof` is more private than the item `table_key_group_prove`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:13764:1
+      |
+13764 | / pub(crate) fn table_key_group_prove(
+13765 | |     chain: Chain,
+13766 | |     group: &TableKeyGroup<'_>,
+13767 | |     trees: Vec<(u64, Arc<RuntimeTree>)>,
+13768 | |     run_seed: Digest,
+13769 | | ) -> Result<ProximityProof> {
+      | |___________________________^ function `table_key_group_prove` is reachable at visibility `pub(crate)`
+      |
+note: but type `ProximityProof` is only usable at visibility `pub(self)`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:9992:1
+      |
+ 9992 | struct ProximityProof {
+      | ^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ProximityVerification` is more private than the item `table_key_group_verify`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:13795:1
+      |
+13795 | / pub(crate) fn table_key_group_verify(
+13796 | |     chain: Chain,
+13797 | |     group: &TableKeyGroup<'_>,
+13798 | |     messages: &ProximityMessages,
+13799 | | ) -> Result<ProximityVerification> {
+      | |__________________________________^ function `table_key_group_verify` is reachable at visibility `pub(crate)`
+      |
+note: but type `ProximityVerification` is only usable at visibility `pub(self)`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:9951:1
+      |
+ 9951 | struct ProximityVerification {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:201:5
+    |
+195 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+201 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `stack_hiding` is never read
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:7456:5
+     |
+7454 | struct SegmentSlotLayout {
+     |        ----------------- field in this struct
+7455 |     token_hiding: usize,
+7456 |     stack_hiding: usize,
+     |     ^^^^^^^^^^^^
+
+warning: fields `lookup`, `member`, and `eval_row` are never read
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:10906:9
+      |
+10903 | pub(crate) struct KeyFirstWitness {
+      |                   --------------- fields in this struct
+...
+10906 |     pub lookup: KeyLookupProof,
+      |         ^^^^^^
+...
+10912 |     pub member: crate::proof::hidden_member::PendingRow,
+      |         ^^^^^^
+10913 |     pub eval_row: BatRow,
+      |         ^^^^^^^^
+
+warning: fields `samples` and `index_answer` are never read
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:10956:9
+      |
+10952 | pub(crate) struct KeyFirstVerified {
+      |                   ---------------- fields in this struct
+...
+10956 |     pub samples: [KeySample; 2],
+      |         ^^^^^^^
+...
+10959 |     pub index_answer: Fp3,
+      |         ^^^^^^^^^^^^
+
+warning: fields `omega`, `gu_seeds`, `gu_answers`, `claims`, and `base` are never read
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:11892:9
+      |
+11886 | pub(crate) struct KeySharedVerified {
+      |                   ----------------- fields in this struct
+...
+11892 |     pub omega: OmegaShapePlan,
+      |         ^^^^^
+11893 |     pub gu_root: Digest,
+11894 |     pub gu_seeds: Vec<zkie_engine::pcs::request::table::SampleSeed>,
+      |         ^^^^^^^^
+11895 |     pub gu_answers: Vec<Fp3>,
+      |         ^^^^^^^^^^
+...
+11901 |     pub claims: Vec<GuRelationRow>,
+      |         ^^^^^^
+11902 |     pub base: ProximityBaseOutcome,
+      |         ^^^^
+      |
+      = note: `KeySharedVerified` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: fields `w_seeds`, `w_answers`, `claims`, and `base` are never read
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:12078:9
+      |
+12076 | pub(crate) struct KeySecondVerified {
+      |                   ----------------- fields in this struct
+12077 |     pub seal: Digest,
+12078 |     pub w_seeds: Vec<SampleSeed>,
+      |         ^^^^^^^
+12079 |     pub w_answers: Vec<Fp3>,
+      |         ^^^^^^^^^
+12080 |     pub claims: Vec<GuRelationRow>,
+      |         ^^^^^^
+12081 |     pub base: ProximityBaseOutcome,
+      |         ^^^^
+      |
+      = note: `KeySecondVerified` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `derive_key_group_plan` is never used
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:13502:15
+      |
+13502 | pub(crate) fn derive_key_group_plan(
+      |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `m` is never read
+  --> crates/zkie-ops/src/proof/proximity_planner.rs:57:5
+   |
+52 | struct Proximity {
+   |        --------- field in this struct
+...
+57 |     m: u64,
+   |     ^
+   |
+   = note: `Proximity` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `batched_rows` is never used
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:2859:4
+     |
+2859 | fn batched_rows(word: &Word) -> u64 {
+     |    ^^^^^^^^^^^^
+
+warning: `zkie-ops` (lib) generated 29 warnings (run `cargo fix --lib -p zkie-ops` to apply 12 suggestions)
+warning: unused import: `zkie_engine::pcs::request::field::E_DEGREE`
+  --> models/gpt2/src/lm_head_plan.rs:11:5
+   |
+11 | use zkie_engine::pcs::request::field::E_DEGREE;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `CodeParams`
+  --> models/gpt2/src/plan.rs:10:56
+   |
+10 | use zkie_engine::pcs::request::code::{build_code_plan, CodeParams};
+   |                                                        ^^^^^^^^^^
+
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:405:21
+    |
+405 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `m`
+   --> models/gemma3/src/executor.rs:309:5
+    |
+309 |     m: usize,
+    |     ^ help: if this is intentional, prefix it with an underscore: `_m`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_rot_step`
+   --> models/gemma3/src/executor.rs:443:21
+    |
+443 |         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
+    |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_rot_step`
+
+warning: `zkie-models-gpt2` (lib) generated 3 warnings (run `cargo fix --lib -p zkie-models-gpt2` to apply 3 suggestions)
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+warning: unused import: `digest_to_hex`
+  --> zkie/src/policy.rs:12:58
+   |
+12 | use zkie_core::artifact::{digest_bytes, digest_from_hex, digest_to_hex};
+   |                                                          ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `VecTableSource` and `commit_table_streaming`
+  --> zkie/src/lm_head_key.rs:58:5
+   |
+58 |     commit_table_streaming, verify_columns, ColumnOpening, IndexReader, IndexShape, SampleSeed,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+59 |     EncodedRowStore, StreamingHolder, TableRowSource, VecTableSource,
+   |                                                       ^^^^^^^^^^^^^^
+
+warning: unused import: `zkie_core::common::field::PrimeCharacteristicRing`
+  --> zkie/src/lm_head_key.rs:15:5
+   |
+15 | use zkie_core::common::field::PrimeCharacteristicRing;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> zkie/src/bounded_trace.rs:705:9
+    |
+705 |     let mut file = fs::File::open(path).map_err(|_| Error::IncompleteArtifact)?;
+    |         ----^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `mask_oracle`
+    --> zkie/src/lm_head_key.rs:3415:9
+     |
+3415 |     let mask_oracle = MaskOracle {
+     |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_oracle`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> zkie/src/lm_head_key.rs:4281:9
+     |
+4281 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ----^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: unused variable: `mask_tail`
+    --> zkie/src/lm_head_key.rs:4281:9
+     |
+4281 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_tail`
+
+warning: variable does not need to be mutable
+   --> zkie/src/lm_head_stage.rs:288:9
+    |
+288 |     let mut options = if private {
+    |         ----^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: field `tree` is never read
+    --> zkie/src/lm_head_key.rs:1534:5
+     |
+1530 | pub struct LmHeadOmegaProvider {
+     |            ------------------- field in this struct
+...
+1534 |     tree: RuntimeTreePlan,
+     |     ^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie` (lib) generated 9 warnings (run `cargo fix --lib -p zkie` to apply 7 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running tests/key_plan_registration.rs (target/release/deps/key_plan_registration-15d3c0a12704dee9)
+
+running 2 tests
+key-plan summary: KeyPlanSummary { plan_digest: Digest([252, 138, 15, 95, 208, 50, 128, 66, 116, 112, 30, 209, 146, 81, 85, 140, 237, 55, 120, 237, 195, 229, 97, 192, 225, 143, 223, 79, 196, 13, 67, 183]), table_identity: Digest([117, 98, 239, 161, 191, 189, 47, 237, 159, 169, 55, 50, 105, 204, 63, 180, 125, 71, 82, 255, 175, 118, 132, 4, 184, 131, 40, 47, 170, 25, 18, 97]), table_configuration: Digest([148, 221, 1, 119, 181, 160, 141, 62, 50, 138, 81, 34, 42, 74, 181, 174, 231, 214, 169, 130, 185, 25, 100, 176, 114, 238, 167, 231, 90, 224, 233, 37]), matrix_rows: 1024, k_lo: 0, columns: 1024, shared_code: CodeParams { log_n: 18, ell: 16384, r: 130 }, shared_mask_code: CodeParams { log_n: 18, ell: 256, r: 66 }, own_code: CodeParams { log_n: 18, ell: 16384, r: 130 }, own_mask_code: CodeParams { log_n: 18, ell: 256, r: 66 }, shared_stages: 3, own_stages: 3, shared_base_positions: 66, own_base_positions: 53, index_rows: 1, lookup_bits_oracle: 21, lookup_mask_oracle: 22, w_oracle: 20, index_oracle: 60, group: 7, bits_bat: 0, mask_bat: 1, index_bat: 2, group_fresh: 3, group_mask_tree: 204, shared_fresh: 2, shared_mask_tree: 200, own_fresh: 8, own_mask_tree: 201, gu_oracle: 10, omega_oracle: 11, column_draws: 52, column_budget: 52 }
+test the_key_plan_derives_from_the_public_configuration ... ok
+key-plan instance: root=Digest([90, 124, 211, 27, 242, 191, 232, 47, 165, 107, 72, 213, 56, 204, 102, 202, 195, 247, 9, 30, 133, 0, 73, 103, 51, 13, 175, 235, 31, 120, 57, 228]) record_len=1024 identity=Digest([117, 98, 239, 161, 191, 189, 47, 237, 159, 169, 55, 50, 105, 204, 63, 180, 125, 71, 82, 255, 175, 118, 132, 4, 184, 131, 40, 47, 170, 25, 18, 97]) reader_identity=Digest([165, 209, 48, 134, 3, 56, 59, 40, 19, 176, 239, 88, 104, 196, 123, 187, 180, 0, 169, 102, 230, 1, 7, 232, 148, 192, 207, 254, 0, 164, 227, 175]) configuration=Digest([148, 221, 1, 119, 181, 160, 141, 62, 50, 138, 81, 34, 42, 74, 181, 174, 231, 214, 169, 130, 185, 25, 100, 176, 114, 238, 167, 231, 90, 224, 233, 37]) plan=Digest([147, 145, 31, 81, 32, 101, 3, 172, 253, 74, 167, 236, 22, 11, 144, 77, 54, 72, 189, 104, 26, 163, 148, 69, 215, 254, 109, 64, 31, 32, 212, 185])
+old instance root=Digest([64, 76, 202, 130, 41, 46, 184, 197, 248, 178, 24, 155, 139, 108, 1, 111, 216, 15, 217, 57, 91, 224, 22, 79, 85, 56, 117, 124, 81, 177, 132, 74]) differs from the candidate root=Digest([90, 124, 211, 27, 242, 191, 232, 47, 165, 107, 72, 213, 56, 204, 102, 202, 195, 247, 9, 30, 133, 0, 73, 103, 51, 13, 175, 235, 31, 120, 57, 228])
+test the_registered_candidate_instance_matches_the_plan ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+
