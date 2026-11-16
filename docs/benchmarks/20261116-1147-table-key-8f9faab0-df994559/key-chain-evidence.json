@@ -1,0 +1,80 @@
+{
+  "bundle": {
+    "bytes": 4551488,
+    "path": "/data/zkIE/docs/benchmarks/20261116-1147-table-key-8f9faab0-df994559/key-proof.bin",
+    "sha256": "b3e218e987f7d5a959147a16a2245930ff374b404dd56fe127100082713cf846"
+  },
+  "first_bytes": 3553072,
+  "ledger_after": 52,
+  "ledger_before": 0,
+  "plan_digest": "905503176b0eaf81158d51f2d67fda428282490a045ff4a7e79fb281c41f6c3a",
+  "proof_bytes": 4551488,
+  "prove_ms": 190938,
+  "read_ledger_spent": true,
+  "record_len": 1024,
+  "second_bytes": 285072,
+  "seed_source": "operating system generator (private)",
+  "shared_bytes": 713312,
+  "summary": {
+    "bits_bat": 0,
+    "column_budget": 52,
+    "column_draws": 52,
+    "columns": 1024,
+    "group": 7,
+    "group_fresh": 3,
+    "group_mask_tree": 204,
+    "gu_oracle": 10,
+    "index_bat": 2,
+    "index_oracle": 60,
+    "index_rows": 1,
+    "k_lo": 0,
+    "lookup_bits_oracle": 21,
+    "lookup_mask_oracle": 22,
+    "mask_bat": 1,
+    "matrix_rows": 1024,
+    "omega_oracle": 11,
+    "own_base_positions": 53,
+    "own_code": {
+      "ell": 16384,
+      "log_n": 18,
+      "r": 130
+    },
+    "own_fresh": 8,
+    "own_mask_code": {
+      "ell": 256,
+      "log_n": 18,
+      "r": 66
+    },
+    "own_mask_tree": 201,
+    "own_stages": 3,
+    "plan_digest": "905503176b0eaf81158d51f2d67fda428282490a045ff4a7e79fb281c41f6c3a",
+    "shared_base_positions": 66,
+    "shared_code": {
+      "ell": 16384,
+      "log_n": 18,
+      "r": 130
+    },
+    "shared_fresh": 2,
+    "shared_mask_code": {
+      "ell": 256,
+      "log_n": 18,
+      "r": 66
+    },
+    "shared_mask_tree": 200,
+    "shared_stages": 3,
+    "table_configuration": "9017dd1ac95292612255381f60c3400bce1674425e043cb70aab915e9df524df",
+    "table_identity": "8aebae8851bbfcf37aa8e969db4351f24ffd0a994674456fabd996b28dd40048",
+    "w_oracle": 20
+  },
+  "table_configuration": "9017dd1ac95292612255381f60c3400bce1674425e043cb70aab915e9df524df",
+  "table_identity": "8aebae8851bbfcf37aa8e969db4351f24ffd0a994674456fabd996b28dd40048",
+  "table_root": "404cca82292eb8c5f8b2189b8b6c016fd80fd9395be0164f5538757c51b1844a",
+  "verify_hwm_delta_kib": 0,
+  "verify_ms": 58632,
+  "verify_rss_delta_kib": 0,
+  "verify_vmhwm_after_kib": 35431832,
+  "verify_vmhwm_before_kib": 35431832,
+  "verify_vmrss_after_kib": 16832672,
+  "verify_vmrss_before_kib": 16948916,
+  "vmhwm_process_kib": 35431832
+}
