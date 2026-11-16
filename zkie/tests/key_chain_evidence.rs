@@ -190,7 +190,11 @@ fn the_complete_key_chain_over_the_registered_instance() {
     let lookup_table = IntegerRangeTable::new(&range_plan, 1 << 20).unwrap();
 
     let plan = production_key_first_plan(&KeyPlanInputs {
-        table_identity: derived.table_identity,
+        // The plan binds the registered instance's reader identity: its
+        // committed root, record, configuration and shape. The model-level
+        // table identity is a separate public fact and does not include the
+        // instance root.
+        table_identity: reader_table_identity(&reader).unwrap(),
         table_configuration: derived.table_configuration,
         table_shape: derived.table_shape,
         matrix_rows: meta.shape.rows(),

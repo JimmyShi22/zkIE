@@ -63,8 +63,7 @@ fn the_registered_candidate_instance_matches_the_plan() {
         return;
     };
     let instance = Path::new(&instance);
-    let (derived, plan) = planned_table();
-    let summary = plan.summary();
+    let derived = derive_table_plan(&TABLE_PLAN_CANDIDATE).unwrap();
     let metas: Vec<AssetTableMeta> = bincode::deserialize(
         &fs::read(instance.join("commit/public/asset-tables.bin")).unwrap(),
     )
@@ -84,14 +83,40 @@ fn the_registered_candidate_instance_matches_the_plan() {
     assert_eq!(meta.identity, derived.table_identity);
     assert_eq!(meta.configuration, derived.table_configuration);
     assert_eq!(meta.shape, derived.table_shape);
-    assert_eq!(meta.identity, summary.table_identity);
+    // The plan binds the registered instance's reader identity, which covers
+    // the committed root and record beside the configuration and shape.
+    let reader = zkie_engine::pcs::request::table::IndexReader {
+        shape: meta.shape,
+        configuration: meta.configuration,
+        root: meta.root,
+        record: meta.record.clone(),
+    };
+    let reader_identity =
+        zkie_engine::pcs::request::foldeq::reader_table_identity(&reader).unwrap();
+    let matrix_rows = derived.table_shape.rows();
+    let k_lo = TABLE_PLAN_CANDIDATE.k_lo;
+    let plan = production_key_first_plan(&KeyPlanInputs {
+        table_identity: reader_identity,
+        table_configuration: derived.table_configuration,
+        table_shape: derived.table_shape,
+        matrix_rows,
+        k_lo,
+        columns: matrix_rows << k_lo,
+        total_columns: derived.total_columns,
+        lin_check: derived.lin_check,
+        range: production_table_range().unwrap(),
+    })
+    .unwrap();
+    let summary = plan.summary();
+    assert_eq!(summary.table_identity, reader_identity);
     assert_eq!(meta.configuration, summary.table_configuration);
     assert_ne!(meta.root, zkie_core::types::Digest::ZERO);
     eprintln!(
-        "key-plan instance: root={:?} record_len={} identity={:?} configuration={:?} plan={:?}",
+        "key-plan instance: root={:?} record_len={} identity={:?} reader_identity={:?} configuration={:?} plan={:?}",
         meta.root,
         meta.record.y.len(),
         meta.identity,
+        reader_identity,
         meta.configuration,
         summary.plan_digest
     );
