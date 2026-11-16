@@ -16409,8 +16409,8 @@ fn hidden_shared_stage(plan: &HiddenLinPlan) -> SharedStagePlan<'_> {
     }
 }
 
-struct SharedProveResult {
-    messages: HiddenSharedMessages,
+pub(crate) struct SharedProveResult {
+    pub(crate) messages: HiddenSharedMessages,
     witness: SharedWitness,
     points: SharedPoints,
 }
@@ -16426,8 +16426,8 @@ pub(crate) struct SharedWitness {
 }
 
 pub(crate) struct SharedPoints {
-    psi: Vec<Fp3>,
-    zeta: Vec<Fp3>,
+    pub(crate) psi: Vec<Fp3>,
+    pub(crate) zeta: Vec<Fp3>,
 }
 
 fn shared_start_chain(
@@ -16487,7 +16487,7 @@ pub(crate) fn shared_start_chain_from_binding(
 
 /// The inputs of the parameter claim members that join the shared proximity
 /// group. The prover also supplies the committed folded message material.
-struct NormParamClaimInput {
+pub(crate) struct NormParamClaimInput {
     identity: NormParamTableIdentity,
     claim: NormParamClaimPlan,
     message: NormParamClaimMessage,
@@ -16604,7 +16604,7 @@ fn prove_shared(
 /// path from the verified binding root. The Gu and Omega messages are built
 /// from the table row source with this run's private coins.
 #[allow(clippy::too_many_arguments)]
-fn prove_shared_public(
+pub(crate) fn prove_shared_public(
     stage: &SharedStagePlan<'_>,
     reader: &IndexReader,
     mut chain: Chain,
@@ -17128,7 +17128,7 @@ fn verify_shared(
 /// Verifier kernel of the shared stage over its public parameters. The chain is
 /// started by the caller; the record and column claims are rebuilt from the
 /// trusted reader and the proof messages, never from prover-reported values.
-fn verify_shared_public(
+pub(crate) fn verify_shared_public(
     stage: &SharedStagePlan<'_>,
     reader: &IndexReader,
     mut chain: Chain,

@@ -117,6 +117,250 @@ pub fn consumer_shared_charge(
     )
 }
 
+// ---------------------------------------------------------------------------
+// The shared stage: binding-root start, Gu/Omega/opening/proximity
+// ---------------------------------------------------------------------------
+
+use zkie_core::types::Digest;
+use zkie_engine::pcs::request::code::CodeParams;
+use zkie_engine::pcs::request::foldeq::{reader_table_identity, OmegaShapePlan};
+use zkie_engine::pcs::request::gu::GuShape;
+use zkie_engine::pcs::request::runtime_tree::MaskTreePlan;
+use zkie_engine::pcs::request::table::{IndexReader, IndexShape};
+
+use crate::proof::hidden_send_session::{
+    prove_shared_public, shared_start_chain_from_binding, verify_shared_public,
+    HiddenSharedMessages, ProximityBaseOutcome, SharedStagePlan,
+};
+use crate::proof::lin_binding::LinBindingRoot;
+
+/// The trusted public geometry of one consumer shared stage. Every field is
+/// plan data: the folded table message and the `Omega` message share one code,
+/// the mask tree hides the fresh mask, and the table row reader is the same
+/// table the consumer request names. Nothing here comes from a proof message.
+#[derive(Clone, Debug)]
+pub struct ConsumerSharedGeometry {
+    pub binding_root: LinBindingRoot,
+    pub table_identity: Digest,
+    pub table_configuration: Digest,
+    pub table_shape: IndexShape,
+    pub matrix_rows: u64,
+    pub k_lo: u32,
+    pub columns: u64,
+    pub code: CodeParams,
+    pub mask_code: CodeParams,
+    pub mask_tree: MaskTreePlan,
+    pub fresh: u64,
+    pub base_positions: usize,
+    pub gu: GuShape,
+    pub omega: OmegaShapePlan,
+    pub column_work_bits: u8,
+    /// The digest the shared chain starts from: fixed statement data.
+    pub parameters: Digest,
+    /// The fixed statement bytes mixed into the chain's first round.
+    pub statement: Vec<u8>,
+    /// The reader's public name record, mixed into the chain's first round.
+    pub record: Vec<u8>,
+}
+
+impl ConsumerSharedGeometry {
+    pub fn fault(&self) -> Option<&'static str> {
+        if self.parameters == Digest::ZERO
+            || self.table_identity == Digest::ZERO
+            || self.table_configuration == Digest::ZERO
+            || self.binding_root.fault().is_some()
+            || self.columns == 0
+            || !self.columns.is_power_of_two()
+            || self.k_lo.checked_add(self.table_shape.v) != Some(self.columns.trailing_zeros())
+        {
+            return Some("the consumer shared geometry is not settled");
+        }
+        if self.gu.fault().is_some()
+            || zkie_engine::pcs::request::relation::gu_layout_fault(&self.gu).is_some()
+            || self.omega.fault().is_some()
+            || self.mask_tree.fault().is_some()
+        {
+            return Some("a consumer shared shape is not a group");
+        }
+        if self.gu.index != self.table_shape
+            || self.gu.u.code != self.code
+            || self.omega.u.code != self.code
+            || self.gu.u.answers != 1
+            || self.omega.u.answers != 1
+            || self.gu.u.mask_rows != 0
+            || self.omega.u.mask_rows != 0
+            || !self.gu.u.main_rows.is_power_of_two()
+            || !self.omega.u.main_rows.is_power_of_two()
+            || self.gu.group != self.omega.group
+            || self.omega.matrix_rows != self.matrix_rows
+            || self.omega.k_lo != self.k_lo
+        {
+            return Some("the consumer shared members do not join one group");
+        }
+        if self.mask_code.log_n != self.code.log_n
+            || self.mask_tree.log_n != self.mask_code.log_n
+            || self.fresh == 0
+            || self.base_positions == 0
+            || self.base_positions as u64 > self.code.r
+            || self.base_positions as u64 > self.mask_code.r
+        {
+            return Some("the consumer shared mask or BASE is not settled");
+        }
+        let mut trees = vec![
+            self.gu.tree.tree_number,
+            self.omega.tree.tree_number,
+            self.mask_tree.tree_number,
+        ];
+        let count = trees.len();
+        trees.sort_unstable();
+        trees.dedup();
+        if trees.len() != count || self.gu.oracle == self.omega.oracle {
+            return Some("a consumer shared identifier is not distinct");
+        }
+        None
+    }
+
+    pub fn check(&self) -> Result<()> {
+        self.fault().map_or(Ok(()), |_| Err(Error::InvalidConfig))
+    }
+
+    fn stage<'a>(&'a self, stage: &'a ConsumerSharedStage) -> SharedStagePlan<'a> {
+        SharedStagePlan {
+            gu: self.gu.clone(),
+            omega: self.omega.clone(),
+            code: self.code,
+            mask_code: self.mask_code,
+            mask_tree: self.mask_tree.clone(),
+            fresh: self.fresh,
+            base_positions: self.base_positions,
+            column_draws: stage.columns.column_draws,
+            column_budget: stage.columns.column_budget,
+            column_work_bits: self.column_work_bits,
+            ledger: &stage.ledger,
+            k_lo: self.k_lo,
+            matrix_rows: self.matrix_rows,
+            columns: self.columns,
+            table_v: self.table_shape.v,
+        }
+    }
+
+    fn check_reader(&self, reader: &IndexReader, table: &dyn HiddenTableProver) -> Result<()> {
+        if reader.shape != self.table_shape
+            || reader.configuration != self.table_configuration
+            || table.reader().root != reader.root
+            || reader_table_identity(reader)? != self.table_identity
+        {
+            return Err(Error::StatementMismatch);
+        }
+        Ok(())
+    }
+}
+
+/// The prover's shared stage messages: the Gu and Omega roots, seeds and
+/// answers, the drawn table columns and the proximity transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumerSharedProof {
+    pub messages: HiddenSharedMessages,
+}
+
+/// The verifier's state after the shared stage: the shared seal and the
+/// points, relation claims and BASE outcome the second stage consumes.
+#[derive(Clone, Debug)]
+pub struct ConsumerSharedVerified {
+    pub seal: Digest,
+    pub gu_root: Digest,
+    pub gu_seeds: Vec<zkie_engine::pcs::request::table::SampleSeed>,
+    pub gu_answers: Vec<zkie_engine::pcs::request::field::Fp3>,
+    pub omega_root: Digest,
+    pub omega_seeds: Vec<zkie_engine::pcs::request::table::SampleSeed>,
+    pub omega_answers: Vec<zkie_engine::pcs::request::field::Fp3>,
+    pub psi: Vec<zkie_engine::pcs::request::field::Fp3>,
+    pub zeta: Vec<zkie_engine::pcs::request::field::Fp3>,
+    pub claims: Vec<zkie_engine::pcs::request::relation::GuRelationRow>,
+    pub base: ProximityBaseOutcome,
+}
+
+/// Prover side of the consumer shared stage over the caller's binding root.
+/// The chain starts from the verified binding object, the table keeper owns
+/// the rows and columns, and the run charges the same fixed batch it draws.
+pub fn prove_consumer_shared(
+    geometry: &ConsumerSharedGeometry,
+    stage: &ConsumerSharedStage,
+    reader: &IndexReader,
+    table: &mut dyn HiddenTableProver,
+    seed: Digest,
+    charge: &HidingCharge,
+) -> Result<ConsumerSharedProof> {
+    geometry.check()?;
+    stage.check()?;
+    geometry.check_reader(reader, table)?;
+    if seed == Digest::ZERO {
+        return Err(Error::InvalidConfig);
+    }
+    if charge.columns() != stage.columns.column_draws || charge.table() != reader.root {
+        return Err(Error::StatementMismatch);
+    }
+    let chain = shared_start_chain_from_binding(
+        &geometry.parameters,
+        &geometry.statement,
+        geometry.table_shape.v as u64,
+        geometry.k_lo,
+        &geometry.record,
+        &geometry.binding_root,
+    )?;
+    let stage_plan = geometry.stage(stage);
+    let result = prove_shared_public(&stage_plan, reader, chain, table, &[], None, &seed, charge)?;
+    Ok(ConsumerSharedProof {
+        messages: result.messages,
+    })
+}
+
+/// Verifier side of the consumer shared stage. It starts from the same
+/// binding root, checks the shared proof and returns the shared seal with the
+/// points and claims the second stage consumes.
+pub fn verify_consumer_shared(
+    geometry: &ConsumerSharedGeometry,
+    stage: &ConsumerSharedStage,
+    reader: &IndexReader,
+    messages: &HiddenSharedMessages,
+) -> Result<ConsumerSharedVerified> {
+    geometry.check()?;
+    stage.check()?;
+    if reader.shape != geometry.table_shape
+        || reader.configuration != geometry.table_configuration
+        || reader_table_identity(reader)? != geometry.table_identity
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let chain = shared_start_chain_from_binding(
+        &geometry.parameters,
+        &geometry.statement,
+        geometry.table_shape.v as u64,
+        geometry.k_lo,
+        &geometry.record,
+        &geometry.binding_root,
+    )?;
+    let stage_plan = geometry.stage(stage);
+    let (seal, claims, points, base) =
+        verify_shared_public(&stage_plan, reader, chain, &[], None, messages)?;
+    if seal != messages.seal {
+        return Err(Error::InvalidProof);
+    }
+    Ok(ConsumerSharedVerified {
+        seal,
+        gu_root: messages.gu_root,
+        gu_seeds: messages.gu_seeds.clone(),
+        gu_answers: messages.gu_answers.clone(),
+        omega_root: messages.omega_root,
+        omega_seeds: messages.omega_seeds.clone(),
+        omega_answers: messages.omega_answers.clone(),
+        psi: points.psi,
+        zeta: points.zeta,
+        claims,
+        base,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +430,280 @@ mod tests {
         assert_eq!(again.count().unwrap(), 4);
         assert!(again.reserve().is_err());
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ------------------------------------------------------------------
+    // The shared stage over a committed table
+    // ------------------------------------------------------------------
+
+    use std::cell::RefCell;
+
+    use zkie_core::common::field::PrimeCharacteristicRing;
+    use zkie_core::types::Digest;
+    use zkie_engine::pcs::request::code::{build_code_plan, CodeParams};
+    use zkie_engine::pcs::request::field::{fp_from_u64, Fp, Fp3, E_DEGREE};
+    use zkie_engine::pcs::request::foldeq::{reader_table_identity, OmegaShapePlan};
+    use zkie_engine::pcs::request::gu::{GuOracleShape, GuShape};
+    use zkie_engine::pcs::request::read::HidingState;
+    use zkie_engine::pcs::request::runtime_tree::{MaskTreePlan, RuntimeTreePart, RuntimeTreePlan};
+    use zkie_engine::pcs::request::table::{
+        commit_table_streaming, IndexReader, IndexShape, StreamingTable, TableDistances,
+        TableRowSource, VecTableSource,
+    };
+
+    use crate::proof::hidden_send_session::HiddenTableProver;
+    use crate::proof::lin_binding::LinBindingRoot;
+
+    const TABLE_CONFIGURATION: Digest = Digest([0x21; 32]);
+
+    fn code() -> CodeParams {
+        build_code_plan(4, 8, 1).unwrap()
+    }
+
+    fn table_shape() -> IndexShape {
+        IndexShape {
+            code: code(),
+            v: 2,
+            answers: 1,
+            salt_bytes: 40,
+            distances: TableDistances {
+                radius: 0,
+                later_radius: 0,
+                m_once: 0,
+                m_later: 0,
+            },
+        }
+    }
+
+    fn shared_plan() -> ConsumerSharedPlan {
+        ConsumerSharedPlan {
+            m_once: 8,
+            m_later: 8,
+            one_time_columns: 1,
+            later_columns: 1,
+            declared_batches: 1,
+            table_tail: 4,
+        }
+    }
+
+    struct Keeper {
+        table: StreamingTable,
+        source: RefCell<VecTableSource>,
+        reader: IndexReader,
+        hiding: HidingState,
+        budget: Option<DurableColumnBudget>,
+    }
+
+    impl TableRowSource for Keeper {
+        fn rows(&self) -> u64 {
+            self.source.borrow().rows()
+        }
+
+        fn row(&mut self, index: u64, message: &mut [Fp], tail: &mut [Fp]) -> Result<()> {
+            self.source.borrow_mut().row(index, message, tail)
+        }
+    }
+
+    impl HiddenTableProver for Keeper {
+        fn reader(&self) -> &IndexReader {
+            &self.reader
+        }
+
+        fn open_columns(
+            &mut self,
+            positions: &[u64],
+        ) -> Result<Vec<zkie_engine::pcs::request::table::ColumnOpening>> {
+            let mut source = self.source.borrow_mut();
+            self.table.open_columns(&mut *source, positions)
+        }
+
+        fn hiding_state(&mut self) -> Option<&mut HidingState> {
+            Some(&mut self.hiding)
+        }
+
+        fn durable_column_budget(&mut self) -> Option<&mut DurableColumnBudget> {
+            self.budget.as_mut()
+        }
+    }
+
+    fn keeper() -> (IndexReader, Keeper) {
+        let shape = table_shape();
+        let mut message_rows = vec![vec![Fp::ZERO; 8]; 4];
+        for row in 0..4 {
+            for column in 0..4 {
+                message_rows[column][row] = crate::proof::column_session::fp_from_signed_word(
+                    (row as i64 * 4 + column as i64 - 8) as u64,
+                );
+            }
+        }
+        let tails = vec![vec![Fp::ZERO; 1]; 4];
+        let mut source = VecTableSource::new(message_rows, tails).unwrap();
+        let salts: Vec<Vec<u8>> = (0..shape.code.n())
+            .map(|position| vec![(position as u8) ^ 0x5A; 40])
+            .collect();
+        let table = commit_table_streaming(
+            &mut source,
+            shape,
+            TABLE_CONFIGURATION,
+            &salts,
+            64,
+            u64::MAX,
+        )
+        .unwrap();
+        let reader = table.reader.clone();
+        let keeper = Keeper {
+            table,
+            source: RefCell::new(source),
+            hiding: HidingState::new(reader.root, 1, reader.shape.code.r as u64),
+            reader: reader.clone(),
+            budget: None,
+        };
+        (reader, keeper)
+    }
+
+    fn geometry(reader: &IndexReader) -> ConsumerSharedGeometry {
+        let c = code();
+        let tree =
+            |tree_number: u64, main_symbols: u64, run: u8, configuration: u8| RuntimeTreePlan {
+                tree_number,
+                leaf_class: 2,
+                log_n: c.log_n,
+                log_n_zk: c.log_n,
+                parts: vec![RuntimeTreePart {
+                    main_symbols,
+                    mask_symbols: 0,
+                }],
+                salt_bytes: 40,
+                run: Digest([run; 32]),
+                configuration: Digest([configuration; 32]),
+            };
+        let oracle = |main_rows: u64| GuOracleShape {
+            code: c,
+            main_rows,
+            main_deg: E_DEGREE as u32,
+            mask_rows: 0,
+            mask_code: None,
+            answers: 1,
+        };
+        ConsumerSharedGeometry {
+            binding_root: LinBindingRoot {
+                digest: Digest([0x91; 32]),
+                places: 1,
+            },
+            table_identity: reader_table_identity(reader).unwrap(),
+            table_configuration: TABLE_CONFIGURATION,
+            table_shape: table_shape(),
+            matrix_rows: 4,
+            k_lo: 0,
+            columns: 4,
+            code: c,
+            mask_code: c,
+            mask_tree: MaskTreePlan {
+                tree_number: 402,
+                leaf_class: 4,
+                log_n: c.log_n,
+                mask_rows: 1,
+                salt_bytes: 40,
+                run: Digest([0x77; 32]),
+                configuration: Digest([0x78; 32]),
+            },
+            fresh: 96,
+            base_positions: 1,
+            gu: GuShape {
+                oracle: 300,
+                group: 8,
+                tree: tree(400, 2 * E_DEGREE as u64, 0x73, 0x74),
+                part: 0,
+                rows_high: true,
+                u: oracle(2),
+                index: table_shape(),
+            },
+            omega: OmegaShapePlan {
+                oracle: 301,
+                group: 8,
+                tree: tree(401, E_DEGREE as u64, 0x75, 0x76),
+                u: oracle(1),
+                rows_high: true,
+                matrix_rows: 4,
+                k_lo: 0,
+            },
+            column_work_bits: 0,
+            parameters: Digest([0x81; 32]),
+            statement: b"consumer shared".to_vec(),
+            record: reader.name(),
+        }
+    }
+
+    #[test]
+    fn the_shared_stage_proves_and_verifies_from_the_binding_root() {
+        let (reader, mut keeper) = keeper();
+        let geom = geometry(&reader);
+        let stage = ConsumerSharedStage::new(&shared_plan()).unwrap();
+        let charge = consumer_shared_charge(&stage, &mut keeper).unwrap();
+        assert_eq!(charge.columns(), 1);
+        assert_eq!(charge.table(), reader.root);
+        let seed = Digest([7; 32]);
+        let proof =
+            prove_consumer_shared(&geom, &stage, &reader, &mut keeper, seed, &charge).unwrap();
+        let check = ConsumerSharedStage::new(&shared_plan()).unwrap();
+        let verified = verify_consumer_shared(&geom, &check, &reader, &proof.messages).unwrap();
+        assert_eq!(verified.seal, proof.messages.seal);
+        assert_eq!(verified.gu_root, proof.messages.gu_root);
+        assert_eq!(verified.omega_root, proof.messages.omega_root);
+        assert!(!verified.psi.is_empty());
+        assert!(!verified.zeta.is_empty());
+        assert!(!verified.claims.is_empty());
+        // A changed Gu root, Omega root, column nonce or point is refused on a
+        // fresh ledger.
+        let check = |changed: &crate::proof::hidden_send_session::HiddenSharedMessages| {
+            let stage = ConsumerSharedStage::new(&shared_plan()).unwrap();
+            verify_consumer_shared(&geom, &stage, &reader, changed).is_err()
+        };
+        let mut changed = proof.messages.clone();
+        changed.gu_root = Digest([0x92; 32]);
+        assert!(check(&changed));
+        let mut changed = proof.messages.clone();
+        changed.omega_root = Digest([0x93; 32]);
+        assert!(check(&changed));
+        let mut changed = proof.messages.clone();
+        changed.column_nonce ^= 1;
+        assert!(check(&changed));
+        let mut changed = proof.messages;
+        changed.zeta[0] = changed.zeta[0].add(&Fp3::from_base(fp_from_u64(1)));
+        assert!(check(&changed));
+    }
+
+    #[test]
+    fn the_binding_root_starts_the_shared_chain() {
+        let (reader, mut keeper) = keeper();
+        let geom = geometry(&reader);
+        let stage = ConsumerSharedStage::new(&shared_plan()).unwrap();
+        let charge = consumer_shared_charge(&stage, &mut keeper).unwrap();
+        let proof = prove_consumer_shared(
+            &geom,
+            &stage,
+            &reader,
+            &mut keeper,
+            Digest([7; 32]),
+            &charge,
+        )
+        .unwrap();
+        // Another root, or another place count, starts another chain and the
+        // proof no longer verifies.
+        let mut other = geometry(&reader);
+        other.binding_root = LinBindingRoot {
+            digest: Digest([0x94; 32]),
+            places: 1,
+        };
+        let stage = ConsumerSharedStage::new(&shared_plan()).unwrap();
+        assert!(verify_consumer_shared(&other, &stage, &reader, &proof.messages).is_err());
+        let mut other = geometry(&reader);
+        other.binding_root.places = 2;
+        let stage = ConsumerSharedStage::new(&shared_plan()).unwrap();
+        assert!(verify_consumer_shared(&other, &stage, &reader, &proof.messages).is_err());
+        // The same root verifies.
+        let stage = ConsumerSharedStage::new(&shared_plan()).unwrap();
+        let verified = verify_consumer_shared(&geom, &stage, &reader, &proof.messages).unwrap();
+        assert_eq!(verified.seal, proof.messages.seal);
     }
 }
