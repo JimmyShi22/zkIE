@@ -20,9 +20,11 @@ use crate::proof::consumer_first::{
     verify_consumer_first, ConsumerFirstMessages, ConsumerFirstObligations, ConsumerFirstPlan,
 };
 use crate::proof::consumer_shared::{
-    verify_consumer_shared, ConsumerSharedGeometry, ConsumerSharedStage, ConsumerSharedVerified,
+    consumer_binding_root, verify_consumer_shared, ConsumerSharedGeometry, ConsumerSharedStage,
+    ConsumerSharedVerified,
 };
 use crate::proof::hidden_send_session::{HiddenSharedMessages, ProximityBaseOutcome};
+use crate::proof::lin_binding::LinBindingPath;
 use zkie_engine::pcs::request::table::IndexReader;
 
 /// Version of the second chain's parameter digest.
@@ -131,6 +133,7 @@ pub fn consumer_second_chain(
 #[derive(Clone, Debug)]
 pub struct ConsumerTotalAccepted {
     pub first_seal: Digest,
+    pub binding_root: crate::proof::lin_binding::LinBindingRoot,
     pub shared_seal: Digest,
     pub second_seal: Digest,
     pub eval_target: Fp3,
@@ -155,6 +158,7 @@ pub fn consumer_total_acceptance(
     shared_stage: &ConsumerSharedStage,
     reader: &IndexReader,
     shared: &HiddenSharedMessages,
+    binding_path: &LinBindingPath,
     own_plan: &ConsumerOwnPlan,
     own: &ConsumerOwnProof,
 ) -> Result<ConsumerTotalAccepted> {
@@ -169,8 +173,19 @@ pub fn consumer_total_acceptance(
     }
     // The first stage, including its own group, must verify.
     let obligations = verify_consumer_first(plan, activation, outputs, first)?;
+    // The shared chain starts from the root rebuilt from this request's own
+    // verified first seal and the proof's binding path.
+    let binding_root = consumer_binding_root(
+        &first.first_seal,
+        &geometry.binding_shape,
+        &geometry.binding_configuration,
+        binding_path,
+    )?;
     // The shared stage must verify against the same table reader.
-    let verified = verify_consumer_shared(geometry, shared_stage, reader, shared)?;
+    let verified = verify_consumer_shared(geometry, shared_stage, reader, shared, &binding_root)?;
+    if verified.binding_root != binding_root {
+        return Err(Error::InvalidProof);
+    }
     // The own plan must consume the same W and the same shared Omega.
     if own_plan.w_root != first.w_root
         || own_plan.omega_root != verified.omega_root
@@ -191,6 +206,7 @@ pub fn consumer_total_acceptance(
     }
     Ok(ConsumerTotalAccepted {
         first_seal: first.first_seal,
+        binding_root,
         shared_seal: verified.seal,
         second_seal,
         eval_target: first.eval_target,
@@ -760,7 +776,7 @@ mod tests {
     use zkie_engine::pcs::request::runtime_tree::{MaskTreePlan, RuntimeTreePart, RuntimeTreePlan};
     use zkie_engine::pcs::request::table::{IndexShape, TableDistances};
 
-    use crate::proof::lin_binding::LinBindingRoot;
+    use crate::proof::lin_binding::{LinBindingRoot, LinBindingShape};
 
     fn code() -> zkie_engine::pcs::request::code::CodeParams {
         build_code_plan(4, 8, 1).unwrap()
@@ -803,10 +819,11 @@ mod tests {
             },
         };
         ConsumerSharedGeometry {
-            binding_root: LinBindingRoot {
-                digest: Digest([0x91; 32]),
-                places: 1,
+            binding_shape: LinBindingShape {
+                log_leaves: 0,
+                salt_bytes: 40,
             },
+            binding_configuration: Digest([0x92; 32]),
             table_identity: Digest([0x12; 32]),
             table_configuration: Digest([0x13; 32]),
             table_shape,
@@ -1095,6 +1112,10 @@ mod tests {
             });
         let shared = ConsumerSharedVerified {
             seal: Digest([0xA3; 32]),
+            binding_root: LinBindingRoot {
+                digest: Digest([0x91; 32]),
+                places: 1,
+            },
             gu_root: Digest([0xA4; 32]),
             gu_seeds: Vec::new(),
             gu_answers: Vec::new(),

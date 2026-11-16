@@ -19,10 +19,13 @@ use crate::proof::consumer_first::{
 use crate::proof::consumer_second::{
     consumer_total_acceptance, ConsumerOwnPlan, ConsumerOwnProof, ConsumerTotalAccepted,
 };
-use crate::proof::consumer_shared::{ConsumerSharedGeometry, ConsumerSharedStage};
+use crate::proof::consumer_shared::{
+    consumer_binding_root, ConsumerSharedGeometry, ConsumerSharedStage,
+};
 use crate::proof::hidden_send_session::{
     decode_shared_messages, encode_shared_messages, HiddenSharedMessages,
 };
+use crate::proof::lin_binding::{LinBindingPath, LinBindingRoot};
 use zkie_engine::pcs::request::table::IndexReader;
 
 /// Version of the consumer proof file.
@@ -33,6 +36,7 @@ pub const CONSUMER_PROOF_VERSION: u64 = 1;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsumerProofTotals {
     pub first_seal: Digest,
+    pub binding_root: LinBindingRoot,
     pub shared_seal: Digest,
     pub second_seal: Digest,
     pub eval_target: Fp3,
@@ -43,6 +47,7 @@ pub struct ConsumerProofTotals {
 impl ConsumerProofTotals {
     pub fn fault(&self) -> Option<&'static str> {
         if self.first_seal == Digest::ZERO
+            || self.binding_root.fault().is_some()
             || self.shared_seal == Digest::ZERO
             || self.second_seal == Digest::ZERO
             || self.w_root == Digest::ZERO
@@ -59,6 +64,8 @@ impl ConsumerProofTotals {
 
     fn put(&self, writer: &mut CanonicalWriter) {
         writer.put_digest(&self.first_seal);
+        writer.put_digest(&self.binding_root.digest);
+        writer.put_u64(self.binding_root.places);
         writer.put_digest(&self.shared_seal);
         writer.put_digest(&self.second_seal);
         writer.put_fp3(&self.eval_target);
@@ -69,6 +76,10 @@ impl ConsumerProofTotals {
     fn get(reader: &mut CanonicalReader<'_>) -> Result<Self> {
         Ok(Self {
             first_seal: reader.get_digest()?,
+            binding_root: LinBindingRoot {
+                digest: reader.get_digest()?,
+                places: reader.get_u64()?,
+            },
             shared_seal: reader.get_digest()?,
             second_seal: reader.get_digest()?,
             eval_target: reader.get_fp3()?,
@@ -85,6 +96,10 @@ pub struct ConsumerProofFile {
     pub first: Vec<u8>,
     pub shared: Vec<u8>,
     pub own: Vec<u8>,
+    /// The per-request binding path from the verified first seal to the
+    /// shared chain's root. The verifier rebuilds the root from its own seal;
+    /// the path is checked, not trusted.
+    pub binding_path: LinBindingPath,
     pub totals: ConsumerProofTotals,
 }
 
@@ -96,13 +111,16 @@ impl ConsumerProofFile {
         shared: &HiddenSharedMessages,
         own: &ConsumerOwnProof,
         accepted: &ConsumerTotalAccepted,
+        binding_path: LinBindingPath,
     ) -> Result<Self> {
         let file = Self {
             first: first.encode(first_plan)?,
             shared: encode_shared_messages(shared)?,
             own: encode_own_proof(own)?,
+            binding_path,
             totals: ConsumerProofTotals {
                 first_seal: accepted.first_seal,
+                binding_root: accepted.binding_root,
                 shared_seal: accepted.shared_seal,
                 second_seal: accepted.second_seal,
                 eval_target: accepted.eval_target,
@@ -132,6 +150,7 @@ impl ConsumerProofFile {
         writer.put_bytes(&self.first);
         writer.put_bytes(&self.shared);
         writer.put_bytes(&self.own);
+        writer.put_bytes(&self.binding_path.encode());
         self.totals.put(&mut writer);
         writer.into_bytes()
     }
@@ -163,12 +182,14 @@ impl ConsumerProofFile {
         let first = body_reader.get_bytes()?.to_vec();
         let shared = body_reader.get_bytes()?.to_vec();
         let own = body_reader.get_bytes()?.to_vec();
+        let binding_path = LinBindingPath::decode(body_reader.get_bytes()?)?;
         let totals = ConsumerProofTotals::get(&mut body_reader)?;
         body_reader.finish()?;
         let file = Self {
             first,
             shared,
             own,
+            binding_path,
             totals,
         };
         file.check()?;
@@ -234,7 +255,14 @@ pub fn verify_consumer_chain(
     let first = ConsumerFirstMessages::decode(first_plan, &file.first)?;
     let shared = decode_shared_messages(&file.shared)?;
     let own = file.own_proof()?;
+    let binding_root = consumer_binding_root(
+        &first.first_seal,
+        &geometry.binding_shape,
+        &geometry.binding_configuration,
+        &file.binding_path,
+    )?;
     if file.totals.first_seal != first.first_seal
+        || file.totals.binding_root != binding_root
         || file.totals.shared_seal != shared.seal
         || file.totals.second_seal != own.seal
         || file.totals.eval_target != first.eval_target
@@ -252,6 +280,7 @@ pub fn verify_consumer_chain(
         shared_stage,
         reader,
         &shared,
+        &file.binding_path,
         own_plan,
         &own,
     )
@@ -358,6 +387,10 @@ mod tests {
     fn totals() -> ConsumerProofTotals {
         ConsumerProofTotals {
             first_seal: Digest([0x21; 32]),
+            binding_root: LinBindingRoot {
+                digest: Digest([0x24; 32]),
+                places: 1,
+            },
             shared_seal: Digest([0x22; 32]),
             second_seal: Digest([0x23; 32]),
             eval_target: fp(7),
@@ -405,6 +438,11 @@ mod tests {
             first: vec![9, 9, 9],
             shared: vec![8, 8],
             own: encode_own_proof(&own()).unwrap(),
+            binding_path: LinBindingPath {
+                place: 0,
+                salt: vec![7u8; 40],
+                siblings: Vec::new(),
+            },
             totals: totals(),
         };
         let path = file.write_to(&root).unwrap();
@@ -432,6 +470,11 @@ mod tests {
             first: vec![9, 9, 9],
             shared: vec![8, 8],
             own: encode_own_proof(&own()).unwrap(),
+            binding_path: LinBindingPath {
+                place: 0,
+                salt: vec![7u8; 40],
+                siblings: Vec::new(),
+            },
             totals: totals(),
         };
         let bytes = file.encode().unwrap();

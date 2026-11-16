@@ -133,7 +133,9 @@ use crate::proof::hidden_send_session::{
     prove_shared_public, shared_start_chain_from_binding, verify_shared_public,
     HiddenSharedMessages, ProximityBaseOutcome, SharedStagePlan,
 };
-use crate::proof::lin_binding::LinBindingRoot;
+use crate::proof::lin_binding::{
+    binding_root_from_path, LinBindingPath, LinBindingRoot, LinBindingShape, LinBindingTree,
+};
 
 /// The trusted public geometry of one consumer shared stage. Every field is
 /// plan data: the folded table message and the `Omega` message share one code,
@@ -141,7 +143,11 @@ use crate::proof::lin_binding::LinBindingRoot;
 /// table the consumer request names. Nothing here comes from a proof message.
 #[derive(Clone, Debug)]
 pub struct ConsumerSharedGeometry {
-    pub binding_root: LinBindingRoot,
+    /// The fixed binding shape and configuration the first chain's seal is
+    /// bound under. The root itself is a per-request value derived from the
+    /// verified first seal and the proof's path; it is never a static field.
+    pub binding_shape: LinBindingShape,
+    pub binding_configuration: Digest,
     pub table_identity: Digest,
     pub table_configuration: Digest,
     pub table_shape: IndexShape,
@@ -169,7 +175,8 @@ impl ConsumerSharedGeometry {
         if self.parameters == Digest::ZERO
             || self.table_identity == Digest::ZERO
             || self.table_configuration == Digest::ZERO
-            || self.binding_root.fault().is_some()
+            || self.binding_shape.fault().is_some()
+            || self.binding_configuration == Digest::ZERO
             || self.columns == 0
             || !self.columns.is_power_of_two()
             || self.k_lo.checked_add(self.table_shape.v) != Some(self.columns.trailing_zeros())
@@ -257,6 +264,44 @@ impl ConsumerSharedGeometry {
     }
 }
 
+/// Builds the per-request binding tree over the verified first seal: one
+/// place, empty siblings, the fixed shape/configuration and the request's
+/// salt. The root and the request's path are proof values, not plan fields.
+pub fn consumer_binding_prove(
+    first_seal: &Digest,
+    shape: LinBindingShape,
+    configuration: &Digest,
+    salts: Vec<u8>,
+) -> Result<(LinBindingPath, LinBindingRoot)> {
+    if *first_seal == Digest::ZERO || salts.is_empty() {
+        return Err(Error::InvalidConfig);
+    }
+    let mut tree = LinBindingTree::new(shape, *configuration, salts)?;
+    tree.place(0, first_seal)?;
+    let root = tree.root()?;
+    let path = tree.path(0)?;
+    Ok((path, root))
+}
+
+/// Rebuilds the binding root from the verifier's own verified first seal and
+/// the proof's path. A wrong seal, salt, place or depth leads to another root
+/// and therefore another shared chain.
+pub fn consumer_binding_root(
+    first_seal: &Digest,
+    shape: &LinBindingShape,
+    configuration: &Digest,
+    path: &LinBindingPath,
+) -> Result<LinBindingRoot> {
+    if *first_seal == Digest::ZERO {
+        return Err(Error::InvalidConfig);
+    }
+    let root = binding_root_from_path(shape, configuration, first_seal, path)?;
+    if root.fault().is_some() {
+        return Err(Error::InvalidProof);
+    }
+    Ok(root)
+}
+
 /// The fixed identifiers and tree geometry of one consumer shared stage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConsumerSharedIds {
@@ -291,7 +336,8 @@ impl ConsumerSharedGeometry {
         table_identity: Digest,
         table_configuration: Digest,
         table_shape: IndexShape,
-        binding_root: crate::proof::lin_binding::LinBindingRoot,
+        binding_shape: LinBindingShape,
+        binding_configuration: Digest,
         parameters: Digest,
         statement: Vec<u8>,
         record: Vec<u8>,
@@ -332,7 +378,8 @@ impl ConsumerSharedGeometry {
             answers: 1,
         };
         let geometry = Self {
-            binding_root,
+            binding_shape,
+            binding_configuration,
             table_identity,
             table_configuration,
             table_shape,
@@ -403,6 +450,7 @@ pub struct ConsumerSharedProof {
 #[derive(Clone, Debug)]
 pub struct ConsumerSharedVerified {
     pub seal: Digest,
+    pub binding_root: LinBindingRoot,
     pub gu_root: Digest,
     pub gu_seeds: Vec<zkie_engine::pcs::request::table::SampleSeed>,
     pub gu_answers: Vec<zkie_engine::pcs::request::field::Fp3>,
@@ -425,6 +473,7 @@ pub fn prove_consumer_shared(
     table: &mut dyn HiddenTableProver,
     seed: Digest,
     charge: &HidingCharge,
+    binding_root: &LinBindingRoot,
 ) -> Result<ConsumerSharedProof> {
     geometry.check()?;
     stage.check()?;
@@ -435,13 +484,16 @@ pub fn prove_consumer_shared(
     if charge.columns() != stage.columns.column_draws || charge.table() != reader.root {
         return Err(Error::StatementMismatch);
     }
+    if binding_root.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
     let chain = shared_start_chain_from_binding(
         &geometry.parameters,
         &geometry.statement,
         geometry.table_shape.v as u64,
         geometry.k_lo,
         &geometry.record,
-        &geometry.binding_root,
+        binding_root,
     )?;
     let stage_plan = geometry.stage(stage);
     let result = prove_shared_public(&stage_plan, reader, chain, table, &[], None, &seed, charge)?;
@@ -460,6 +512,7 @@ pub fn verify_consumer_shared(
     stage: &ConsumerSharedStage,
     reader: &IndexReader,
     messages: &HiddenSharedMessages,
+    binding_root: &LinBindingRoot,
 ) -> Result<ConsumerSharedVerified> {
     geometry.check()?;
     stage.check()?;
@@ -469,13 +522,16 @@ pub fn verify_consumer_shared(
     {
         return Err(Error::StatementMismatch);
     }
+    if binding_root.fault().is_some() {
+        return Err(Error::InvalidConfig);
+    }
     let chain = shared_start_chain_from_binding(
         &geometry.parameters,
         &geometry.statement,
         geometry.table_shape.v as u64,
         geometry.k_lo,
         &geometry.record,
-        &geometry.binding_root,
+        binding_root,
     )?;
     let stage_plan = geometry.stage(stage);
     let (seal, claims, points, base) =
@@ -485,6 +541,7 @@ pub fn verify_consumer_shared(
     }
     Ok(ConsumerSharedVerified {
         seal,
+        binding_root: *binding_root,
         gu_root: messages.gu_root,
         gu_seeds: messages.gu_seeds.clone(),
         gu_answers: messages.gu_answers.clone(),
@@ -589,7 +646,9 @@ mod tests {
     };
 
     use crate::proof::hidden_send_session::HiddenTableProver;
-    use crate::proof::lin_binding::LinBindingRoot;
+    use crate::proof::lin_binding::{
+        binding_root_from_path, LinBindingPath, LinBindingRoot, LinBindingShape, LinBindingTree,
+    };
 
     const TABLE_CONFIGURATION: Digest = Digest([0x21; 32]);
 
@@ -723,10 +782,11 @@ mod tests {
             answers: 1,
         };
         ConsumerSharedGeometry {
-            binding_root: LinBindingRoot {
-                digest: Digest([0x91; 32]),
-                places: 1,
+            binding_shape: LinBindingShape {
+                log_leaves: 0,
+                salt_bytes: 40,
             },
+            binding_configuration: Digest([0x92; 32]),
             table_identity: reader_table_identity(reader).unwrap(),
             table_configuration: TABLE_CONFIGURATION,
             table_shape: table_shape(),
@@ -771,19 +831,34 @@ mod tests {
         }
     }
 
+    fn binding_root(geom: &ConsumerSharedGeometry) -> (LinBindingPath, LinBindingRoot) {
+        let salts: Vec<u8> = (0..40).map(|i| (i as u8) ^ 0x5A).collect();
+        consumer_binding_prove(
+            &Digest([0xA1; 32]),
+            geom.binding_shape,
+            &geom.binding_configuration,
+            salts,
+        )
+        .unwrap()
+    }
+
     #[test]
     fn the_shared_stage_proves_and_verifies_from_the_binding_root() {
         let (reader, mut keeper) = keeper();
         let geom = geometry(&reader);
+        let (_path, root) = binding_root(&geom);
         let stage = ConsumerSharedStage::new(&shared_plan()).unwrap();
         let charge = consumer_shared_charge(&stage, &mut keeper).unwrap();
         assert_eq!(charge.columns(), 1);
         assert_eq!(charge.table(), reader.root);
         let seed = Digest([7; 32]);
         let proof =
-            prove_consumer_shared(&geom, &stage, &reader, &mut keeper, seed, &charge).unwrap();
+            prove_consumer_shared(&geom, &stage, &reader, &mut keeper, seed, &charge, &root)
+                .unwrap();
         let check = ConsumerSharedStage::new(&shared_plan()).unwrap();
-        let verified = verify_consumer_shared(&geom, &check, &reader, &proof.messages).unwrap();
+        let verified =
+            verify_consumer_shared(&geom, &check, &reader, &proof.messages, &root).unwrap();
+        assert_eq!(verified.binding_root, root);
         assert_eq!(verified.seal, proof.messages.seal);
         assert_eq!(verified.gu_root, proof.messages.gu_root);
         assert_eq!(verified.omega_root, proof.messages.omega_root);
@@ -794,7 +869,7 @@ mod tests {
         // fresh ledger.
         let check = |changed: &crate::proof::hidden_send_session::HiddenSharedMessages| {
             let stage = ConsumerSharedStage::new(&shared_plan()).unwrap();
-            verify_consumer_shared(&geom, &stage, &reader, changed).is_err()
+            verify_consumer_shared(&geom, &stage, &reader, changed, &root).is_err()
         };
         let mut changed = proof.messages.clone();
         changed.gu_root = Digest([0x92; 32]);
@@ -814,6 +889,7 @@ mod tests {
     fn the_binding_root_starts_the_shared_chain() {
         let (reader, mut keeper) = keeper();
         let geom = geometry(&reader);
+        let (path, root) = binding_root(&geom);
         let stage = ConsumerSharedStage::new(&shared_plan()).unwrap();
         let charge = consumer_shared_charge(&stage, &mut keeper).unwrap();
         let proof = prove_consumer_shared(
@@ -823,24 +899,46 @@ mod tests {
             &mut keeper,
             Digest([7; 32]),
             &charge,
+            &root,
         )
         .unwrap();
-        // Another root, or another place count, starts another chain and the
-        // proof no longer verifies.
-        let mut other = geometry(&reader);
-        other.binding_root = LinBindingRoot {
-            digest: Digest([0x94; 32]),
-            places: 1,
-        };
+        // Another salt, another first seal or a changed path place leads to
+        // another root and the proof no longer verifies.
+        let other_salts: Vec<u8> = (0..40).map(|i| (i as u8) ^ 0xC3).collect();
+        let (other_path, other_root) = consumer_binding_prove(
+            &Digest([0xA1; 32]),
+            geom.binding_shape,
+            &geom.binding_configuration,
+            other_salts,
+        )
+        .unwrap();
+        assert_ne!(other_root, root);
+        assert_ne!(other_path, path);
         let stage = ConsumerSharedStage::new(&shared_plan()).unwrap();
-        assert!(verify_consumer_shared(&other, &stage, &reader, &proof.messages).is_err());
-        let mut other = geometry(&reader);
-        other.binding_root.places = 2;
+        assert!(
+            verify_consumer_shared(&geom, &stage, &reader, &proof.messages, &other_root).is_err()
+        );
+        let mut wrong_place = path.clone();
+        wrong_place.place = 1;
+        assert!(consumer_binding_root(
+            &Digest([0xA1; 32]),
+            &geom.binding_shape,
+            &geom.binding_configuration,
+            &wrong_place,
+        )
+        .is_err());
+        // The verifier rebuilds the same root from its own first seal.
+        let rebuilt = consumer_binding_root(
+            &Digest([0xA1; 32]),
+            &geom.binding_shape,
+            &geom.binding_configuration,
+            &path,
+        )
+        .unwrap();
+        assert_eq!(rebuilt, root);
         let stage = ConsumerSharedStage::new(&shared_plan()).unwrap();
-        assert!(verify_consumer_shared(&other, &stage, &reader, &proof.messages).is_err());
-        // The same root verifies.
-        let stage = ConsumerSharedStage::new(&shared_plan()).unwrap();
-        let verified = verify_consumer_shared(&geom, &stage, &reader, &proof.messages).unwrap();
+        let verified =
+            verify_consumer_shared(&geom, &stage, &reader, &proof.messages, &rebuilt).unwrap();
         assert_eq!(verified.seal, proof.messages.seal);
     }
 }

@@ -2383,11 +2383,25 @@ mod tests {
         ConsumerOwnPlan, ConsumerOwnWitness,
     };
     use crate::proof::consumer_shared::{
-        consumer_shared_charge, prove_consumer_shared, verify_consumer_shared,
-        ConsumerSharedGeometry, ConsumerSharedIds, ConsumerSharedStage,
+        consumer_binding_prove, consumer_shared_charge, prove_consumer_shared,
+        verify_consumer_shared, ConsumerSharedGeometry, ConsumerSharedIds, ConsumerSharedStage,
     };
+    use crate::proof::lin_binding::{LinBindingPath, LinBindingRoot, LinBindingShape};
+
+    fn composition_binding(
+        geometry: &ConsumerSharedGeometry,
+        first_seal: &Digest,
+    ) -> (LinBindingPath, LinBindingRoot) {
+        let salts: Vec<u8> = (0..40).map(|index| (index as u8) ^ 0x6D).collect();
+        consumer_binding_prove(
+            first_seal,
+            geometry.binding_shape,
+            &geometry.binding_configuration,
+            salts,
+        )
+        .unwrap()
+    }
     use crate::proof::hidden_send_session::HiddenTableProver;
-    use crate::proof::lin_binding::LinBindingRoot;
 
     const COMPOSITION_CONFIGURATION: Digest = Digest([0x55; 32]);
 
@@ -2519,10 +2533,11 @@ mod tests {
             reader_table_identity(reader).unwrap(),
             COMPOSITION_CONFIGURATION,
             reader.shape,
-            LinBindingRoot {
-                digest: Digest([0x91; 32]),
-                places: 1,
+            LinBindingShape {
+                log_leaves: 0,
+                salt_bytes: 40,
             },
+            Digest([0x92; 32]),
             Digest([0x98; 32]),
             b"consumer composition".to_vec(),
             reader.name(),
@@ -2561,6 +2576,9 @@ mod tests {
         let (messages, _obligations) = prove_group(&mut fixture).unwrap();
         let plan = fixture.plan.clone();
         let geometry = composition_geometry(&plan, &reader);
+        // The per-request binding root comes from this request's own first
+        // seal; the proof carries the path, the verifier rebuilds the root.
+        let (binding_path, binding_root) = composition_binding(&geometry, &messages.first_seal);
         // The shared stage over the same table.
         let shared_plan = composition_shared_plan();
         let stage = ConsumerSharedStage::new(&shared_plan).unwrap();
@@ -2572,12 +2590,19 @@ mod tests {
             &mut keeper,
             Digest([0xE2; 32]),
             &charge,
+            &binding_root,
         )
         .unwrap();
         let check_stage = ConsumerSharedStage::new(&shared_plan).unwrap();
-        let shared_verified =
-            verify_consumer_shared(&geometry, &check_stage, &reader, &shared_proof.messages)
-                .unwrap();
+        let shared_verified = verify_consumer_shared(
+            &geometry,
+            &check_stage,
+            &reader,
+            &shared_proof.messages,
+            &binding_root,
+        )
+        .unwrap();
+        assert_eq!(shared_verified.binding_root, binding_root);
         // The W witness is the first stage's committed W rebuilt from the same
         // stored-column matrix view.
         let weights = pending_row_weights(&plan.member, plan.draft.matrix_rows).unwrap();
@@ -2653,6 +2678,7 @@ mod tests {
             &accept_stage,
             &reader,
             &shared_proof.messages,
+            &binding_path,
             &own_plan,
             &own_proof,
         )
@@ -2670,6 +2696,7 @@ mod tests {
             &shared_proof.messages,
             &own_proof,
             &total,
+            binding_path.clone(),
         )
         .unwrap();
         let bytes = file.encode().unwrap();
@@ -2695,6 +2722,22 @@ mod tests {
         // A changed total seal is refused before any stage runs.
         let mut bad = file.clone();
         bad.totals.second_seal = Digest([0x77; 32]);
+        let bad = ConsumerProofFile::decode(&bad.encode().unwrap()).unwrap();
+        assert!(verify_consumer_chain(
+            &plan,
+            &fixture.activation,
+            &fixture.outputs,
+            &geometry,
+            &ConsumerSharedStage::new(&shared_plan).unwrap(),
+            &reader,
+            &own_plan,
+            &bad,
+        )
+        .is_err());
+        // A changed binding salt or a changed path place no longer rebuilds
+        // the root, so the file is refused before the stages.
+        let mut bad = file.clone();
+        bad.binding_path.salt[0] ^= 1;
         let bad = ConsumerProofFile::decode(&bad.encode().unwrap()).unwrap();
         assert!(verify_consumer_chain(
             &plan,
@@ -2736,6 +2779,7 @@ mod tests {
         let (messages, _) = prove_group(&mut fixture).unwrap();
         let plan = fixture.plan.clone();
         let geometry = composition_geometry(&plan, &reader);
+        let (_binding_path, binding_root) = composition_binding(&geometry, &messages.first_seal);
         let shared_plan = composition_shared_plan();
         let stage = ConsumerSharedStage::new(&shared_plan).unwrap();
         let charge = consumer_shared_charge(&stage, &mut keeper).unwrap();
@@ -2746,12 +2790,18 @@ mod tests {
             &mut keeper,
             Digest([0xE2; 32]),
             &charge,
+            &binding_root,
         )
         .unwrap();
         let check_stage = ConsumerSharedStage::new(&shared_plan).unwrap();
-        let shared_verified =
-            verify_consumer_shared(&geometry, &check_stage, &reader, &shared_proof.messages)
-                .unwrap();
+        let shared_verified = verify_consumer_shared(
+            &geometry,
+            &check_stage,
+            &reader,
+            &shared_proof.messages,
+            &binding_root,
+        )
+        .unwrap();
         // The wrong-axis witness: places as rows, records as entries.
         let records = 16usize;
         let places = 16usize;
