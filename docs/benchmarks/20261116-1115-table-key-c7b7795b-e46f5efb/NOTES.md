@@ -153,3 +153,12 @@ the clean run is recorded in the final trace of the round.
 The run wrappers record the true `cargo test` status and propagate it as the
 command's exit status; a failed run is never recorded as a pass through an
 outer zero.
+
+## Deterministic diagnostic evidence (amended after review)
+
+All diagnostic runs in this trace used the fixed public constant
+`Digest([0x6B; 32])` as the run seed. They are deterministic diagnostic
+evidence for the shape-handoff investigation, not hidden-key delivery
+evidence. The private-seed delivery evidence is
+`20261116-1147-table-key-8f9faab0-df994559`. The diagnostic roots stay spent
+(52 each) and are not reset.

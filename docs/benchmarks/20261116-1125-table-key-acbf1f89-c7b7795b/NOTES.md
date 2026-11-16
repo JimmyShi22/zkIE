@@ -94,3 +94,13 @@ verification on the spent read budget are all refused.
 The run wrapper records the true `cargo test` status and propagates it as the
 command's exit status; the recorded EXIT above is the real status, not an
 outer wrapper's zero.
+
+## Deterministic functional evidence (amended after review)
+
+This run used the fixed public constant `Digest([0x6B; 32])` as the run seed
+for `prove_key`. The hiding material of the index mask and the lookup is
+derived from that public seed, so this run is deterministic functional
+evidence over the fixed table and range declaration, not hidden-key delivery
+evidence. The run and its numbers are kept unchanged in this trace. The
+private-seed rework run is `20261116-1147-table-key-8f9faab0-df994559`; this
+instance's durable budget stays spent (52) and is not reset.
