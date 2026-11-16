@@ -464,6 +464,25 @@ pub struct ConsumerGroupWitness<'a> {
     pub mask_tails: Vec<Vec<Fp3>>,
 }
 
+/// The plan's row count is the group's real BAT row count: the plain relation
+/// rows plus one sample row per member. A group run whose actual rows differ
+/// from the plan is refused before any challenge.
+fn check_planned_rows(
+    plan: &ConsumerGroupPlan,
+    members: &[ProximityMember],
+    plain_rows: usize,
+) -> Result<()> {
+    let samples: u64 = members.iter().map(|member| u64::from(member.answers)).sum();
+    let actual = u64::try_from(plain_rows)
+        .map_err(|_| Error::ResourceLimit)?
+        .checked_add(samples)
+        .ok_or(Error::ResourceLimit)?;
+    if actual != plan.shapes.entries.rows {
+        return Err(Error::StatementMismatch);
+    }
+    Ok(())
+}
+
 fn split_tails(flat: &[Fp3], rows: u64, tail_len: u64) -> Result<Vec<Vec<Fp3>>> {
     let rows = usize::try_from(rows).map_err(|_| Error::ResourceLimit)?;
     let tail_len = usize::try_from(tail_len).map_err(|_| Error::ResourceLimit)?;
@@ -901,6 +920,7 @@ pub fn prove_consumer_group(
 ) -> Result<(ConsumerGroupProof, Chain)> {
     plan.check()?;
     let members = members(plan, Some(witness))?;
+    check_planned_rows(plan, &members, plain_rows.len())?;
     let mut chain = chain;
     absorb_roots(&mut chain, plan, &members)?;
     let sample_rows = prover_sample_rows(&mut chain, plan, &members)?;
@@ -968,6 +988,7 @@ pub fn verify_consumer_group(
 ) -> Result<(Digest, Chain)> {
     plan.check()?;
     let members = members(plan, None)?;
+    check_planned_rows(plan, &members, plain_rows.len())?;
     let mut chain = chain;
     absorb_roots(&mut chain, plan, &members)?;
     let sample_rows = verifier_sample_rows(&mut chain, plan, &members, &proof.answers)?;
@@ -1012,7 +1033,7 @@ mod tests {
             bits_columns: 256,
             w_columns: 16,
             mask_entries: 512,
-            rows: 1,
+            rows: 5,
         }
     }
 
