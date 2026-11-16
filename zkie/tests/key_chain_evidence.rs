@@ -164,7 +164,29 @@ fn the_complete_key_chain_over_the_registered_instance() {
         budget,
     };
 
-    let range_plan = production_table_range().unwrap();
+    // The declared range is a public plan parameter. The production
+    // declaration is R18; a diagnostic run may select another approved width
+    // to check that the chain itself closes when the declaration covers the
+    // real entries.
+    let range_bits: u32 = std::env::var("ZKIE_KEY_RANGE_BITS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(18);
+    let range_plan = if range_bits == 18 {
+        production_table_range().unwrap()
+    } else {
+        let width = 1i64 << (range_bits - 1);
+        zkie_ops::proof::table_range::derive_entry_range(
+            1024,
+            10,
+            zkie_ops::proof::table_range::EntryRange::new(-width, width - 1).unwrap(),
+            zkie_ops::proof::table_range::EntryRangeLimits {
+                max_table_log: range_bits,
+                max_bit_entries: 1u64 << 24,
+            },
+        )
+        .unwrap()
+    };
     let entries: Vec<Fp3> = values
         .iter()
         .map(|value| Fp3::from_base(fp_from_signed_word(*value as u64)))
