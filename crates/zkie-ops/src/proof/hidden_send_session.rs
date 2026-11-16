@@ -12664,6 +12664,395 @@ pub(crate) fn key_second_verify(
 }
 
 // ---------------------------------------------------------------------------
+// The key proof bytes and the independent verifier
+// ---------------------------------------------------------------------------
+
+/// Version of the key proof bundle. The bundle carries the first part, the
+/// shared stage and the second stage; each section is length-prefixed and the
+/// whole file must be consumed exactly.
+pub const KEY_PROOF_FORMAT_VERSION: u64 = 1;
+
+/// The key group's plan from the public planned row count. The runtime plan
+/// derives its row count from the verified lookup outcome; this planned form
+/// is what the message decoder uses, and the two must agree or the verified
+/// messages do not fit the proof.
+fn key_group_planned_plan(plan: &KeyFirstPlan) -> Result<KeyGroupPlan> {
+    let leaf_index =
+        (plan.lookup.planes()? - 1) + plan.lookup.key_bits as usize + plan.lookup.table_log as usize;
+    let planned = (leaf_index + 7) as u64;
+    let mask_entries = crate::proof::lookup::mask_count(&plan.lookup)?;
+    derive_key_group_plan_with_mask(
+        &plan.group_config,
+        key_bit_entries(plan)?,
+        mask_entries,
+        plan.index.mask_rows,
+        planned,
+        Some(plan.commit.mask_code),
+    )
+}
+
+fn key_group_iopp_plan(
+    plan: &KeyFirstPlan,
+    group: &KeyGroupPlan,
+) -> Result<crate::proof::proximity_iopp::ProximityIoppPlan> {
+    let bound = key_group_bound(plan, group)?;
+    crate::proof::proximity_iopp::derive_proximity_iopp(
+        &group.stages,
+        ProximityGroupRole::Own,
+        &group.mask_tree,
+        0,
+        group.fresh,
+        group.base_positions,
+        &bound,
+    )
+}
+
+fn put_key_first(
+    writer: &mut CanonicalWriter,
+    plan: &KeyFirstPlan,
+    message: &KeyFirstMessages,
+) -> Result<()> {
+    writer.put_digest(&message.index_root);
+    writer.put_fp3(&message.index_answer);
+    writer.put_digest(&message.lookup.bits_root);
+    writer.put_digest(&message.lookup.mask_root);
+    writer.put_fp3(&message.lookup.bits_answer);
+    writer.put_fp3(&message.lookup.mask_answer);
+    writer.put_bytes(&message.lookup.proof.encode()?);
+    writer.put_digest(&message.w_root);
+    put_fp3_vec(writer, &message.psi);
+    writer.put_fp3(&message.eval_target);
+    writer.put_digest(&message.seal);
+    writer.put_bytes(&message.binding.encode());
+    put_fold_start(writer, &message.group.fold_start);
+    writer.put_u64(message.group.fold_rounds.len() as u64);
+    for (c0, c2) in &message.group.fold_rounds {
+        writer.put_fp3(c0);
+        writer.put_fp3(c2);
+    }
+    put_tail(writer, &message.group.tail);
+    Ok(())
+}
+
+fn get_key_first(plan: &KeyFirstPlan, bytes: &[u8]) -> Result<KeyFirstMessages> {
+    let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+    let index_root = reader.get_digest()?;
+    let index_answer = reader.get_fp3()?;
+    let bits_root = reader.get_digest()?;
+    let mask_root = reader.get_digest()?;
+    let bits_answer = reader.get_fp3()?;
+    let mask_answer = reader.get_fp3()?;
+    let proof_bytes = reader.get_bytes()?;
+    let proof = crate::proof::lookup::LookupProof::decode(&plan.lookup, proof_bytes)?;
+    let w_root = reader.get_digest()?;
+    let psi = get_fp3_vec(&mut reader, SEED_COORDINATE_BOUND)?;
+    let eval_target = reader.get_fp3()?;
+    let seal = reader.get_digest()?;
+    let binding_bytes = reader.get_bytes()?;
+    let binding = crate::proof::lin_binding::LinBindingPath::decode(binding_bytes)?;
+    let fold_start = get_fold_start(&mut reader)?;
+    let round_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+    if round_count > 64 {
+        return Err(Error::ResourceLimit);
+    }
+    let mut fold_rounds = Vec::with_capacity(round_count);
+    for _ in 0..round_count {
+        fold_rounds.push((reader.get_fp3()?, reader.get_fp3()?));
+    }
+    let group_plan = key_group_planned_plan(plan)?;
+    let iopp = key_group_iopp_plan(plan, &group_plan)?;
+    let tail = get_tail(&mut reader, Some(&iopp))?;
+    reader.finish()?;
+    Ok(KeyFirstMessages {
+        index_root,
+        index_answer,
+        lookup: KeyLookupMessages {
+            bits_root,
+            mask_root,
+            bits_answer,
+            mask_answer,
+            proof,
+        },
+        w_root,
+        psi,
+        eval_target,
+        seal,
+        binding,
+        group: ProximityMessages {
+            fold_start,
+            fold_rounds,
+            tail,
+        },
+    })
+}
+
+fn put_key_shared(writer: &mut CanonicalWriter, message: &HiddenSharedMessages) {
+    put_shared(writer, message);
+}
+
+fn get_key_shared(
+    plan: &KeyFirstPlan,
+    first: &KeyFirstVerified,
+    bytes: &[u8],
+) -> Result<HiddenSharedMessages> {
+    let iopp = key_shared_iopp(plan, first)?;
+    let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+    let message = get_shared_with_iopp(&mut reader, iopp.as_ref())?;
+    reader.finish()?;
+    Ok(message)
+}
+
+fn put_key_second(writer: &mut CanonicalWriter, message: &KeySecondMessages) {
+    put_seed_vec(writer, &message.w_seeds);
+    put_fp3_vec(writer, &message.w_answers);
+    put_fold_start(writer, &message.fold_start);
+    writer.put_u64(message.fold_rounds.len() as u64);
+    for (c0, c2) in &message.fold_rounds {
+        writer.put_fp3(c0);
+        writer.put_fp3(c2);
+    }
+    put_tail(writer, &message.tail);
+    writer.put_digest(&message.seal);
+}
+
+fn get_key_second(
+    plan: &KeyFirstPlan,
+    first: &KeyFirstVerified,
+    bytes: &[u8],
+) -> Result<KeySecondMessages> {
+    let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+    let w_seeds = get_seed_vec(&mut reader)?;
+    let w_answers = get_fp3_vec(&mut reader, SEED_COORDINATE_BOUND)?;
+    let fold_start = get_fold_start(&mut reader)?;
+    let round_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+    if round_count > 64 {
+        return Err(Error::ResourceLimit);
+    }
+    let mut fold_rounds = Vec::with_capacity(round_count);
+    for _ in 0..round_count {
+        fold_rounds.push((reader.get_fp3()?, reader.get_fp3()?));
+    }
+    let iopp = key_own_iopp(plan, first)?;
+    let tail = get_tail(&mut reader, iopp.as_ref())?;
+    let seal = reader.get_digest()?;
+    reader.finish()?;
+    Ok(KeySecondMessages {
+        w_seeds,
+        w_answers,
+        fold_start,
+        fold_rounds,
+        tail,
+        seal,
+    })
+}
+
+/// The complete key proof bytes: the first part, the shared stage and the
+/// second stage, each length-prefixed under one format version.
+pub fn encode_key_proof(
+    plan: &KeyFirstPlan,
+    first: &KeyFirstMessages,
+    shared: &HiddenSharedMessages,
+    second: &KeySecondMessages,
+) -> Result<Vec<u8>> {
+    let mut first_writer = CanonicalWriter::new();
+    put_key_first(&mut first_writer, plan, first)?;
+    let mut shared_writer = CanonicalWriter::new();
+    put_key_shared(&mut shared_writer, shared);
+    let mut second_writer = CanonicalWriter::new();
+    put_key_second(&mut second_writer, second);
+    let mut writer = CanonicalWriter::new();
+    writer.put_u64(KEY_PROOF_FORMAT_VERSION);
+    writer.put_bytes(&first_writer.into_bytes());
+    writer.put_bytes(&shared_writer.into_bytes());
+    writer.put_bytes(&second_writer.into_bytes());
+    Ok(writer.into_bytes())
+}
+
+fn split_key_proof(proof: &[u8]) -> Result<(&[u8], &[u8], &[u8])> {
+    let mut reader = CanonicalReader::new(proof, DecodeLimits::unlimited());
+    if reader.get_u64()? != KEY_PROOF_FORMAT_VERSION {
+        return Err(Error::InvalidEncoding);
+    }
+    let first = reader.get_bytes()?;
+    let shared = reader.get_bytes()?;
+    let second = reader.get_bytes()?;
+    reader.finish()?;
+    Ok((first, shared, second))
+}
+
+/// The independent verifier's success object. It can only be produced by
+/// [`verify_key`] after all three stages and their obligations verify; it
+/// binds the verified table identity, configuration, root, record, range and
+/// the three seals. It is one table's one-time authentication only.
+#[derive(Clone, Debug)]
+pub struct AcceptedKey {
+    plan_digest: Digest,
+    table_identity: Digest,
+    table_configuration: Digest,
+    table_root: Digest,
+    record_digest: Digest,
+    range_digest: Digest,
+    binding_root: crate::proof::lin_binding::LinBindingRoot,
+    first_seal: Digest,
+    shared_seal: Digest,
+    second_seal: Digest,
+    w_root: Digest,
+    index_root: Digest,
+    omega_root: Digest,
+}
+
+impl AcceptedKey {
+    pub fn plan_digest(&self) -> Digest {
+        self.plan_digest
+    }
+    pub fn table_identity(&self) -> Digest {
+        self.table_identity
+    }
+    pub fn table_configuration(&self) -> Digest {
+        self.table_configuration
+    }
+    pub fn table_root(&self) -> Digest {
+        self.table_root
+    }
+    pub fn record_digest(&self) -> Digest {
+        self.record_digest
+    }
+    pub fn range_digest(&self) -> Digest {
+        self.range_digest
+    }
+    pub fn binding_root(&self) -> &crate::proof::lin_binding::LinBindingRoot {
+        &self.binding_root
+    }
+    pub fn first_seal(&self) -> Digest {
+        self.first_seal
+    }
+    pub fn shared_seal(&self) -> Digest {
+        self.shared_seal
+    }
+    pub fn second_seal(&self) -> Digest {
+        self.second_seal
+    }
+    pub fn w_root(&self) -> Digest {
+        self.w_root
+    }
+    pub fn index_root(&self) -> Digest {
+        self.index_root
+    }
+    pub fn omega_root(&self) -> Digest {
+        self.omega_root
+    }
+}
+
+/// The independent key verifier: the trusted plan, the trusted reader, the
+/// public range lookup table and the complete proof bytes. It never reads
+/// weights, encoded tables, private parameters, randomness, tails or masks.
+/// The accepted object is built only after the first, shared and second
+/// stages and their own checks all pass.
+pub fn verify_key(
+    plan: &KeyFirstPlan,
+    reader: &IndexReader,
+    lookup_table: &dyn crate::proof::lookup::LookupTable,
+    proof: &[u8],
+) -> Result<AcceptedKey> {
+    key_plan_fault(plan)?;
+    if reader_table_identity(reader)? != plan.table_identity
+        || reader.configuration != plan.table_configuration
+        || reader.shape != plan.table_shape
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let (first_bytes, shared_bytes, second_bytes) = split_key_proof(proof)?;
+    let first_messages = get_key_first(plan, first_bytes)?;
+    let first = key_first_verify(plan, reader, lookup_table, &first_messages)?;
+    let shared_messages = get_key_shared(plan, &first, shared_bytes)?;
+    let shared = key_shared_verify(plan, reader, &first, &shared_messages)?;
+    let second_messages = get_key_second(plan, &first, second_bytes)?;
+    let second = key_second_verify(plan, reader, &first, &shared, &second_messages)?;
+    let mut record_writer = CanonicalWriter::new();
+    record_writer.put_bytes(&reader.record.encode());
+    Ok(AcceptedKey {
+        plan_digest: plan.statement_digest(),
+        table_identity: plan.table_identity,
+        table_configuration: plan.table_configuration,
+        table_root: reader.root,
+        record_digest: zkie_core::artifact::digest_bytes(&record_writer.into_bytes()),
+        range_digest: plan.range.digest(),
+        binding_root: first.binding_root,
+        first_seal: first.seal,
+        shared_seal: shared.seal,
+        second_seal: second.seal,
+        w_root: first.w_root,
+        index_root: first.index_root,
+        omega_root: shared.omega_root,
+    })
+}
+
+/// The byte sizes of the three proof sections, for evidence and diagnostics.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyProofParts {
+    pub first: usize,
+    pub shared: usize,
+    pub second: usize,
+}
+
+/// Proves the complete key chain over the keeper and returns the public proof
+/// bytes. The keeper keeps the private material; nothing else is returned.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_key(
+    plan: &KeyFirstPlan,
+    reader: &IndexReader,
+    table: &mut dyn HiddenTableProver,
+    lookup_table: &dyn crate::proof::lookup::LookupTable,
+    lookup_key_values: &[Fp3],
+    bit_values: &[Fp3],
+    seed: Digest,
+) -> Result<(Vec<u8>, KeyProofParts)> {
+    if seed == Digest::ZERO {
+        return Err(Error::InvalidConfig);
+    }
+    // The index-mask message's private randomness comes from this run's own
+    // coin domain, never from a public oracle number.
+    let mut index_coins = ByteMaskCoins::new(derive_run_seed(&seed, 14, 0)?)?;
+    let index_randomness = IndexMaskRandomness::from_coins(&mut index_coins, &plan.index)?;
+    let charge = key_shared_charge(plan, table)?;
+    let (first, _seal, _binding_root, first_witness) = key_first_prove(
+        plan,
+        reader,
+        table,
+        lookup_table,
+        lookup_key_values,
+        bit_values,
+        &index_randomness,
+        seed,
+    )?;
+    let verified = key_first_verify(plan, reader, lookup_table, &first)?;
+    let shared_proof = key_shared_prove(plan, reader, table, &verified, seed, &charge)?;
+    let shared = key_shared_verify(plan, reader, &verified, &shared_proof.messages)?;
+    let second = key_second_prove(
+        plan,
+        reader,
+        &verified,
+        &first_witness,
+        &shared_proof,
+        &shared,
+        seed,
+    )?;
+    let mut first_writer = CanonicalWriter::new();
+    put_key_first(&mut first_writer, plan, &first)?;
+    let mut shared_writer = CanonicalWriter::new();
+    put_key_shared(&mut shared_writer, &shared_proof.messages);
+    let mut second_writer = CanonicalWriter::new();
+    put_key_second(&mut second_writer, &second);
+    let parts = KeyProofParts {
+        first: first_writer.into_bytes().len(),
+        shared: shared_writer.into_bytes().len(),
+        second: second_writer.into_bytes().len(),
+    };
+    let bytes = encode_key_proof(plan, &first, &shared_proof.messages, &second)?;
+    Ok((bytes, parts))
+}
+
+// ---------------------------------------------------------------------------
 // The key chain's lookup
 // ---------------------------------------------------------------------------
 
@@ -26595,6 +26984,23 @@ fn get_shared(
     reader: &mut CanonicalReader<'_>,
     plan: &HiddenLinPlan,
 ) -> Result<HiddenSharedMessages> {
+    let iopp = proximity_iopp_plan(
+        &plan.proximity,
+        &plan.send,
+        plan.closure.as_ref(),
+        plan.norm.as_ref(),
+        ProximityGroupRole::Shared,
+    )?;
+    get_shared_with_iopp(reader, iopp.as_ref())
+}
+
+/// Decodes the shared messages under a caller-provided tail plan. The key
+/// chain derives the tail plan from the verified first state instead of a
+/// hidden activation plan; both paths share this decoder.
+fn get_shared_with_iopp(
+    reader: &mut CanonicalReader<'_>,
+    iopp: Option<&crate::proof::proximity_iopp::ProximityIoppPlan>,
+) -> Result<HiddenSharedMessages> {
     let gu_root = reader.get_digest()?;
     let gu_seeds = get_seed_vec(reader)?;
     let gu_answers = get_fp3_vec(reader, SEED_COORDINATE_BOUND)?;
@@ -26621,14 +27027,7 @@ fn get_shared(
     for _ in 0..round_count {
         fold_rounds.push((reader.get_fp3()?, reader.get_fp3()?));
     }
-    let iopp = proximity_iopp_plan(
-        &plan.proximity,
-        &plan.send,
-        plan.closure.as_ref(),
-        plan.norm.as_ref(),
-        ProximityGroupRole::Shared,
-    )?;
-    let tail = get_tail(reader, iopp.as_ref())?;
+    let tail = get_tail(reader, iopp)?;
     let seal = reader.get_digest()?;
     Ok(HiddenSharedMessages {
         gu_root,
@@ -39592,6 +39991,208 @@ mod key_first_flow_tests {
             seed,
         )
         .is_err());
+    }
+
+    fn public_lookup_table() -> IntegerRangeTable {
+        let range_plan = derive_entry_range(
+            4,
+            2,
+            EntryRange::new(-8, 7).unwrap(),
+            EntryRangeLimits {
+                max_table_log: 8,
+                max_bit_entries: 1 << 16,
+            },
+        )
+        .unwrap();
+        IntegerRangeTable::new(&range_plan, 1 << 8).unwrap()
+    }
+
+    /// The full byte path: first + shared + second are encoded, and the
+    /// independent verifier accepts the bundle with public inputs only.
+    fn full_run(
+    ) -> (
+        KeyFirstPlan,
+        IndexReader,
+        IntegerRangeTable,
+        KeyFirstMessages,
+        KeyFirstWitness,
+        KeySharedProof,
+        KeySharedVerified,
+        KeySecondMessages,
+    ) {
+        let (mut plan, keys, bits) = flow_plan();
+        let mut message_rows = vec![vec![Fp::ZERO; 8]; 4];
+        for row in 0..4 {
+            for column in 0..4 {
+                message_rows[column][row] = crate::proof::column_session::fp_from_signed_word(
+                    (row as i64 * 4 + column as i64 - 8) as u64,
+                );
+            }
+        }
+        let tails = vec![vec![Fp::ZERO; 1]; 4];
+        let mut source = VecTableSource::new(message_rows, tails).unwrap();
+        let salts: Vec<Vec<u8>> = (0..plan.table_shape.code.n())
+            .map(|position| vec![(position as u8) ^ 0x5A; 40])
+            .collect();
+        let table = commit_table_streaming(
+            &mut source,
+            plan.table_shape,
+            plan.table_configuration,
+            &salts,
+            64,
+            u64::MAX,
+        )
+        .unwrap();
+        let reader = table.reader.clone();
+        plan.table_identity = reader_table_identity(&reader).unwrap();
+        let mut keeper = KeyKeeper {
+            table,
+            source: RefCell::new(source),
+            hiding: HidingState::new(reader.root, 1, reader.shape.code.r as u64),
+            reader: reader.clone(),
+            budget: None,
+        };
+        let lookup_table = public_lookup_table();
+        let mut coins = ByteMaskCoins::new(Digest([5; 32])).unwrap();
+        let index_randomness = IndexMaskRandomness::from_coins(&mut coins, &plan.index).unwrap();
+        let charge = key_shared_charge(&plan, &mut keeper).unwrap();
+        let seed = Digest([7; 32]);
+        let (first_messages, seal, binding_root, first_witness) = key_first_prove(
+            &plan,
+            &reader,
+            &mut keeper,
+            &lookup_table,
+            &keys,
+            &bits,
+            &index_randomness,
+            seed,
+        )
+        .unwrap();
+        let verified = key_first_verify(&plan, &reader, &lookup_table, &first_messages).unwrap();
+        assert_eq!(verified.seal, seal);
+        assert_eq!(verified.binding_root, binding_root);
+        let shared_proof =
+            key_shared_prove(&plan, &reader, &mut keeper, &verified, seed, &charge).unwrap();
+        let shared =
+            key_shared_verify(&plan, &reader, &verified, &shared_proof.messages).unwrap();
+        let second = key_second_prove(
+            &plan,
+            &reader,
+            &verified,
+            &first_witness,
+            &shared_proof,
+            &shared,
+            seed,
+        )
+        .unwrap();
+        (
+            plan,
+            reader,
+            lookup_table,
+            first_messages,
+            first_witness,
+            shared_proof,
+            shared,
+            second,
+        )
+    }
+
+    #[test]
+    fn the_key_proof_verifies_through_the_public_entry() {
+        let (plan, reader, lookup_table, first, _witness, shared, _verified_shared, second) =
+            full_run();
+        let bytes = encode_key_proof(&plan, &first, &shared.messages, &second).unwrap();
+        // The run above spent this plan's shared read ledger; the verifier
+        // starts from a plan clone with a fresh ledger at the same maximum.
+        let verify_plan = plan.clone();
+        let accepted = verify_key(&verify_plan, &reader, &lookup_table, &bytes).unwrap();
+        assert_eq!(accepted.plan_digest(), plan.statement_digest());
+        assert_eq!(accepted.table_identity(), plan.table_identity);
+        assert_eq!(accepted.table_root(), reader.root);
+        assert_eq!(accepted.first_seal(), first.seal);
+        assert_eq!(accepted.shared_seal(), shared.messages.seal);
+        assert_eq!(accepted.second_seal(), second.seal);
+        assert_eq!(accepted.omega_root(), shared.messages.omega_root);
+        // A repeated verification on the same plan finds the read budget
+        // spent; a plan clone starts a fresh ledger.
+        assert!(verify_key(&verify_plan, &reader, &lookup_table, &bytes).is_err());
+        let fresh_plan = verify_plan.clone();
+        assert!(verify_key(&fresh_plan, &reader, &lookup_table, &bytes).is_ok());
+    }
+
+    #[test]
+    fn tampered_key_proof_bytes_are_refused() {
+        let (plan, reader, lookup_table, first, _witness, shared, _verified_shared, second) =
+            full_run();
+        let bytes = encode_key_proof(&plan, &first, &shared.messages, &second).unwrap();
+        let check = |proof: &[u8]| verify_key(&plan.clone(), &reader, &lookup_table, proof).is_err();
+        let mut truncated = bytes.clone();
+        truncated.pop();
+        assert!(check(&truncated));
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(check(&trailing));
+        let mut bad_version = bytes.clone();
+        bad_version[0] ^= 1;
+        assert!(check(&bad_version));
+        // Section tampering: rebuild the bundle from changed messages.
+        let mut changed = first.clone();
+        changed.index_root = Digest([0xA1; 32]);
+        let changed_bytes = encode_key_proof(&plan, &changed, &shared.messages, &second).unwrap();
+        assert!(check(&changed_bytes));
+        let mut changed = first.clone();
+        changed.eval_target = changed.eval_target.add(&Fp3::ONE);
+        let changed_bytes = encode_key_proof(&plan, &changed, &shared.messages, &second).unwrap();
+        assert!(check(&changed_bytes));
+        let mut changed = first.clone();
+        changed.binding.place = 1;
+        let changed_bytes = encode_key_proof(&plan, &changed, &shared.messages, &second).unwrap();
+        assert!(check(&changed_bytes));
+        let mut changed_shared = shared.messages.clone();
+        changed_shared.omega_answers[0] = changed_shared.omega_answers[0].add(&Fp3::ONE);
+        let changed_bytes = encode_key_proof(&plan, &first, &changed_shared, &second).unwrap();
+        assert!(check(&changed_bytes));
+        let mut changed_second = second.clone();
+        changed_second.w_answers[0] = changed_second.w_answers[0].add(&Fp3::ONE);
+        let changed_bytes = encode_key_proof(&plan, &first, &shared.messages, &changed_second).unwrap();
+        assert!(check(&changed_bytes));
+        // Swapped sections and a different plan.
+        let shared_bytes = {
+            let mut writer = CanonicalWriter::new();
+            put_key_shared(&mut writer, &shared.messages);
+            writer.into_bytes()
+        };
+        let swapped = {
+            let mut writer = CanonicalWriter::new();
+            writer.put_u64(KEY_PROOF_FORMAT_VERSION);
+            writer.put_bytes(&shared_bytes);
+            writer.put_bytes(&shared_bytes);
+            writer.put_bytes(&shared_bytes);
+            writer.into_bytes()
+        };
+        assert!(check(&swapped));
+        let mut changed_plan = plan.clone();
+        changed_plan.group_config.fresh += 1;
+        assert!(verify_key(&changed_plan, &reader, &lookup_table, &bytes).is_err());
+        // A different trusted reader and a different public range table.
+        let mut bad_reader = reader.clone();
+        bad_reader.root = Digest([0xA2; 32]);
+        assert!(verify_key(&plan.clone(), &bad_reader, &lookup_table, &bytes).is_err());
+        let mut bad_reader = reader.clone();
+        bad_reader.configuration = Digest([0xA3; 32]);
+        assert!(verify_key(&plan.clone(), &bad_reader, &lookup_table, &bytes).is_err());
+        let other_range = derive_entry_range(
+            4,
+            2,
+            EntryRange::new(-16, 15).unwrap(),
+            EntryRangeLimits {
+                max_table_log: 8,
+                max_bit_entries: 1 << 16,
+            },
+        )
+        .unwrap();
+        let other_table = IntegerRangeTable::new(&other_range, 1 << 8).unwrap();
+        assert!(verify_key(&plan.clone(), &reader, &other_table, &bytes).is_err());
     }
 
     #[test]

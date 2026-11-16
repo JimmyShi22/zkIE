@@ -75,3 +75,26 @@ test additionally checks the committed meta through
 - The key proof over this instance (first/binding/shared/second), the
   independent `verify_key`/`AcceptedKey` entry and its negative matrix, and
   the release wall/VmHWM evidence are not in this trace.
+
+## Independent verifier and negative matrix (fixture scale)
+
+The key proof now has a canonical byte bundle: a format version and three
+length-prefixed sections (first, shared, second). The public entry
+`verify_key` takes only the trusted plan, the trusted reader, the public range
+lookup table and the complete proof bytes; it decodes and verifies first,
+shared and second in order and returns an `AcceptedKey` only when all three
+pass. The accepted object binds the plan digest, table identity,
+configuration, root, record digest, range digest, the binding root, the three
+seals and the W/index-mask/Omega roots. The verifier never reads weights,
+encoded tables, private parameters, randomness, tails, masks or a keeper.
+
+The shared read ledger is part of the plan: the first verification consumes
+it, a repeated verification on the same plan is refused, and a plan clone
+starts a fresh ledger at the same maximum.
+
+Negative coverage in the byte path: truncation, one trailing byte, a changed
+format version, changed first-message fields (index root, Eval target,
+binding place), changed shared answers, changed second-stage answers, swapped
+sections, a changed plan (group fresh), a different trusted reader root and a
+different reader configuration, and a range table with another identity. All
+are refused. The test log is `s6-tests.log` in this directory.
