@@ -1,0 +1,20 @@
+{
+  "case": "gpt2-seq16",
+  "commit_ms": 254505,
+  "prove_ms": 90958,
+  "verify_ms": 77860,
+  "trace_bytes": 1879423254,
+  "trace_assets": 195,
+  "removed_opening_bytes": 8413688,
+  "trace_with_opening_bytes": 1887836942,
+  "statement_bytes": 214,
+  "consumer_proof_bytes": 2326312,
+  "key_prove_ms": 191925,
+  "key_commit_verify_ms": 58708,
+  "key_request_verify_ms": 58640,
+  "key_file_bytes": 4540968,
+  "vmhwm_after_prove_kib": 35405828,
+  "vmhwm_after_verify_kib": 35405828,
+  "accepted": true,
+  "negatives": 11
+}

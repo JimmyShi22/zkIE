@@ -1,0 +1,37 @@
+policy_version = 1
+model = "gpt2"
+model_version = 2
+
+[[case]]
+case_id = "gpt2-seq16"
+sequence_length = 16
+anchor_id = "c465f6bfe76712385bd807f31af21e90d1c3bdd99fc07088f361a1dd2de86053"
+model_id = "c2971c0179463bf12aecaefc3488417228008c1314e6905c49a55078242c1268"
+output_mode = "none"
+
+[case.limited_table_identity]
+version = 1
+model = "gpt2"
+model_version = 2
+case_id = "gpt2-seq16"
+anchor_id = "c465f6bfe76712385bd807f31af21e90d1c3bdd99fc07088f361a1dd2de86053"
+model_id = "c2971c0179463bf12aecaefc3488417228008c1314e6905c49a55078242c1268"
+asset_id = 2
+asset_table_identity = "7562efa1bfbd2fed9fa9373269cc3fb47d4752ffaf768404b883282faa191261"
+table_root = "0d2f1c17376b9ace4ecbc2ee4c88f45343f8bf2e7ba20eb774b4090410cab520"
+table_record_digest = "0c180802324300079b2e178ff269e1069e45ccbf3d5d66591544f6ff930d11b6"
+table_configuration = "94dd0177b5a08d3e328a51222a4ab5aee7d6a982b91964b072eea7e75ae0e925"
+code_log_n = 12
+code_ell = 2048
+code_r = 128
+table_v = 10
+answers = 1
+salt_bytes = 40
+distance_radius = 0
+distance_later_radius = 0
+distance_m_once = 284
+distance_m_later = 284
+matrix_rows_log = 10
+k_lo = 0
+k_col = 10
+protocol_identity = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
