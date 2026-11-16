@@ -47,7 +47,7 @@ use crate::proof::committed_psc::{
     CommittedGroupMessage, PositionPscChallenges, PscTranscriptTags,
 };
 use crate::proof::consumer_request::ConsumerIntegerBound;
-use crate::proof::hidden_send_session::{SendGroup, WShape};
+use crate::proof::hidden_send_session::{SendGroup, TableLayout, WShape};
 use crate::proof::psc::{hp_entries, Weight};
 use crate::proof::psc_general::{
     general_variables, prove_general, verify_general, GeneralChallenges, GeneralMaskEntries,
@@ -467,6 +467,46 @@ pub struct ConsumerRawObligation {
     pub row: RowForm,
     pub hiding_slots: Vec<u64>,
     pub shown_slot: u64,
+    /// The shown map's linear end claim of this instance: the (E) row the
+    /// group must check against the same head's committed messages and this
+    /// instance's own shown slot. The squared end value never appears here; it
+    /// is already part of the output's row target.
+    pub end: ConsumerRawEndForm,
+}
+
+/// The linear end claim of one relation instance. The row is
+/// `<raw_columns, raw message> + <bits_columns, bits message>
+///  + mask_scale * shown entry = target`, where every coordinate is the
+/// instance's own: the same head's committed raw and bit messages and the
+/// instance's shown slot. The columns are in the message column order; a
+/// group scatters them onto the member tables.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsumerRawEndForm {
+    pub instance: usize,
+    pub head: u32,
+    pub raw_oracle: u64,
+    pub raw_columns: Vec<Fp3>,
+    pub bits_oracle: u64,
+    pub bits_columns: Vec<Fp3>,
+    pub shown_slot: u64,
+    pub mask_scale: Fp3,
+    pub target: Fp3,
+}
+
+impl ConsumerRawEndForm {
+    pub fn raw_table(&self, shape: &WShape) -> Result<Vec<Fp3>> {
+        if self.raw_columns.is_empty() {
+            return Ok(Vec::new());
+        }
+        TableLayout::of(shape).scatter(self.raw_columns.len() as u64, &self.raw_columns)
+    }
+
+    pub fn bits_table(&self, shape: &WShape) -> Result<Vec<Fp3>> {
+        if self.bits_columns.is_empty() {
+            return Ok(Vec::new());
+        }
+        TableLayout::of(shape).scatter(self.bits_columns.len() as u64, &self.bits_columns)
+    }
 }
 
 /// The second message: one masked sumcheck per instance, with its point value.
@@ -642,15 +682,65 @@ fn obligations(
 ) -> Result<ConsumerRawObligation> {
     let spaces = plan.mask_spaces()?;
     let space = spaces.get(instance).ok_or(Error::InvalidIndex)?;
+    let relation = plan.relation(instance)?;
+    let head = plan.head(instance)?;
     let row = RowForm::from_output(&output);
+    let columns = usize::try_from(plan.shape.columns).map_err(|_| Error::ResourceLimit)?;
+    let real = plan.shape.real_entries() as usize;
+    let shift = plan.shape.shift as usize;
+    let raw_oracle = plan
+        .raw
+        .oracle_base
+        .checked_add(u64::from(head))
+        .ok_or(Error::ResourceLimit)?;
+    let bits_oracle = plan
+        .bits
+        .oracle_base
+        .checked_add(u64::from(head))
+        .ok_or(Error::ResourceLimit)?;
+    let (raw_columns, bits_columns) = match relation {
+        ConsumerRawRelation::Rounding => {
+            let mut raw = vec![Fp3::ZERO; columns];
+            let mut bits = vec![Fp3::ZERO; columns * shift];
+            for entry in 0..real {
+                let weight = eq_at(&output.point, entry as u64);
+                raw[entry] = weight;
+                let mut power = Fp3::ONE;
+                for bit in 0..shift {
+                    bits[entry * shift + bit] = Fp3::ZERO.sub(&weight.mul(&power));
+                    power = power.add(&power);
+                }
+            }
+            (raw, bits)
+        }
+        ConsumerRawRelation::Bits => {
+            let mut bits = vec![Fp3::ZERO; columns * shift];
+            for (entry, coefficient) in bits.iter_mut().enumerate() {
+                *coefficient = eq_at(&output.point, entry as u64);
+            }
+            (Vec::new(), bits)
+        }
+    };
+    let end = ConsumerRawEndForm {
+        instance,
+        head,
+        raw_oracle,
+        raw_columns,
+        bits_oracle,
+        bits_columns,
+        shown_slot: space.shown,
+        mask_scale: output.ends[0].mask_scale,
+        target: output.ends[0].value,
+    };
     Ok(ConsumerRawObligation {
         instance,
-        head: plan.head(instance)?,
-        relation: plan.relation(instance)?,
+        head,
+        relation,
         output,
         row,
         hiding_slots: space.hiding.clone(),
         shown_slot: space.shown,
+        end,
     })
 }
 
@@ -755,6 +845,36 @@ pub fn prove_consumer_raw(
             .evaluate(&hiding, &|_| Err(Error::ShapeMismatch), &[])?
             != row.row.constant
         {
+            return Err(Error::InvalidProof);
+        }
+    }
+    // The end forms are the other half of every relation: the shown map's
+    // linear claim on the same head's committed messages and this instance's
+    // shown slot. The prover checks them on its witness; the group checks them
+    // against the commitments.
+    for obligation in &rows_out {
+        let end = &obligation.end;
+        let mut value = Fp3::ZERO;
+        if !end.raw_columns.is_empty() {
+            let raw = raw.get(end.head as usize).ok_or(Error::ShapeMismatch)?;
+            if raw.len() < end.raw_columns.len() {
+                return Err(Error::ShapeMismatch);
+            }
+            for (coefficient, entry) in end.raw_columns.iter().zip(raw) {
+                value = value.add(&coefficient.mul(entry));
+            }
+        }
+        if !end.bits_columns.is_empty() {
+            let bits = bits.get(end.head as usize).ok_or(Error::ShapeMismatch)?;
+            if bits.len() < end.bits_columns.len() {
+                return Err(Error::ShapeMismatch);
+            }
+            for (coefficient, entry) in end.bits_columns.iter().zip(bits) {
+                value = value.add(&coefficient.mul(entry));
+            }
+        }
+        value = value.add(&end.mask_scale.mul(&masks.entry(end.shown_slot)?));
+        if value != end.target {
             return Err(Error::InvalidProof);
         }
     }
@@ -1102,6 +1222,34 @@ mod tests {
             assert_eq!(row.shown_slot, space.shown);
             assert_eq!(row.output.ends.len(), 1);
             assert_eq!(row.row.constant, row.output.row_target);
+            // The (E) end form holds on the same head's committed witness and
+            // this instance's shown slot.
+            let end = &row.end;
+            assert_eq!(
+                end.raw_oracle,
+                fixture.plan.raw.oracle_base + u64::from(end.head)
+            );
+            assert_eq!(
+                end.bits_oracle,
+                fixture.plan.bits.oracle_base + u64::from(end.head)
+            );
+            let mut value = Fp3::ZERO;
+            for (coefficient, entry) in end.raw_columns.iter().zip(&fixture.raw[end.head as usize])
+            {
+                value = value.add(&coefficient.mul(entry));
+            }
+            for (coefficient, entry) in end
+                .bits_columns
+                .iter()
+                .zip(&fixture.bits[end.head as usize])
+            {
+                value = value.add(&coefficient.mul(entry));
+            }
+            value = value.add(
+                &end.mask_scale
+                    .mul(&fixture.masks.entry(end.shown_slot).unwrap()),
+            );
+            assert_eq!(value, end.target);
         }
         let bytes = second.encode(&fixture.plan).unwrap();
         let decoded = ConsumerRawSecond::decode(&fixture.plan, &bytes).unwrap();
@@ -1187,6 +1335,24 @@ mod tests {
                     .unwrap(),
                 row.row.constant
             );
+            let end = &row.end;
+            let mut value = Fp3::ZERO;
+            for (coefficient, entry) in end.raw_columns.iter().zip(&fixture.raw[end.head as usize])
+            {
+                value = value.add(&coefficient.mul(entry));
+            }
+            for (coefficient, entry) in end
+                .bits_columns
+                .iter()
+                .zip(&fixture.bits[end.head as usize])
+            {
+                value = value.add(&coefficient.mul(entry));
+            }
+            value = value.add(
+                &end.mask_scale
+                    .mul(&fixture.masks.entry(end.shown_slot).unwrap()),
+            );
+            assert_ne!(value, end.target);
         }
     }
 
