@@ -352,6 +352,9 @@ fn the_complete_key_chain_over_the_registered_instance() {
             .saturating_sub(memory_before_verify.rss),
         "ledger_before": count_before,
         "ledger_after": count_after,
+        "instance_total_columns": derived.total_columns,
+        "declared_later_batches": derived.declared_later_batches,
+        "later_batch_columns": derived.later_batch_columns,
         "read_ledger_spent": true,
         "seed_source": "operating system generator (private)",
         "bundle": {
