@@ -2375,7 +2375,9 @@ mod tests {
         commit_table_streaming, IndexReader, IndexShape, StreamingTable, VecTableSource,
     };
 
-    use crate::proof::consumer_proof::ConsumerProofFile;
+    use crate::proof::consumer_proof::{
+        encode_own_proof, verify_consumer_chain, ConsumerProofFile,
+    };
     use crate::proof::consumer_second::{
         consumer_second_chain, consumer_total_acceptance, prove_consumer_own, ConsumerChainBinding,
         ConsumerOwnPlan, ConsumerOwnWitness,
@@ -2675,6 +2677,54 @@ mod tests {
         assert_eq!(decoded, file);
         assert_eq!(decoded.own_proof().unwrap(), own_proof);
         assert_eq!(decoded.totals.first_seal, total.first_seal);
+        // The verifier-side global order runs from the file alone: decode the
+        // three sections, compare the totals, then verify every stage.
+        let accepted = verify_consumer_chain(
+            &plan,
+            &fixture.activation,
+            &fixture.outputs,
+            &geometry,
+            &ConsumerSharedStage::new(&shared_plan).unwrap(),
+            &reader,
+            &own_plan,
+            &file,
+        )
+        .unwrap();
+        assert_eq!(accepted.first_seal, total.first_seal);
+        assert_eq!(accepted.second_seal, total.second_seal);
+        // A changed total seal is refused before any stage runs.
+        let mut bad = file.clone();
+        bad.totals.second_seal = Digest([0x77; 32]);
+        let bad = ConsumerProofFile::decode(&bad.encode().unwrap()).unwrap();
+        assert!(verify_consumer_chain(
+            &plan,
+            &fixture.activation,
+            &fixture.outputs,
+            &geometry,
+            &ConsumerSharedStage::new(&shared_plan).unwrap(),
+            &reader,
+            &own_plan,
+            &bad,
+        )
+        .is_err());
+        // A changed own seal with matching totals is refused by the own stage.
+        let mut own_bad = own_proof.clone();
+        own_bad.seal = Digest([0x78; 32]);
+        let mut bad = file.clone();
+        bad.own = encode_own_proof(&own_bad).unwrap();
+        bad.totals.second_seal = own_bad.seal;
+        let bad = ConsumerProofFile::decode(&bad.encode().unwrap()).unwrap();
+        assert!(verify_consumer_chain(
+            &plan,
+            &fixture.activation,
+            &fixture.outputs,
+            &geometry,
+            &ConsumerSharedStage::new(&shared_plan).unwrap(),
+            &reader,
+            &own_plan,
+            &bad,
+        )
+        .is_err());
     }
 
     #[test]

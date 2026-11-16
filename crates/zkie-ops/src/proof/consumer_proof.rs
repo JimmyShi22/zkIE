@@ -13,9 +13,17 @@ use zkie_engine::pcs::request::field::Fp3;
 use zkie_engine::pcs::request::table::SampleSeed;
 use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
 
-use crate::proof::consumer_first::{ConsumerFirstMessages, ConsumerFirstPlan};
-use crate::proof::consumer_second::{ConsumerOwnProof, ConsumerTotalAccepted};
-use crate::proof::hidden_send_session::{encode_shared_messages, HiddenSharedMessages};
+use crate::proof::consumer_first::{
+    ConsumerFirstMessages, ConsumerFirstObligations, ConsumerFirstPlan,
+};
+use crate::proof::consumer_second::{
+    consumer_total_acceptance, ConsumerOwnPlan, ConsumerOwnProof, ConsumerTotalAccepted,
+};
+use crate::proof::consumer_shared::{ConsumerSharedGeometry, ConsumerSharedStage};
+use crate::proof::hidden_send_session::{
+    decode_shared_messages, encode_shared_messages, HiddenSharedMessages,
+};
+use zkie_engine::pcs::request::table::IndexReader;
 
 /// Version of the consumer proof file.
 pub const CONSUMER_PROOF_VERSION: u64 = 1;
@@ -205,6 +213,48 @@ impl ConsumerProofFile {
         let bytes = std::fs::read(&path).map_err(|_| Error::InvalidProof)?;
         Self::decode(&bytes)
     }
+}
+
+/// Verifies one consumer proof file in the global order: first stage, shared
+/// stage, own group and total acceptance. The file's totals must equal the
+/// decoded stage seals and bound roots before any stage runs; every stage
+/// then verifies against its own plan.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_consumer_chain(
+    first_plan: &ConsumerFirstPlan,
+    activation: &[Fp3],
+    outputs: &[Vec<i64>],
+    geometry: &ConsumerSharedGeometry,
+    shared_stage: &ConsumerSharedStage,
+    reader: &IndexReader,
+    own_plan: &ConsumerOwnPlan,
+    file: &ConsumerProofFile,
+) -> Result<ConsumerTotalAccepted> {
+    file.check()?;
+    let first = ConsumerFirstMessages::decode(first_plan, &file.first)?;
+    let shared = decode_shared_messages(&file.shared)?;
+    let own = file.own_proof()?;
+    if file.totals.first_seal != first.first_seal
+        || file.totals.shared_seal != shared.seal
+        || file.totals.second_seal != own.seal
+        || file.totals.eval_target != first.eval_target
+        || file.totals.w_root != first.w_root
+        || file.totals.omega_root != own_plan.omega_root
+    {
+        return Err(Error::InvalidProof);
+    }
+    consumer_total_acceptance(
+        first_plan,
+        activation,
+        outputs,
+        &first,
+        geometry,
+        shared_stage,
+        reader,
+        &shared,
+        own_plan,
+        &own,
+    )
 }
 
 fn put_seed(writer: &mut CanonicalWriter, seed: &SampleSeed) {
