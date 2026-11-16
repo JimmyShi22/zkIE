@@ -1269,6 +1269,7 @@ pub fn verify_request_chain_direct(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proof::projection_claim::PlaceRows;
 
     use zkie_core::common::codec::DecodeLimits;
     use zkie_engine::pcs::request::field::Fp3;
@@ -1688,13 +1689,13 @@ mod tests {
             .unwrap();
         let cell = needed.mul(&outputs.gamma[row].inverse().unwrap());
         matrix[row] = vec![cell; 4];
-        crate::proof::hidden_member::check_pending(&outputs.pending, &matrix, &index_mask).unwrap();
+        crate::proof::hidden_member::check_pending(&outputs.pending, &PlaceRows::new(&matrix), &index_mask).unwrap();
         // Another matrix value or mask value breaks the pending claim.
         let mut changed = matrix.clone();
         changed[row][0] = changed[row][0].add(&Fp3::ONE);
-        assert!(crate::proof::hidden_member::check_pending(&outputs.pending, &changed, &index_mask).is_err());
+        assert!(crate::proof::hidden_member::check_pending(&outputs.pending, &PlaceRows::new(&changed), &index_mask).is_err());
         let other_mask = |_oracle: u64, slot: u64| Ok(f(601 + slot));
-        assert!(crate::proof::hidden_member::check_pending(&outputs.pending, &matrix, &other_mask).is_err());
+        assert!(crate::proof::hidden_member::check_pending(&outputs.pending, &PlaceRows::new(&matrix), &other_mask).is_err());
         // Another mask source, or a repeated end slot, is refused: every end
         // value has its own slot and its own entry.
         let other_chain_mask = |slot: usize| -> Result<Fp3> {

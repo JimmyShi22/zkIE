@@ -133,6 +133,70 @@ pub fn check_projection_reduction(
     Ok(())
 }
 
+/// The authenticated table matrix in its stored-record orientation: one call
+/// writes `M[place, record] = A[record, place]` for every place of one stored
+/// row. The real prover streams exactly one stored row at a time through the
+/// asset mapping; no caller holds the whole matrix. The component fixtures
+/// expose their place-major rows through the same interface.
+pub trait ConsumerMatrixColumns {
+    fn places(&self) -> u64;
+    fn records(&self) -> u64;
+    fn row(&self, record: u64, out: &mut [Fp3]) -> Result<()>;
+}
+
+/// The place-major fixture matrix behind the stored-row interface. It exists
+/// for component tests only; the production path reads the asset mapping.
+pub struct PlaceRows<'a> {
+    rows: &'a [Vec<Fp3>],
+}
+
+impl<'a> PlaceRows<'a> {
+    pub fn new(rows: &'a [Vec<Fp3>]) -> Self {
+        Self { rows }
+    }
+
+    fn records_of(&self) -> usize {
+        self.rows.first().map_or(0, |row| row.len())
+    }
+}
+
+impl ConsumerMatrixColumns for PlaceRows<'_> {
+    fn places(&self) -> u64 {
+        self.rows.len() as u64
+    }
+
+    fn records(&self) -> u64 {
+        self.records_of() as u64
+    }
+
+    fn row(&self, record: u64, out: &mut [Fp3]) -> Result<()> {
+        let record = usize::try_from(record).map_err(|_| Error::ResourceLimit)?;
+        if out.len() != self.rows.len()
+            || self.rows.iter().any(|row| row.len() != self.records_of())
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        for (place, row) in self.rows.iter().enumerate() {
+            out[place] = *row.get(record).ok_or(Error::ShapeMismatch)?;
+        }
+        Ok(())
+    }
+}
+
+/// The multilinear equality weight of one index at a point.
+fn eq_at(point: &[Fp3], index: u64) -> Fp3 {
+    let mut weight = Fp3::ONE;
+    for (bit, coordinate) in point.iter().enumerate() {
+        let chosen = if (index >> bit) & 1 == 1 {
+            *coordinate
+        } else {
+            Fp3::ONE.sub(coordinate)
+        };
+        weight = weight.mul(&chosen);
+    }
+    weight
+}
+
 /// One projection consumer's reduction claim: the public activation rows are
 /// reduced by the challenge coefficients of the positions, the raw output
 /// columns of one head slice by the challenge coefficients of the columns.
@@ -158,9 +222,9 @@ pub struct ConsumerReduction {
 
 impl ConsumerReduction {
     /// The right side on a known matrix: `Σ_k shown[k] · Σ_n weights[n]
-    /// M[n,k]`. `matrix_places[n]` is the matrix's row `n` over the records.
-    pub fn identity_on(&self, matrix_places: &[Vec<Fp3>]) -> Result<Fp3> {
-        let columns = self.column_values(matrix_places)?;
+    /// M[n,k]`. The matrix is streamed one stored record at a time.
+    pub fn identity_on(&self, matrix: &dyn ConsumerMatrixColumns) -> Result<Fp3> {
+        let columns = self.column_values(matrix)?;
         let mut total = Fp3::ZERO;
         for (shown, column) in self.shown.iter().zip(&columns) {
             total = total.add(&shown.mul(column));
@@ -169,25 +233,25 @@ impl ConsumerReduction {
     }
 
     /// The private second map of the product sum, `V[k] = Σ_n weights[n]
-    /// M[n,k]`: one value per contraction index. `matrix_places[n]` is the
-    /// matrix's row `n` over the records, the same matrix the key
-    /// authenticates.
-    pub fn column_values(&self, matrix_places: &[Vec<Fp3>]) -> Result<Vec<Fp3>> {
-        if matrix_places.len() != self.weights.len() {
+    /// M[n,k]`: one value per contraction index. The matrix is streamed one
+    /// stored record at a time, so the memory stays one row of places.
+    pub fn column_values(&self, matrix: &dyn ConsumerMatrixColumns) -> Result<Vec<Fp3>> {
+        let places = usize::try_from(matrix.places()).map_err(|_| Error::ResourceLimit)?;
+        let records = usize::try_from(matrix.records()).map_err(|_| Error::ResourceLimit)?;
+        if self.weights.len() != places || self.shown.len() != records {
             return Err(Error::ShapeMismatch);
         }
-        let mut columns = vec![Fp3::ZERO; self.shown.len()];
-        for (n, row) in matrix_places.iter().enumerate() {
-            if row.len() != columns.len() {
-                return Err(Error::ShapeMismatch);
+        let mut columns = vec![Fp3::ZERO; records];
+        let mut row = vec![Fp3::ZERO; places];
+        for (record, column) in columns.iter_mut().enumerate() {
+            matrix.row(record as u64, &mut row)?;
+            let mut total = Fp3::ZERO;
+            for (weight, value) in self.weights.iter().zip(&row) {
+                if !weight.is_zero() {
+                    total = total.add(&weight.mul(value));
+                }
             }
-            let weight = self.weights[n];
-            if weight.is_zero() {
-                continue;
-            }
-            for (k, value) in row.iter().enumerate() {
-                columns[k] = columns[k].add(&weight.mul(value));
-            }
+            *column = total;
         }
         Ok(columns)
     }
@@ -558,21 +622,21 @@ mod tests {
         assert_eq!(reduction.weights.len(), 16);
         assert!(reduction.weights[..4].iter().all(|weight| weight.is_zero()));
         assert!(reduction.weights[8..].iter().all(|weight| weight.is_zero()));
-        assert_eq!(reduction.target, reduction.identity_on(&matrix).unwrap());
+        assert_eq!(reduction.target, reduction.identity_on(&PlaceRows::new(&matrix)).unwrap());
     }
 
     #[test]
     fn the_consumer_column_values_carry_the_identity() {
         let (matrix, _records, x, y_raw, a, b) = consumer_fixture();
         let reduction = consumer_reduction(3, 8, 16, (4, 8), &x, &y_raw, &a, &b).unwrap();
-        let columns = reduction.column_values(&matrix).unwrap();
+        let columns = reduction.column_values(&PlaceRows::new(&matrix)).unwrap();
         assert_eq!(columns.len(), 8);
         assert_eq!(activation_shown(3, 8, &x, &a).unwrap(), reduction.shown);
         let mut total = Fp3::ZERO;
         for (shown, column) in reduction.shown.iter().zip(&columns) {
             total = total.add(&shown.mul(column));
         }
-        assert_eq!(total, reduction.identity_on(&matrix).unwrap());
+        assert_eq!(total, reduction.identity_on(&PlaceRows::new(&matrix)).unwrap());
     }
 
     #[test]
@@ -596,10 +660,10 @@ mod tests {
     fn consumer_maps_refuse_broken_shapes() {
         let (matrix, _records, x, y_raw, a, b) = consumer_fixture();
         let reduction = consumer_reduction(3, 8, 16, (4, 8), &x, &y_raw, &a, &b).unwrap();
-        assert!(reduction.column_values(&matrix[..15]).is_err());
+        assert!(reduction.column_values(&PlaceRows::new(&matrix[..15])).is_err());
         let mut broken = matrix.clone();
         broken[0].pop();
-        assert!(reduction.column_values(&broken).is_err());
+        assert!(reduction.column_values(&PlaceRows::new(&broken)).is_err());
         assert!(activation_shown(3, 8, &x[..23], &a).is_err());
         assert!(activation_shown(3, 8, &x, &a[..2]).is_err());
         assert!(activation_shown(0, 8, &x, &a).is_err());
@@ -609,13 +673,13 @@ mod tests {
     fn the_requantized_output_does_not_satisfy_the_raw_identity() {
         let (matrix, _records, x, mut y_raw, a, b) = consumer_fixture();
         let honest = consumer_reduction(3, 8, 16, (4, 8), &x, &y_raw, &a, &b).unwrap();
-        assert_eq!(honest.target, honest.identity_on(&matrix).unwrap());
+        assert_eq!(honest.target, honest.identity_on(&PlaceRows::new(&matrix)).unwrap());
         // A rounding or truncation change to one raw entry breaks the
         // identity; the reduction is over the raw accumulator, never the
         // requantized output.
         y_raw[1] = y_raw[1].add(&value(1));
         let changed = consumer_reduction(3, 8, 16, (4, 8), &x, &y_raw, &a, &b).unwrap();
-        assert_ne!(changed.target, changed.identity_on(&matrix).unwrap());
+        assert_ne!(changed.target, changed.identity_on(&PlaceRows::new(&matrix)).unwrap());
     }
 
     #[test]

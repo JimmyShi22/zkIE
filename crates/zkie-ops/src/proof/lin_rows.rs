@@ -121,6 +121,7 @@ pub fn lin_fold(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proof::projection_claim::PlaceRows;
 
     fn f(value: u64) -> Fp3 {
         Fp3::from_u64(value)
@@ -180,7 +181,7 @@ mod tests {
             masks: Vec::<MaskTerm>::new(),
         };
         assert_eq!(
-            pending_value(&pending, &matrix, &|_, _| Ok(Fp3::ZERO)).unwrap(),
+            pending_value(&pending, &PlaceRows::new(&matrix), &|_, _| Ok(Fp3::ZERO)).unwrap(),
             eval
         );
         // Another weight or matrix row moves both sides together only when
@@ -188,7 +189,7 @@ mod tests {
         let mut changed = matrix.clone();
         changed[0][0] = changed[0][0].add(&Fp3::ONE);
         assert_ne!(
-            pending_value(&pending, &changed, &|_, _| Ok(Fp3::ZERO)).unwrap(),
+            pending_value(&pending, &PlaceRows::new(&changed), &|_, _| Ok(Fp3::ZERO)).unwrap(),
             eval
         );
     }

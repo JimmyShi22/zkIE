@@ -646,7 +646,7 @@ pub fn prove_consumer_psc(
     obligation: &ConsumerObligation,
     activation: &[Fp3],
     raw: &[Fp3],
-    matrix_places: &[Vec<Fp3>],
+    matrix_places: &dyn crate::proof::projection_claim::ConsumerMatrixColumns,
     masks: &ConsumerPscMasks,
 ) -> Result<(ConsumerPscProof, ConsumerPscOutcome)> {
     obligation.check()?;
@@ -657,9 +657,7 @@ pub fn prove_consumer_psc(
     if activation.len() != positions.checked_mul(records).ok_or(Error::ResourceLimit)? {
         return Err(Error::ShapeMismatch);
     }
-    if matrix_places.len() != usize::try_from(shape.places).map_err(|_| Error::ResourceLimit)?
-        || matrix_places.iter().any(|row| row.len() != records)
-    {
+    if matrix_places.places() != shape.places || matrix_places.records() != shape.records {
         return Err(Error::ShapeMismatch);
     }
     obligation.absorb(chain)?;
@@ -774,7 +772,7 @@ pub fn prove_consumer_psc_fixed(
     obligation: &ConsumerObligation,
     activation: &[Fp3],
     raw: &[Fp3],
-    matrix_places: &[Vec<Fp3>],
+    matrix_places: &dyn crate::proof::projection_claim::ConsumerMatrixColumns,
     masks: &ConsumerPscMasks,
     position: &[Fp3],
     column: &[Fp3],
@@ -792,9 +790,7 @@ pub fn prove_consumer_psc_fixed(
     {
         return Err(Error::ShapeMismatch);
     }
-    if matrix_places.len() != usize::try_from(shape.places).map_err(|_| Error::ResourceLimit)?
-        || matrix_places.iter().any(|row| row.len() != records)
-    {
+    if matrix_places.places() != shape.places || matrix_places.records() != shape.records {
         return Err(Error::ShapeMismatch);
     }
     let reduction = consumer_reduction(
@@ -911,6 +907,7 @@ pub fn verify_consumer_psc_fixed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proof::projection_claim::PlaceRows;
     use zkie_engine::pcs::request::field::fp_from_u64;
 
     fn value(word: u64) -> Fp3 {
@@ -1036,7 +1033,7 @@ mod tests {
             &obligation,
             &activation,
             &raw,
-            &matrix,
+            &PlaceRows::new(&matrix),
             &masks,
         )
         .unwrap();
@@ -1072,7 +1069,7 @@ mod tests {
         );
         // The same-matrix pending row holds against the real matrix and the
         // one-time shown entry.
-        crate::proof::hidden_member::check_pending(&outcome.pending, &matrix, &|oracle, slot| {
+        crate::proof::hidden_member::check_pending(&outcome.pending, &PlaceRows::new(&matrix), &|oracle, slot| {
             if oracle == obligation.mask.oracle && slot == obligation.mask.shown_slot {
                 Ok(masks.entries.shown[1])
             } else {
@@ -1156,7 +1153,7 @@ mod tests {
             &obligation,
             &activation,
             &raw,
-            &matrix,
+            &PlaceRows::new(&matrix),
             &masked_public
         )
         .is_err());
@@ -1168,7 +1165,7 @@ mod tests {
             &obligation,
             &activation,
             &raw,
-            &matrix,
+            &PlaceRows::new(&matrix),
             &unmasked_private
         )
         .is_err());
@@ -1180,7 +1177,7 @@ mod tests {
             &obligation,
             &activation,
             &raw,
-            &matrix,
+            &PlaceRows::new(&matrix),
             &wrong_count
         )
         .is_err());
@@ -1203,7 +1200,7 @@ mod tests {
             &obligation,
             &activation,
             &requantized,
-            &matrix,
+            &PlaceRows::new(&matrix),
             &masks(&shape)
         )
         .is_err());
@@ -1219,7 +1216,7 @@ mod tests {
         changed_mask.entries.shown[1] = changed_mask.entries.shown[1].add(&value(1));
         assert!(crate::proof::hidden_member::check_pending(
             &verified.pending,
-            &matrix,
+            &PlaceRows::new(&matrix),
             &|oracle, slot| {
                 if oracle == obligation.mask.oracle && slot == obligation.mask.shown_slot {
                     Ok(changed_mask.entries.shown[1])
@@ -1436,7 +1433,7 @@ mod tests {
             &obligation,
             &activation,
             &first_raw,
-            &first_matrix,
+            &PlaceRows::new(&first_matrix),
             &masks,
         )
         .unwrap();
@@ -1448,7 +1445,7 @@ mod tests {
             &obligation,
             &activation,
             &second_raw,
-            &second_matrix,
+            &PlaceRows::new(&second_matrix),
             &masks,
         )
         .unwrap();

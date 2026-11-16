@@ -56,7 +56,7 @@ use crate::proof::hidden_send_session::{
     commit_request_w, derive_w_values, pending_row_weights, request_eval_row, TableLayout, WShape,
 };
 use crate::proof::output_closure::CommittedValueGroup;
-use crate::proof::projection_claim::raw_target;
+use crate::proof::projection_claim::{raw_target, ConsumerMatrixColumns};
 use crate::proof::psc::multilinear_eval;
 
 /// Version of the first-stage messages.
@@ -780,7 +780,7 @@ pub fn derive_consumer_first_member(
     outputs: &[Vec<i64>],
     raw_first: &ConsumerRawFirst,
     raw_masks: &ConsumerRawMaskWitness,
-    matrix_places: &[Vec<Fp3>],
+    matrix_places: &dyn ConsumerMatrixColumns,
     psc_masks: &ConsumerPscMasks,
 ) -> Result<(PendingRow, Fp3)> {
     draft.check()?;
@@ -851,7 +851,7 @@ pub fn prove_consumer_first(
     raw_first: &ConsumerRawFirst,
     raw_masks: &ConsumerRawMaskWitness,
     psc_masks: &ConsumerPscMasks,
-    matrix_places: &[Vec<Fp3>],
+    matrix_places: &dyn ConsumerMatrixColumns,
     table_source: &mut dyn TableRowSource,
     w_randomness: &ConsumerWCommitRandomness,
     eval_mask: &dyn Fn(u64, u64) -> Result<Fp3>,
@@ -1058,6 +1058,7 @@ mod tests {
     use zkie_engine::pcs::request::field::{fp_from_u64, Fp};
     use zkie_engine::pcs::request::fold::{ByteMaskCoins, MaskCoins};
     use zkie_engine::pcs::request::table::TableDistances;
+    use crate::proof::projection_claim::PlaceRows;
 
     use crate::proof::column_session::fp_from_signed_word;
     use crate::proof::consumer_group::{
@@ -1527,7 +1528,7 @@ mod tests {
             &outputs,
             &raw_first,
             &raw_masks,
-            &matrix,
+            &PlaceRows::new(&matrix),
             &psc_masks,
         )
         .unwrap();
@@ -1569,7 +1570,7 @@ mod tests {
             &fixture.raw_first,
             &fixture.raw_masks,
             &fixture.psc_masks,
-            &fixture.matrix,
+            &PlaceRows::new(&fixture.matrix),
             &mut fixture.table_source,
             &fixture.w_randomness,
             &eval_mask,
@@ -1746,7 +1747,7 @@ mod tests {
             &fixture.raw_first,
             &fixture.raw_masks,
             &fixture.psc_masks,
-            &fixture.matrix,
+            &PlaceRows::new(&fixture.matrix),
             &mut fixture.table_source,
             &fixture.w_randomness,
             &eval_mask,
@@ -1794,7 +1795,7 @@ mod tests {
             &fixture.raw_first,
             &fixture.raw_masks,
             &fixture.psc_masks,
-            &fixture.matrix,
+            &PlaceRows::new(&fixture.matrix),
             &mut fixture.table_source,
             &fixture.w_randomness,
             &eval_mask,
@@ -2179,7 +2180,7 @@ mod tests {
             &outputs,
             &raw_first,
             &raw_masks,
-            &matrix,
+            &PlaceRows::new(&matrix),
             &psc_masks,
         )
         .unwrap();
@@ -2273,7 +2274,7 @@ mod tests {
             &fixture.raw_first,
             &fixture.raw_masks,
             &fixture.psc_masks,
-            &fixture.matrix,
+            &PlaceRows::new(&fixture.matrix),
             &mut fixture.table_source,
             &fixture.w_randomness,
             &eval_mask,

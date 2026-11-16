@@ -256,26 +256,49 @@ pub fn row_at(row: &[Fp3], psi: &[Fp3]) -> Result<Fp3> {
     Ok(value)
 }
 
-/// The pending claim's left side: the row weights against the matrix rows at
-/// the column point, plus the index-mask entries.
+/// The equality weight of one record index at the pending column point.
+fn eq_at(point: &[Fp3], index: u64) -> Fp3 {
+    let mut weight = Fp3::ONE;
+    for (bit, coordinate) in point.iter().enumerate() {
+        let chosen = if (index >> bit) & 1 == 1 {
+            *coordinate
+        } else {
+            Fp3::ONE.sub(coordinate)
+        };
+        weight = weight.mul(&chosen);
+    }
+    weight
+}
+
+/// The pending claim's left side: the row weights against the matrix at the
+/// column point, plus the index-mask entries. The matrix is streamed one
+/// stored record at a time; the memory stays one row of places and the
+/// stretched weight vector.
 pub fn pending_value(
     pending: &PendingRow,
-    matrix: &[Vec<Fp3>],
+    matrix: &dyn crate::proof::projection_claim::ConsumerMatrixColumns,
     mask_value: &dyn Fn(u64, u64) -> Result<Fp3>,
 ) -> Result<Fp3> {
-    if pending.weights.is_empty() {
+    if pending.weights.is_empty() || pending.psi.is_empty() {
         return Err(Error::InvalidConfig);
     }
     let cube = 1u64 << pending.row_bits()?;
-    let mut value = Fp3::ZERO;
+    let places = usize::try_from(matrix.places()).map_err(|_| Error::ResourceLimit)?;
+    if cube > matrix.places() {
+        return Err(Error::ShapeMismatch);
+    }
+    let records = usize::try_from(matrix.records()).map_err(|_| Error::ResourceLimit)?;
+    if records != 1usize << pending.psi.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut weights = vec![Fp3::ZERO; places];
     for block in &pending.weights {
         match block {
             WeightBlock::Scalar { row, value: weight } => {
                 if *row >= cube {
                     return Err(Error::BoundViolation);
                 }
-                let row_values = matrix.get(*row as usize).ok_or(Error::ShapeMismatch)?;
-                value = value.add(&weight.mul(&row_at(row_values, &pending.psi)?));
+                weights[*row as usize] = *weight;
             }
             WeightBlock::Dense {
                 first_row,
@@ -292,11 +315,22 @@ pub fn pending_value(
                     if row >= cube {
                         return Err(Error::BoundViolation);
                     }
-                    let row_values = matrix.get(row as usize).ok_or(Error::ShapeMismatch)?;
-                    value = value.add(&weight.mul(&row_at(row_values, &pending.psi)?));
+                    weights[row as usize] = *weight;
                 }
             }
         }
+    }
+    let mut value = Fp3::ZERO;
+    let mut row = vec![Fp3::ZERO; places];
+    for record in 0..records {
+        matrix.row(record as u64, &mut row)?;
+        let mut total = Fp3::ZERO;
+        for (weight, entry) in weights.iter().zip(&row) {
+            if !weight.is_zero() {
+                total = total.add(&weight.mul(entry));
+            }
+        }
+        value = value.add(&eq_at(&pending.psi, record as u64).mul(&total));
     }
     for term in &pending.masks {
         value = value.add(&term.coeff.mul(&mask_value(term.oracle, term.slot)?));
@@ -322,7 +356,7 @@ pub fn check_member_claim(plan: &PendingRow, chain: &PendingRow) -> Result<()> {
 /// Checks the pending claim: the left side must equal the target.
 pub fn check_pending(
     pending: &PendingRow,
-    matrix: &[Vec<Fp3>],
+    matrix: &dyn crate::proof::projection_claim::ConsumerMatrixColumns,
     mask_value: &dyn Fn(u64, u64) -> Result<Fp3>,
 ) -> Result<()> {
     if pending_value(pending, matrix, mask_value)? != pending.target {
@@ -850,6 +884,7 @@ impl ReductionWitnessPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proof::projection_claim::PlaceRows;
 
     fn fp(value: u64) -> Fp3 {
         Fp3::from_u64(value)
@@ -1224,13 +1259,13 @@ mod tests {
                 coeff: fp(7),
             }],
         };
-        check_pending(&pending, &matrix, &mask_value).unwrap();
+        check_pending(&pending, &PlaceRows::new(&matrix), &mask_value).unwrap();
         // Another matrix value or mask value breaks the claim.
         let mut changed = matrix.clone();
         changed[1][0] = changed[1][0].add(&fp(1));
-        assert!(check_pending(&pending, &changed, &mask_value).is_err());
+        assert!(check_pending(&pending, &PlaceRows::new(&changed), &mask_value).is_err());
         let other_mask = |oracle: u64, slot: u64| Ok(fp(oracle + slot + 101));
-        assert!(check_pending(&pending, &matrix, &other_mask).is_err());
+        assert!(check_pending(&pending, &PlaceRows::new(&matrix), &other_mask).is_err());
         // A scalar block with a gap and a block outside the row cube.
         let scalar = PendingRow {
             weights: vec![WeightBlock::Scalar {
@@ -1245,7 +1280,7 @@ mod tests {
                 coeff: fp(7),
             }],
         };
-        check_pending(&scalar, &matrix, &mask_value).unwrap();
+        check_pending(&scalar, &PlaceRows::new(&matrix), &mask_value).unwrap();
         let outside = PendingRow {
             weights: vec![WeightBlock::Scalar {
                 row: 4,
@@ -1253,6 +1288,6 @@ mod tests {
             }],
             ..scalar.clone()
         };
-        assert!(check_pending(&outside, &matrix, &mask_value).is_err());
+        assert!(check_pending(&outside, &PlaceRows::new(&matrix), &mask_value).is_err());
     }
 }
