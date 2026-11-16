@@ -474,7 +474,8 @@ pub fn column_ledger_dir(asset_dir: &Path, table_root: Digest) -> PathBuf {
 /// batch size and `max_columns` the table-life limit; both are trusted plan
 /// values.
 pub struct AssetTableKeeper {
-    table: AssetEncodingTable,
+    table: StreamingTable,
+    source: Box<dyn TableRowSource>,
     hiding: HidingState,
     budget: DurableColumnBudget,
 }
@@ -487,6 +488,25 @@ impl AssetTableKeeper {
     /// asset directory and the table root.
     pub fn open(
         table: AssetEncodingTable,
+        ledger_dir: impl Into<PathBuf>,
+        columns: u64,
+        max_columns: u64,
+    ) -> Result<Self> {
+        let AssetEncodingTable { table, source, .. } = table;
+        Self::open_with_source(
+            table,
+            Box::new(source.into_inner()),
+            ledger_dir,
+            columns,
+            max_columns,
+        )
+    }
+
+    /// The same keeper over a streaming row source: the source recomputes one
+    /// stored row on demand, so the encoded messages are never held whole.
+    pub fn open_with_source(
+        table: StreamingTable,
+        source: Box<dyn TableRowSource>,
         ledger_dir: impl Into<PathBuf>,
         columns: u64,
         max_columns: u64,
@@ -508,12 +528,13 @@ impl AssetTableKeeper {
         let hiding = HidingState::new(root, 1, max_columns);
         Ok(Self {
             table,
+            source,
             hiding,
             budget,
         })
     }
 
-    pub fn table(&self) -> &AssetEncodingTable {
+    pub fn table(&self) -> &StreamingTable {
         &self.table
     }
 
@@ -525,11 +546,11 @@ impl AssetTableKeeper {
 
 impl TableRowSource for AssetTableKeeper {
     fn rows(&self) -> u64 {
-        self.table.source.borrow().rows()
+        self.source.rows()
     }
 
     fn row(&mut self, index: u64, message: &mut [Fp], tail: &mut [Fp]) -> Result<()> {
-        self.table.source.borrow_mut().row(index, message, tail)
+        self.source.row(index, message, tail)
     }
 }
 
@@ -539,8 +560,7 @@ impl HiddenTableProver for AssetTableKeeper {
     }
 
     fn open_columns(&mut self, positions: &[u64]) -> Result<Vec<ColumnOpening>> {
-        let mut source = self.table.source.borrow_mut();
-        self.table.table.open_columns(&mut *source, positions)
+        self.table.open_columns(self.source.as_mut(), positions)
     }
 
     fn hiding_state(&mut self) -> Option<&mut HidingState> {
@@ -1298,9 +1318,9 @@ mod tests {
         let mut keeper =
             AssetTableKeeper::open(built, ledger.clone(), columns, max_columns).unwrap();
         assert_eq!(keeper.count().unwrap(), 0);
-        assert_eq!(keeper.rows(), keeper.table().shape.rows());
-        let mut message = vec![Fp::ZERO; keeper.table().shape.code.ell as usize];
-        let mut tail = vec![Fp::ZERO; keeper.table().shape.code.r as usize];
+        assert_eq!(keeper.rows(), keeper.table().reader.shape.rows());
+        let mut message = vec![Fp::ZERO; keeper.table().reader.shape.code.ell as usize];
+        let mut tail = vec![Fp::ZERO; keeper.table().reader.shape.code.r as usize];
         keeper.row(0, &mut message, &mut tail).unwrap();
         assert_eq!(message[0], fp_from_signed_word(1));
         let openings = keeper.open_columns(&[0, 1]).unwrap();

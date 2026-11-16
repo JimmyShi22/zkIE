@@ -16,6 +16,7 @@ use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
 use crate::proof::consumer_first::{
     ConsumerFirstMessages, ConsumerFirstObligations, ConsumerFirstPlan,
 };
+use crate::proof::consumer_plan::ConsumerPlanAssembly;
 use crate::proof::consumer_second::{
     consumer_total_acceptance, ConsumerOwnPlan, ConsumerOwnProof, ConsumerTotalAccepted,
 };
@@ -29,7 +30,7 @@ use crate::proof::lin_binding::{LinBindingPath, LinBindingRoot};
 use zkie_engine::pcs::request::table::IndexReader;
 
 /// Version of the consumer proof file.
-pub const CONSUMER_PROOF_VERSION: u64 = 1;
+pub const CONSUMER_PROOF_VERSION: u64 = 2;
 
 /// The accepted totals repeated in the file: the three seals, the Eval target
 /// and the two committed roots.
@@ -100,6 +101,10 @@ pub struct ConsumerProofFile {
     /// shared chain's root. The verifier rebuilds the root from its own seal;
     /// the path is checked, not trusted.
     pub binding_path: LinBindingPath,
+    /// The prover-dependent plan values of the first stage. The verifier
+    /// rebuilds the plan structure from the trusted facts and reads only these
+    /// committed values; the first chain and the group bind every one of them.
+    pub assembly: Vec<u8>,
     pub totals: ConsumerProofTotals,
 }
 
@@ -113,23 +118,53 @@ impl ConsumerProofFile {
         accepted: &ConsumerTotalAccepted,
         binding_path: LinBindingPath,
     ) -> Result<Self> {
+        let totals = ConsumerProofTotals {
+            first_seal: accepted.first_seal,
+            binding_root: accepted.binding_root,
+            shared_seal: accepted.shared_seal,
+            second_seal: accepted.second_seal,
+            eval_target: accepted.eval_target,
+            w_root: accepted.w_root,
+            omega_root: accepted.omega_root,
+        };
+        Self::assemble_with_totals(first_plan, first, shared, own, totals, binding_path)
+    }
+
+    /// The same assembly from the stage results the prover already holds. The
+    /// totals carry exactly the seals and roots the stages produced; the
+    /// verifier never reads them as evidence, it only compares them with its
+    /// own decoded stages before running the chain.
+    pub fn assemble_with_totals(
+        first_plan: &ConsumerFirstPlan,
+        first: &ConsumerFirstMessages,
+        shared: &HiddenSharedMessages,
+        own: &ConsumerOwnProof,
+        totals: ConsumerProofTotals,
+        binding_path: LinBindingPath,
+    ) -> Result<Self> {
+        let group = first_plan.group.as_ref().ok_or(Error::InvalidConfig)?;
+        let assembly = ConsumerPlanAssembly {
+            member: first_plan.member.clone(),
+            target: first_plan.target,
+            mask_root: group.mask_root,
+            raw_roots: first_plan.draft.raw.raw.roots.clone(),
+            bits_roots: first_plan.draft.raw.bits.roots.clone(),
+        };
         let file = Self {
             first: first.encode(first_plan)?,
             shared: encode_shared_messages(shared)?,
             own: encode_own_proof(own)?,
             binding_path,
-            totals: ConsumerProofTotals {
-                first_seal: accepted.first_seal,
-                binding_root: accepted.binding_root,
-                shared_seal: accepted.shared_seal,
-                second_seal: accepted.second_seal,
-                eval_target: accepted.eval_target,
-                w_root: accepted.w_root,
-                omega_root: accepted.omega_root,
-            },
+            assembly: assembly.encode()?,
+            totals,
         };
         file.check()?;
         Ok(file)
+    }
+
+    /// Decodes the prover-dependent plan values carried by this file.
+    pub fn plan_assembly(&self) -> Result<ConsumerPlanAssembly> {
+        ConsumerPlanAssembly::decode(&self.assembly)
     }
 
     pub fn fault(&self) -> Option<&'static str> {
@@ -138,9 +173,14 @@ impl ConsumerProofFile {
 
     pub fn check(&self) -> Result<()> {
         self.totals.check()?;
-        if self.first.is_empty() || self.shared.is_empty() || self.own.is_empty() {
+        if self.first.is_empty()
+            || self.shared.is_empty()
+            || self.own.is_empty()
+            || self.assembly.is_empty()
+        {
             return Err(Error::InvalidProof);
         }
+        self.plan_assembly()?;
         Ok(())
     }
 
@@ -151,6 +191,7 @@ impl ConsumerProofFile {
         writer.put_bytes(&self.shared);
         writer.put_bytes(&self.own);
         writer.put_bytes(&self.binding_path.encode());
+        writer.put_bytes(&self.assembly);
         self.totals.put(&mut writer);
         writer.into_bytes()
     }
@@ -183,6 +224,7 @@ impl ConsumerProofFile {
         let shared = body_reader.get_bytes()?.to_vec();
         let own = body_reader.get_bytes()?.to_vec();
         let binding_path = LinBindingPath::decode(body_reader.get_bytes()?)?;
+        let assembly = body_reader.get_bytes()?.to_vec();
         let totals = ConsumerProofTotals::get(&mut body_reader)?;
         body_reader.finish()?;
         let file = Self {
@@ -190,6 +232,7 @@ impl ConsumerProofFile {
             shared,
             own,
             binding_path,
+            assembly,
             totals,
         };
         file.check()?;
@@ -384,6 +427,26 @@ mod tests {
         }
     }
 
+    fn assembly() -> Vec<u8> {
+        ConsumerPlanAssembly {
+            member: crate::proof::hidden_member::PendingRow {
+                weights: vec![crate::proof::hidden_member::WeightBlock::Scalar {
+                    row: 0,
+                    value: fp(1),
+                }],
+                psi: vec![fp(2)],
+                target: fp(3),
+                masks: Vec::new(),
+            },
+            target: fp(4),
+            mask_root: Digest([0x31; 32]),
+            raw_roots: vec![Digest([0x32; 32])],
+            bits_roots: vec![Digest([0x33; 32])],
+        }
+        .encode()
+        .unwrap()
+    }
+
     fn totals() -> ConsumerProofTotals {
         ConsumerProofTotals {
             first_seal: Digest([0x21; 32]),
@@ -443,6 +506,7 @@ mod tests {
                 salt: vec![7u8; 40],
                 siblings: Vec::new(),
             },
+            assembly: assembly(),
             totals: totals(),
         };
         let path = file.write_to(&root).unwrap();
@@ -475,6 +539,7 @@ mod tests {
                 salt: vec![7u8; 40],
                 siblings: Vec::new(),
             },
+            assembly: assembly(),
             totals: totals(),
         };
         let bytes = file.encode().unwrap();

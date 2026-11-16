@@ -14,6 +14,7 @@ pub mod consumer_plan;
 pub mod consumer_source;
 pub mod consumer_proof;
 pub mod consumer_group;
+pub mod consumer_session;
 pub mod consumer_request;
 pub mod cs_final_session;
 pub mod cs_multi_session;

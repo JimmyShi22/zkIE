@@ -438,19 +438,66 @@ pub fn decode_asset_table_randomness_set(
     Ok(tables)
 }
 
-struct AssetRowSource<'a> {
-    reader: &'a AssetReader,
+/// One read-only row access of the asset mapping, owned so a committed table
+/// keeper can hold it beside the encoding table.
+pub trait AssetRowReader {
+    fn read_row(&self, row: u64, row_width: usize) -> Result<Vec<u64>>;
+}
+
+impl AssetRowReader for AssetReader {
+    fn read_row(&self, row: u64, row_width: usize) -> Result<Vec<u64>> {
+        AssetReader::read_row(self, row, row_width)
+    }
+}
+
+impl<T: AssetRowReader + ?Sized> AssetRowReader for &T {
+    fn read_row(&self, row: u64, row_width: usize) -> Result<Vec<u64>> {
+        T::read_row(self, row, row_width)
+    }
+}
+
+impl<T: AssetRowReader + ?Sized> AssetRowReader for std::sync::Arc<T> {
+    fn read_row(&self, row: u64, row_width: usize) -> Result<Vec<u64>> {
+        T::read_row(self, row, row_width)
+    }
+}
+
+/// The streaming row source of one encoded table over the asset mapping. The
+/// message keeps the plain asset columns and zero pads; the tail is the private
+/// table randomness of that row.
+pub struct AssetRowSource<R> {
+    reader: R,
     rows: u64,
     row_width: usize,
     valid_elements: u64,
     message_len: usize,
     valid_min: i64,
     valid_max: i64,
-    tails: &'a [Vec<Fp>],
+    tails: Vec<Vec<Fp>>,
     tail_len: usize,
 }
 
-impl TableRowSource for AssetRowSource<'_> {
+/// Builds the streaming row source of one table from the trusted parameters.
+pub fn asset_row_source<R: AssetRowReader>(
+    reader: R,
+    spec: &ModelAssetSpec,
+    params: &AssetTableParams,
+    tails: Vec<Vec<Fp>>,
+) -> Result<AssetRowSource<R>> {
+    Ok(AssetRowSource {
+        reader,
+        rows: params.shape.rows(),
+        row_width: spec.row_width,
+        valid_elements: spec.element_count,
+        message_len: usize::try_from(params.shape.code.ell).map_err(|_| ZkieError::ResourceLimit)?,
+        valid_min: params.valid_min,
+        valid_max: params.valid_max,
+        tails,
+        tail_len: usize::try_from(params.shape.code.r).map_err(|_| ZkieError::ResourceLimit)?,
+    })
+}
+
+impl<R: AssetRowReader> TableRowSource for AssetRowSource<R> {
     fn rows(&self) -> u64 {
         self.rows
     }
@@ -525,17 +572,7 @@ pub fn build_asset_table(
     }
     let configuration = asset_table_configuration(model_commitment, spec, params)?;
     let identity = asset_table_identity(model_commitment, spec, params)?;
-    let mut source = AssetRowSource {
-        reader,
-        rows,
-        row_width: spec.row_width,
-        valid_elements: spec.element_count,
-        message_len: usize::try_from(shape.code.ell).map_err(|_| ZkieError::ResourceLimit)?,
-        valid_min: params.valid_min,
-        valid_max: params.valid_max,
-        tails: &input.randomness.tails,
-        tail_len: usize::try_from(shape.code.r).map_err(|_| ZkieError::ResourceLimit)?,
-    };
+    let mut source = asset_row_source(reader, spec, params, input.randomness.tails.clone())?;
     let panel_columns = shape.code.n().min(1024).max(1);
     let table = commit_table_streaming(
         &mut source,

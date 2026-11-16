@@ -46,7 +46,7 @@ use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
 use crate::proof::committed_psc::{
     CommittedGroupMessage, PositionPscChallenges, PscTranscriptTags,
 };
-use crate::proof::consumer_request::ConsumerIntegerBound;
+use crate::proof::consumer_request::{signed_fp3, ConsumerIntegerBound};
 use crate::proof::hidden_send_session::{SendGroup, TableLayout, WShape};
 use crate::proof::psc::{hp_entries, Weight};
 use crate::proof::psc_general::{
@@ -196,6 +196,27 @@ pub struct ConsumerRawPlan {
 pub enum ConsumerRawRelation {
     Rounding,
     Bits,
+}
+
+/// The mask-message slots one raw shape consumes from `base_slot`: every
+/// instance's hiding entries and its shown entry. The group plan sizes its
+/// mask member from this count before any witness is built.
+pub fn consumer_raw_mask_entries(shape: &ConsumerRawShape, base_slot: u64) -> Result<u64> {
+    shape
+        .fault()
+        .map_or(Ok(()), |_| Err(Error::InvalidConfig))?;
+    let mut next = base_slot;
+    for _ in 0..shape.heads {
+        for hiding in [
+            rounding_hiding(shape.columns_variables())?,
+            bits_hiding(shape.bits_variables())?,
+        ] {
+            next = next
+                .checked_add(hiding as u64 + 1)
+                .ok_or(Error::ResourceLimit)?;
+        }
+    }
+    Ok(next)
 }
 
 impl ConsumerRawPlan {
@@ -414,16 +435,7 @@ fn eq_at(point: &[Fp3], index: u64) -> Fp3 {
     weight
 }
 
-fn signed_fp3(value: i128) -> Result<Fp3> {
-    let magnitude = u64::try_from(value.unsigned_abs()).map_err(|_| Error::BoundViolation)?;
-    let base = zkie_engine::pcs::request::field::fp_from_u64(magnitude);
-    let positive = Fp3::from_base(base);
-    Ok(if value < 0 {
-        Fp3::ZERO.sub(&positive)
-    } else {
-        positive
-    })
-}
+
 
 /// The prover's hidden rounding map of one head: `Y_e - sum_j 2^j bit[e,j]`
 /// over the padded entry cube, zero on the padding. The public side is added

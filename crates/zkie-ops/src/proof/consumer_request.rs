@@ -648,7 +648,7 @@ impl ConsumerRequestClaim {
     }
 }
 
-fn signed_fp3(value: i128) -> Result<Fp3> {
+pub fn signed_fp3(value: i128) -> Result<Fp3> {
     let magnitude = u64::try_from(value.unsigned_abs()).map_err(|_| Error::BoundViolation)?;
     let base = zkie_engine::pcs::request::field::fp_from_u64(magnitude);
     let positive = Fp3::from_base(base);

@@ -316,6 +316,32 @@ impl ConsumerOwnPlan {
         fresh: u64,
         base_positions: usize,
     ) -> Result<Self> {
+        Self::from_first_omega(
+            first_plan,
+            first,
+            geometry,
+            shared.omega_root,
+            mask_tree,
+            fresh,
+            base_positions,
+        )
+    }
+
+    /// The same own plan from the shared message's Omega root. The verifier
+    /// builds the plan before the shared stage verifies; the total acceptance
+    /// then requires the verified shared root to equal this one.
+    pub(crate) fn from_first_omega(
+        first_plan: &ConsumerFirstPlan,
+        first: &ConsumerFirstMessages,
+        geometry: &crate::proof::consumer_shared::ConsumerSharedGeometry,
+        omega_root: Digest,
+        mask_tree: MaskTreePlan,
+        fresh: u64,
+        base_positions: usize,
+    ) -> Result<Self> {
+        if omega_root == Digest::ZERO {
+            return Err(Error::InvalidConfig);
+        }
         let plan = Self {
             code: geometry.code,
             mask_code: geometry.mask_code,
@@ -324,7 +350,7 @@ impl ConsumerOwnPlan {
             w_shape: first_plan.draft.w_shape.clone(),
             w_root: first.w_root,
             omega: geometry.omega.clone(),
-            omega_root: shared.omega_root,
+            omega_root,
             group: first_plan.draft.w_group,
             fresh,
             base_positions,

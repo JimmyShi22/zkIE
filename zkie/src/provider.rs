@@ -34,6 +34,9 @@ use zkie_ops::proof::asset_table::{
     decode_asset_table_randomness_set, encode_asset_table_randomness_set,
     sample_asset_table_inputs, AssetTableInput, AssetTableMeta, AssetTableParams,
 };
+use zkie_ops::proof::consumer_proof::ConsumerProofFile;
+use zkie_ops::proof::consumer_request::ConsumerSharedPlan;
+use zkie_ops::proof::consumer_session::verify_consumer_request;
 
 const PROTOCOL_ID: Digest = Digest([0xA1; 32]);
 const PARAMETERS_DIGEST: Digest = Digest([0xA2; 32]);
@@ -276,24 +279,29 @@ fn build_commitment(
 fn execute_shared(
     config: &ProviderConfig,
     commitment: &zkie_ops::proof::model_commitment::ModelCommitment,
+    tables: &[AssetTableInput],
     progress: &dyn ProgressSink,
-) -> Result<SharedTrace> {
+) -> Result<(SharedTrace, Option<ConsumerProofFile>)> {
     match config.model.as_str() {
-        "gpt2" => gpt2::execute_shared_with_progress_public(
+        "gpt2" => gpt2::execute_shared_with_progress_public_consumer(
             commitment,
             &config.tokens.iter().map(|value| *value as i64).collect::<Vec<_>>(),
+            tables,
             Some(progress),
-        ),
+        )
+        .map(|(trace, file)| (trace, Some(file))),
         "gemma3" => gemma3::execute_shared_with_progress_public(
             commitment,
             &config.tokens.iter().map(|value| *value as i64).collect::<Vec<_>>(),
             Some(progress),
-        ),
+        )
+        .map(|trace| (trace, None)),
         "timesfm" => timesfm::execute_shared_with_progress_public(
             commitment,
             &config.input.iter().map(|value| *value as i64).collect::<Vec<_>>(),
             Some(progress),
-        ),
+        )
+        .map(|trace| (trace, None)),
         _ => Err(Error::UnsupportedPrimitive),
     }
 }
@@ -401,7 +409,11 @@ impl PipelineProvider for ProductionProvider {
             expected_output: config.expected_output.clone(),
         };
         let statement_bytes = bincode::serialize(&statement).map_err(|_| Error::InvalidEncoding)?;
-        let trace = execute_shared(&config, &commitment, ctx.progress)?;
+        let (trace, consumer) = execute_shared(&config, &commitment, &tables, ctx.progress)?;
+        let consumer_bytes = consumer
+            .as_ref()
+            .map(|file| file.encode())
+            .transpose()?;
         let proof_bytes = bincode::serialize(&trace).map_err(|_| Error::InvalidEncoding)?;
         let public_inputs = if config.model == "timesfm" {
             bincode::serialize(&config.expected_output).map_err(|_| Error::InvalidEncoding)?
@@ -411,24 +423,33 @@ impl PipelineProvider for ProductionProvider {
         let statement_digest = digest_bytes(&statement_bytes);
         let proof_digest = digest_bytes(&proof_bytes);
         let public_inputs_digest = digest_bytes(&public_inputs);
-        let files: Vec<(&str, &[u8])> = vec![
+        let mut files: Vec<(&str, &[u8])> = vec![
             ("statement.bin", statement_bytes.as_slice()),
             ("proof.bin", proof_bytes.as_slice()),
             ("public-inputs.bin", public_inputs.as_slice()),
         ];
-        let digests: Vec<(&str, Digest)> = vec![
+        let mut digests: Vec<(&str, Digest)> = vec![
             ("statement.bin", statement_digest),
             ("proof.bin", proof_digest),
             ("public-inputs.bin", public_inputs_digest),
         ];
-        let manifest = proof_manifest(
-            model,
-            vec![
-                ArtifactFile::new("statement.bin", statement_bytes.len() as u64, statement_digest),
-                ArtifactFile::new("proof.bin", proof_bytes.len() as u64, proof_digest),
-                ArtifactFile::new("public-inputs.bin", public_inputs.len() as u64, public_inputs_digest),
-            ],
-        );
+        let mut manifest_files = vec![
+            ArtifactFile::new("statement.bin", statement_bytes.len() as u64, statement_digest),
+            ArtifactFile::new("proof.bin", proof_bytes.len() as u64, proof_digest),
+            ArtifactFile::new("public-inputs.bin", public_inputs.len() as u64, public_inputs_digest),
+        ];
+        if let Some(bytes) = &consumer_bytes {
+            let digest = digest_bytes(bytes);
+            files.push((zkie_ops::proof::consumer_proof::CONSUMER_PROOF_FILE, bytes.as_slice()));
+            digests.push((zkie_ops::proof::consumer_proof::CONSUMER_PROOF_FILE, digest));
+            manifest_files.push(ArtifactFile::new(
+                zkie_ops::proof::consumer_proof::CONSUMER_PROOF_FILE,
+                bytes.len() as u64,
+                digest,
+            ));
+            ctx.metrics.record("consumer_proof_bytes", bytes.len() as u64);
+        }
+        let manifest = proof_manifest(model, manifest_files);
         ArtifactPublisher::publish_with_digests(&request.output_dir, &manifest, &files, &digests)?;
         ctx.metrics.record("proof_bytes", proof_bytes.len() as u64);
         Ok(ProofReceipt {
@@ -506,8 +527,54 @@ impl PipelineProvider for ProductionProvider {
                     &table_metas,
                     &table_params,
                 )?;
-                let argmax =
-                    verify_shared_trace(&public, &trace, &statement.tokens, &plan, Some(public_root))?;
+                let outputs = zkie_ops::proof::model_commitment::verify_shared_trace_outputs(
+                    &public,
+                    &trace,
+                    &statement.tokens,
+                    &plan,
+                    Some(public_root),
+                )?;
+                // The registered asset's consumer chain joins the same request
+                // before any output binding: the sidecar is required, its
+                // plans are rebuilt from the trusted model plan and the
+                // verified trace outputs, and the first, shared and second
+                // stages must all verify over the committed table.
+                let proof_dir = request.proof.parent().ok_or(Error::IncompleteArtifact)?;
+                let consumer = ConsumerProofFile::read_from(proof_dir)?;
+                let path = "gpt2/weights/L0_k_w_i32.bin";
+                let consumer_params =
+                    zkie_models_gpt2::plan::projection_table_params(path)
+                        .ok_or(Error::UnsupportedPrimitive)?;
+                let derived = zkie_models_gpt2::plan::derive_table_plan(
+                    &zkie_models_gpt2::plan::TABLE_PLAN_CANDIDATE,
+                )?;
+                let shared = ConsumerSharedPlan {
+                    m_once: derived.table_shape.distances.m_once,
+                    m_later: derived.table_shape.distances.m_later,
+                    one_time_columns: derived.one_time_columns,
+                    later_columns: derived.later_batch_columns,
+                    declared_batches: 1,
+                    table_tail: derived.table_shape.code.r,
+                };
+                let spec = zkie_models_gpt2::plan::asset_specs()
+                    .into_iter()
+                    .find(|spec| spec.path == path)
+                    .ok_or(Error::UnsupportedPrimitive)?;
+                let meta = table_metas
+                    .iter()
+                    .find(|meta| meta.path == path)
+                    .ok_or(Error::IncompleteArtifact)?;
+                verify_consumer_request(
+                    &plan,
+                    &outputs,
+                    zkie_models_gpt2::plan::table_model_identity()?,
+                    meta,
+                    &consumer_params,
+                    &spec,
+                    shared,
+                    &consumer,
+                )?;
+                let argmax = trace.argmax.clone();
                 let computed: Vec<i64> = argmax.iter().map(|value| *value as i64).collect();
                 let bound = crate::output::bind(
                     &trusted.output,

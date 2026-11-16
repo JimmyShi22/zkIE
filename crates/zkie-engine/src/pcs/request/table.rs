@@ -527,7 +527,7 @@ impl StreamingTable {
     /// Recomputes the drawn columns from the row source and opens them against
     /// the stored tree. One row's message, one tail and one codeword are held
     /// at a time; no column is stored.
-    pub fn open_columns<S: TableRowSource>(
+    pub fn open_columns<S: TableRowSource + ?Sized>(
         &self,
         source: &mut S,
         positions: &[u64],

@@ -336,12 +336,10 @@ impl ConsumerGroupPlan {
         {
             return Some("a consumer group root is missing");
         }
-        let heads = self.shapes.entries.heads;
-        if self.raw_bat_base != 0
-            || self.bits_bat_base != u64::from(heads)
-            || self.mask_bat != 2 * u64::from(heads)
-            || self.w_bat != 2 * u64::from(heads) + 1
-        {
+        let heads = u64::from(self.shapes.entries.heads);
+        let contiguous = (self.raw_bat_base == 0 && self.bits_bat_base == heads)
+            || (self.bits_bat_base == 0 && self.raw_bat_base == heads);
+        if !contiguous || self.mask_bat != 2 * heads || self.w_bat != 2 * heads + 1 {
             return Some("the BAT member identifiers are not the contiguous member order");
         }
         let mut ids = vec![
@@ -536,6 +534,16 @@ fn members(
     let shapes = &plan.shapes;
     let mask_tree = shapes.mask_tree.runtime_plan()?;
     let mut members = Vec::with_capacity(plan.member_count());
+    // The isolated FOLD handoff places the members' main blocks in descending
+    // block size, so the plan's own BAT order fixes which family is built
+    // first: the family whose base is zero. Both sides read the same plan.
+    let order = if plan.raw_bat_base < plan.bits_bat_base {
+        [0u8, 1u8]
+    } else {
+        [1u8, 0u8]
+    };
+    for kind in order {
+    if kind == 0 {
     for head in 0..heads {
         let (message, tails) = match witness {
             Some(witness) => (
@@ -569,6 +577,7 @@ fn members(
             Vec::new(),
         ));
     }
+    } else {
     for head in 0..heads {
         let (message, tails) = match witness {
             Some(witness) => (
@@ -601,6 +610,8 @@ fn members(
             Vec::new(),
             Vec::new(),
         ));
+    }
+    }
     }
     let (mask_message, mask_tails) = match witness {
         Some(witness) => (witness.mask_rows.clone(), witness.mask_tails.clone()),

@@ -674,6 +674,25 @@ pub struct ConsumerFirstMessages {
 }
 
 impl ConsumerFirstMessages {
+    /// Reads the wire prefix that does not depend on the plan: the committed
+    /// raw and bit groups and the W root. The verifier uses it to build the
+    /// plan that completes the same bytes; the full decode re-checks every
+    /// field against that plan.
+    pub fn peek_header(bytes: &[u8]) -> Result<(ConsumerRawFirst, Digest)> {
+        let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+        if reader.get_u64()? != CONSUMER_FIRST_VERSION {
+            return Err(Error::InvalidEncoding);
+        }
+        let raw_first = ConsumerRawFirst::decode(reader.get_bytes()?)?;
+        let _raw_second = reader.get_bytes()?;
+        let _psc = reader.get_bytes()?;
+        let w_root = reader.get_digest()?;
+        if w_root == Digest::ZERO {
+            return Err(Error::InvalidProof);
+        }
+        Ok((raw_first, w_root))
+    }
+
     pub fn encode(&self, plan: &ConsumerFirstPlan) -> Result<Vec<u8>> {
         self.check(plan)?;
         let mut writer = CanonicalWriter::new();

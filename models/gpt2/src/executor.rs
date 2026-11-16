@@ -16,6 +16,11 @@ use zkie_ops::matmul::MatMulOp;
 use zkie_ops::profile_norm::ProfileLayerNormOp;
 use zkie_ops::projection::ProjectionOp;
 use zkie_ops::proof::asset_table::AssetTableInput;
+use zkie_ops::proof::consumer_proof::ConsumerProofFile;
+use zkie_ops::proof::consumer_request::ConsumerSharedPlan;
+use zkie_ops::proof::consumer_session::{
+    prove_consumer_request, ConsumerRequestSeed, ConsumerRequestWitness,
+};
 use zkie_ops::proof::model_commitment::{
     commit_assets_with_tables_on_identity, AssetOpening, AssetStore, ModelAssetSpec,
     ModelCommitment,
@@ -293,7 +298,7 @@ fn ln(
 }
 
 pub fn execute_shared(commitment: &ModelCommitment, tokens: &[i64]) -> Result<SharedTrace> {
-    execute_shared_inner(commitment, tokens, None, false)
+    execute_shared_inner(commitment, tokens, None, false, None).map(|(trace, _)| trace)
 }
 
 pub fn execute_shared_with_progress(
@@ -301,7 +306,7 @@ pub fn execute_shared_with_progress(
     tokens: &[i64],
     progress: Option<&dyn ProgressSink>,
 ) -> Result<SharedTrace> {
-    execute_shared_inner(commitment, tokens, progress, false)
+    execute_shared_inner(commitment, tokens, progress, false, None).map(|(trace, _)| trace)
 }
 
 /// The production trace: the migrated public tables are not carried as trace
@@ -311,7 +316,21 @@ pub fn execute_shared_with_progress_public(
     tokens: &[i64],
     progress: Option<&dyn ProgressSink>,
 ) -> Result<SharedTrace> {
-    execute_shared_inner(commitment, tokens, progress, true)
+    execute_shared_inner(commitment, tokens, progress, true, None).map(|(trace, _)| trace)
+}
+
+/// The production trace together with the request's consumer proof over the
+/// registered encoded table. The consumer witness is built from the same
+/// activation rows and projection outputs the trace commits, and the
+/// per-request seed is fresh private material.
+pub fn execute_shared_with_progress_public_consumer(
+    commitment: &ModelCommitment,
+    tokens: &[i64],
+    tables: &[AssetTableInput],
+    progress: Option<&dyn ProgressSink>,
+) -> Result<(SharedTrace, ConsumerProofFile)> {
+    let (trace, consumer) = execute_shared_inner(commitment, tokens, progress, true, Some(tables))?;
+    Ok((trace, consumer.ok_or(Error::IncompleteArtifact)?))
 }
 
 fn execute_shared_inner(
@@ -319,7 +338,8 @@ fn execute_shared_inner(
     tokens: &[i64],
     progress: Option<&dyn ProgressSink>,
     public_tables: bool,
-) -> Result<SharedTrace> {
+    consumer_tables: Option<&[AssetTableInput]>,
+) -> Result<(SharedTrace, Option<ConsumerProofFile>)> {
     if tokens.is_empty() || tokens.len() > 512 {
         return Err(Error::InvalidConfig);
     }
@@ -358,6 +378,7 @@ fn execute_shared_inner(
         vec![Some((embed_step, 0)), None],
     )?;
     let mut current = x[0].clone();
+    let mut consumer_witness: Option<(Vec<i64>, Vec<(Vec<i128>, Vec<i64>)>)> = None;
     let mask = {
         let mut values = vec![0i64; m * m];
         for row in 0..m {
@@ -388,6 +409,7 @@ fn execute_shared_inner(
 
         let (h, h_step) = ln(&mut builder, current.clone(), x_step, ln1_w, ln1_b, rsqrt.clone(), public_pool("gpt2/weights/rsqrt_table_i32.bin")?, m)?;
         let mut head_acc: Option<(Vec<i64>, usize)> = None;
+        let mut consumer_heads: Vec<(Vec<i128>, Vec<i64>)> = Vec::new();
         for head in 0..HEADS {
             let qw = assets.columns(&path("q_w"), HIDDEN, head * HEAD_DIM, (head + 1) * HEAD_DIM)?;
             let kw = assets.columns(&path("k_w"), HIDDEN, head * HEAD_DIM, (head + 1) * HEAD_DIM)?;
@@ -401,6 +423,27 @@ fn execute_shared_inner(
                 let (out, step) = builder.step(&op, vec![(q, None)], vec![Some((q_step, 0))])?;
                 (out[0].clone(), step)
             };
+            if layer == 0 {
+                let probe = ProjectionOp {
+                    m,
+                    n: HEAD_DIM,
+                    k: HIDDEN,
+                    shift: 16,
+                    bias: None,
+                };
+                let record = probe.forward_values(&[h.clone(), kw.clone()])?;
+                let raw = record
+                    .raw_accumulators
+                    .first()
+                    .ok_or(Error::IncompleteArtifact)?
+                    .clone();
+                let output = record
+                    .outputs
+                    .first()
+                    .ok_or(Error::IncompleteArtifact)?
+                    .clone();
+                consumer_heads.push((raw, output));
+            }
             let (k, k_step) = project(&mut builder, h.clone(), h_step, kw, kb, m, HEAD_DIM, HIDDEN, 16)?;
             let (k, k_step) = {
                 let op = AffineScaleOp { multiplier: 23170, addend: 0, shift: 16, clamp: None };
@@ -462,6 +505,9 @@ fn execute_shared_inner(
                     (sum[0].clone(), step)
                 }
             });
+        }
+        if layer == 0 {
+            consumer_witness = Some((h.clone(), consumer_heads));
         }
         let (head_acc, head_step) = head_acc.ok_or(Error::IncompleteArtifact)?;
         let (attn_biased, attn_step) = builder.step(
@@ -533,6 +579,47 @@ fn execute_shared_inner(
         let _ = step;
     }
     let Builder { steps, .. } = builder;
+    let consumer = match (consumer_tables, consumer_witness) {
+        (Some(tables), Some((activation, heads))) => {
+            let plan = crate::plan::trace_plan_public(m)?;
+            let path = "gpt2/weights/L0_k_w_i32.bin";
+            let params = crate::plan::projection_table_params(path).ok_or(Error::InvalidConfig)?;
+            let meta = commitment
+                .tables
+                .iter()
+                .find(|meta| meta.path == path)
+                .ok_or(Error::IncompleteArtifact)?;
+            let derived = crate::plan::derive_table_plan(&crate::plan::TABLE_PLAN_CANDIDATE)?;
+            let shared = ConsumerSharedPlan {
+                m_once: derived.table_shape.distances.m_once,
+                m_later: derived.table_shape.distances.m_later,
+                one_time_columns: derived.one_time_columns,
+                later_columns: derived.later_batch_columns,
+                declared_batches: 1,
+                table_tail: derived.table_shape.code.r,
+            };
+            let raw: Vec<Vec<i128>> = heads.iter().map(|(raw, _)| raw.clone()).collect();
+            let outputs: Vec<Vec<i64>> = heads.iter().map(|(_, values)| values.clone()).collect();
+            let witness = ConsumerRequestWitness {
+                activation: &activation,
+                raw: &raw,
+                outputs: &outputs,
+            };
+            Some(prove_consumer_request(
+                &plan,
+                commitment,
+                &assets.store,
+                tables,
+                meta,
+                &params,
+                crate::plan::table_model_identity()?,
+                shared,
+                &witness,
+                ConsumerRequestSeed::sample()?,
+            )?)
+        }
+        _ => None,
+    };
     if let Some(progress) = progress {
         let actual = steps.len() as u64;
         let mut event = ProgressEvent::new("prove", "prove", ProgressKind::WorkAdvanced);
@@ -541,13 +628,16 @@ fn execute_shared_inner(
         event.unit = Some("relation_steps".into());
         let _ = progress.emit(event);
     }
-    Ok(SharedTrace {
-        tokens: tokens.iter().map(|value| *value as u32).collect(),
-        assets: assets.trace_assets,
-        steps,
-        argmax,
-        output: Vec::new(),
-    })
+    Ok((
+        SharedTrace {
+            tokens: tokens.iter().map(|value| *value as u32).collect(),
+            assets: assets.trace_assets,
+            steps,
+            argmax,
+            output: Vec::new(),
+        },
+        consumer,
+    ))
 }
 
 /// Commits the raw asset rows and the encoded tables of the trusted table
