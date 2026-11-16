@@ -173,6 +173,40 @@ impl ConsumerProofFile {
     }
 }
 
+/// The sidecar file name in the proof output directory.
+pub const CONSUMER_PROOF_FILE: &str = "consumer_proof.bin";
+
+/// The largest admitted sidecar file. The three stages' messages are far
+/// below it; a larger file is refused before it is read.
+pub const CONSUMER_PROOF_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+impl ConsumerProofFile {
+    /// Writes the sidecar file beside the proof artifact. The bytes are
+    /// written to a temporary name in the same directory and renamed, so a
+    /// reader never observes a partial file.
+    pub fn write_to(&self, dir: &std::path::Path) -> Result<std::path::PathBuf> {
+        let bytes = self.encode()?;
+        let path = dir.join(CONSUMER_PROOF_FILE);
+        let temporary = dir.join(format!(".{CONSUMER_PROOF_FILE}.tmp"));
+        std::fs::write(&temporary, &bytes).map_err(|_| Error::Io)?;
+        std::fs::rename(&temporary, &path).map_err(|_| Error::Io)?;
+        Ok(path)
+    }
+
+    /// Reads and decodes the sidecar file. A missing, oversized or malformed
+    /// file is refused; the container digest is checked before any section is
+    /// decoded against its plan.
+    pub fn read_from(dir: &std::path::Path) -> Result<Self> {
+        let path = dir.join(CONSUMER_PROOF_FILE);
+        let metadata = std::fs::metadata(&path).map_err(|_| Error::InvalidProof)?;
+        if metadata.len() > CONSUMER_PROOF_MAX_BYTES {
+            return Err(Error::ResourceLimit);
+        }
+        let bytes = std::fs::read(&path).map_err(|_| Error::InvalidProof)?;
+        Self::decode(&bytes)
+    }
+}
+
 fn put_seed(writer: &mut CanonicalWriter, seed: &SampleSeed) {
     writer.put_u64(seed.z.len() as u64);
     for value in &seed.z {
@@ -304,6 +338,42 @@ mod tests {
             seal: Digest([0x11; 32]),
         };
         assert!(encode_own_proof(&empty).is_err());
+    }
+
+    #[test]
+    fn the_sidecar_file_round_trips_and_a_missing_or_oversized_file_is_refused() {
+        let root = std::env::temp_dir().join(format!(
+            "zkie-consumer-proof-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let file = ConsumerProofFile {
+            first: vec![9, 9, 9],
+            shared: vec![8, 8],
+            own: encode_own_proof(&own()).unwrap(),
+            totals: totals(),
+        };
+        let path = file.write_to(&root).unwrap();
+        assert!(path.ends_with(CONSUMER_PROOF_FILE));
+        assert_eq!(ConsumerProofFile::read_from(&root).unwrap(), file);
+        // A missing file is refused.
+        let empty = root.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(ConsumerProofFile::read_from(&empty).is_err());
+        // A file above the size bound is refused before it is read.
+        let big = root.join("big");
+        std::fs::create_dir_all(&big).unwrap();
+        std::fs::write(
+            big.join(CONSUMER_PROOF_FILE),
+            vec![0u8; (CONSUMER_PROOF_MAX_BYTES + 1) as usize],
+        )
+        .unwrap();
+        assert!(ConsumerProofFile::read_from(&big).is_err());
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
