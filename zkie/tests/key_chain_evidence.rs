@@ -167,10 +167,23 @@ fn the_complete_key_chain_over_the_registered_instance() {
     // The declared range is a public plan parameter: it comes from the fixed
     // public configuration and the verifier rebuilds the same declaration.
     let range_plan = production_table_range().unwrap();
-    let entries: Vec<Fp3> = values
-        .iter()
-        .map(|value| Fp3::from_base(fp_from_signed_word(*value as u64)))
-        .collect();
+    // The key plan fixes the matrix order: its matrix rows are the record
+    // places and its matrix columns are the records, and a key number's low
+    // coordinates are the matrix columns. The asset file stores the records in
+    // its own order, so the enumerated entry `row * columns + column` is the
+    // cell of record `column` at place `row`: the transpose of the file order.
+    let matrix_rows = rows;
+    let columns = (meta.shape.rows() as usize) << TABLE_PLAN_CANDIDATE.k_lo;
+    assert_eq!(columns, row_width);
+    assert_eq!(values.len(), matrix_rows * columns);
+    let mut entries = Vec::with_capacity(values.len());
+    for row in 0..matrix_rows {
+        for column in 0..columns {
+            entries.push(Fp3::from_base(fp_from_signed_word(
+                values[column * row_width + row] as u64,
+            )));
+        }
+    }
     let keys = range_key_values(&range_plan, &entries).unwrap();
     let counts = range_multiplicities(&range_plan, &keys).unwrap();
     let bits = range_bit_values(&range_plan, &counts).unwrap();
