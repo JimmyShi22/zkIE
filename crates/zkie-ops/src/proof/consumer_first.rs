@@ -29,7 +29,7 @@ use zkie_core::artifact::digest_bytes;
 use zkie_core::common::codec::DecodeLimits;
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
-use zkie_engine::pcs::request::bat::BatRow;
+use zkie_engine::pcs::request::bat::{BatPart, BatRow, BatRowKind};
 use zkie_engine::pcs::request::chain::Chain;
 use zkie_engine::pcs::request::field::Fp3;
 use zkie_engine::pcs::request::table::{IndexShape, TableRowSource};
@@ -476,6 +476,66 @@ fn check_bindings(
     Ok(())
 }
 
+fn consumer_mask_row_bat(plan: &ConsumerFirstPlan, mask_row: &ConsumerMaskRow) -> Result<BatRow> {
+    let mut row = BatRow::new(BatRowKind::Plain);
+    for (index, coefficient) in mask_row.coefficients.iter().enumerate() {
+        let slot = mask_row
+            .base_slot
+            .checked_add(index as u64)
+            .ok_or(Error::ResourceLimit)?;
+        row.add_unit(mask_row.oracle, BatPart::Mask, slot, *coefficient);
+    }
+    row.target = mask_row.target;
+    Ok(row)
+}
+
+fn raw_obligation_bats(
+    plan: &ConsumerFirstPlan,
+    obligation: &ConsumerRawObligation,
+) -> Result<Vec<BatRow>> {
+    let mask_oracle = plan.draft.raw.mask.oracle;
+    let mut upper = BatRow::new(BatRowKind::Plain);
+    if obligation.hiding_slots.len() != obligation.row.hiding.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    for (slot, coefficient) in obligation.hiding_slots.iter().zip(&obligation.row.hiding) {
+        upper.add_unit(mask_oracle, BatPart::Mask, *slot, *coefficient);
+    }
+    upper.target = obligation.row.constant;
+    let mut end_row = BatRow::new(BatRowKind::Plain);
+    let end = &obligation.end;
+    if !end.raw_columns.is_empty() {
+        end_row.add_term(
+            end.raw_oracle,
+            BatPart::Main,
+            end.raw_table(&plan.draft.raw.raw.shape)?,
+        );
+    }
+    end_row.add_term(
+        end.bits_oracle,
+        BatPart::Main,
+        end.bits_table(&plan.draft.raw.bits.shape)?,
+    );
+    end_row.add_unit(mask_oracle, BatPart::Mask, end.shown_slot, end.mask_scale);
+    end_row.target = end.target;
+    Ok(vec![upper, end_row])
+}
+
+fn group_rows(
+    plan: &ConsumerFirstPlan,
+    eval_row: &BatRow,
+    mask_row: &ConsumerMaskRow,
+    raw_rows: &[ConsumerRawObligation],
+) -> Result<Vec<BatRow>> {
+    let mut rows = Vec::with_capacity(2 + raw_rows.len() * 2);
+    rows.push(eval_row.clone());
+    rows.push(consumer_mask_row_bat(plan, mask_row)?);
+    for obligation in raw_rows {
+        rows.extend(raw_obligation_bats(plan, obligation)?);
+    }
+    Ok(rows)
+}
+
 /// The BAT rows the first-stage group test must check: the Eval row on the W
 /// message, the consumer mask row and the raw relation rows. The module
 /// returns them as obligations; it never verifies them itself.
@@ -484,6 +544,11 @@ pub struct ConsumerFirstObligations {
     pub eval_row: BatRow,
     pub mask_row: ConsumerMaskRow,
     pub raw_rows: Vec<ConsumerRawObligation>,
+    /// Every linear group row of the stage, in the fixed order: the Eval row,
+    /// the consumer mask row, and per raw relation instance its `(U)` row then
+    /// its `(E)` row. The group test takes exactly this list; the module never
+    /// verifies it itself.
+    pub group_rows: Vec<BatRow>,
 }
 
 /// The public first-stage messages.
@@ -726,12 +791,14 @@ pub fn prove_consumer_first(
         psi: plan.member.psi.clone(),
         stage_seal,
     };
+    let rows = group_rows(plan, &eval_row, &outcome.mask_row, &raw_rows)?;
     Ok((
         messages,
         ConsumerFirstObligations {
             eval_row,
             mask_row: outcome.mask_row,
             raw_rows,
+            group_rows: rows,
         },
     ))
 }
@@ -783,10 +850,12 @@ pub fn verify_consumer_first(
     if *chain.value() != messages.stage_seal {
         return Err(Error::InvalidProof);
     }
+    let rows = group_rows(plan, &eval_row, &outcome.mask_row, &raw_rows)?;
     Ok(ConsumerFirstObligations {
         eval_row,
         mask_row: outcome.mask_row,
         raw_rows,
+        group_rows: rows,
     })
 }
 
@@ -1304,6 +1373,75 @@ mod tests {
         )
     }
 
+    fn witness_tables(fixture: &Fixture) -> std::collections::BTreeMap<u64, Vec<Fp3>> {
+        use std::collections::BTreeMap;
+        let mut tables = BTreeMap::new();
+        for head in 0..HEADS {
+            tables.insert(
+                20 + head as u64,
+                TableLayout::of(&fixture.plan.draft.raw.raw.shape)
+                    .scatter(COLUMNS as u64, &fixture.raw[head])
+                    .unwrap(),
+            );
+            tables.insert(
+                30 + head as u64,
+                TableLayout::of(&fixture.plan.draft.raw.bits.shape)
+                    .scatter((COLUMNS * SHIFT as usize) as u64, &fixture.bits[head])
+                    .unwrap(),
+            );
+        }
+        let weights =
+            pending_row_weights(&fixture.plan.member, fixture.plan.draft.matrix_rows).unwrap();
+        let mut source = FixtureSource(fixture);
+        let w_values = derive_w_values(
+            &fixture.plan.draft.table_shape,
+            fixture.plan.draft.matrix_rows,
+            fixture.plan.draft.k_lo,
+            fixture.plan.draft.columns,
+            &weights,
+            &mut source,
+        )
+        .unwrap();
+        tables.insert(
+            fixture.plan.draft.w_oracle,
+            TableLayout::of(&fixture.plan.draft.w_shape)
+                .scatter(fixture.plan.draft.columns, &w_values)
+                .unwrap(),
+        );
+        let mut mask = vec![Fp3::ZERO; 512];
+        for (index, value) in fixture.psc_masks.entries.hiding.iter().enumerate() {
+            mask[fixture.plan.draft.request.mask.hiding_base as usize + index] = *value;
+        }
+        mask[fixture.plan.draft.request.mask.shown_slot as usize] =
+            fixture.psc_masks.entries.shown[1];
+        for space in fixture.plan.draft.raw.mask_spaces().unwrap() {
+            for slot in &space.hiding {
+                mask[*slot as usize] = fixture.raw_masks.entry(*slot).unwrap();
+            }
+            mask[space.shown as usize] = fixture.raw_masks.entry(space.shown).unwrap();
+        }
+        mask[5] = fp(3);
+        tables.insert(fixture.plan.draft.raw.mask.oracle, mask);
+        tables
+    }
+
+    fn evaluate_bat_row(row: &BatRow, tables: &std::collections::BTreeMap<u64, Vec<Fp3>>) -> Fp3 {
+        let mut value = Fp3::ZERO;
+        for term in &row.terms {
+            let table = tables.get(&term.oracle).expect("a member table");
+            assert_eq!(term.values.len(), table.len());
+            for (coefficient, entry) in term.values.iter().zip(table) {
+                value = value.add(&coefficient.mul(entry));
+            }
+        }
+        for unit in &row.units {
+            let table = tables.get(&unit.oracle).expect("a member table");
+            value = value.add(&unit.coefficient.mul(&table[unit.index as usize]));
+        }
+        assert!(row.runs.is_empty() && row.forms.is_empty());
+        value
+    }
+
     #[test]
     fn the_first_stage_binds_the_member_w_and_eval() {
         let mut fixture = fixture();
@@ -1316,6 +1454,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(proven, verified);
+        // Every linear group row holds on the witness tables; the group test
+        // checks the same rows against the commitments.
+        assert_eq!(proven.group_rows.len(), 2 + proven.raw_rows.len() * 2);
+        let tables = witness_tables(&fixture);
+        for row in &proven.group_rows {
+            assert_eq!(evaluate_bat_row(row, &tables), row.target);
+        }
         assert_eq!(messages.psi, fixture.plan.member.psi);
         assert_ne!(messages.stage_seal, Digest::ZERO);
         assert_ne!(messages.w_root, Digest::ZERO);
