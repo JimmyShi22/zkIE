@@ -10507,41 +10507,41 @@ pub(crate) const KEY_FIRST_PLAN_VERSION: u64 = 3;
 /// first chain's statement digest binds all of it, so a swapped table, range,
 /// message or mask changes every challenge and the seal.
 #[derive(Clone, Debug)]
-pub(crate) struct KeyFirstPlan {
-    pub table_identity: Digest,
-    pub table_configuration: Digest,
-    pub table_shape: IndexShape,
-    pub matrix_rows: u64,
-    pub k_lo: u32,
-    pub columns: u64,
-    pub range: crate::proof::table_range::TableKeyRangeConfig,
-    pub lookup: crate::proof::lookup::LookupPlan,
-    pub commit: crate::proof::lookup_messages::LookupCommitPlan,
-    pub index: IndexMaskPlan,
-    pub w: WShape,
-    pub w_oracle: u64,
-    pub group: u64,
-    pub bits_bat: u64,
-    pub mask_bat: u64,
+pub struct KeyFirstPlan {
+    pub(crate) table_identity: Digest,
+    pub(crate) table_configuration: Digest,
+    pub(crate) table_shape: IndexShape,
+    pub(crate) matrix_rows: u64,
+    pub(crate) k_lo: u32,
+    pub(crate) columns: u64,
+    pub(crate) range: crate::proof::table_range::TableKeyRangeConfig,
+    pub(crate) lookup: crate::proof::lookup::LookupPlan,
+    pub(crate) commit: crate::proof::lookup_messages::LookupCommitPlan,
+    pub(crate) index: IndexMaskPlan,
+    pub(crate) w: WShape,
+    pub(crate) w_oracle: u64,
+    pub(crate) group: u64,
+    pub(crate) bits_bat: u64,
+    pub(crate) mask_bat: u64,
     /// The BAT id of the index-mask member of the key group.
-    pub index_bat: u64,
+    pub(crate) index_bat: u64,
     /// The LIN shared group's own codes, as the public key plan fixes them.
     /// They are checked against the shared result by role, not inferred from
     /// the lookup messages' codes.
-    pub shared_code: CodeParams,
-    pub shared_mask_code: CodeParams,
+    pub(crate) shared_code: CodeParams,
+    pub(crate) shared_mask_code: CodeParams,
     /// The public geometry of the shared stage: the Gu and Omega message
     /// shapes, the shared fresh mask tree, the derived stage chain and the
     /// table column draws. Every value is public plan data, never prover
     /// choice.
-    pub shared: KeySharedPlan,
+    pub(crate) shared: KeySharedPlan,
     /// The public geometry of the own second stage: its codes by role, the
     /// fresh mask tree, the derived stage chain and the BASE position count.
-    pub own: KeyOwnPlan,
+    pub(crate) own: KeyOwnPlan,
     /// The shape of the one-leaf binding tree over the first chain's seal.
-    pub binding: crate::proof::lin_binding::LinBindingShape,
+    pub(crate) binding: crate::proof::lin_binding::LinBindingShape,
     /// The public parameters of the key group's derived chain.
-    pub group_config: KeyGroupConfig,
+    pub(crate) group_config: KeyGroupConfig,
 }
 
 /// The public parameters of the key group's chain: its fresh identifier, the
@@ -10716,6 +10716,86 @@ fn key_first_put_own(w: &mut CanonicalWriter, own: &KeyOwnPlan) {
         key_first_put_stage(w, stage);
     }
     w.put_u64(own.base_positions as u64);
+}
+
+/// The public geometry of a derived key plan, for registration checks and
+/// evidence. It carries only public plan values.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KeyPlanSummary {
+    pub plan_digest: Digest,
+    pub table_identity: Digest,
+    pub table_configuration: Digest,
+    pub matrix_rows: u64,
+    pub k_lo: u32,
+    pub columns: u64,
+    pub shared_code: CodeParams,
+    pub shared_mask_code: CodeParams,
+    pub own_code: CodeParams,
+    pub own_mask_code: CodeParams,
+    pub shared_stages: usize,
+    pub own_stages: usize,
+    pub shared_base_positions: usize,
+    pub own_base_positions: usize,
+    pub index_rows: u64,
+    pub lookup_bits_oracle: u64,
+    pub lookup_mask_oracle: u64,
+    pub w_oracle: u64,
+    pub index_oracle: u64,
+    pub group: u64,
+    pub bits_bat: u64,
+    pub mask_bat: u64,
+    pub index_bat: u64,
+    pub group_fresh: u64,
+    pub group_mask_tree: u64,
+    pub shared_fresh: u64,
+    pub shared_mask_tree: u64,
+    pub own_fresh: u64,
+    pub own_mask_tree: u64,
+    pub gu_oracle: u64,
+    pub omega_oracle: u64,
+    pub column_draws: usize,
+    pub column_budget: usize,
+}
+
+impl KeyFirstPlan {
+    /// The public summary bound into the statement and used by registration.
+    pub fn summary(&self) -> KeyPlanSummary {
+        KeyPlanSummary {
+            plan_digest: self.statement_digest(),
+            table_identity: self.table_identity,
+            table_configuration: self.table_configuration,
+            matrix_rows: self.matrix_rows,
+            k_lo: self.k_lo,
+            columns: self.columns,
+            shared_code: self.shared_code,
+            shared_mask_code: self.shared_mask_code,
+            own_code: self.own.code,
+            own_mask_code: self.own.mask_code,
+            shared_stages: self.shared.stages.len(),
+            own_stages: self.own.stages.len(),
+            shared_base_positions: self.shared.base_positions,
+            own_base_positions: self.own.base_positions,
+            index_rows: self.index.mask_rows,
+            lookup_bits_oracle: self.commit.bits_oracle,
+            lookup_mask_oracle: self.commit.mask_oracle,
+            w_oracle: self.w_oracle,
+            index_oracle: self.index.oracle,
+            group: self.group,
+            bits_bat: self.bits_bat,
+            mask_bat: self.mask_bat,
+            index_bat: self.index_bat,
+            group_fresh: self.group_config.fresh,
+            group_mask_tree: self.group_config.mask_tree_number,
+            shared_fresh: self.shared.fresh,
+            shared_mask_tree: self.shared.mask_tree.tree_number,
+            own_fresh: self.own.fresh,
+            own_mask_tree: self.own.mask_tree.tree_number,
+            gu_oracle: self.shared.gu.oracle,
+            omega_oracle: self.shared.omega.oracle,
+            column_draws: self.shared.column_draws,
+            column_budget: self.shared.column_budget,
+        }
+    }
 }
 
 impl KeyFirstPlan {
@@ -11364,6 +11444,372 @@ fn key_plan_fault(plan: &KeyFirstPlan) -> Result<()> {
         return Err(Error::InvalidConfig);
     }
     Ok(())
+}
+
+/// The public inputs of the production key plan that come from the trusted
+/// table configuration. The object identities are the fixed public schedule
+/// of this candidate, not prover choice.
+pub struct KeyPlanInputs {
+    pub table_identity: Digest,
+    pub table_configuration: Digest,
+    pub table_shape: IndexShape,
+    pub matrix_rows: u64,
+    pub k_lo: u32,
+    pub columns: u64,
+    pub total_columns: u64,
+    pub lin_check: SharedLinCheck,
+    pub range: crate::proof::table_range::EntryRangePlan,
+}
+
+fn key_plan_stage(stage: &crate::proof::proximity_planner::SolvedStage) -> IoppStagePlan {
+    IoppStagePlan {
+        main: CodeParams {
+            log_n: stage.log_n,
+            ell: stage.main_ell,
+            r: stage.main_r,
+        },
+        mask: CodeParams {
+            log_n: stage.mask_log_n,
+            ell: stage.mask_ell,
+            r: stage.mask_r,
+        },
+        k: stage.k,
+        h: stage.h,
+        positions: stage.positions as usize,
+        samples: 1,
+        work_bits: 0,
+    }
+}
+
+/// Derives the complete key plan from the trusted table configuration and the
+/// fixed public object schedule. Every shape, code, stage and identifier is
+/// deterministic; the verifier derives the same plan and compares it against
+/// its own registration. The index-mask message is one object shared by the
+/// key group and the own group, so both groups use its mask code by role.
+pub fn production_key_first_plan(inputs: &KeyPlanInputs) -> Result<KeyFirstPlan> {
+    use crate::proof::proximity_planner::{
+        assemble_proximity, smallest_mask_rows, AssemblyInput, AssemblyMember, AssemblyOwnObject,
+    };
+    if inputs.table_identity == Digest::ZERO
+        || inputs.table_configuration == Digest::ZERO
+        || inputs.table_shape.rows() != inputs.matrix_rows
+        || inputs.k_lo.checked_add(inputs.table_shape.v)
+            != Some(inputs.columns.trailing_zeros())
+        || inputs.columns
+            != inputs
+                .matrix_rows
+                .checked_shl(inputs.k_lo)
+                .ok_or(Error::ResourceLimit)?
+        || inputs.total_columns == 0
+        || inputs.total_columns > inputs.table_shape.code.r
+    {
+        return Err(Error::InvalidConfig);
+    }
+    let range = &inputs.range;
+    if range.matrix_rows != inputs.matrix_rows
+        || range.column_bits != inputs.columns.trailing_zeros()
+    {
+        return Err(Error::InvalidConfig);
+    }
+    let lookup = crate::proof::table_range::range_lookup_plan(range)?;
+    let mask_entries = crate::proof::lookup::mask_count(&lookup)?;
+    let variables =
+        usize::try_from(inputs.matrix_rows.trailing_zeros()).map_err(|_| Error::ResourceLimit)?;
+    let allocation = MaskEntryAllocation::for_variables(variables, 1)?;
+    let allocated = allocation.total()?;
+    let planned = {
+        let leaf_index =
+            (lookup.planes()? - 1) + lookup.key_bits as usize + lookup.table_log as usize;
+        (leaf_index + 7) as u64
+    };
+    // The key group's fresh mask tree is the new 204; the shared and own
+    // fresh masks keep 200/201. The lookup message trees are 101 and 203.
+    let group_config = KeyGroupConfig {
+        fresh: 3,
+        mask_tree_number: 204,
+        salt_bytes: 40,
+        run: Digest([0x63; 32]),
+        configuration: Digest([0x64; 32]),
+    };
+    let mut index_rows = 1u64;
+    let mut assembled = None;
+    let mut group_plan = None;
+    // The index-mask row count and the assembly's mask code are a fixed point:
+    // the rows size the own mask block, and the assembly's mask length sizes
+    // the rows the allocation needs.
+    for _ in 0..8 {
+        let input = AssemblyInput {
+            shared_members: vec![
+                AssemblyMember::Fixed {
+                    main_rows: 1,
+                    mask_rows: 0,
+                },
+                AssemblyMember::Fixed {
+                    main_rows: 1,
+                    mask_rows: 0,
+                },
+            ],
+            own_objects: vec![
+                AssemblyOwnObject {
+                    member: AssemblyMember::Columns {
+                        entries: inputs.columns,
+                        answers: 1,
+                    },
+                    shared_too: false,
+                    spent: 0,
+                },
+                AssemblyOwnObject {
+                    member: AssemblyMember::Fixed {
+                        main_rows: 1,
+                        mask_rows: 0,
+                    },
+                    shared_too: true,
+                    spent: 0,
+                },
+                AssemblyOwnObject {
+                    member: AssemblyMember::Fixed {
+                        main_rows: 0,
+                        mask_rows: index_rows,
+                    },
+                    shared_too: false,
+                    spent: 1,
+                },
+            ],
+            shared_mask_spent: 0,
+            requests: 1,
+            samples: 1,
+            columns: inputs.columns,
+            circle: false,
+        };
+        let solved = assemble_proximity(&input).map_err(|_| Error::InvalidConfig)?;
+        let needed = smallest_mask_rows(allocated, solved.first_mask.ell)?;
+        let gp = derive_key_group_plan_with_mask(
+            &group_config,
+            range.bit_entries,
+            mask_entries,
+            index_rows,
+            planned,
+            Some(solved.first_mask),
+        )?;
+        if needed == index_rows {
+            assembled = Some(solved);
+            group_plan = Some(gp);
+            break;
+        }
+        index_rows = needed;
+    }
+    let assembled = assembled.ok_or(Error::InvalidConfig)?;
+    let group_plan = group_plan.ok_or(Error::InvalidConfig)?;
+    let mask_code = assembled.first_mask;
+    let message = crate::proof::table_range::derive_range_lookup_message(
+        range,
+        group_plan.first_main,
+        group_plan.first_mask,
+        40,
+        101,
+        1,
+        Digest([0x41; 32]),
+        Digest([0x51; 32]),
+    )?;
+    let index = IndexMaskPlan {
+        oracle: 60,
+        group: 7,
+        mask_code: group_plan.first_mask,
+        mask_rows: index_rows,
+        answers: 1,
+        openings: 1,
+        tree: RuntimeTreePlan {
+            tree_number: 202,
+            leaf_class: 10,
+            log_n: group_plan.first_mask.log_n,
+            log_n_zk: group_plan.first_mask.log_n,
+            parts: vec![RuntimeTreePart {
+                main_symbols: 0,
+                mask_symbols: index_rows
+                    .checked_mul(E_DEGREE as u64)
+                    .ok_or(Error::ResourceLimit)?,
+            }],
+            salt_bytes: 40,
+            run: Digest([0x66; 32]),
+            configuration: Digest([0x51; 32]),
+        },
+        entries: allocation,
+    };
+    let commit = crate::proof::lookup_messages::LookupCommitPlan {
+        bits_shape: message.bits_shape,
+        bits_oracle: 21,
+        group: 7,
+        bits_openings: 1,
+        mask_oracle: 22,
+        mask_code: group_plan.first_mask,
+        mask_rows: message.mask_rows,
+        mask_openings: 1,
+        mask_tree: RuntimeTreePlan {
+            tree_number: 203,
+            leaf_class: 3,
+            log_n: group_plan.first_mask.log_n,
+            log_n_zk: group_plan.first_mask.log_n,
+            parts: vec![RuntimeTreePart {
+                main_symbols: 0,
+                mask_symbols: message
+                    .mask_rows
+                    .checked_mul(E_DEGREE as u64)
+                    .ok_or(Error::ResourceLimit)?,
+            }],
+            salt_bytes: 40,
+            run: Digest([0x63; 32]),
+            configuration: Digest([0x64; 32]),
+        },
+    };
+    let w = WShape::new(
+        inputs.columns,
+        assembled.first_main,
+        1,
+        1,
+        40,
+        100,
+        1,
+        Digest([0x41; 32]),
+        Digest([0x51; 32]),
+    )?;
+    let gu_tree = RuntimeTreePlan {
+        tree_number: 300,
+        leaf_class: 2,
+        log_n: assembled.first_main.log_n,
+        log_n_zk: mask_code.log_n,
+        parts: vec![RuntimeTreePart {
+            main_symbols: E_DEGREE as u64,
+            mask_symbols: 0,
+        }],
+        salt_bytes: 40,
+        run: Digest([0x61; 32]),
+        configuration: Digest([0x62; 32]),
+    };
+    let omega_tree = RuntimeTreePlan {
+        tree_number: 301,
+        leaf_class: 2,
+        log_n: assembled.first_main.log_n,
+        log_n_zk: mask_code.log_n,
+        parts: vec![RuntimeTreePart {
+            main_symbols: E_DEGREE as u64,
+            mask_symbols: 0,
+        }],
+        salt_bytes: 40,
+        run: Digest([0x61; 32]),
+        configuration: Digest([0x62; 32]),
+    };
+    let shared_mask_tree = MaskTreePlan {
+        tree_number: 200,
+        leaf_class: 3,
+        log_n: mask_code.log_n,
+        mask_rows: 1u64
+            .checked_shl(assembled.shared.first().ok_or(Error::InvalidConfig)?.h)
+            .ok_or(Error::ResourceLimit)?,
+        salt_bytes: 40,
+        run: Digest([0x63; 32]),
+        configuration: Digest([0x64; 32]),
+    };
+    let own_mask_tree = MaskTreePlan {
+        tree_number: 201,
+        leaf_class: 3,
+        log_n: mask_code.log_n,
+        mask_rows: 1u64
+            .checked_shl(assembled.own.first().ok_or(Error::InvalidConfig)?.h)
+            .ok_or(Error::ResourceLimit)?,
+        salt_bytes: 40,
+        run: Digest([0x63; 32]),
+        configuration: Digest([0x64; 32]),
+    };
+    let oracle_shape = |code: CodeParams| GuOracleShape {
+        code,
+        main_rows: 1,
+        main_deg: E_DEGREE as u32,
+        mask_rows: 0,
+        mask_code: None,
+        answers: 1,
+    };
+    let shared = KeySharedPlan {
+        gu: GuShape {
+            oracle: 10,
+            group: 5,
+            tree: gu_tree,
+            part: 0,
+            rows_high: true,
+            u: oracle_shape(assembled.first_main),
+            index: inputs.table_shape,
+        },
+        omega: OmegaShapePlan {
+            oracle: 11,
+            group: 5,
+            tree: omega_tree,
+            u: oracle_shape(assembled.first_main),
+            rows_high: true,
+            matrix_rows: inputs.matrix_rows,
+            k_lo: inputs.k_lo,
+        },
+        mask_tree: shared_mask_tree,
+        fresh: 2,
+        stages: assembled.shared.iter().map(key_plan_stage).collect(),
+        base_positions: usize::try_from(
+            assembled
+                .shared
+                .last()
+                .ok_or(Error::InvalidConfig)?
+                .positions,
+        )
+        .map_err(|_| Error::ResourceLimit)?,
+        column_draws: usize::try_from(inputs.total_columns)
+            .map_err(|_| Error::ResourceLimit)?,
+        column_budget: usize::try_from(inputs.total_columns)
+            .map_err(|_| Error::ResourceLimit)?,
+        column_work_bits: 0,
+        lin_check: Some(inputs.lin_check),
+        ledger: ReadLedgerCell::new(inputs.total_columns),
+    };
+    let own = KeyOwnPlan {
+        code: assembled.first_main,
+        mask_code,
+        mask_tree: own_mask_tree,
+        fresh: 8,
+        stages: assembled.own.iter().map(key_plan_stage).collect(),
+        base_positions: usize::try_from(
+            assembled
+                .own
+                .last()
+                .ok_or(Error::InvalidConfig)?
+                .positions,
+        )
+        .map_err(|_| Error::ResourceLimit)?,
+    };
+    let plan = KeyFirstPlan {
+        table_identity: inputs.table_identity,
+        table_configuration: inputs.table_configuration,
+        table_shape: inputs.table_shape,
+        matrix_rows: inputs.matrix_rows,
+        k_lo: inputs.k_lo,
+        columns: inputs.columns,
+        range: crate::proof::table_range::table_key_range_config(range),
+        lookup,
+        commit,
+        index,
+        w,
+        w_oracle: 20,
+        group: 7,
+        bits_bat: 0,
+        mask_bat: 1,
+        index_bat: 2,
+        shared_code: assembled.first_main,
+        shared_mask_code: mask_code,
+        shared,
+        own,
+        binding: crate::proof::lin_binding::LinBindingShape {
+            log_leaves: 0,
+            salt_bytes: 40,
+        },
+        group_config,
+    };
+    key_plan_fault(&plan)?;
+    Ok(plan)
 }
 
 /// The shared stage's derived IOPP chain, when the public plan carries a stage
@@ -12623,6 +13069,29 @@ pub(crate) fn derive_key_group_plan(
     extra_mask_rows: u64,
     rows: u64,
 ) -> Result<KeyGroupPlan> {
+    derive_key_group_plan_with_mask(
+        config,
+        bit_entries,
+        mask_entries,
+        extra_mask_rows,
+        rows,
+        None,
+    )
+}
+
+/// Derives the key group's chain and, when a trusted public plan fixes the
+/// index-mask code, uses that code by role. Only the tail length may differ
+/// from the solved candidate: the mask code's depth and length define the
+/// stage geometry, so a code with another depth or length is refused. The
+/// larger tail is re-checked against the BASE positions.
+pub(crate) fn derive_key_group_plan_with_mask(
+    config: &KeyGroupConfig,
+    bit_entries: u64,
+    mask_entries: usize,
+    extra_mask_rows: u64,
+    rows: u64,
+    required_mask: Option<CodeParams>,
+) -> Result<KeyGroupPlan> {
     if config.fresh == 0 {
         return Err(Error::InvalidConfig);
     }
@@ -12635,14 +13104,27 @@ pub(crate) fn derive_key_group_plan(
         false,
     )
     .map_err(|_| Error::InvalidConfig)?;
-    let stages: Vec<IoppStagePlan> = derived.stages.iter().map(key_group_stage).collect();
+    let mut stages: Vec<IoppStagePlan> = derived.stages.iter().map(key_group_stage).collect();
     let base_positions = stages.last().ok_or(Error::InvalidConfig)?.positions;
     let first_h = stages.first().ok_or(Error::InvalidConfig)?.h;
     let tree_rows = 1u64.checked_shl(first_h).ok_or(Error::ResourceLimit)?;
+    let first_mask = match required_mask {
+        Some(code) => {
+            if code.log_n != derived.first_mask.log_n || code.ell != derived.first_mask.ell {
+                return Err(Error::InvalidConfig);
+            }
+            stages
+                .first_mut()
+                .ok_or(Error::InvalidConfig)?
+                .mask = code;
+            code
+        }
+        None => derived.first_mask,
+    };
     let mask_tree = MaskTreePlan {
         tree_number: config.mask_tree_number,
         leaf_class: crate::proof::multi_stage_iopp::IOPP_MASK_LEAF_CLASS,
-        log_n: derived.first_mask.log_n,
+        log_n: first_mask.log_n,
         mask_rows: tree_rows,
         salt_bytes: config.salt_bytes,
         run: config.run,
@@ -12650,19 +13132,14 @@ pub(crate) fn derive_key_group_plan(
     };
     if mask_tree.fault().is_some()
         || mask_tree.width()? > mask_tree.columns()
-        || iopp_stage_fault(
-            &stages,
-            derived.first_main,
-            derived.first_mask,
-            base_positions,
-        )
-        .is_some()
+        || base_positions as u64 > first_mask.r
+        || iopp_stage_fault(&stages, derived.first_main, first_mask, base_positions).is_some()
     {
         return Err(Error::InvalidConfig);
     }
     Ok(KeyGroupPlan {
         first_main: derived.first_main,
-        first_mask: derived.first_mask,
+        first_mask,
         mask_rows: derived.mask_rows,
         stages,
         base_positions,
@@ -12706,12 +13183,13 @@ fn key_group_plan_for(
         .checked_add(answers)
         .ok_or(Error::ResourceLimit)?;
     let mask_entries = crate::proof::lookup::mask_count(&plan.lookup)?;
-    derive_key_group_plan(
+    derive_key_group_plan_with_mask(
         &plan.group_config,
         key_bit_entries(plan)?,
         mask_entries,
         plan.index.mask_rows,
         planned,
+        Some(plan.commit.mask_code),
     )
 }
 
@@ -39267,3 +39745,61 @@ mod key_first_flow_tests {
     }
 }
 
+
+#[cfg(test)]
+mod production_key_geometry_tests {
+    use super::*;
+
+    #[test]
+    fn the_production_plan_derives_from_the_public_configuration() {
+        let range = crate::proof::table_range::production_table_range().unwrap();
+        let shape = IndexShape {
+            code: zkie_engine::pcs::request::code::build_code_plan(12, 2048, 128).unwrap(),
+            v: 10,
+            answers: 1,
+            salt_bytes: 40,
+            distances: zkie_engine::pcs::request::table::TableDistances {
+                radius: 0,
+                later_radius: 0,
+                m_once: 284,
+                m_later: 0,
+            },
+        };
+        let inputs = KeyPlanInputs {
+            table_identity: Digest([0x11; 32]),
+            table_configuration: Digest([0x12; 32]),
+            table_shape: shape,
+            matrix_rows: 1024,
+            k_lo: 0,
+            columns: 1024,
+            total_columns: 52,
+            lin_check: SharedLinCheck {
+                point_work_bits: 0,
+                zeta_work_bits: 0,
+            },
+            range,
+        };
+        let plan = production_key_first_plan(&inputs).unwrap();
+        eprintln!(
+            "DERIVED group={:?} shared={:?} own={:?} index_rows={} index_code={:?} k_mask={:?} shared_base={} own_base={} sh_stages={} own_stages={} gmask={:?}",
+            plan.group_config,
+            plan.shared_code,
+            plan.own.code,
+            plan.index.mask_rows,
+            plan.index.mask_code,
+            plan.commit.mask_code,
+            plan.shared.base_positions,
+            plan.own.base_positions,
+            plan.shared.stages.len(),
+            plan.own.stages.len(),
+            plan.group_config,
+        );
+        assert_eq!(plan.shared_code, plan.own.code);
+        assert_eq!(plan.index.mask_code, plan.commit.mask_code);
+        assert_eq!(plan.shared.base_positions, 66);
+        assert_eq!(plan.own.base_positions, 53);
+        assert_eq!(plan.index.mask_rows, 1);
+        assert_eq!(plan.shared.stages.len(), 3);
+        assert_eq!(plan.own.stages.len(), 3);
+    }
+}
