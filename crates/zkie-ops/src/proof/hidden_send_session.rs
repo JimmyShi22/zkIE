@@ -10497,8 +10497,9 @@ impl ProximityTreeSource<'_> {
 // The public plan of the key chain's first part
 // ---------------------------------------------------------------------------
 
-/// Version of the key first plan's canonical encoding.
-pub(crate) const KEY_FIRST_PLAN_VERSION: u64 = 1;
+/// Version of the key first plan's canonical encoding. Version 2 adds the
+/// public geometry of the shared stage.
+pub(crate) const KEY_FIRST_PLAN_VERSION: u64 = 2;
 
 /// The public plan of the key chain's first part: the table's identity and
 /// configuration, the declared entry range, the lookup plan and its message
@@ -10529,6 +10530,11 @@ pub(crate) struct KeyFirstPlan {
     /// the lookup messages' codes.
     pub shared_code: CodeParams,
     pub shared_mask_code: CodeParams,
+    /// The public geometry of the shared stage: the Gu and Omega message
+    /// shapes, the shared fresh mask tree, the derived stage chain and the
+    /// table column draws. Every value is public plan data, never prover
+    /// choice.
+    pub shared: KeySharedPlan,
     /// The shape of the one-leaf binding tree over the first chain's seal.
     pub binding: crate::proof::lin_binding::LinBindingShape,
     /// The public parameters of the key group's derived chain.
@@ -10546,6 +10552,26 @@ pub(crate) struct KeyGroupConfig {
     pub salt_bytes: usize,
     pub run: Digest,
     pub configuration: Digest,
+}
+
+/// The public geometry of the key chain's shared stage. The Gu and Omega
+/// message shapes, the shared fresh mask tree, the derived stage chain and the
+/// table column draws are derived from the public configuration and bound by
+/// the first chain's statement digest. The read ledger is verifier runtime
+/// state: it is never encoded and a plan clone starts a fresh budget.
+#[derive(Clone, Debug)]
+pub(crate) struct KeySharedPlan {
+    pub gu: GuShape,
+    pub omega: OmegaShapePlan,
+    pub mask_tree: MaskTreePlan,
+    pub fresh: u64,
+    pub stages: Vec<IoppStagePlan>,
+    pub base_positions: usize,
+    pub column_draws: usize,
+    pub column_budget: usize,
+    pub column_work_bits: u8,
+    pub lin_check: Option<SharedLinCheck>,
+    pub ledger: ReadLedgerCell,
 }
 
 fn key_first_put_code(w: &mut CanonicalWriter, code: &CodeParams) {
@@ -10578,6 +10604,89 @@ fn key_first_put_w_shape(w: &mut CanonicalWriter, shape: &WShape) {
     w.put_u64(shape.leaf_class as u64);
     w.put_digest(&shape.run);
     w.put_digest(&shape.configuration);
+}
+
+fn key_first_put_mask_tree(w: &mut CanonicalWriter, tree: &MaskTreePlan) {
+    w.put_u64(tree.tree_number);
+    w.put_u64(tree.leaf_class as u64);
+    w.put_u64(tree.log_n as u64);
+    w.put_u64(tree.mask_rows);
+    w.put_u64(tree.salt_bytes as u64);
+    w.put_digest(&tree.run);
+    w.put_digest(&tree.configuration);
+}
+
+fn key_first_put_gu_oracle_shape(w: &mut CanonicalWriter, u: &GuOracleShape) {
+    key_first_put_code(w, &u.code);
+    w.put_u64(u.main_rows);
+    w.put_u64(u.main_deg as u64);
+    w.put_u64(u.mask_rows);
+    match &u.mask_code {
+        Some(code) => {
+            w.put_u64(1);
+            key_first_put_code(w, code);
+        }
+        None => w.put_u64(0),
+    }
+    w.put_u64(u.answers as u64);
+}
+
+fn key_first_put_index_shape(w: &mut CanonicalWriter, shape: &IndexShape) {
+    key_first_put_code(w, &shape.code);
+    w.put_u64(shape.v as u64);
+    w.put_u64(shape.answers as u64);
+    w.put_u64(shape.salt_bytes as u64);
+    w.put_u64(shape.distances.radius);
+    w.put_u64(shape.distances.later_radius);
+    w.put_u64(shape.distances.m_once);
+    w.put_u64(shape.distances.m_later);
+}
+
+fn key_first_put_stage(w: &mut CanonicalWriter, stage: &IoppStagePlan) {
+    key_first_put_code(w, &stage.main);
+    key_first_put_code(w, &stage.mask);
+    w.put_u64(stage.k as u64);
+    w.put_u64(stage.h as u64);
+    w.put_u64(stage.positions as u64);
+    w.put_u64(stage.samples as u64);
+    w.put_u64(stage.work_bits as u64);
+}
+
+fn key_first_put_shared(w: &mut CanonicalWriter, shared: &KeySharedPlan) {
+    let gu = &shared.gu;
+    w.put_u64(gu.oracle);
+    w.put_u64(gu.group);
+    key_first_put_tree(w, &gu.tree);
+    w.put_u64(gu.part as u64);
+    w.put_u64(gu.rows_high as u64);
+    key_first_put_gu_oracle_shape(w, &gu.u);
+    key_first_put_index_shape(w, &gu.index);
+    let omega = &shared.omega;
+    w.put_u64(omega.oracle);
+    w.put_u64(omega.group);
+    key_first_put_tree(w, &omega.tree);
+    key_first_put_gu_oracle_shape(w, &omega.u);
+    w.put_u64(omega.rows_high as u64);
+    w.put_u64(omega.matrix_rows);
+    w.put_u64(omega.k_lo as u64);
+    key_first_put_mask_tree(w, &shared.mask_tree);
+    w.put_u64(shared.fresh);
+    w.put_u64(shared.stages.len() as u64);
+    for stage in &shared.stages {
+        key_first_put_stage(w, stage);
+    }
+    w.put_u64(shared.base_positions as u64);
+    w.put_u64(shared.column_draws as u64);
+    w.put_u64(shared.column_budget as u64);
+    w.put_u64(shared.column_work_bits as u64);
+    match &shared.lin_check {
+        Some(check) => {
+            w.put_u64(1);
+            w.put_u64(check.point_work_bits as u64);
+            w.put_u64(check.zeta_work_bits as u64);
+        }
+        None => w.put_u64(0),
+    }
 }
 
 impl KeyFirstPlan {
@@ -10636,6 +10745,7 @@ impl KeyFirstPlan {
         w.put_u64(self.index_bat);
         key_first_put_code(&mut w, &self.shared_code);
         key_first_put_code(&mut w, &self.shared_mask_code);
+        key_first_put_shared(&mut w, &self.shared);
         w.put_bytes(&self.binding.encode());
         w.put_u64(self.group_config.fresh);
         w.put_u64(self.group_config.mask_tree_number);
@@ -11053,6 +11163,377 @@ pub(crate) fn key_first_verify(
         psi: messages.psi.clone(),
         eval_target: messages.eval_target,
         member,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// The key chain's shared stage
+// ---------------------------------------------------------------------------
+
+/// The public geometry of the key plan's shared stage, converted to the
+/// kernel's input. The key plan fixes the shared codes by role; the Gu and
+/// Omega shapes and the stage list are plan data derived from the public
+/// configuration.
+fn key_shared_stage(plan: &KeyFirstPlan) -> Result<SharedStagePlan<'_>> {
+    key_shared_fault(plan)?;
+    Ok(SharedStagePlan {
+        gu: plan.shared.gu.clone(),
+        omega: plan.shared.omega.clone(),
+        code: plan.shared_code,
+        mask_code: plan.shared_mask_code,
+        mask_tree: plan.shared.mask_tree.clone(),
+        fresh: plan.shared.fresh,
+        base_positions: plan.shared.base_positions,
+        column_draws: plan.shared.column_draws,
+        column_budget: plan.shared.column_budget,
+        column_work_bits: plan.shared.column_work_bits,
+        ledger: &plan.shared.ledger,
+        k_lo: plan.k_lo,
+        matrix_rows: plan.matrix_rows,
+        columns: plan.columns,
+        table_v: plan.table_shape.v,
+    })
+}
+
+/// Checks the key plan's shared geometry before any chain runs: the shapes,
+/// the codes by role, the column draws and budget, the mask tree, the stage
+/// list and the distinct identifiers. A plan that fails here is a public
+/// configuration error, not a proof error.
+fn key_shared_fault(plan: &KeyFirstPlan) -> Result<()> {
+    let shared = &plan.shared;
+    if plan.columns == 0
+        || !plan.columns.is_power_of_two()
+        || plan.k_lo.checked_add(plan.table_shape.v) != Some(plan.columns.trailing_zeros())
+    {
+        return Err(Error::InvalidConfig);
+    }
+    if shared.gu.fault().is_some()
+        || zkie_engine::pcs::request::relation::gu_layout_fault(&shared.gu).is_some()
+        || shared.omega.fault().is_some()
+        || shared.mask_tree.fault().is_some()
+    {
+        return Err(Error::InvalidConfig);
+    }
+    if shared.gu.index != plan.table_shape
+        || shared.gu.u.code != plan.shared_code
+        || shared.omega.u.code != plan.shared_code
+        || shared.gu.u.answers != 1
+        || shared.omega.u.answers != 1
+        || shared.gu.u.mask_rows != 0
+        || shared.omega.u.mask_rows != 0
+        || !shared.gu.u.main_rows.is_power_of_two()
+        || !shared.omega.u.main_rows.is_power_of_two()
+        || shared.gu.group != shared.omega.group
+        || shared.omega.matrix_rows != plan.matrix_rows
+        || shared.omega.k_lo != plan.k_lo
+    {
+        return Err(Error::InvalidConfig);
+    }
+    if shared.mask_tree.log_n != plan.shared_mask_code.log_n
+        || shared.fresh == 0
+        || shared.column_draws == 0
+        || shared.column_draws > shared.column_budget
+        || shared.column_budget as u64 > plan.table_shape.code.r
+        || shared.base_positions == 0
+        || shared.base_positions as u64 > plan.shared_code.r
+        || shared.base_positions as u64 > plan.shared_mask_code.r
+        || shared.ledger.max_reads()? != shared.column_budget as u64
+    {
+        return Err(Error::InvalidConfig);
+    }
+    if let Some(check) = shared.lin_check {
+        if check.point_work_bits != 0 || check.zeta_work_bits != 0 {
+            return Err(Error::InvalidConfig);
+        }
+        crate::proof::proximity_planner::shared_lin_plan_fault(
+            crate::proof::proximity_planner::SharedLinPlanFault {
+                v: plan.table_shape.v,
+                k_lo: plan.k_lo,
+                rows_log: plan.matrix_rows.trailing_zeros(),
+                m: plan.table_shape.distances.m_once,
+                column_draws: shared.column_draws as u64,
+                point_work_bits: check.point_work_bits as u32,
+                column_work_bits: shared.column_work_bits as u32,
+                zeta_work_bits: check.zeta_work_bits as u32,
+            },
+            plan.table_shape.code,
+        )?;
+    }
+    if !shared.stages.is_empty()
+        && iopp_stage_fault(
+            &shared.stages,
+            plan.shared_code,
+            plan.shared_mask_code,
+            shared.base_positions,
+        )
+        .is_some()
+    {
+        return Err(Error::InvalidConfig);
+    }
+    let mut oracles = vec![
+        0,
+        plan.commit.bits_oracle,
+        plan.commit.mask_oracle,
+        plan.index.oracle,
+        plan.w_oracle,
+        shared.gu.oracle,
+        shared.omega.oracle,
+    ];
+    oracles.sort_unstable();
+    oracles.dedup();
+    if oracles.len() != 7 {
+        return Err(Error::InvalidConfig);
+    }
+    let mut trees = vec![
+        plan.commit.bits_shape.tree_number,
+        plan.commit.mask_tree.tree_number,
+        plan.index.tree.tree_number,
+        plan.w.tree_number,
+        plan.group_config.mask_tree_number,
+        shared.gu.tree.tree_number,
+        shared.omega.tree.tree_number,
+        shared.mask_tree.tree_number,
+    ];
+    trees.sort_unstable();
+    trees.dedup();
+    if trees.len() != 8 {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(())
+}
+
+/// The shared stage's derived IOPP chain, when the public plan carries a stage
+/// list. The key group's derived identifiers and trees are reserved first, so
+/// the later shared group never repeats one. An empty list keeps the
+/// single-stage BASE path.
+fn key_shared_iopp(
+    plan: &KeyFirstPlan,
+    first: &KeyFirstVerified,
+) -> Result<Option<crate::proof::proximity_iopp::ProximityIoppPlan>> {
+    if plan.shared.stages.is_empty() {
+        return Ok(None);
+    }
+    let group_plan = key_group_plan_for(plan, &first.claims)?;
+    let key_bound = key_group_bound(plan, &group_plan)?;
+    let key_iopp = crate::proof::proximity_iopp::derive_proximity_iopp(
+        &group_plan.stages,
+        ProximityGroupRole::Own,
+        &group_plan.mask_tree,
+        0,
+        group_plan.fresh,
+        group_plan.base_positions,
+        &key_bound,
+    )?;
+    let mut oracles = key_bound.oracles.clone();
+    let mut trees = key_bound.trees.clone();
+    for ids in &key_iopp.chain.config.fold_ids {
+        oracles.extend([ids.group, ids.member, ids.fresh]);
+    }
+    trees.extend(&key_iopp.chain.config.switch_tree_numbers);
+    trees.extend(&key_iopp.chain.config.fold_tree_numbers);
+    trees.push(key_iopp.chain.config.base_star.tree_number);
+    oracles.extend([
+        0,
+        plan.shared.gu.oracle,
+        plan.shared.omega.oracle,
+        plan.shared.fresh,
+    ]);
+    trees.extend([
+        plan.shared.gu.tree.tree_number,
+        plan.shared.omega.tree.tree_number,
+        plan.shared.mask_tree.tree_number,
+    ]);
+    let bound = crate::proof::proximity_iopp::IoppBoundIds::new(oracles, trees);
+    crate::proof::proximity_iopp::derive_proximity_iopp(
+        &plan.shared.stages,
+        ProximityGroupRole::Shared,
+        &plan.shared.mask_tree,
+        0,
+        plan.shared.fresh,
+        plan.shared.base_positions,
+        &bound,
+    )
+    .map(Some)
+}
+
+/// The prover's key shared stage: the Gu and Omega messages and the stored
+/// witness. The witness is private and never enters the proof bytes.
+pub(crate) struct KeySharedProof {
+    pub(crate) messages: HiddenSharedMessages,
+    pub(crate) witness: SharedWitness,
+    pub(crate) points: SharedPoints,
+}
+
+/// The verifier's own shared state: the seal, the public roots and samples it
+/// re-derived and checked, the shared points and the rebuilt relation claims.
+/// Every later chain consumes this state, never caller-filled values. The
+/// seeds and answers recorded here are the message values only after the
+/// verifier re-drew and compared them against the transcript.
+#[derive(Clone, Debug)]
+pub(crate) struct KeySharedVerified {
+    pub seal: Digest,
+    pub table_identity: Digest,
+    pub table_configuration: Digest,
+    pub code: CodeParams,
+    pub mask_code: CodeParams,
+    pub omega: OmegaShapePlan,
+    pub gu_root: Digest,
+    pub gu_seeds: Vec<zkie_engine::pcs::request::table::SampleSeed>,
+    pub gu_answers: Vec<Fp3>,
+    pub omega_root: Digest,
+    pub omega_seeds: Vec<zkie_engine::pcs::request::table::SampleSeed>,
+    pub omega_answers: Vec<Fp3>,
+    pub psi: Vec<Fp3>,
+    pub zeta: Vec<Fp3>,
+    pub claims: Vec<GuRelationRow>,
+    pub base: ProximityBaseOutcome,
+}
+
+impl KeySharedVerified {
+    /// The second chain's internal view of a completed shared verification.
+    pub(crate) fn second_inputs(&self) -> KeySecondInputs<'_> {
+        KeySecondInputs {
+            shared_seal: self.seal,
+            shared_code: self.code,
+            shared_mask_code: self.mask_code,
+            shared_table: self.table_identity,
+            shared_configuration: self.table_configuration,
+            omega_root: self.omega_root,
+            shared_point: &self.psi,
+            zeta: &self.zeta,
+        }
+    }
+}
+
+/// Reserves the batch's table columns once, before the first part. The same
+/// token is consumed by the shared stage; a keeper with a durable budget is
+/// charged exactly one batch and its count is written before any read.
+pub(crate) fn key_shared_charge(
+    plan: &KeyFirstPlan,
+    table: &mut dyn HiddenTableProver,
+) -> Result<HidingCharge> {
+    key_shared_fault(plan)?;
+    if table.reader().shape != plan.table_shape {
+        return Err(Error::StatementMismatch);
+    }
+    if let Some(budget) = table.durable_column_budget() {
+        if budget.columns() != plan.shared.column_draws as u64 {
+            return Err(Error::StatementMismatch);
+        }
+        let _receipt = budget.reserve()?;
+    }
+    let state = table.hiding_state().ok_or(Error::InvalidConfig)?;
+    let table_id = state.table();
+    let lifecycle = state.lifecycle();
+    state.begin_charge(table_id, lifecycle, plan.shared.column_draws)
+}
+
+/// The prover's key shared stage. The chain starts from the verifier's own
+/// key-first state (the binding root) and the table row source is the keeper
+/// that owns M; the Gu and Omega messages take fresh private coins.
+pub(crate) fn key_shared_prove(
+    plan: &KeyFirstPlan,
+    reader: &IndexReader,
+    table: &mut dyn HiddenTableProver,
+    first: &KeyFirstVerified,
+    seed: Digest,
+    charge: &HidingCharge,
+) -> Result<KeySharedProof> {
+    key_shared_fault(plan)?;
+    if seed == Digest::ZERO
+        || first.binding_root.fault().is_some()
+        || first.binding_root.places != 1
+    {
+        return Err(Error::InvalidConfig);
+    }
+    if reader.shape != plan.table_shape
+        || reader.configuration != plan.table_configuration
+        || table.reader().root != reader.root
+        || reader_table_identity(reader)? != plan.table_identity
+    {
+        return Err(Error::StatementMismatch);
+    }
+    if charge.columns() != plan.shared.column_draws || charge.table() != reader.root {
+        return Err(Error::StatementMismatch);
+    }
+    let chain = shared_start_chain_from_binding(
+        &plan.statement_digest(),
+        &plan.range.encode(),
+        plan.table_shape.v as u64,
+        plan.k_lo,
+        &reader.name(),
+        &first.binding_root,
+    )?;
+    let stage = key_shared_stage(plan)?;
+    let iopp = key_shared_iopp(plan, first)?;
+    let result = prove_shared_public(
+        &stage,
+        reader,
+        chain,
+        table,
+        &[],
+        iopp.as_ref(),
+        &seed,
+        charge,
+    )?;
+    Ok(KeySharedProof {
+        messages: result.messages,
+        witness: result.witness,
+        points: result.points,
+    })
+}
+
+/// The verifier's key shared stage. It takes only the trusted reader, the
+/// public plan, the verified key-first state and the proof messages, and
+/// returns the state the second chain consumes.
+pub(crate) fn key_shared_verify(
+    plan: &KeyFirstPlan,
+    reader: &IndexReader,
+    first: &KeyFirstVerified,
+    messages: &HiddenSharedMessages,
+) -> Result<KeySharedVerified> {
+    key_shared_fault(plan)?;
+    if first.binding_root.fault().is_some() || first.binding_root.places != 1 {
+        return Err(Error::InvalidConfig);
+    }
+    if reader.shape != plan.table_shape
+        || reader.configuration != plan.table_configuration
+        || reader_table_identity(reader)? != plan.table_identity
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let chain = shared_start_chain_from_binding(
+        &plan.statement_digest(),
+        &plan.range.encode(),
+        plan.table_shape.v as u64,
+        plan.k_lo,
+        &reader.name(),
+        &first.binding_root,
+    )?;
+    let stage = key_shared_stage(plan)?;
+    let iopp = key_shared_iopp(plan, first)?;
+    let (seal, claims, points, base) =
+        verify_shared_public(&stage, reader, chain, &[], iopp.as_ref(), messages)?;
+    if seal != messages.seal {
+        return Err(Error::InvalidProof);
+    }
+    Ok(KeySharedVerified {
+        seal,
+        table_identity: plan.table_identity,
+        table_configuration: plan.table_configuration,
+        code: plan.shared_code,
+        mask_code: plan.shared_mask_code,
+        omega: plan.shared.omega.clone(),
+        gu_root: messages.gu_root,
+        gu_seeds: messages.gu_seeds.clone(),
+        gu_answers: messages.gu_answers.clone(),
+        omega_root: messages.omega_root,
+        omega_seeds: messages.omega_seeds.clone(),
+        omega_answers: messages.omega_answers.clone(),
+        psi: points.psi,
+        zeta: points.zeta,
+        claims,
+        base,
     })
 }
 
@@ -14248,13 +14729,79 @@ fn gu_vector_bat_index(gu: &GuShape, entry: u64) -> Result<usize> {
 // Shared stage
 // ---------------------------------------------------------------------------
 
+/// The public parameters of the shared stage, independent of the
+/// activation-driven plan: the folded-message and Omega shapes, the group codes,
+/// the fresh mask tree, the derived stage list, the table column draws and the
+/// verifier's read ledger. The hidden three-stage path and the key chain pass
+/// this same struct to the shared stage kernels; nothing here comes from a
+/// caller-supplied proof message.
+#[derive(Clone, Debug)]
+pub(crate) struct SharedStagePlan<'a> {
+    pub gu: GuShape,
+    pub omega: OmegaShapePlan,
+    pub code: CodeParams,
+    pub mask_code: CodeParams,
+    pub mask_tree: MaskTreePlan,
+    pub fresh: u64,
+    pub base_positions: usize,
+    pub column_draws: usize,
+    pub column_budget: usize,
+    pub column_work_bits: u8,
+    /// The verifier's shared read ledger. It is borrowed from the trusted plan
+    /// so repeated verifications of one plan share one budget.
+    pub ledger: &'a ReadLedgerCell,
+    pub k_lo: u32,
+    pub matrix_rows: u64,
+    pub columns: u64,
+    pub table_v: u32,
+}
+
+impl SharedStagePlan<'_> {
+    /// The shared point's column bit count. The low bits are the Omega fold's
+    /// row coordinates and the high bits the table's index-row coordinates;
+    /// the shapes must split them exactly.
+    fn point_bits(&self) -> Result<u32> {
+        let k_col = self.columns.trailing_zeros();
+        if self
+            .k_lo
+            .checked_add(self.table_v)
+            != Some(k_col)
+            || self.columns == 0
+            || !self.columns.is_power_of_two()
+        {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(k_col)
+    }
+}
+
+fn hidden_shared_stage(plan: &HiddenLinPlan) -> SharedStagePlan<'_> {
+    SharedStagePlan {
+        gu: plan.proximity.gu.clone(),
+        omega: plan.proximity.omega.clone(),
+        code: plan.proximity.code,
+        mask_code: plan.proximity.mask_code,
+        mask_tree: plan.proximity.shared_mask_tree.clone(),
+        fresh: plan.proximity.shared_fresh,
+        base_positions: plan.proximity.shared_base_positions,
+        column_draws: plan.proximity.column_draws,
+        column_budget: plan.proximity.column_budget,
+        column_work_bits: plan.proximity.column_work_bits,
+        ledger: &plan.proximity.ledger,
+        k_lo: plan.send.k_lo,
+        matrix_rows: plan.send.matrix_rows,
+        columns: plan.send.columns,
+        table_v: plan.send.table_shape.v,
+    }
+}
+
 struct SharedProveResult {
     messages: HiddenSharedMessages,
     witness: SharedWitness,
     points: SharedPoints,
 }
 
-struct SharedWitness {
+pub(crate) struct SharedWitness {
     gu_message: Vec<Vec<Fp3>>,
     gu_tails: Vec<Vec<Fp3>>,
     omega_message: Vec<Fp3>,
@@ -14264,7 +14811,7 @@ struct SharedWitness {
     omega_opening: TreeOpeningCount,
 }
 
-struct SharedPoints {
+pub(crate) struct SharedPoints {
     psi: Vec<Fp3>,
     zeta: Vec<Fp3>,
 }
@@ -14322,19 +14869,6 @@ pub(crate) fn shared_start_chain_from_binding(
         &[binding_root.places, shape_v, k_lo as u64],
     )?;
     Ok(chain)
-}
-
-fn shared_point_bits(plan: &HiddenLinPlan) -> Result<u32> {
-    let k_col = plan.send.columns.trailing_zeros();
-    if plan
-        .send
-        .k_lo
-        .checked_add(plan.send.table_shape.v)
-        != Some(k_col)
-    {
-        return Err(Error::InvalidConfig);
-    }
-    Ok(k_col)
 }
 
 /// The inputs of the parameter claim members that join the shared proximity
@@ -14415,7 +14949,9 @@ fn norm_param_registry(
     Ok(registry)
 }
 
-/// Prover side of the shared stage.
+/// Prover side of the shared stage in the hidden three-stage path. The public
+/// parameters are extracted into [`SharedStagePlan`]; the same kernel serves the
+/// key chain through [`prove_shared_public`].
 fn prove_shared(
     plan: &HiddenLinPlan,
     reader: &IndexReader,
@@ -14426,29 +14962,66 @@ fn prove_shared(
     norm_witness: Option<&NormWitness>,
     fold_charge: Option<&HidingCharge>,
 ) -> Result<SharedProveResult> {
+    let stage = hidden_shared_stage(plan);
+    let chain = shared_start_chain(plan, reader, first_seal)?;
+    let param_inputs = norm_param_claim_inputs(plan, first, norm_witness)?;
+    let iopp = proximity_iopp_plan(
+        &plan.proximity,
+        &plan.send,
+        plan.closure.as_ref(),
+        plan.norm.as_ref(),
+        ProximityGroupRole::Shared,
+    )?;
+    let charge = fold_charge.ok_or(Error::InvalidConfig)?;
+    prove_shared_public(
+        &stage,
+        reader,
+        chain,
+        table,
+        &param_inputs,
+        iopp.as_ref(),
+        seed,
+        charge,
+    )
+}
+
+/// Prover kernel of the shared stage over its public parameters. The chain is
+/// started by the caller: the hidden path resumes from the first seal, the key
+/// path from the verified binding root. The Gu and Omega messages are built
+/// from the table row source with this run's private coins.
+#[allow(clippy::too_many_arguments)]
+fn prove_shared_public(
+    stage: &SharedStagePlan<'_>,
+    reader: &IndexReader,
+    mut chain: Chain,
+    table: &mut dyn HiddenTableProver,
+    param_inputs: &[NormParamClaimInput],
+    iopp: Option<&crate::proof::proximity_iopp::ProximityIoppPlan>,
+    seed: &Digest,
+    charge: &HidingCharge,
+) -> Result<SharedProveResult> {
     let _profile_shared = zkie_engine::profile::Scope::new("shared.prove_shared");
-    let k_col = shared_point_bits(plan)?;
-    let mut chain = shared_start_chain(plan, reader, first_seal)?;
+    let k_col = stage.point_bits()?;
     let psi = draw_point_round(
         &mut chain,
         KIND_SEED,
         &[HIDDEN_SEND_SCHEMA_VERSION, 10],
         k_col,
     )?;
-    let gamma = psi[plan.send.k_lo as usize..].to_vec();
+    let gamma = psi[stage.k_lo as usize..].to_vec();
     let _profile_fold_table = zkie_engine::profile::Scope::new("shared.fold_table");
     let (folded, folded_tail) = fold_table(table, reader.shape, &gamma)?;
     drop(_profile_fold_table);
-    let gu = plan.proximity.gu.clone();
+    let gu = stage.gu.clone();
     // The fold shape and the table reader are one parameter set: the folded
     // message, the generator rows and the opened columns use the same code,
     // row count, answers, salt and sampling distances.
-    if gu.index != reader.shape {
+    if gu.index != reader.shape || gu.u.code != stage.code || gu.u.answers != 1 {
         return Err(Error::StatementMismatch);
     }
-    if plan.proximity.column_draws == 0
-        || plan.proximity.column_draws > plan.proximity.column_budget
-        || plan.proximity.column_budget as u64 > reader.shape.code.r
+    if stage.column_draws == 0
+        || stage.column_draws > stage.column_budget
+        || stage.column_budget as u64 > reader.shape.code.r
     {
         return Err(Error::InvalidConfig);
     }
@@ -14515,21 +15088,21 @@ fn prove_shared(
 
     let (positions, nonce) = draw_columns(
         &mut chain,
-        plan.proximity.column_draws,
-        plan.proximity.column_work_bits,
+        stage.column_draws,
+        stage.column_work_bits,
         reader.shape.code.log_n,
         None,
     )?;
     let unique = unique_sorted(&positions);
-    if positions.len() != plan.proximity.column_draws
-        || unique.len() > plan.proximity.column_budget
-    {
+    if positions.len() != stage.column_draws || unique.len() > stage.column_budget {
         return Err(Error::ShapeMismatch);
     }
     // The provider hides the columns it exposes: the batch's columns were
     // charged against the keeper's hiding state before the first part, a
     // repeated position is free, and the reservation is never refunded.
-    let charge = fold_charge.ok_or(Error::InvalidConfig)?;
+    if charge.columns() != stage.column_draws || charge.table() != reader.root {
+        return Err(Error::StatementMismatch);
+    }
     let _fresh = charge.consume(&unique)?;
     let _profile_open_columns = zkie_engine::profile::Scope::new("shared.table_open_columns");
     let gu_openings = table.open_columns(&unique)?;
@@ -14557,10 +15130,13 @@ fn prove_shared(
     }
     drop(_profile_column_rows);
 
-    let omega = plan.proximity.omega.clone();
+    let omega = stage.omega.clone();
     let matrix_rows = omega.matrix_rows;
     let k_lo = omega.k_lo;
-    if plan.send.k_lo != k_lo || plan.send.matrix_rows != matrix_rows {
+    if omega.u.code != stage.code || omega.u.answers != 1 {
+        return Err(Error::StatementMismatch);
+    }
+    if stage.k_lo != k_lo || stage.matrix_rows != matrix_rows {
         return Err(Error::StatementMismatch);
     }
     let low_count = 1u64 << k_lo;
@@ -14659,7 +15235,7 @@ fn prove_shared(
             bat_oracle: 0,
             source_oracle: gu.oracle,
             main_code: gu.u.code,
-            mask_code: plan.proximity.mask_code,
+            mask_code: stage.mask_code,
             main_rows: gu.u.main_rows,
             mask_rows: 0,
             answers: gu.u.answers,
@@ -14674,7 +15250,7 @@ fn prove_shared(
             bat_oracle: 1,
             source_oracle: omega.oracle,
             main_code: omega.u.code,
-            mask_code: plan.proximity.mask_code,
+            mask_code: stage.mask_code,
             main_rows: omega.u.main_rows,
             mask_rows: 0,
             answers: omega.u.answers,
@@ -14686,9 +15262,8 @@ fn prove_shared(
             mask_tails: Vec::new(),
         },
     ];
-    let param_inputs = norm_param_claim_inputs(plan, first, norm_witness)?;
     let mut param_trees = Vec::new();
-    for input in &param_inputs {
+    for input in param_inputs {
         let gu = &input.claim.gu;
         let material = input.material.as_ref().ok_or(Error::ShapeMismatch)?;
         let tree = commit_rows_tree(
@@ -14706,7 +15281,7 @@ fn prove_shared(
             bat_oracle: 0,
             source_oracle: gu.oracle,
             main_code: gu.u.code,
-            mask_code: plan.proximity.mask_code,
+            mask_code: stage.mask_code,
             main_rows: gu.u.main_rows,
             mask_rows: 0,
             answers: gu.u.answers,
@@ -14733,7 +15308,7 @@ fn prove_shared(
     let gu_bat = gu_bat.ok_or(Error::StatementMismatch)?;
     let omega_bat = omega_bat.ok_or(Error::StatementMismatch)?;
     let mut param_registries = Vec::with_capacity(param_inputs.len());
-    for input in &param_inputs {
+    for input in param_inputs {
         param_registries.push(norm_param_registry(&input.claim, &input.message)?);
     }
     let param_of = |oracle: u64| {
@@ -14813,19 +15388,12 @@ fn prove_shared(
         omega: Some(omega_opening.clone()),
     };
     let fold = member_fold_shape(
-        plan.proximity.code,
-        plan.proximity.mask_code,
+        stage.code,
+        stage.mask_code,
         &members,
-        plan.proximity.shared_mask_tree.leaf_class,
+        stage.mask_tree.leaf_class,
     )?;
     let _profile_proximity = zkie_engine::profile::Scope::new("shared.proximity");
-    let iopp = proximity_iopp_plan(
-        &plan.proximity,
-        &plan.send,
-        plan.closure.as_ref(),
-        plan.norm.as_ref(),
-        ProximityGroupRole::Shared,
-    )?;
     let proximity = proximity_prove(
         chain,
         fold,
@@ -14833,11 +15401,11 @@ fn prove_shared(
         trees,
         &sample_rows,
         plain_rows,
-        plan.proximity.shared_fresh,
-        plan.proximity.shared_mask_tree,
+        stage.fresh,
+        stage.mask_tree,
         derive_run_seed(seed, 4, 0)?,
-        plan.proximity.shared_base_positions,
-        iopp.as_ref(),
+        stage.base_positions,
+        iopp,
     )?;
     drop(_profile_proximity);
     let messages = HiddenSharedMessages {
@@ -14914,7 +15482,8 @@ fn commit_rows_tree(
     )
 }
 
-/// Verifier side of the shared stage.
+/// Verifier side of the shared stage in the hidden three-stage path. The same
+/// public kernel serves the key chain through [`verify_shared_public`].
 fn verify_shared(
     plan: &HiddenLinPlan,
     reader: &IndexReader,
@@ -14922,26 +15491,56 @@ fn verify_shared(
     first_seal: &Digest,
     messages: &HiddenSharedMessages,
 ) -> Result<(Digest, Vec<GuRelationRow>, SharedPoints, ProximityBaseOutcome)> {
+    let stage = hidden_shared_stage(plan);
+    let chain = shared_start_chain(plan, reader, first_seal)?;
+    let param_inputs = norm_param_claim_inputs(plan, first, None)?;
+    let iopp = proximity_iopp_plan(
+        &plan.proximity,
+        &plan.send,
+        plan.closure.as_ref(),
+        plan.norm.as_ref(),
+        ProximityGroupRole::Shared,
+    )?;
+    verify_shared_public(
+        &stage,
+        reader,
+        chain,
+        &param_inputs,
+        iopp.as_ref(),
+        messages,
+    )
+}
+
+/// Verifier kernel of the shared stage over its public parameters. The chain is
+/// started by the caller; the record and column claims are rebuilt from the
+/// trusted reader and the proof messages, never from prover-reported values.
+fn verify_shared_public(
+    stage: &SharedStagePlan<'_>,
+    reader: &IndexReader,
+    mut chain: Chain,
+    param_inputs: &[NormParamClaimInput],
+    iopp: Option<&crate::proof::proximity_iopp::ProximityIoppPlan>,
+    messages: &HiddenSharedMessages,
+) -> Result<(Digest, Vec<GuRelationRow>, SharedPoints, ProximityBaseOutcome)> {
     let _profile = zkie_engine::profile::Scope::new("verify.shared");
-    let k_col = shared_point_bits(plan)?;
-    let mut chain = shared_start_chain(plan, reader, first_seal)?;
+    let k_col = stage.point_bits()?;
     let psi = draw_point_round(
         &mut chain,
         KIND_SEED,
         &[HIDDEN_SEND_SCHEMA_VERSION, 10],
         k_col,
     )?;
-    let gamma = psi[plan.send.k_lo as usize..].to_vec();
+    let gamma = psi[stage.k_lo as usize..].to_vec();
     let eq_gamma = foldeq_weights(&gamma, reader.shape.v)?;
-    let gu = plan.proximity.gu.clone();
+    let gu = stage.gu.clone();
     // The fold shape and the verifier's reader are one parameter set; the
     // table identity is checked at the first part.
-    if gu.index != reader.shape {
+    if gu.index != reader.shape || gu.u.code != stage.code || gu.u.answers != 1 {
         return Err(Error::StatementMismatch);
     }
-    if plan.proximity.column_draws == 0
-        || plan.proximity.column_draws > plan.proximity.column_budget
-        || plan.proximity.column_budget as u64 > reader.shape.code.r
+    if stage.column_draws == 0
+        || stage.column_draws > stage.column_budget
+        || stage.column_budget as u64 > reader.shape.code.r
     {
         return Err(Error::InvalidConfig);
     }
@@ -14957,8 +15556,8 @@ fn verify_shared(
     absorb_answer_round(&mut chain, &messages.gu_answers)?;
     let (positions, _nonce) = draw_columns(
         &mut chain,
-        plan.proximity.column_draws,
-        plan.proximity.column_work_bits,
+        stage.column_draws,
+        stage.column_work_bits,
         reader.shape.code.log_n,
         Some(messages.column_nonce),
     )?;
@@ -14966,8 +15565,8 @@ fn verify_shared(
         return Err(Error::InvalidProof);
     }
     let unique = unique_sorted(&positions);
-    if positions.len() != plan.proximity.column_draws
-        || unique.len() > plan.proximity.column_budget
+    if positions.len() != stage.column_draws
+        || unique.len() > stage.column_budget
     {
         return Err(Error::ShapeMismatch);
     }
@@ -14976,7 +15575,7 @@ fn verify_shared(
     // the columns are used; a repeated position must return the same column.
     // The plan keeps the ledger across calls, and a plan clone starts a fresh
     // ledger with the same maximum.
-    let mut reads = VerifierReads::new(plan.proximity.ledger.arc());
+    let mut reads = VerifierReads::new(stage.ledger.arc());
     let columns = reads.read(reader, &unique, &messages.column_openings)?;
     let column_map = column_map_from_reads(&unique, &columns)?;
     drop(_profile_columns);
@@ -15013,7 +15612,13 @@ fn verify_shared(
     }
     drop(_profile_column_rows);
 
-    let omega = plan.proximity.omega.clone();
+    let omega = stage.omega.clone();
+    if omega.u.code != stage.code || omega.u.answers != 1 {
+        return Err(Error::StatementMismatch);
+    }
+    if stage.k_lo != omega.k_lo || stage.matrix_rows != omega.matrix_rows {
+        return Err(Error::StatementMismatch);
+    }
     absorb_root_round(&mut chain, &messages.omega_root)?;
     let omega_bits = sample_cube_of(&omega.u)?.bits;
     let omega_seeds = draw_seed_set(&mut chain, omega_bits, omega.u.answers)?;
@@ -15038,7 +15643,7 @@ fn verify_shared(
             bat_oracle: 0,
             source_oracle: gu.oracle,
             main_code: gu.u.code,
-            mask_code: plan.proximity.mask_code,
+            mask_code: stage.mask_code,
             main_rows: gu.u.main_rows,
             mask_rows: 0,
             answers: gu.u.answers,
@@ -15053,7 +15658,7 @@ fn verify_shared(
             bat_oracle: 1,
             source_oracle: omega.oracle,
             main_code: omega.u.code,
-            mask_code: plan.proximity.mask_code,
+            mask_code: stage.mask_code,
             main_rows: omega.u.main_rows,
             mask_rows: 0,
             answers: omega.u.answers,
@@ -15065,14 +15670,13 @@ fn verify_shared(
             mask_tails: Vec::new(),
         },
     ];
-    let param_inputs = norm_param_claim_inputs(plan, first, None)?;
-    for input in &param_inputs {
+        for input in param_inputs {
         let gu = &input.claim.gu;
         members.push(ProximityMember {
             bat_oracle: 0,
             source_oracle: gu.oracle,
             main_code: gu.u.code,
-            mask_code: plan.proximity.mask_code,
+            mask_code: stage.mask_code,
             main_rows: gu.u.main_rows,
             mask_rows: 0,
             answers: gu.u.answers,
@@ -15099,7 +15703,7 @@ fn verify_shared(
     let gu_bat = gu_bat.ok_or(Error::StatementMismatch)?;
     let omega_bat = omega_bat.ok_or(Error::StatementMismatch)?;
     let mut param_registries = Vec::with_capacity(param_inputs.len());
-    for input in &param_inputs {
+    for input in param_inputs {
         param_registries.push(norm_param_registry(&input.claim, &input.message)?);
     }
     let param_of = |oracle: u64| {
@@ -15153,7 +15757,7 @@ fn verify_shared(
         omega.k_lo,
     )?);
     let mut param_claim_rows = Vec::new();
-    for input in &param_inputs {
+    for input in param_inputs {
         let member = members
             .iter()
             .find(|member| member.source_oracle == input.claim.gu.oracle)
@@ -15166,17 +15770,10 @@ fn verify_shared(
     }
     drop(_profile_plain_rows);
     let fold = member_fold_shape(
-        plan.proximity.code,
-        plan.proximity.mask_code,
+        stage.code,
+        stage.mask_code,
         &members,
-        plan.proximity.shared_mask_tree.leaf_class,
-    )?;
-    let iopp = proximity_iopp_plan(
-        &plan.proximity,
-        &plan.send,
-        plan.closure.as_ref(),
-        plan.norm.as_ref(),
-        ProximityGroupRole::Shared,
+        stage.mask_tree.leaf_class,
     )?;
     let _profile_proximity = zkie_engine::profile::Scope::new("verify.shared.proximity");
     let proximity = proximity_verify(
@@ -15190,10 +15787,10 @@ fn verify_shared(
             fold_rounds: messages.fold_rounds.clone(),
             tail: messages.tail.clone(),
         },
-        plan.proximity.shared_fresh,
-        plan.proximity.shared_mask_tree,
-        plan.proximity.shared_base_positions,
-        iopp.as_ref(),
+        stage.fresh,
+        stage.mask_tree,
+        stage.base_positions,
+        iopp,
     )?;
     drop(_profile_proximity);
     if proximity.seal != messages.seal {
@@ -36980,11 +37577,84 @@ mod iopp_stage_plan_tests {
 mod key_first_plan_tests {
     use super::*;
 
+    fn sample_shared(code: CodeParams, table_shape: IndexShape) -> KeySharedPlan {
+        let tree = |tree_number: u64, main_symbols: u64, run: u8, configuration: u8| RuntimeTreePlan {
+            tree_number,
+            leaf_class: 2,
+            log_n: code.log_n,
+            log_n_zk: code.log_n,
+            parts: vec![RuntimeTreePart {
+                main_symbols,
+                mask_symbols: 0,
+            }],
+            salt_bytes: 40,
+            run: Digest([run; 32]),
+            configuration: Digest([configuration; 32]),
+        };
+        let oracle_shape = |main_rows: u64| GuOracleShape {
+            code,
+            main_rows,
+            main_deg: E_DEGREE as u32,
+            mask_rows: 0,
+            mask_code: None,
+            answers: 1,
+        };
+        KeySharedPlan {
+            gu: GuShape {
+                oracle: 300,
+                group: 8,
+                tree: tree(400, 2 * E_DEGREE as u64, 0x73, 0x74),
+                part: 0,
+                rows_high: true,
+                u: oracle_shape(2),
+                index: table_shape,
+            },
+            omega: OmegaShapePlan {
+                oracle: 301,
+                group: 8,
+                tree: tree(401, E_DEGREE as u64, 0x75, 0x76),
+                u: oracle_shape(1),
+                rows_high: true,
+                matrix_rows: 4,
+                k_lo: 0,
+            },
+            mask_tree: MaskTreePlan {
+                tree_number: 402,
+                leaf_class: 4,
+                log_n: code.log_n,
+                mask_rows: 1,
+                salt_bytes: 40,
+                run: Digest([0x77; 32]),
+                configuration: Digest([0x78; 32]),
+            },
+            fresh: 96,
+            stages: Vec::new(),
+            base_positions: 1,
+            column_draws: 1,
+            column_budget: 1,
+            column_work_bits: 0,
+            lin_check: None,
+            ledger: ReadLedgerCell::new(1),
+        }
+    }
+
     fn sample_plan() -> KeyFirstPlan {
         let code = CodeParams {
             log_n: 10,
             ell: 512,
             r: 32,
+        };
+        let table_shape = IndexShape {
+            code,
+            v: 2,
+            answers: 1,
+            salt_bytes: 40,
+            distances: zkie_engine::pcs::request::table::TableDistances {
+                radius: 0,
+                later_radius: 0,
+                m_once: 1,
+                m_later: 0,
+            },
         };
         let tree = RuntimeTreePlan {
             tree_number: 1,
@@ -37022,18 +37692,7 @@ mod key_first_plan_tests {
         KeyFirstPlan {
             table_identity: Digest([9; 32]),
             table_configuration: Digest([8; 32]),
-            table_shape: IndexShape {
-                code,
-                v: 2,
-                answers: 1,
-                salt_bytes: 40,
-                distances: zkie_engine::pcs::request::table::TableDistances {
-                    radius: 0,
-                    later_radius: 0,
-                    m_once: 1,
-                    m_later: 0,
-                },
-            },
+            table_shape,
             matrix_rows: 4,
             k_lo: 0,
             columns: 4,
@@ -37073,6 +37732,7 @@ mod key_first_plan_tests {
             index_bat: 12,
             shared_code: code,
             shared_mask_code: code,
+            shared: sample_shared(code, table_shape),
             binding: crate::proof::lin_binding::LinBindingShape {
                 log_leaves: 0,
                 salt_bytes: 40,
@@ -37121,6 +37781,72 @@ mod key_first_flow_tests {
         derive_entry_range, derive_range_lookup_message, range_bit_values, range_key_values,
         range_multiplicities, EntryRange, EntryRangeLimits, IntegerRangeTable,
     };
+    use std::cell::RefCell;
+    use zkie_engine::pcs::request::table::{commit_table_streaming, StreamingTable, VecTableSource};
+
+    /// The public shared geometry of the flow fixture: Gu over two rows and
+    /// Omega over one row of the same code as the table, an empty stage list
+    /// (single-stage BASE) and one drawn table column.
+    fn flow_shared_plan(table_shape: IndexShape, code: CodeParams) -> KeySharedPlan {
+        let tree = |tree_number: u64, main_symbols: u64, run: u8, configuration: u8| RuntimeTreePlan {
+            tree_number,
+            leaf_class: 2,
+            log_n: code.log_n,
+            log_n_zk: code.log_n,
+            parts: vec![RuntimeTreePart {
+                main_symbols,
+                mask_symbols: 0,
+            }],
+            salt_bytes: 40,
+            run: Digest([run; 32]),
+            configuration: Digest([configuration; 32]),
+        };
+        let oracle_shape = |main_rows: u64| GuOracleShape {
+            code,
+            main_rows,
+            main_deg: E_DEGREE as u32,
+            mask_rows: 0,
+            mask_code: None,
+            answers: 1,
+        };
+        KeySharedPlan {
+            gu: GuShape {
+                oracle: 300,
+                group: 8,
+                tree: tree(400, 2 * E_DEGREE as u64, 0x73, 0x74),
+                part: 0,
+                rows_high: true,
+                u: oracle_shape(2),
+                index: table_shape,
+            },
+            omega: OmegaShapePlan {
+                oracle: 301,
+                group: 8,
+                tree: tree(401, E_DEGREE as u64, 0x75, 0x76),
+                u: oracle_shape(1),
+                rows_high: true,
+                matrix_rows: 4,
+                k_lo: 0,
+            },
+            mask_tree: MaskTreePlan {
+                tree_number: 402,
+                leaf_class: 4,
+                log_n: code.log_n,
+                mask_rows: 1,
+                salt_bytes: 40,
+                run: Digest([0x77; 32]),
+                configuration: Digest([0x78; 32]),
+            },
+            fresh: 96,
+            stages: Vec::new(),
+            base_positions: 1,
+            column_draws: 1,
+            column_budget: 1,
+            column_work_bits: 0,
+            lin_check: None,
+            ledger: ReadLedgerCell::new(1),
+        }
+    }
 
     fn flow_plan() -> (KeyFirstPlan, Vec<Fp3>, Vec<Fp3>) {
         let code = zkie_engine::pcs::request::code::build_code_plan(4, 8, 1).unwrap();
@@ -37192,21 +37918,22 @@ mod key_first_flow_tests {
             run: Digest([0x42; 32]),
             configuration: Digest([0x52; 32]),
         };
+        let table_shape = zkie_engine::pcs::request::table::IndexShape {
+            code,
+            v: 2,
+            answers: 1,
+            salt_bytes: 40,
+            distances: zkie_engine::pcs::request::table::TableDistances {
+                radius: 0,
+                later_radius: 0,
+                m_once: 1,
+                m_later: 0,
+            },
+        };
         let plan = KeyFirstPlan {
             table_identity: Digest([9; 32]),
             table_configuration: Digest([8; 32]),
-            table_shape: zkie_engine::pcs::request::table::IndexShape {
-                code,
-                v: 2,
-                answers: 1,
-                salt_bytes: 40,
-                distances: zkie_engine::pcs::request::table::TableDistances {
-                    radius: 0,
-                    later_radius: 0,
-                    m_once: 1,
-                    m_later: 0,
-                },
-            },
+            table_shape,
             matrix_rows: 4,
             k_lo: 0,
             columns: 4,
@@ -37262,8 +37989,9 @@ mod key_first_flow_tests {
             bits_bat: 0,
             mask_bat: 1,
             index_bat: 2,
-            shared_code: group_plan.first_main,
-            shared_mask_code: group_plan.first_mask,
+            shared_code: code,
+            shared_mask_code: code,
+            shared: flow_shared_plan(table_shape, code),
             binding: crate::proof::lin_binding::LinBindingShape {
                 log_leaves: 0,
                 salt_bytes: 40,
@@ -37328,6 +38056,215 @@ mod key_first_flow_tests {
         )
         .unwrap();
         (plan, reader, table, messages, seal, witness, binding_root)
+    }
+
+    /// The keeper of the shared flow: the committed M, its one row source, the
+    /// hiding state that is charged before the first part and an optional
+    /// durable budget.
+    struct KeyKeeper {
+        table: StreamingTable,
+        source: RefCell<VecTableSource>,
+        reader: IndexReader,
+        hiding: HidingState,
+        budget: Option<DurableColumnBudget>,
+    }
+
+    impl TableRowSource for KeyKeeper {
+        fn rows(&self) -> u64 {
+            self.source.borrow().rows()
+        }
+
+        fn row(&mut self, index: u64, message: &mut [Fp], tail: &mut [Fp]) -> Result<()> {
+            self.source.borrow_mut().row(index, message, tail)
+        }
+    }
+
+    impl HiddenTableProver for KeyKeeper {
+        fn reader(&self) -> &IndexReader {
+            &self.reader
+        }
+
+        fn open_columns(&mut self, positions: &[u64]) -> Result<Vec<ColumnOpening>> {
+            let mut source = self.source.borrow_mut();
+            self.table.open_columns(&mut *source, positions)
+        }
+
+        fn hiding_state(&mut self) -> Option<&mut HidingState> {
+            Some(&mut self.hiding)
+        }
+
+        fn durable_column_budget(&mut self) -> Option<&mut DurableColumnBudget> {
+            self.budget.as_mut()
+        }
+    }
+
+    /// The full key prefix on one committed table: charge the batch's columns
+    /// once, run the first part, verify it, then let the same keeper generate
+    /// Gu and Omega and the verifier rebuild its shared state.
+    fn shared_run() -> (
+        KeyFirstPlan,
+        IndexReader,
+        KeyFirstVerified,
+        HiddenSharedMessages,
+        KeySharedVerified,
+    ) {
+        let (mut plan, keys, bits) = flow_plan();
+        let mut message_rows = vec![vec![Fp::ZERO; 8]; 4];
+        for row in 0..4 {
+            for column in 0..4 {
+                message_rows[column][row] = crate::proof::column_session::fp_from_signed_word(
+                    (row as i64 * 4 + column as i64 - 8) as u64,
+                );
+            }
+        }
+        let tails = vec![vec![Fp::ZERO; 1]; 4];
+        let mut source = VecTableSource::new(message_rows, tails).unwrap();
+        let salts: Vec<Vec<u8>> = (0..plan.table_shape.code.n())
+            .map(|position| vec![(position as u8) ^ 0x5A; 40])
+            .collect();
+        let table = commit_table_streaming(
+            &mut source,
+            plan.table_shape,
+            plan.table_configuration,
+            &salts,
+            64,
+            u64::MAX,
+        )
+        .unwrap();
+        let reader = table.reader.clone();
+        plan.table_identity = reader_table_identity(&reader).unwrap();
+        let mut keeper = KeyKeeper {
+            table,
+            source: RefCell::new(source),
+            hiding: HidingState::new(reader.root, 1, reader.shape.code.r as u64),
+            reader: reader.clone(),
+            budget: None,
+        };
+        let range_plan = derive_entry_range(
+            4,
+            2,
+            EntryRange::new(-8, 7).unwrap(),
+            EntryRangeLimits {
+                max_table_log: 8,
+                max_bit_entries: 1 << 16,
+            },
+        )
+        .unwrap();
+        let lookup_table = IntegerRangeTable::new(&range_plan, 1 << 8).unwrap();
+        let mut coins = ByteMaskCoins::new(Digest([5; 32])).unwrap();
+        let index_randomness = IndexMaskRandomness::from_coins(&mut coins, &plan.index).unwrap();
+        let charge = key_shared_charge(&plan, &mut keeper).unwrap();
+        let seed = Digest([7; 32]);
+        let (messages, seal, binding_root, _witness) = key_first_prove(
+            &plan,
+            &reader,
+            &mut keeper,
+            &lookup_table,
+            &keys,
+            &bits,
+            &index_randomness,
+            seed,
+        )
+        .unwrap();
+        let verified = key_first_verify(&plan, &reader, &lookup_table, &messages).unwrap();
+        assert_eq!(verified.seal, seal);
+        assert_eq!(verified.binding_root, binding_root);
+        let proof = key_shared_prove(&plan, &reader, &mut keeper, &verified, seed, &charge).unwrap();
+        let shared = key_shared_verify(&plan, &reader, &verified, &proof.messages).unwrap();
+        (plan, reader, verified, proof.messages, shared)
+    }
+
+    #[test]
+    fn the_key_shared_stage_proves_and_verifies() {
+        let (plan, reader, verified, messages, shared) = shared_run();
+        assert_eq!(shared.seal, messages.seal);
+        assert_eq!(shared.gu_root, messages.gu_root);
+        assert_eq!(shared.omega_root, messages.omega_root);
+        assert_eq!(shared.gu_seeds, messages.gu_seeds);
+        assert_eq!(shared.omega_seeds, messages.omega_seeds);
+        assert!(!shared.psi.is_empty());
+        assert!(!shared.zeta.is_empty());
+        assert!(!shared.claims.is_empty());
+        assert_eq!(shared.code, plan.shared_code);
+        assert_eq!(shared.mask_code, plan.shared_mask_code);
+        // The second chain starts from the verifier's own shared state.
+        let inputs = shared.second_inputs();
+        let chain = key_second_chain(&plan, &reader, &verified, &inputs).unwrap();
+        let again = key_second_chain(&plan, &reader, &verified, &shared.second_inputs()).unwrap();
+        assert_eq!(*chain.value(), *again.value());
+        let other = key_second_chain(
+            &plan,
+            &reader,
+            &verified,
+            &KeySecondInputs {
+                shared_seal: Digest([0x81; 32]),
+                ..inputs
+            },
+        )
+        .unwrap();
+        assert_ne!(*chain.value(), *other.value());
+    }
+
+    #[test]
+    fn tampered_shared_roots_samples_and_claims_are_refused() {
+        let (plan, reader, verified, messages, _shared) = shared_run();
+        // Every rejection is checked on a plan clone, which starts a fresh
+        // verifier read ledger at the same maximum; an exhausted ledger would
+        // otherwise reject for the wrong reason.
+        let check = |changed: &HiddenSharedMessages| {
+            key_shared_verify(&plan.clone(), &reader, &verified, changed).is_err()
+        };
+        let mut changed = messages.clone();
+        changed.gu_root = Digest([0x91; 32]);
+        assert!(check(&changed));
+        let mut changed = messages.clone();
+        changed.omega_root = Digest([0x92; 32]);
+        assert!(check(&changed));
+        let mut changed = messages.clone();
+        changed.gu_seeds[0].z[0] = changed.gu_seeds[0].z[0].add(&Fp3::ONE);
+        assert!(check(&changed));
+        let mut changed = messages.clone();
+        changed.gu_answers[0] = changed.gu_answers[0].add(&Fp3::ONE);
+        assert!(check(&changed));
+        let mut changed = messages.clone();
+        changed.omega_seeds[0].beta = changed.omega_seeds[0].beta.add(&Fp3::ONE);
+        assert!(check(&changed));
+        let mut changed = messages.clone();
+        changed.omega_answers[0] = changed.omega_answers[0].add(&Fp3::ONE);
+        assert!(check(&changed));
+        let mut changed = messages.clone();
+        changed.zeta[0] = changed.zeta[0].add(&Fp3::ONE);
+        assert!(check(&changed));
+        let mut changed = messages.clone();
+        changed.column_nonce ^= 1;
+        assert!(check(&changed));
+        let mut changed = messages.clone();
+        changed.column_positions[0] ^= 1;
+        assert!(check(&changed));
+        let mut changed = messages.clone();
+        changed.column_openings[0].symbols[0] = changed.column_openings[0].symbols[0] + Fp::ONE;
+        assert!(check(&changed));
+        let mut changed = messages.clone();
+        changed.column_openings[0].salt[0] ^= 1;
+        assert!(check(&changed));
+        let mut changed = messages.clone();
+        changed.seal = Digest([0x93; 32]);
+        assert!(check(&changed));
+        let mut changed = messages.clone();
+        let round = changed
+            .fold_rounds
+            .first_mut()
+            .expect("the shared fold has a round to tamper");
+        round.0 = round.0.add(&Fp3::ONE);
+        assert!(check(&changed));
+        // A changed record claim changes the trusted reader's name and the
+        // rebuilt record row: the transcript no longer matches.
+        let mut bad_reader = reader.clone();
+        bad_reader.record.y = vec![Fp3::ONE];
+        assert!(key_shared_verify(&plan.clone(), &bad_reader, &verified, &messages).is_err());
+        let mut bad_reader = reader.clone();
+        bad_reader.root = Digest([0x94; 32]);
+        assert!(key_shared_verify(&plan.clone(), &bad_reader, &verified, &messages).is_err());
     }
 
     #[test]
