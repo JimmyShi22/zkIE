@@ -35,6 +35,10 @@ use zkie_engine::pcs::request::field::Fp3;
 use zkie_engine::pcs::request::table::{IndexShape, TableRowSource};
 use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
 
+use crate::proof::consumer_group::{
+    prove_consumer_group, verify_consumer_group, CommittedConsumerGroupMask, ConsumerGroupPlan,
+    ConsumerGroupProof, ConsumerGroupWitness,
+};
 use crate::proof::consumer_psc::{
     prove_consumer_psc_fixed, verify_consumer_psc_fixed, ConsumerMaskRow, ConsumerPscMasks,
     ConsumerPscProof,
@@ -51,6 +55,7 @@ use crate::proof::hidden_member::{check_member_claim, PendingRow, WeightBlock};
 use crate::proof::hidden_send_session::{
     commit_request_w, derive_w_values, pending_row_weights, request_eval_row, TableLayout, WShape,
 };
+use crate::proof::output_closure::CommittedValueGroup;
 use crate::proof::projection_claim::raw_target;
 use crate::proof::psc::multilinear_eval;
 
@@ -250,6 +255,10 @@ pub struct ConsumerFirstPlan {
     /// sumcheck proves. The prover enforces it against its witness reduction;
     /// the verifier takes it from the plan, never from the proof.
     pub target: Fp3,
+    /// The proximity group of the stage. With a group the stage's real first
+    /// seal is the chain value after the group verification; without one the
+    /// stage is a component fixture and its seal is the pre-group value.
+    pub group: Option<ConsumerGroupPlan>,
 }
 
 impl ConsumerFirstPlan {
@@ -287,9 +296,27 @@ impl ConsumerFirstPlan {
             draft,
             member,
             target,
+            group: None,
         };
         plan.fault().map_or(Ok(()), |_| Err(Error::InvalidConfig))?;
         Ok(plan)
+    }
+
+    /// Attaches the proximity group to the stage. The group's member shapes
+    /// must be the draft's raw, bit and W shapes and its roots must be the
+    /// committed roots of the plan.
+    pub fn with_group(mut self, group: ConsumerGroupPlan) -> Result<Self> {
+        group.check()?;
+        if group.shapes.raw_shape != self.draft.raw.raw.shape
+            || group.shapes.bits_shape != self.draft.raw.bits.shape
+            || group.shapes.w_shape != self.draft.w_shape
+            || group.raw_roots != self.draft.raw.raw.roots
+            || group.bits_roots != self.draft.raw.bits.roots
+        {
+            return Err(Error::StatementMismatch);
+        }
+        self.group = Some(group);
+        Ok(self)
     }
 
     pub fn fault(&self) -> Option<&'static str> {
@@ -521,6 +548,51 @@ fn raw_obligation_bats(
     Ok(vec![upper, end_row])
 }
 
+/// Maps a stage row from the source oracles to the group's BAT members. The
+/// mask units keep their compact table index: the BAT layout maps it into the
+/// combined row itself.
+fn remap_group_rows(
+    plan: &ConsumerFirstPlan,
+    group: &ConsumerGroupPlan,
+    rows: &[BatRow],
+) -> Result<Vec<BatRow>> {
+    let heads = u64::from(group.shapes.entries.heads);
+    let raw_base = plan.draft.raw.raw.oracle_base;
+    let bits_base = plan.draft.raw.bits.oracle_base;
+    let mask_oracle = plan.draft.raw.mask.oracle;
+    let map = |oracle: u64| -> Result<u64> {
+        if oracle == plan.draft.w_oracle {
+            return Ok(group.w_bat);
+        }
+        if oracle == mask_oracle {
+            return Ok(group.mask_bat);
+        }
+        if oracle >= raw_base && oracle - raw_base < heads {
+            return Ok(group.raw_bat_base + (oracle - raw_base));
+        }
+        if oracle >= bits_base && oracle - bits_base < heads {
+            return Ok(group.bits_bat_base + (oracle - bits_base));
+        }
+        Err(Error::StatementMismatch)
+    };
+    let mut out = Vec::with_capacity(rows.len());
+    for row in rows {
+        if !row.runs.is_empty() || !row.forms.is_empty() {
+            return Err(Error::StatementMismatch);
+        }
+        let mut mapped = BatRow::new(row.kind);
+        mapped.target = row.target;
+        for term in &row.terms {
+            mapped.add_term(map(term.oracle)?, term.part, term.values.clone());
+        }
+        for unit in &row.units {
+            mapped.add_unit(map(unit.oracle)?, unit.part, unit.index, unit.coefficient);
+        }
+        out.push(mapped);
+    }
+    Ok(out)
+}
+
 fn group_rows(
     plan: &ConsumerFirstPlan,
     eval_row: &BatRow,
@@ -551,6 +623,24 @@ pub struct ConsumerFirstObligations {
     pub group_rows: Vec<BatRow>,
 }
 
+/// The prover's committed raw and bit messages, the mask message and the W
+/// encoding tail for the group run. The W commitment itself is built inside
+/// the stage from the plan's randomness and must reproduce the group plan's W
+/// root; the mask commitment is made against the group's mask root.
+pub struct ConsumerFirstGroupWitness<'a> {
+    pub raw: &'a CommittedValueGroup,
+    pub raw_tails: &'a [Vec<Fp3>],
+    pub bits: &'a CommittedValueGroup,
+    pub bits_tails: &'a [Vec<Fp3>],
+    pub mask: &'a CommittedConsumerGroupMask,
+    pub mask_rows: Vec<Vec<Fp3>>,
+    pub mask_tails: Vec<Vec<Fp3>>,
+    pub w_tails: &'a [Vec<Fp3>],
+    /// The run seed of the group's SEND test, from the caller's transcript
+    /// source; it is never a fixed test constant in production.
+    pub run_seed: Digest,
+}
+
 /// The public first-stage messages.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsumerFirstMessages {
@@ -560,7 +650,13 @@ pub struct ConsumerFirstMessages {
     pub w_root: Digest,
     pub eval_target: Fp3,
     pub psi: Vec<Fp3>,
+    /// The chain value after the pre-group stage.
     pub stage_seal: Digest,
+    /// The proximity group proof, when the plan carries a group.
+    pub group: Option<ConsumerGroupProof>,
+    /// The chain value after the group verification: the stage's real first
+    /// seal when a group is present.
+    pub first_seal: Digest,
 }
 
 impl ConsumerFirstMessages {
@@ -578,6 +674,11 @@ impl ConsumerFirstMessages {
             writer.put_fp3(value);
         }
         writer.put_digest(&self.stage_seal);
+        writer.put_u64(u64::from(self.group.is_some()));
+        if let Some(group) = &self.group {
+            writer.put_bytes(&group.encode()?);
+        }
+        writer.put_digest(&self.first_seal);
         Ok(writer.into_bytes())
     }
 
@@ -598,6 +699,15 @@ impl ConsumerFirstMessages {
             psi.push(reader.get_fp3()?);
         }
         let stage_seal = reader.get_digest()?;
+        let group = match reader.get_u64()? {
+            0 => None,
+            1 => {
+                let group_plan = plan.group.as_ref().ok_or(Error::InvalidProof)?;
+                Some(ConsumerGroupProof::decode(group_plan, reader.get_bytes()?)?)
+            }
+            _ => return Err(Error::InvalidEncoding),
+        };
+        let first_seal = reader.get_digest()?;
         reader.finish()?;
         let messages = Self {
             raw_first,
@@ -607,6 +717,8 @@ impl ConsumerFirstMessages {
             eval_target,
             psi,
             stage_seal,
+            group,
+            first_seal,
         };
         messages.check(plan)?;
         Ok(messages)
@@ -622,6 +734,20 @@ impl ConsumerFirstMessages {
         }
         if self.psi != plan.member.psi {
             return Err(Error::StatementMismatch);
+        }
+        match (&plan.group, &self.group) {
+            (Some(group_plan), Some(group)) => {
+                if group.group_seal != self.first_seal {
+                    return Err(Error::StatementMismatch);
+                }
+                let _ = group.proximity_messages(group_plan)?;
+            }
+            (None, None) => {
+                if self.first_seal != self.stage_seal {
+                    return Err(Error::StatementMismatch);
+                }
+            }
+            _ => return Err(Error::StatementMismatch),
         }
         Ok(())
     }
@@ -715,6 +841,7 @@ pub fn prove_consumer_first(
     table_source: &mut dyn TableRowSource,
     w_randomness: &ConsumerWCommitRandomness,
     eval_mask: &dyn Fn(u64, u64) -> Result<Fp3>,
+    group_witness: Option<&ConsumerFirstGroupWitness<'_>>,
 ) -> Result<(ConsumerFirstMessages, ConsumerFirstObligations)> {
     check_bindings(plan, activation, outputs)?;
     w_randomness.check(&plan.draft.w_shape)?;
@@ -782,6 +909,45 @@ pub fn prove_consumer_first(
         eval_target,
     )?;
     let stage_seal = *chain.value();
+    let rows = group_rows(plan, &eval_row, &outcome.mask_row, &raw_rows)?;
+    let mut group = None;
+    let mut first_seal = stage_seal;
+    let mut chain = chain;
+    if let Some(group_plan) = &plan.group {
+        let witness = group_witness.ok_or(Error::InvalidConfig)?;
+        if witness.raw.roots != group_plan.raw_roots
+            || witness.bits.roots != group_plan.bits_roots
+            || witness.mask.root != group_plan.mask_root
+            || w_root != group_plan.w_roots[0]
+        {
+            return Err(Error::StatementMismatch);
+        }
+        let group_witness = ConsumerGroupWitness {
+            raw: witness.raw,
+            raw_tails: witness.raw_tails,
+            bits: witness.bits,
+            bits_tails: witness.bits_tails,
+            w: &w_commit,
+            w_tails: witness.w_tails,
+            mask: witness.mask,
+            mask_rows: witness.mask_rows.clone(),
+            mask_tails: witness.mask_tails.clone(),
+        };
+        let bat_rows = remap_group_rows(plan, group_plan, &rows)?;
+        let (proof, next) = prove_consumer_group(
+            chain,
+            group_plan,
+            &group_witness,
+            bat_rows,
+            witness.run_seed,
+        )?;
+        first_seal = proof.group_seal;
+        group = Some(proof);
+        chain = next;
+    } else if group_witness.is_some() {
+        return Err(Error::StatementMismatch);
+    }
+    let _ = chain;
     let messages = ConsumerFirstMessages {
         raw_first: raw_first.clone(),
         raw_second,
@@ -790,8 +956,9 @@ pub fn prove_consumer_first(
         eval_target,
         psi: plan.member.psi.clone(),
         stage_seal,
+        group,
+        first_seal,
     };
-    let rows = group_rows(plan, &eval_row, &outcome.mask_row, &raw_rows)?;
     Ok((
         messages,
         ConsumerFirstObligations {
@@ -851,6 +1018,16 @@ pub fn verify_consumer_first(
         return Err(Error::InvalidProof);
     }
     let rows = group_rows(plan, &eval_row, &outcome.mask_row, &raw_rows)?;
+    let mut first_seal = messages.stage_seal;
+    if let Some(group_plan) = &plan.group {
+        let proof = messages.group.as_ref().ok_or(Error::InvalidProof)?;
+        let bat_rows = remap_group_rows(plan, group_plan, &rows)?;
+        let (seal, _next) = verify_consumer_group(chain, group_plan, bat_rows, proof)?;
+        first_seal = seal;
+    }
+    if first_seal != messages.first_seal {
+        return Err(Error::InvalidProof);
+    }
     Ok(ConsumerFirstObligations {
         eval_row,
         mask_row: outcome.mask_row,
@@ -869,6 +1046,9 @@ mod tests {
     use zkie_engine::pcs::request::table::TableDistances;
 
     use crate::proof::column_session::fp_from_signed_word;
+    use crate::proof::consumer_group::{
+        CommittedConsumerGroupMask, ConsumerGroupPlan, ConsumerGroupProof, ConsumerGroupWitness,
+    };
     use crate::proof::consumer_psc::{
         ConsumerObligation, ConsumerPscMasks, ConsumerPscShape, ConsumerTable,
     };
@@ -1370,6 +1550,7 @@ mod tests {
             &mut fixture.table_source,
             &fixture.w_randomness,
             &eval_mask,
+            None,
         )
     }
 
@@ -1546,6 +1727,7 @@ mod tests {
             &mut fixture.table_source,
             &fixture.w_randomness,
             &eval_mask,
+            None,
         )
         .is_err());
         // Another member point is refused at the message check.
@@ -1593,6 +1775,7 @@ mod tests {
             &mut fixture.table_source,
             &fixture.w_randomness,
             &eval_mask,
+            None,
         )
         .is_err());
         // Another output row no longer matches the statement binding.

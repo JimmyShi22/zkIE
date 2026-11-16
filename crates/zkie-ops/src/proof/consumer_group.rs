@@ -44,7 +44,9 @@ use crate::proof::output_closure::CommittedValueGroup;
 use crate::proof::proximity_iopp::{
     derive_proximity_iopp, IoppBoundIds, ProximityGroupRole, ProximityIoppPlan,
 };
-use crate::proof::proximity_planner::derive_single_group_plan_with_extra_mask_rows;
+use crate::proof::proximity_planner::{
+    derive_single_group_plan_with_extra_mask_rows, lin_group_bits, rows_for_columns,
+};
 
 /// Version of the consumer group messages.
 pub const CONSUMER_GROUP_VERSION: u64 = 1;
@@ -117,6 +119,30 @@ fn stage_plan(stage: &crate::proof::proximity_planner::SolvedStage) -> IoppStage
     }
 }
 
+/// The members' main and mask row counts under one first main code: raw and
+/// bits messages one per head, the W message, and the mask-only member.
+fn member_rows(
+    entries: ConsumerGroupEntries,
+    ell: u64,
+    mask_rows: u64,
+) -> Result<(Vec<u64>, Vec<u64>)> {
+    let mut main = Vec::with_capacity(2 * entries.heads as usize + 2);
+    let mut mask = Vec::with_capacity(2 * entries.heads as usize + 2);
+    for _ in 0..entries.heads {
+        main.push(rows_for_columns(entries.raw_columns, ell, entries.heads)?);
+        mask.push(0);
+    }
+    for _ in 0..entries.heads {
+        main.push(rows_for_columns(entries.bits_columns, ell, entries.heads)?);
+        mask.push(0);
+    }
+    main.push(rows_for_columns(entries.w_columns, ell, 1)?);
+    mask.push(0);
+    main.push(0);
+    mask.push(mask_rows);
+    Ok((main, mask))
+}
+
 /// Derives the group geometry from the entry counts.
 pub fn derive_consumer_group_shapes(
     entries: ConsumerGroupEntries,
@@ -128,15 +154,52 @@ pub fn derive_consumer_group_shapes(
     entries
         .fault()
         .map_or(Ok(()), |_| Err(Error::InvalidConfig))?;
-    let derived = derive_single_group_plan_with_extra_mask_rows(
-        entries.bits_columns,
-        usize::try_from(entries.mask_entries).map_err(|_| Error::ResourceLimit)?,
-        0,
-        entries.rows,
-        1,
-        false,
-    )
-    .map_err(|_| Error::InvalidConfig)?;
+    let mask_entries = usize::try_from(entries.mask_entries).map_err(|_| Error::ResourceLimit)?;
+    let derive = |bit_entries: u64| {
+        derive_single_group_plan_with_extra_mask_rows(
+            bit_entries,
+            mask_entries,
+            0,
+            entries.rows,
+            1,
+            false,
+        )
+        .map_err(|_| Error::InvalidConfig)
+    };
+    // The single-group solver takes one main-table row count, while the group
+    // joins one main table per member (raw and bits per head, and W). The
+    // solver's row input must be the power-of-two row count that holds the
+    // members' aligned main blocks, so the derived group bits equal the bits
+    // of the real BAT layout. The fixed point below feeds the solver that
+    // aggregate until the derived first code reproduces it exactly.
+    let mut bit_entries = entries.bits_columns;
+    let mut derived = derive(bit_entries)?;
+    for _ in 0..8 {
+        let (main_rows, mask_rows) =
+            member_rows(entries, derived.first_main.ell, derived.mask_rows)?;
+        let (k, _h) = lin_group_bits(&main_rows, &mask_rows)?;
+        let (_, planner_h) = lin_group_bits(&[1], &[derived.mask_rows])?;
+        let required = 1u64
+            .checked_shl(k.max(planner_h).max(1))
+            .ok_or(Error::ResourceLimit)?;
+        let capacity = derived
+            .first_main
+            .ell
+            .checked_sub(1)
+            .ok_or(Error::ResourceLimit)?;
+        let target = required.checked_mul(capacity).ok_or(Error::ResourceLimit)?;
+        if target == bit_entries {
+            break;
+        }
+        bit_entries = target;
+        derived = derive(bit_entries)?;
+    }
+    let (main_rows, mask_rows) = member_rows(entries, derived.first_main.ell, derived.mask_rows)?;
+    let (k_actual, h_actual) = lin_group_bits(&main_rows, &mask_rows)?;
+    let first = derived.stages.first().ok_or(Error::InvalidConfig)?;
+    if first.k != k_actual || first.h != h_actual {
+        return Err(Error::InvalidConfig);
+    }
     let stages: Vec<IoppStagePlan> = derived.stages.iter().map(stage_plan).collect();
     let base_positions = stages.last().ok_or(Error::InvalidConfig)?.positions;
     let raw_shape = WShape::new(
@@ -837,52 +900,22 @@ pub fn prove_consumer_group(
     run_seed: Digest,
 ) -> Result<(ConsumerGroupProof, Chain)> {
     plan.check()?;
-    let members = match members(plan, Some(witness)) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("DBG members {:?}", e);
-            return Err(e);
-        }
-    };
+    let members = members(plan, Some(witness))?;
     let mut chain = chain;
-    if let Err(e) = absorb_roots(&mut chain, plan, &members) {
-        eprintln!("DBG roots {:?}", e);
-        return Err(e);
-    }
-    let sample_rows = match prover_sample_rows(&mut chain, plan, &members) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("DBG samples {:?}", e);
-            return Err(e);
-        }
-    };
+    absorb_roots(&mut chain, plan, &members)?;
+    let sample_rows = prover_sample_rows(&mut chain, plan, &members)?;
     let answers: Vec<Fp3> = sample_rows
         .iter()
         .map(|rows| rows.first().map_or(Fp3::ZERO, |row| row.target))
         .collect();
-    if let Err(e) = absorb_answers(&mut chain, &answers) {
-        eprintln!("DBG answers {:?}", e);
-        return Err(e);
-    }
-    let fold = match member_fold_shape(
+    absorb_answers(&mut chain, &answers)?;
+    let fold = member_fold_shape(
         plan.shapes.first_main,
         plan.shapes.first_mask,
         &members,
         plan.shapes.mask_tree.leaf_class,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("DBG fold {:?}", e);
-            return Err(e);
-        }
-    };
-    let iopp = match plan.iopp() {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("DBG iopp {:?}", e);
-            return Err(e);
-        }
-    };
+    )?;
+    let iopp = plan.iopp()?;
     let mut trees: Vec<(u64, Arc<RuntimeTree>)> = Vec::with_capacity(members.len());
     for head in 0..plan.shapes.entries.heads as usize {
         trees.push((
@@ -899,8 +932,7 @@ pub fn prove_consumer_group(
         plan.w_oracle,
         Arc::clone(witness.w.trees.0.first().ok_or(Error::ShapeMismatch)?),
     ));
-    eprintln!("DBG calling proximity_prove");
-    let proof = match proximity_prove(
+    let proof = proximity_prove(
         chain,
         fold,
         members,
@@ -912,13 +944,7 @@ pub fn prove_consumer_group(
         run_seed,
         plan.shapes.base_positions,
         Some(&iopp),
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("DBG proximity {:?}", e);
-            return Err(e);
-        }
-    };
+    )?;
     let ProximityProof {
         messages, chain, ..
     } = proof;
@@ -1240,14 +1266,6 @@ mod tests {
             999,
         )
         .unwrap();
-        eprintln!(
-            "first_main {:?} first_mask {:?} mask_rows {} stages {} base_positions {}",
-            shapes.first_main,
-            shapes.first_mask,
-            shapes.mask_rows,
-            shapes.stages.len(),
-            shapes.base_positions
-        );
         assert_eq!(shapes.raw_shape.code, shapes.first_main);
         assert!(shapes.mask_message_entries().unwrap() >= shapes.entries.mask_entries);
     }
