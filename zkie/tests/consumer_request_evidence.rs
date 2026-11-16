@@ -400,6 +400,18 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
         "a changed plan member is refused"
     );
 
+    let mut changed_member_target = file.plan_assembly().unwrap();
+    changed_member_target.member.target = changed_member_target.member.target.add(&Fp3::ONE);
+    let mut tampered = file.clone();
+    tampered.assembly = changed_member_target.encode().unwrap();
+    let dir = broken.join("member-target");
+    copy_proof(&proof_dir, &dir);
+    rewrite_manifest_file(&dir, CONSUMER_PROOF_FILE, &tampered.encode().unwrap());
+    assert!(
+        verify_dir(&provider, &policy, &dir, &commit_dir, &config.model).is_err(),
+        "a plan member target that is not the PSC pending is refused"
+    );
+
     let mut changed_target = file.plan_assembly().unwrap();
     changed_target.target = changed_target.target.add(&Fp3::ONE);
     let mut tampered = file.clone();
@@ -507,7 +519,7 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
     assert!(refused, "a changed key bundle is refused");
 
     let evidence = format!(
-        "{{\n  \"case\": \"{}\",\n  \"commit_ms\": {},\n  \"prove_ms\": {},\n  \"verify_ms\": {},\n  \"trace_bytes\": {},\n  \"trace_assets\": {},\n  \"removed_opening_bytes\": {},\n  \"trace_with_opening_bytes\": {},\n  \"statement_bytes\": {},\n  \"consumer_proof_bytes\": {},\n  \"key_prove_ms\": {},\n  \"key_commit_verify_ms\": {},\n  \"key_request_verify_ms\": {},\n  \"key_file_bytes\": {},\n  \"vmhwm_after_prove_kib\": {},\n  \"vmhwm_after_verify_kib\": {},\n  \"accepted\": true,\n  \"negatives\": 11\n}}\n",
+        "{{\n  \"case\": \"{}\",\n  \"commit_ms\": {},\n  \"prove_ms\": {},\n  \"verify_ms\": {},\n  \"trace_bytes\": {},\n  \"trace_assets\": {},\n  \"removed_opening_bytes\": {},\n  \"trace_with_opening_bytes\": {},\n  \"statement_bytes\": {},\n  \"consumer_proof_bytes\": {},\n  \"key_prove_ms\": {},\n  \"key_commit_verify_ms\": {},\n  \"key_request_verify_ms\": {},\n  \"key_file_bytes\": {},\n  \"vmhwm_after_prove_kib\": {},\n  \"vmhwm_after_verify_kib\": {},\n  \"accepted\": true,\n  \"negatives\": 12\n}}\n",
         config.case_id,
         commit_ms,
         prove_ms,
@@ -535,5 +547,5 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
     writeln!(log, "statement bytes {}", statement_bytes).unwrap();
     writeln!(log, "consumer proof bytes {}", sidecar_bytes).unwrap();
     writeln!(log, "key prove {} ms, commit verify {} ms, request verify {} ms, file {} bytes", key_prove_ms, key_commit_verify_ms, key_request_verify_ms, key_file_bytes).unwrap();
-    writeln!(log, "accepted; eleven negatives refused").unwrap();
+    writeln!(log, "accepted; twelve negatives refused").unwrap();
 }
