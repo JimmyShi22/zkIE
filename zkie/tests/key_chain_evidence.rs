@@ -347,6 +347,9 @@ fn the_complete_key_chain_over_the_registered_instance() {
             .saturating_sub(memory_before_verify.hwm),
         "verify_vmrss_before_kib": memory_before_verify.rss,
         "verify_vmrss_after_kib": memory_after_verify.rss,
+        "verify_rss_delta_kib": memory_after_verify
+            .rss
+            .saturating_sub(memory_before_verify.rss),
         "ledger_before": count_before,
         "ledger_after": count_after,
         "read_ledger_spent": true,
