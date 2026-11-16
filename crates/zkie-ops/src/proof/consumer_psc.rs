@@ -762,6 +762,152 @@ pub fn verify_consumer_psc(
     outcome(obligation, &coefficients, proof.target, &output)
 }
 
+/// Prover side of one consumer instance with fixed coefficients and target.
+/// The caller owns the chain statement and has fixed the obligation, the
+/// coefficients and the target before this call; the function neither absorbs
+/// the obligation nor draws any coefficient. The sumcheck enforces the fixed
+/// target against the prover's own reduction, so a plan target that is not the
+/// witness reduction is refused.
+#[allow(clippy::too_many_arguments)]
+pub fn prove_consumer_psc_fixed(
+    chain: &mut Chain,
+    obligation: &ConsumerObligation,
+    activation: &[Fp3],
+    raw: &[Fp3],
+    matrix_places: &[Vec<Fp3>],
+    masks: &ConsumerPscMasks,
+    position: &[Fp3],
+    column: &[Fp3],
+    target: Fp3,
+) -> Result<(ConsumerPscProof, ConsumerPscOutcome)> {
+    obligation.check()?;
+    masks.check(&obligation.shape)?;
+    let shape = &obligation.shape;
+    let positions = shape.positions as usize;
+    let records = usize::try_from(shape.records).map_err(|_| Error::ResourceLimit)?;
+    let slice_len = usize::try_from(shape.slice_len()?).map_err(|_| Error::ResourceLimit)?;
+    if activation.len() != positions.checked_mul(records).ok_or(Error::ResourceLimit)?
+        || position.len() != positions
+        || column.len() != slice_len
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    if matrix_places.len() != usize::try_from(shape.places).map_err(|_| Error::ResourceLimit)?
+        || matrix_places.iter().any(|row| row.len() != records)
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let reduction = consumer_reduction(
+        positions,
+        shape.records,
+        shape.places,
+        shape.slice,
+        activation,
+        raw,
+        position,
+        column,
+    )?;
+    if reduction.target != target {
+        return Err(Error::InvalidProof);
+    }
+    let columns = reduction.column_values(matrix_places)?;
+    let claim = DotClaim {
+        masks: Vec::new(),
+        target,
+    };
+    let mut challenges =
+        PositionPscChallenges::new(chain, CONSUMER_PSC_TAGS, u64::from(obligation.head));
+    let (dot, output) = prove_dot_sumcheck(
+        &reduction.shown,
+        &columns,
+        &claim,
+        &masks.entries,
+        &mut challenges,
+    )?;
+    check_product_claims(&output, &claim, &masks.entries, &reduction.shown, &columns)?;
+    let coefficients = ConsumerCoefficients {
+        position: position.to_vec(),
+        column: column.to_vec(),
+    };
+    let outcome = outcome(obligation, &coefficients, target, &output)?;
+    crate::proof::hidden_member::check_pending(
+        &outcome.pending,
+        matrix_places,
+        &|oracle, slot| {
+            if oracle == obligation.mask.oracle && slot == obligation.mask.shown_slot {
+                Ok(masks.entries.shown[1])
+            } else {
+                Err(Error::ShapeMismatch)
+            }
+        },
+    )?;
+    let proof = ConsumerPscProof {
+        target,
+        point_values: [output.ends[0].value, output.ends[1].value],
+        dot,
+    };
+    Ok((proof, outcome))
+}
+
+/// Verifier side of one consumer instance with fixed coefficients and target.
+/// The verifier uses the caller's target, not the proof's, and refuses a proof
+/// whose declared target differs.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_consumer_psc_fixed(
+    chain: &mut Chain,
+    obligation: &ConsumerObligation,
+    activation: &[Fp3],
+    proof: &ConsumerPscProof,
+    position: &[Fp3],
+    column: &[Fp3],
+    target: Fp3,
+) -> Result<ConsumerPscOutcome> {
+    obligation.check()?;
+    proof.check(&obligation.shape)?;
+    if proof.target != target {
+        return Err(Error::InvalidProof);
+    }
+    let shape = &obligation.shape;
+    let positions = shape.positions as usize;
+    let records = usize::try_from(shape.records).map_err(|_| Error::ResourceLimit)?;
+    let slice_len = usize::try_from(shape.slice_len()?).map_err(|_| Error::ResourceLimit)?;
+    if activation.len() != positions.checked_mul(records).ok_or(Error::ResourceLimit)?
+        || position.len() != positions
+        || column.len() != slice_len
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let entries = DotMaskEntries {
+        hiding: vec![Fp3::ZERO; shape.hiding_entries()?],
+        shown: [Fp3::ZERO; SHOWN_MAPS],
+    };
+    let claim = DotClaim {
+        masks: Vec::new(),
+        target,
+    };
+    let mut challenges =
+        PositionPscChallenges::new(chain, CONSUMER_PSC_TAGS, u64::from(obligation.head));
+    let output = verify_psc_transcript(
+        &claim,
+        &entries,
+        &proof.dot,
+        shape.variables()?,
+        &mut challenges,
+    )?;
+    if proof.point_values != [output.ends[0].value, output.ends[1].value] {
+        return Err(Error::InvalidProof);
+    }
+    let shown = activation_shown(positions, shape.records, activation, position)?;
+    if multilinear_eval(&shown, &output.point)? != output.ends[0].value {
+        return Err(Error::InvalidProof);
+    }
+    let coefficients = ConsumerCoefficients {
+        position: position.to_vec(),
+        column: column.to_vec(),
+    };
+    outcome(obligation, &coefficients, target, &output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

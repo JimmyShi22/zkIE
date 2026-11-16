@@ -2953,7 +2953,7 @@ pub fn derive_w_rows(
 /// owns the source of the rows: the committed activation, or the committed
 /// norm hidden-output messages.
 /// The row-weight vector of a pending claim over the matrix's rows.
-fn pending_row_weights(
+pub(crate) fn pending_row_weights(
     pending: &crate::proof::hidden_member::PendingRow,
     matrix_rows: u64,
 ) -> Result<Vec<Fp3>> {
@@ -22362,13 +22362,13 @@ fn eq_vector(point: &[Fp3]) -> Result<Vec<Fp3>> {
 /// The flat layout of one table message: `main_rows` rows of the code's `ell`
 /// places, entry `j` at row `j mod main_rows`, place `j div main_rows`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct TableLayout {
-    main_rows: u64,
-    ell: u64,
+pub(crate) struct TableLayout {
+    pub(crate) main_rows: u64,
+    pub(crate) ell: u64,
 }
 
 impl TableLayout {
-    fn of(shape: &WShape) -> Self {
+    pub(crate) fn of(shape: &WShape) -> Self {
         Self {
             main_rows: shape.main_rows,
             ell: shape.code.ell,
@@ -22377,7 +22377,7 @@ impl TableLayout {
 
     /// The table of a coefficient vector on this layout: `column` carries the
     /// coefficient of entry `column`.
-    fn scatter(self, columns: u64, coefficients: &[Fp3]) -> Result<Vec<Fp3>> {
+    pub(crate) fn scatter(self, columns: u64, coefficients: &[Fp3]) -> Result<Vec<Fp3>> {
         let rows = usize::try_from(self.main_rows).map_err(|_| Error::ResourceLimit)?;
         let ell = usize::try_from(self.ell).map_err(|_| Error::ResourceLimit)?;
         let mut values = vec![Fp3::ZERO; rows.checked_mul(ell).ok_or(Error::ResourceLimit)?];
@@ -22403,7 +22403,7 @@ impl TableLayout {
 /// The request's (Eval) row: the request-level W at the claim's column point,
 /// on the W message's own layout, plus the claim's mask slots, against the
 /// claim's target.
-fn request_eval_row(
+pub(crate) fn request_eval_row(
     layout: TableLayout,
     columns: u64,
     w_oracle: u64,

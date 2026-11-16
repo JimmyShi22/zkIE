@@ -729,6 +729,49 @@ pub fn consumer_request_claim(
     })
 }
 
+/// The combined instance's obligation of the request: the whole consumed
+/// region as one consumer shape, head zero, the request's table and mask. The
+/// first stage uses it with the request claim's fixed coefficients and the
+/// plan member's target.
+pub fn consumer_combined_obligation(plan: &ConsumerRequestPlan) -> Result<ConsumerObligation> {
+    plan.fault().map_or(Ok(()), |_| Err(Error::InvalidConfig))?;
+    let obligation = ConsumerObligation {
+        request: plan.request,
+        source_step: plan.obligations[0].source_step,
+        activation_step: plan.obligations[0].activation_step,
+        head: 0,
+        shape: plan.shape,
+        shift: plan.shift,
+        table: plan.table.clone(),
+        mask: plan.mask,
+    };
+    obligation.check()?;
+    Ok(obligation)
+}
+
+/// The combined raw field rows of the request from the per-head committed
+/// value rows: position-major over the whole consumed region, real entries
+/// only. Padding columns of a head are the committed message's padding and
+/// never enter the claim.
+pub fn consumer_combined_raw(plan: &ConsumerRequestPlan, raw: &[Vec<Fp3>]) -> Result<Vec<Fp3>> {
+    let positions = plan.shape.positions as usize;
+    let width = usize::try_from(plan.head_width).map_err(|_| Error::ResourceLimit)?;
+    let hidden = usize::try_from(plan.shape.slice_len()?).map_err(|_| Error::ResourceLimit)?;
+    if raw.len() != plan.obligations.len() || raw.iter().any(|head| head.len() < positions * width)
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut combined = vec![Fp3::ZERO; positions * hidden];
+    for (head, rows) in raw.iter().enumerate() {
+        for position in 0..positions {
+            for index in 0..width {
+                combined[position * hidden + head * width + index] = rows[position * width + index];
+            }
+        }
+    }
+    Ok(combined)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
