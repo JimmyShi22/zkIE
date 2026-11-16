@@ -13277,7 +13277,22 @@ fn table_key_members(group: &TableKeyGroup<'_>, prover: bool) -> Result<Vec<Prox
             Vec::new()
         },
         tails: if prover {
-            vec![group.bits_tails.clone()]
+            // The bits message's encoding tails are one flat row-major vector
+            // for its committed rows; the FOLD handoff contracts one tail per
+            // real row at that row's virtual position.
+            let tail_len =
+                usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
+            let rows =
+                usize::try_from(shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+            let expected = rows.checked_mul(tail_len).ok_or(Error::ResourceLimit)?;
+            if group.bits_tails.len() != expected {
+                return Err(Error::ShapeMismatch);
+            }
+            group
+                .bits_tails
+                .chunks_exact(tail_len)
+                .map(|row| row.to_vec())
+                .collect()
         } else {
             Vec::new()
         },
