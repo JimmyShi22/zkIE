@@ -160,22 +160,105 @@ impl ConsumerReduction {
     /// The right side on a known matrix: `Σ_k shown[k] · Σ_n weights[n]
     /// M[n,k]`. `matrix_places[n]` is the matrix's row `n` over the records.
     pub fn identity_on(&self, matrix_places: &[Vec<Fp3>]) -> Result<Fp3> {
-        if matrix_places.len() != self.weights.len() {
-            return Err(Error::ShapeMismatch);
-        }
+        let columns = self.column_values(matrix_places)?;
         let mut total = Fp3::ZERO;
-        for k in 0..self.shown.len() {
-            let mut column = Fp3::ZERO;
-            for (n, row) in matrix_places.iter().enumerate() {
-                let value = row.get(k).ok_or(Error::ShapeMismatch)?;
-                if !self.weights[n].is_zero() {
-                    column = column.add(&self.weights[n].mul(value));
-                }
-            }
-            total = total.add(&self.shown[k].mul(&column));
+        for (shown, column) in self.shown.iter().zip(&columns) {
+            total = total.add(&shown.mul(column));
         }
         Ok(total)
     }
+
+    /// The private second map of the product sum, `V[k] = Σ_n weights[n]
+    /// M[n,k]`: one value per contraction index. `matrix_places[n]` is the
+    /// matrix's row `n` over the records, the same matrix the key
+    /// authenticates.
+    pub fn column_values(&self, matrix_places: &[Vec<Fp3>]) -> Result<Vec<Fp3>> {
+        if matrix_places.len() != self.weights.len() {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut columns = vec![Fp3::ZERO; self.shown.len()];
+        for (n, row) in matrix_places.iter().enumerate() {
+            if row.len() != columns.len() {
+                return Err(Error::ShapeMismatch);
+            }
+            let weight = self.weights[n];
+            if weight.is_zero() {
+                continue;
+            }
+            for (k, value) in row.iter().enumerate() {
+                columns[k] = columns[k].add(&weight.mul(value));
+            }
+        }
+        Ok(columns)
+    }
+}
+
+/// The public first map of the product sum, `U[k] = Σ_p a[p] X[p,k]`: the
+/// activation rows reduced by the position coefficients over the contraction
+/// index. The activation rows are public verified values; both sides derive
+/// this vector, and the raw output never enters it.
+pub fn activation_shown(positions: usize, records: u64, x: &[Fp3], a: &[Fp3]) -> Result<Vec<Fp3>> {
+    let contraction = usize::try_from(records).map_err(|_| Error::ResourceLimit)?;
+    if positions == 0 || contraction == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    if x.len()
+        != positions
+            .checked_mul(contraction)
+            .ok_or(Error::ResourceLimit)?
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    if a.len() != positions {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut shown = vec![Fp3::ZERO; contraction];
+    for position in 0..positions {
+        let coefficient = a[position];
+        if coefficient.is_zero() {
+            continue;
+        }
+        for k in 0..contraction {
+            shown[k] = shown[k].add(&coefficient.mul(&x[position * contraction + k]));
+        }
+    }
+    Ok(shown)
+}
+
+/// The left side of the consumer identity on the raw output rows:
+/// `Σ_p a[p] · Σ_n b[n] Y[p,n]`. The rows are the operator's actual raw
+/// accumulator over the consumed slice; the product sumcheck proves the two
+/// reduced maps multiply to this value.
+pub fn raw_target(
+    positions: usize,
+    slice_len: usize,
+    y_raw: &[Fp3],
+    a: &[Fp3],
+    b: &[Fp3],
+) -> Result<Fp3> {
+    if positions == 0 || slice_len == 0 || a.len() != positions || b.len() != slice_len {
+        return Err(Error::InvalidConfig);
+    }
+    if y_raw.len()
+        != positions
+            .checked_mul(slice_len)
+            .ok_or(Error::ResourceLimit)?
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut target = Fp3::ZERO;
+    for position in 0..positions {
+        let mut row = Fp3::ZERO;
+        for index in 0..slice_len {
+            let coefficient = b[index];
+            if coefficient.is_zero() {
+                continue;
+            }
+            row = row.add(&coefficient.mul(&y_raw[position * slice_len + index]));
+        }
+        target = target.add(&a[position].mul(&row));
+    }
+    Ok(target)
 }
 
 /// Builds one head slice's reduction claim from the public activation rows,
@@ -207,38 +290,20 @@ pub fn consumer_reduction(
     let expected_x = positions
         .checked_mul(contraction)
         .ok_or(Error::ResourceLimit)?;
-    let expected_y = positions.checked_mul(slice_len).ok_or(Error::ResourceLimit)?;
+    let expected_y = positions
+        .checked_mul(slice_len)
+        .ok_or(Error::ResourceLimit)?;
     if x.len() != expected_x || y_raw.len() != expected_y {
         return Err(Error::ShapeMismatch);
     }
     if a.len() != positions || b_slice.len() != slice_len {
         return Err(Error::ShapeMismatch);
     }
-    let mut shown = vec![Fp3::ZERO; contraction];
-    for position in 0..positions {
-        let coefficient = a[position];
-        if coefficient.is_zero() {
-            continue;
-        }
-        for k in 0..contraction {
-            shown[k] = shown[k].add(&coefficient.mul(&x[position * contraction + k]));
-        }
-    }
+    let shown = activation_shown(positions, matrix_rows, x, a)?;
     let mut weights = vec![Fp3::ZERO; full_columns];
     let start = usize::try_from(slice_start).map_err(|_| Error::ResourceLimit)?;
     weights[start..start + slice_len].copy_from_slice(b_slice);
-    let mut target = Fp3::ZERO;
-    for position in 0..positions {
-        let mut row = Fp3::ZERO;
-        for index in 0..slice_len {
-            let coefficient = b_slice[index];
-            if coefficient.is_zero() {
-                continue;
-            }
-            row = row.add(&coefficient.mul(&y_raw[position * slice_len + index]));
-        }
-        target = target.add(&a[position].mul(&row));
-    }
+    let target = raw_target(positions, slice_len, y_raw, a, b_slice)?;
     Ok(ConsumerReduction {
         shown,
         weights,
@@ -395,8 +460,7 @@ mod tests {
                 for row in 0..matrix_rows {
                     let index = entry(shape, column as u64, row as u64).unwrap() as usize;
                     sum = sum.add(
-                        &activation[position * matrix_rows + row]
-                            .mul(&table[table_row][index]),
+                        &activation[position * matrix_rows + row].mul(&table[table_row][index]),
                     );
                 }
                 output[position * columns + column] = sum;
@@ -423,7 +487,9 @@ mod tests {
         let output = reduce(&shape, &activation, &table);
         let mut claims = projection_claims(shape, &activation, &output).unwrap();
         claims.output[0][0] = claims.output[0][0].add(&value(1));
-        assert!(check_projection_reduction(shape, &claims.weights, &table, &claims.output).is_err());
+        assert!(
+            check_projection_reduction(shape, &claims.weights, &table, &claims.output).is_err()
+        );
 
         let mut bad_shape = shape;
         bad_shape.columns += 1;
@@ -459,7 +525,11 @@ mod tests {
             })
             .collect();
         let matrix: Vec<Vec<Fp3>> = (0..columns)
-            .map(|place| (0..contraction).map(|record| records[record][place]).collect())
+            .map(|place| {
+                (0..contraction)
+                    .map(|record| records[record][place])
+                    .collect()
+            })
             .collect();
         let x: Vec<Fp3> = (0..positions * contraction)
             .map(|index| value(((index * 5 + 2) % 13) as u64))
@@ -474,7 +544,9 @@ mod tests {
                 y_raw[position * (c1 - c0) + (place - c0)] = sum;
             }
         }
-        let a: Vec<Fp3> = (0..positions).map(|index| value(index as u64 + 1)).collect();
+        let a: Vec<Fp3> = (0..positions)
+            .map(|index| value(index as u64 + 1))
+            .collect();
         let b: Vec<Fp3> = (0..c1 - c0).map(|index| value(index as u64 + 4)).collect();
         (matrix, records, x, y_raw, a, b)
     }
@@ -487,6 +559,50 @@ mod tests {
         assert!(reduction.weights[..4].iter().all(|weight| weight.is_zero()));
         assert!(reduction.weights[8..].iter().all(|weight| weight.is_zero()));
         assert_eq!(reduction.target, reduction.identity_on(&matrix).unwrap());
+    }
+
+    #[test]
+    fn the_consumer_column_values_carry_the_identity() {
+        let (matrix, _records, x, y_raw, a, b) = consumer_fixture();
+        let reduction = consumer_reduction(3, 8, 16, (4, 8), &x, &y_raw, &a, &b).unwrap();
+        let columns = reduction.column_values(&matrix).unwrap();
+        assert_eq!(columns.len(), 8);
+        assert_eq!(activation_shown(3, 8, &x, &a).unwrap(), reduction.shown);
+        let mut total = Fp3::ZERO;
+        for (shown, column) in reduction.shown.iter().zip(&columns) {
+            total = total.add(&shown.mul(column));
+        }
+        assert_eq!(total, reduction.identity_on(&matrix).unwrap());
+    }
+
+    #[test]
+    fn the_raw_target_is_the_reduction_target() {
+        let (_matrix, _records, x, y_raw, a, b) = consumer_fixture();
+        let reduction = consumer_reduction(3, 8, 16, (4, 8), &x, &y_raw, &a, &b).unwrap();
+        assert_eq!(raw_target(3, 4, &y_raw, &a, &b).unwrap(), reduction.target);
+        let mut changed = y_raw.clone();
+        changed[0] = changed[0].add(&value(1));
+        assert_ne!(
+            raw_target(3, 4, &changed, &a, &b).unwrap(),
+            reduction.target
+        );
+        assert!(raw_target(0, 4, &y_raw, &a, &b).is_err());
+        assert!(raw_target(3, 4, &y_raw[..11], &a, &b).is_err());
+        assert!(raw_target(3, 4, &y_raw, &a[..2], &b).is_err());
+        assert!(raw_target(3, 4, &y_raw, &a, &b[..3]).is_err());
+    }
+
+    #[test]
+    fn consumer_maps_refuse_broken_shapes() {
+        let (matrix, _records, x, y_raw, a, b) = consumer_fixture();
+        let reduction = consumer_reduction(3, 8, 16, (4, 8), &x, &y_raw, &a, &b).unwrap();
+        assert!(reduction.column_values(&matrix[..15]).is_err());
+        let mut broken = matrix.clone();
+        broken[0].pop();
+        assert!(reduction.column_values(&broken).is_err());
+        assert!(activation_shown(3, 8, &x[..23], &a).is_err());
+        assert!(activation_shown(3, 8, &x, &a[..2]).is_err());
+        assert!(activation_shown(0, 8, &x, &a).is_err());
     }
 
     #[test]
@@ -525,7 +641,10 @@ mod tests {
         assert!(!coverage.covers(768));
         for (index, slice) in coverage.slices().iter().enumerate() {
             assert_eq!(slice.head as usize, index);
-            assert_eq!(slice.columns, ((index as u64) * 64, (index as u64 + 1) * 64));
+            assert_eq!(
+                slice.columns,
+                ((index as u64) * 64, (index as u64 + 1) * 64)
+            );
         }
         let sixteen = ConsumerCoverage::new(16, 64, 12, 768, 1024).unwrap();
         assert_eq!(sixteen.references().unwrap(), 16 * 768);
