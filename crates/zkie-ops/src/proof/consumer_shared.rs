@@ -258,9 +258,12 @@ impl ConsumerSharedGeometry {
 
 /// The prover's shared stage messages: the Gu and Omega roots, seeds and
 /// answers, the drawn table columns and the proximity transcript.
-#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsumerSharedProof {
     pub messages: HiddenSharedMessages,
+    /// Prover-side only: the committed Gu and Omega material the second stage
+    /// consumes. It is never encoded into the proof.
+    pub(crate) witness: crate::proof::hidden_send_session::SharedWitness,
+    pub(crate) points: crate::proof::hidden_send_session::SharedPoints,
 }
 
 /// The verifier's state after the shared stage: the shared seal and the
@@ -312,6 +315,8 @@ pub fn prove_consumer_shared(
     let result = prove_shared_public(&stage_plan, reader, chain, table, &[], None, &seed, charge)?;
     Ok(ConsumerSharedProof {
         messages: result.messages,
+        witness: result.witness,
+        points: result.points,
     })
 }
 

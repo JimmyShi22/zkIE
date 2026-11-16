@@ -266,7 +266,6 @@ impl ConsumerOwnPlan {
             || self.columns == 0
             || !self.columns.is_power_of_two()
             || self.weights.len() as u64 != self.matrix_rows
-            || self.w_shape.answers != self.omega.u.answers
             || self.w_oracle == self.omega.oracle
         {
             return Some("the consumer own plan is not settled");

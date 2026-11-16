@@ -16411,8 +16411,8 @@ fn hidden_shared_stage(plan: &HiddenLinPlan) -> SharedStagePlan<'_> {
 
 pub(crate) struct SharedProveResult {
     pub(crate) messages: HiddenSharedMessages,
-    witness: SharedWitness,
-    points: SharedPoints,
+    pub(crate) witness: SharedWitness,
+    pub(crate) points: SharedPoints,
 }
 
 pub(crate) struct SharedWitness {

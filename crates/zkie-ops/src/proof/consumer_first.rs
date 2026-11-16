@@ -1190,14 +1190,18 @@ mod tests {
         .unwrap()
     }
 
-    fn table() -> ConsumerTable {
+    fn table_with(identity: Digest, configuration: Digest) -> ConsumerTable {
         ConsumerTable {
             path: "weights/L0_k_w_i32.bin".to_string(),
             oracle: 30,
             root: Digest([0x11; 32]),
-            identity: Digest([0x12; 32]),
-            configuration: Digest([0x13; 32]),
+            identity,
+            configuration,
         }
+    }
+
+    fn table() -> ConsumerTable {
+        table_with(Digest([0x12; 32]), Digest([0x13; 32]))
     }
 
     fn mask_source() -> crate::proof::consumer_psc::ConsumerMaskSource {
@@ -1227,7 +1231,7 @@ mod tests {
         }
     }
 
-    fn obligation(head: u32, source_step: u32) -> ConsumerObligation {
+    fn obligation_with(table: ConsumerTable, head: u32, source_step: u32) -> ConsumerObligation {
         ConsumerObligation {
             request: 7,
             source_step,
@@ -1243,9 +1247,13 @@ mod tests {
                 ),
             },
             shift: i64::from(SHIFT),
-            table: table(),
+            table,
             mask: mask_source(),
         }
+    }
+
+    fn obligation(head: u32, source_step: u32) -> ConsumerObligation {
+        obligation_with(table(), head, source_step)
     }
 
     struct TableSource {
@@ -1888,25 +1896,35 @@ mod tests {
         (committed, tails)
     }
 
+    /// The stored-column view of M: row `k` (a record) carries `M[n,k]` for
+    /// every place `n`. The first stage's W derivation reads the stored
+    /// columns and weights the place axis, so W comes out over the record
+    /// axis. The shared reader consumes the same view, and the Dot row then
+    /// contracts the same M on the complementary axes.
     fn group_table_source(matrix_words: &[Vec<i64>]) -> TableSource {
+        let places = matrix_words.len();
+        let records = matrix_words.first().map(|row| row.len()).unwrap_or(0);
         TableSource {
-            messages: matrix_words
-                .iter()
-                .map(|row| {
+            messages: (0..records)
+                .map(|record| {
                     let mut message = vec![Fp::ZERO; ELL];
-                    for (place, value) in row.iter().enumerate() {
-                        message[place] = fp_from_signed_word(*value as u64);
+                    for place in 0..places {
+                        message[place] = fp_from_signed_word(matrix_words[place][record] as u64);
                     }
                     message
                 })
                 .collect(),
-            tails: (0..PLACES)
+            tails: (0..records)
                 .map(|_| (0..TABLE_R).map(|_| Fp::ZERO).collect())
                 .collect(),
         }
     }
 
     fn group_fixture() -> GroupFixture {
+        group_fixture_with(table())
+    }
+
+    fn group_fixture_with(table: ConsumerTable) -> GroupFixture {
         let real = POSITIONS * WIDTH;
         let activation_words: Vec<i64> = (0..POSITIONS * RECORDS)
             .map(|index| ((index as i64 * 5 + 2) % 11) + 1)
@@ -1970,26 +1988,32 @@ mod tests {
         }
         let mut request = ConsumerRequestPlan::new(
             7,
-            table(),
+            table.clone(),
             mask_source(),
             shared(),
             ranges(),
             Digest([0x41; 32]),
             Digest([0x42; 32]),
-            vec![obligation(0, 20), obligation(1, 21)],
+            vec![
+                obligation_with(table.clone(), 0, 20),
+                obligation_with(table.clone(), 1, 21),
+            ],
         )
         .unwrap();
         let activation_digest = consumer_activation_digest(&activation);
         let outputs_digest = consumer_outputs_digest(&request, &outputs).unwrap();
         request = ConsumerRequestPlan::new(
             7,
-            table(),
+            table.clone(),
             mask_source(),
             shared(),
             ranges(),
             activation_digest,
             outputs_digest,
-            vec![obligation(0, 20), obligation(1, 21)],
+            vec![
+                obligation_with(table.clone(), 0, 20),
+                obligation_with(table.clone(), 1, 21),
+            ],
         )
         .unwrap();
         let entries = ConsumerGroupEntries {
@@ -2330,6 +2354,460 @@ mod tests {
             &fixture.activation,
             &fixture.outputs,
             &changed
+        )
+        .is_err());
+    }
+
+    // ------------------------------------------------------------------
+    // The full consumer composition: first stage, shared stage, own group
+    // ------------------------------------------------------------------
+
+    use std::cell::RefCell;
+
+    use zkie_engine::pcs::request::field::E_DEGREE;
+    use zkie_engine::pcs::request::foldeq::{reader_table_identity, OmegaShapePlan};
+    use zkie_engine::pcs::request::gu::{GuOracleShape, GuShape};
+    use zkie_engine::pcs::request::read::{DurableColumnBudget, HidingState};
+    use zkie_engine::pcs::request::runtime_tree::{
+        MaskTreePlan, RuntimePartRows, RuntimeTree, RuntimeTreePart, RuntimeTreePlan,
+    };
+    use zkie_engine::pcs::request::table::{
+        commit_table_streaming, IndexReader, IndexShape, StreamingTable, VecTableSource,
+    };
+
+    use crate::proof::consumer_second::{
+        consumer_second_chain, consumer_total_acceptance, prove_consumer_own, ConsumerChainBinding,
+        ConsumerOwnPlan, ConsumerOwnWitness,
+    };
+    use crate::proof::consumer_shared::{
+        consumer_shared_charge, prove_consumer_shared, verify_consumer_shared,
+        ConsumerSharedGeometry, ConsumerSharedStage,
+    };
+    use crate::proof::hidden_send_session::HiddenTableProver;
+    use crate::proof::lin_binding::LinBindingRoot;
+
+    const COMPOSITION_CONFIGURATION: Digest = Digest([0x55; 32]);
+
+    struct CompositionKeeper {
+        table: StreamingTable,
+        source: RefCell<VecTableSource>,
+        reader: IndexReader,
+        hiding: HidingState,
+        budget: Option<DurableColumnBudget>,
+    }
+
+    impl TableRowSource for CompositionKeeper {
+        fn rows(&self) -> u64 {
+            self.source.borrow().rows()
+        }
+
+        fn row(&mut self, index: u64, message: &mut [Fp], tail: &mut [Fp]) -> Result<()> {
+            self.source.borrow_mut().row(index, message, tail)
+        }
+    }
+
+    impl HiddenTableProver for CompositionKeeper {
+        fn reader(&self) -> &IndexReader {
+            &self.reader
+        }
+
+        fn open_columns(
+            &mut self,
+            positions: &[u64],
+        ) -> Result<Vec<zkie_engine::pcs::request::table::ColumnOpening>> {
+            let mut source = self.source.borrow_mut();
+            self.table.open_columns(&mut *source, positions)
+        }
+
+        fn hiding_state(&mut self) -> Option<&mut HidingState> {
+            Some(&mut self.hiding)
+        }
+
+        fn durable_column_budget(&mut self) -> Option<&mut DurableColumnBudget> {
+            self.budget.as_mut()
+        }
+    }
+
+    struct GroupSource<'a>(&'a GroupFixture);
+
+    impl TableRowSource for GroupSource<'_> {
+        fn rows(&self) -> u64 {
+            self.0.table_source.messages.len() as u64
+        }
+
+        fn row(&mut self, index: u64, message: &mut [Fp], tail: &mut [Fp]) -> Result<()> {
+            let source = self
+                .0
+                .table_source
+                .messages
+                .get(index as usize)
+                .ok_or(Error::ShapeMismatch)?;
+            message.copy_from_slice(source);
+            let source_tail = self
+                .0
+                .table_source
+                .tails
+                .get(index as usize)
+                .ok_or(Error::ShapeMismatch)?;
+            tail.copy_from_slice(source_tail);
+            Ok(())
+        }
+    }
+
+    fn matrix_word(place: usize, record: usize) -> i64 {
+        ((record as i64 * 7 + place as i64 * 3 + 1) % 17) + 1
+    }
+
+    /// The shared table is the same M in its stored-column view: row `k` is
+    /// the record and the entries are the places, exactly the view the first
+    /// stage's W derivation reads.
+    fn composition_table() -> (IndexReader, CompositionKeeper) {
+        let code = build_code_plan(6, 16, 1).unwrap();
+        let shape = IndexShape {
+            code,
+            v: 4,
+            answers: 1,
+            salt_bytes: 40,
+            distances: TableDistances {
+                radius: 0,
+                later_radius: 0,
+                m_once: 0,
+                m_later: 0,
+            },
+        };
+        let mut message_rows = vec![vec![Fp::ZERO; 16]; 16];
+        for record in 0..16 {
+            for place in 0..16 {
+                message_rows[record][place] =
+                    fp_from_signed_word(matrix_word(place, record) as u64);
+            }
+        }
+        let tails = vec![vec![Fp::ZERO; 1]; 16];
+        let mut source = VecTableSource::new(message_rows, tails).unwrap();
+        let salts: Vec<Vec<u8>> = (0..code.n())
+            .map(|position| vec![(position as u8) ^ 0x5A; 40])
+            .collect();
+        let table = commit_table_streaming(
+            &mut source,
+            shape,
+            COMPOSITION_CONFIGURATION,
+            &salts,
+            64,
+            u64::MAX,
+        )
+        .unwrap();
+        let reader = table.reader.clone();
+        let keeper = CompositionKeeper {
+            table,
+            source: RefCell::new(source),
+            hiding: HidingState::new(reader.root, 1, reader.shape.code.r as u64),
+            reader: reader.clone(),
+            budget: None,
+        };
+        (reader, keeper)
+    }
+
+    fn composition_geometry(
+        plan: &ConsumerFirstPlan,
+        reader: &IndexReader,
+    ) -> ConsumerSharedGeometry {
+        let code = plan.draft.w_shape.code;
+        let mask_code = plan
+            .group
+            .as_ref()
+            .expect("the first plan carries its group")
+            .shapes
+            .first_mask;
+        let table_shape = reader.shape;
+        let tree = |tree_number: u64, run: u8, configuration: u8| RuntimeTreePlan {
+            tree_number,
+            leaf_class: 2,
+            log_n: code.log_n,
+            log_n_zk: mask_code.log_n,
+            parts: vec![RuntimeTreePart {
+                main_symbols: E_DEGREE as u64,
+                mask_symbols: 0,
+            }],
+            salt_bytes: 40,
+            run: Digest([run; 32]),
+            configuration: Digest([configuration; 32]),
+        };
+        let oracle = GuOracleShape {
+            code,
+            main_rows: 1,
+            main_deg: E_DEGREE as u32,
+            mask_rows: 0,
+            mask_code: None,
+            answers: 1,
+        };
+        ConsumerSharedGeometry {
+            binding_root: LinBindingRoot {
+                digest: Digest([0x91; 32]),
+                places: 1,
+            },
+            table_identity: reader_table_identity(reader).unwrap(),
+            table_configuration: COMPOSITION_CONFIGURATION,
+            table_shape,
+            matrix_rows: plan.draft.matrix_rows,
+            k_lo: plan.draft.k_lo,
+            columns: plan.draft.columns,
+            code,
+            mask_code,
+            mask_tree: MaskTreePlan {
+                tree_number: 970,
+                leaf_class: 4,
+                log_n: mask_code.log_n,
+                mask_rows: 1,
+                salt_bytes: 40,
+                run: Digest([0x92; 32]),
+                configuration: Digest([0x93; 32]),
+            },
+            fresh: 980,
+            base_positions: 1,
+            gu: GuShape {
+                oracle: 960,
+                group: 9,
+                tree: tree(971, 0x94, 0x95),
+                part: 0,
+                rows_high: true,
+                u: oracle,
+                index: table_shape,
+            },
+            omega: OmegaShapePlan {
+                oracle: 961,
+                group: 9,
+                tree: tree(972, 0x96, 0x97),
+                u: oracle,
+                rows_high: true,
+                matrix_rows: plan.draft.matrix_rows,
+                k_lo: plan.draft.k_lo,
+            },
+            column_work_bits: 0,
+            parameters: Digest([0x98; 32]),
+            statement: b"consumer composition".to_vec(),
+            record: reader.name(),
+        }
+    }
+
+    fn composition_shared_plan() -> ConsumerSharedPlan {
+        ConsumerSharedPlan {
+            m_once: 8,
+            m_later: 8,
+            one_time_columns: 1,
+            later_columns: 1,
+            declared_batches: 1,
+            table_tail: 4,
+        }
+    }
+
+    #[test]
+    #[ignore = "release composition run"]
+    fn the_consumer_composition_accepts_on_the_same_matrix() {
+        let (reader, mut keeper) = composition_table();
+        let table_identity = reader_table_identity(&reader).unwrap();
+        let mut fixture = group_fixture_with(table_with(table_identity, COMPOSITION_CONFIGURATION));
+        let (messages, _obligations) = prove_group(&mut fixture).unwrap();
+        let plan = fixture.plan.clone();
+        let geometry = composition_geometry(&plan, &reader);
+        // The shared stage over the same table.
+        let shared_plan = composition_shared_plan();
+        let stage = ConsumerSharedStage::new(&shared_plan).unwrap();
+        let charge = consumer_shared_charge(&stage, &mut keeper).unwrap();
+        let shared_proof = prove_consumer_shared(
+            &geometry,
+            &stage,
+            &reader,
+            &mut keeper,
+            Digest([0xE2; 32]),
+            &charge,
+        )
+        .unwrap();
+        let check_stage = ConsumerSharedStage::new(&shared_plan).unwrap();
+        let shared_verified =
+            verify_consumer_shared(&geometry, &check_stage, &reader, &shared_proof.messages)
+                .unwrap();
+        // The W witness is the first stage's committed W rebuilt from the same
+        // stored-column matrix view.
+        let weights = pending_row_weights(&plan.member, plan.draft.matrix_rows).unwrap();
+        let mut source = GroupSource(&fixture);
+        let w_values = derive_w_values(
+            &plan.draft.table_shape,
+            plan.draft.matrix_rows,
+            plan.draft.k_lo,
+            plan.draft.columns,
+            &weights,
+            &mut source,
+        )
+        .unwrap();
+        let w_commit = commit_request_w(
+            &plan.draft.w_shape,
+            plan.draft.w_oracle,
+            plan.draft.w_group,
+            &w_values,
+            &fixture.w_randomness.pads,
+            &fixture.w_randomness.tails,
+            &fixture.w_randomness.salts,
+        )
+        .unwrap();
+        assert_eq!(*w_commit.roots.first().unwrap(), messages.w_root);
+        let tail_len = usize::try_from(plan.draft.w_shape.code.r).unwrap();
+        let rows = usize::try_from(plan.draft.w_shape.main_rows).unwrap();
+        let flat = &fixture.w_randomness.tails[0];
+        let w_tails: Vec<Vec<Fp3>> = (0..rows)
+            .map(|row| flat[row * tail_len..(row + 1) * tail_len].to_vec())
+            .collect();
+        // The own group and the total acceptance.
+        let own_mask_tree = MaskTreePlan {
+            tree_number: 986,
+            leaf_class: 4,
+            log_n: geometry.mask_code.log_n,
+            mask_rows: 1,
+            salt_bytes: 40,
+            run: Digest([0x99; 32]),
+            configuration: Digest([0x9A; 32]),
+        };
+        let own_plan = ConsumerOwnPlan::from_first_shared(
+            &plan,
+            &messages,
+            &geometry,
+            &shared_verified,
+            own_mask_tree,
+            985,
+            1,
+        )
+        .unwrap();
+        let binding = ConsumerChainBinding::from_first_shared(&messages, &shared_verified).unwrap();
+        let chain = consumer_second_chain(&geometry, &binding).unwrap();
+        let witness = ConsumerOwnWitness {
+            w: &w_commit,
+            w_tails: &w_tails,
+            shared: &shared_proof.witness,
+        };
+        let own_proof = prove_consumer_own(
+            chain,
+            &own_plan,
+            &shared_verified,
+            &witness,
+            Digest([0xE3; 32]),
+        )
+        .unwrap();
+        let accept_stage = ConsumerSharedStage::new(&shared_plan).unwrap();
+        let total = consumer_total_acceptance(
+            &plan,
+            &fixture.activation,
+            &fixture.outputs,
+            &messages,
+            &geometry,
+            &accept_stage,
+            &reader,
+            &shared_proof.messages,
+            &own_plan,
+            &own_proof,
+        )
+        .unwrap();
+        assert_eq!(total.first_seal, messages.first_seal);
+        assert_eq!(total.shared_seal, shared_verified.seal);
+        assert_eq!(total.second_seal, own_proof.seal);
+        assert!(!total.obligations.group_rows.is_empty());
+        assert!(!plan.member.psi.is_empty());
+    }
+
+    #[test]
+    #[ignore = "release composition run"]
+    fn the_composition_refuses_a_witness_on_the_wrong_axis() {
+        let (reader, mut keeper) = composition_table();
+        let table_identity = reader_table_identity(&reader).unwrap();
+        let mut fixture = group_fixture_with(table_with(table_identity, COMPOSITION_CONFIGURATION));
+        let (messages, _) = prove_group(&mut fixture).unwrap();
+        let plan = fixture.plan.clone();
+        let geometry = composition_geometry(&plan, &reader);
+        let shared_plan = composition_shared_plan();
+        let stage = ConsumerSharedStage::new(&shared_plan).unwrap();
+        let charge = consumer_shared_charge(&stage, &mut keeper).unwrap();
+        let shared_proof = prove_consumer_shared(
+            &geometry,
+            &stage,
+            &reader,
+            &mut keeper,
+            Digest([0xE2; 32]),
+            &charge,
+        )
+        .unwrap();
+        let check_stage = ConsumerSharedStage::new(&shared_plan).unwrap();
+        let shared_verified =
+            verify_consumer_shared(&geometry, &check_stage, &reader, &shared_proof.messages)
+                .unwrap();
+        // The wrong-axis witness: places as rows, records as entries.
+        let records = 16usize;
+        let places = 16usize;
+        let mut rows = vec![vec![Fp::ZERO; ELL]; places];
+        for place in 0..places {
+            for record in 0..records {
+                rows[place][record] = fp_from_signed_word(matrix_word(place, record) as u64);
+            }
+        }
+        let mut wrong = TableSource {
+            messages: rows,
+            tails: (0..places)
+                .map(|_| (0..TABLE_R).map(|_| Fp::ZERO).collect())
+                .collect(),
+        };
+        let weights = pending_row_weights(&plan.member, plan.draft.matrix_rows).unwrap();
+        let wrong_values = derive_w_values(
+            &plan.draft.table_shape,
+            plan.draft.matrix_rows,
+            plan.draft.k_lo,
+            plan.draft.columns,
+            &weights,
+            &mut wrong,
+        )
+        .unwrap();
+        let wrong_commit = commit_request_w(
+            &plan.draft.w_shape,
+            plan.draft.w_oracle,
+            plan.draft.w_group,
+            &wrong_values,
+            &fixture.w_randomness.pads,
+            &fixture.w_randomness.tails,
+            &fixture.w_randomness.salts,
+        )
+        .unwrap();
+        assert_ne!(*wrong_commit.roots.first().unwrap(), messages.w_root);
+        let tail_len = usize::try_from(plan.draft.w_shape.code.r).unwrap();
+        let flat = &fixture.w_randomness.tails[0];
+        let w_tails: Vec<Vec<Fp3>> = vec![flat[..tail_len].to_vec()];
+        let witness = ConsumerOwnWitness {
+            w: &wrong_commit,
+            w_tails: &w_tails,
+            shared: &shared_proof.witness,
+        };
+        let own_mask_tree = MaskTreePlan {
+            tree_number: 986,
+            leaf_class: 4,
+            log_n: geometry.mask_code.log_n,
+            mask_rows: 1,
+            salt_bytes: 40,
+            run: Digest([0x99; 32]),
+            configuration: Digest([0x9A; 32]),
+        };
+        let own_plan = ConsumerOwnPlan::from_first_shared(
+            &plan,
+            &messages,
+            &geometry,
+            &shared_verified,
+            own_mask_tree,
+            985,
+            1,
+        )
+        .unwrap();
+        let binding = ConsumerChainBinding::from_first_shared(&messages, &shared_verified).unwrap();
+        let chain = consumer_second_chain(&geometry, &binding).unwrap();
+        assert!(prove_consumer_own(
+            chain,
+            &own_plan,
+            &shared_verified,
+            &witness,
+            Digest([0xE3; 32]),
         )
         .is_err());
     }
