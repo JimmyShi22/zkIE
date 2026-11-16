@@ -227,6 +227,21 @@ pub fn summarize_profile(samples: &[ProfileSample]) -> Result<serde_json::Value>
     Ok(serde_json::json!({"groups": rows}))
 }
 
+/// Writes this stage's protocol counters beside the run report. The key
+/// qualification's proof time and bundle bytes are recorded separately from
+/// the request stages, so the end-to-end cost can be read per part.
+pub fn write_metrics(run_dir: &Path, metrics: &zkie_engine::context::Metrics) -> Result<PathBuf> {
+    fs::create_dir_all(run_dir).map_err(|_| Error::Io)?;
+    let path = run_dir.join("metrics.json");
+    let body = serde_json::to_string_pretty(&serde_json::json!({
+        "schema": 1,
+        "counters": metrics.counters,
+    }))
+    .map_err(|_| Error::InvalidEncoding)?;
+    fs::write(&path, body).map_err(|_| Error::Io)?;
+    Ok(path)
+}
+
 /// Writes operator/kernel counters for this stage when profiling is enabled.
 pub fn write_profile(run_dir: &Path) -> Result<Option<PathBuf>> {
     if !zkie_core::profile::Scope::is_enabled() {

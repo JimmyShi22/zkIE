@@ -59,6 +59,7 @@ pub fn run(args: &[String], provider: &dyn PipelineProvider) -> Result<CommitRec
     let runtime = RuntimeConfig::default();
     let mut services = PipelineServices::new(provider, progress.as_ref(), &mut metrics, &runtime);
     let result = pipeline::commit_model(&request, &mut services);
+    drop(services);
 
     let mut report = match &result {
         Ok(_) => RunReport::new("commit", RunOutcome::Passed),
@@ -80,6 +81,7 @@ pub fn run(args: &[String], provider: &dyn PipelineProvider) -> Result<CommitRec
     report.last_event_seq = progress.last_event_seq();
     report.last_completed_stage = Some("commit".into());
     let _ = report.write(&request.run_dir);
+    let _ = crate::report::write_metrics(&request.run_dir, &metrics);
     let _ = crate::report::write_profile(&request.run_dir);
     result
 }

@@ -2,19 +2,23 @@
 //! pipeline. Ignored by default; run explicitly with `ZKIE_CONSUMER_EV`
 //! pointing at the round's evidence directory.
 //!
-//! The driver runs the real gpt2 case through commit, prove and verify. Prove
-//! builds the consumer witness from the executed trace and writes the request
-//! proof file beside the proof artifact; verify rebuilds the request plans from
-//! the trusted model plan and the verified trace outputs and runs the first,
+//! The driver runs the real gpt2 case through commit, prove and verify. The
+//! commit proves the table's one-time key qualification and publishes it in
+//! the public bundle; prove and verify re-verify that bundle per request into
+//! an in-memory accepted key and check every accepted field. Prove builds the
+//! consumer witness from the executed trace and writes the request proof file
+//! beside the proof artifact; verify rebuilds the request plans from the
+//! trusted model plan and the verified trace outputs and runs the first,
 //! shared and second stages before it accepts. The negatives tamper the
-//! auxiliary file and require the production verify entry to refuse.
+//! auxiliary file and the key bundle and require the production verify entry
+//! to refuse.
 
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use zkie_core::artifact::{digest_bytes, digest_to_hex};
+use zkie_core::artifact::{digest_bytes, digest_to_hex, COMPLETE_FILE, MANIFEST_FILE};
 use zkie_core::error::Result;
 use zkie_core::progress::{ProgressEvent, ProgressSink};
 use zkie_engine::context::{Metrics, RuntimeConfig};
@@ -23,6 +27,8 @@ use zkie_ops::pipeline::{
     commit_model, prove_request, verify_request, CommitRequest, PipelineProvider, PipelineServices,
     ProveRequest, VerifyRequest,
 };
+use zkie_engine::artifact::load_manifest;
+use zkie_ops::proof::asset_key::ASSET_KEY_BUNDLE;
 use zkie_ops::proof::consumer_proof::{ConsumerProofFile, CONSUMER_PROOF_FILE};
 use zkie_ops::proof::model_commitment::ModelCommitmentPublic;
 
@@ -108,9 +114,51 @@ fn table_identity_text(
 
 fn copy_proof(src: &Path, dst: &Path) {
     fs::create_dir_all(dst).unwrap();
-    for name in ["statement.bin", "proof.bin", "public-inputs.bin", CONSUMER_PROOF_FILE] {
+    for name in [
+        "statement.bin",
+        "proof.bin",
+        "public-inputs.bin",
+        CONSUMER_PROOF_FILE,
+        MANIFEST_FILE,
+        COMPLETE_FILE,
+    ] {
         fs::copy(src.join(name), dst.join(name)).unwrap();
     }
+}
+
+fn copy_commit(src: &Path, dst: &Path) {
+    fs::create_dir_all(dst.join("public")).unwrap();
+    fs::create_dir_all(dst.join("private")).unwrap();
+    for name in [MANIFEST_FILE, COMPLETE_FILE] {
+        fs::copy(src.join(name), dst.join(name)).unwrap();
+    }
+    for dir in ["public", "private"] {
+        for entry in fs::read_dir(src.join(dir)).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(entry.path(), dst.join(dir).join(entry.file_name())).unwrap();
+        }
+    }
+}
+
+/// Rewrites one file and its manifest entry so the artifact is internally
+/// consistent: the refusal must then come from the protocol checks, not only
+/// from the container digest.
+fn rewrite_manifest_file(root: &Path, relative_path: &str, bytes: &[u8]) {
+    fs::write(root.join(relative_path), bytes).unwrap();
+    let mut manifest = load_manifest(root).unwrap();
+    let entry = manifest
+        .files
+        .iter_mut()
+        .find(|entry| entry.relative_path == relative_path)
+        .expect("the manifest lists the file");
+    entry.byte_length = bytes.len() as u64;
+    entry.content_digest = digest_bytes(bytes);
+    fs::write(root.join(MANIFEST_FILE), manifest.to_json().unwrap()).unwrap();
+    fs::write(
+        root.join(COMPLETE_FILE),
+        format!("{}\n", digest_to_hex(&manifest.manifest_digest().unwrap())),
+    )
+    .unwrap();
 }
 
 fn runtime() -> RuntimeConfig {
@@ -120,15 +168,24 @@ fn runtime() -> RuntimeConfig {
     }
 }
 
-fn verify(provider: &dyn PipelineProvider, request: &VerifyRequest) -> Result<bool> {
+fn verify(
+    provider: &dyn PipelineProvider,
+    request: &VerifyRequest,
+) -> Result<(bool, Metrics)> {
     let mut metrics = Metrics::new();
     let runtime = runtime();
     let quiet = Quiet;
     let mut services = PipelineServices::new(provider, &quiet, &mut metrics, &runtime);
-    verify_request(request, &mut services).map(|receipt| receipt.accepted)
+    verify_request(request, &mut services).map(|receipt| (receipt.accepted, metrics))
 }
 
-fn verify_dir(provider: &dyn PipelineProvider, policy: &Path, base: &Path, commit: &Path, model: &str) -> Result<bool> {
+fn verify_dir(
+    provider: &dyn PipelineProvider,
+    policy: &Path,
+    base: &Path,
+    commit: &Path,
+    model: &str,
+) -> Result<(bool, Metrics)> {
     let request = VerifyRequest {
         public_bundle_dir: commit.join("public"),
         statement: base.join("statement.bin"),
@@ -186,6 +243,9 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
         .unwrap();
     }
     let commit_ms = started.elapsed().as_millis() as u64;
+    let key_prove_ms = metrics.get("key_prove_ms");
+    let key_commit_verify_ms = metrics.get("key_verify_ms");
+    let key_file_bytes = fs::metadata(commit_dir.join(ASSET_KEY_BUNDLE)).unwrap().len();
 
     let public: ModelCommitmentPublic =
         bincode::deserialize(&fs::read(commit_dir.join("public/model-commitment.bin")).unwrap())
@@ -244,8 +304,10 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
     let statement_bytes = fs::metadata(proof_dir.join("statement.bin")).unwrap().len();
 
     let started = Instant::now();
-    let accepted = verify_dir(&provider, &policy, &proof_dir, &commit_dir, &config.model).unwrap();
+    let (accepted, verify_metrics) =
+        verify_dir(&provider, &policy, &proof_dir, &commit_dir, &config.model).unwrap();
     let verify_ms = started.elapsed().as_millis() as u64;
+    let key_request_verify_ms = verify_metrics.get("key_verify_ms");
     let (hwm_after_verify, _) = memory_kib();
     assert!(accepted, "the request with its consumer chain is accepted");
 
@@ -268,7 +330,7 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
     tampered.assembly = changed_member.encode().unwrap();
     let dir = broken.join("member");
     copy_proof(&proof_dir, &dir);
-    tampered.write_to(&dir).unwrap();
+    rewrite_manifest_file(&dir, CONSUMER_PROOF_FILE, &tampered.encode().unwrap());
     assert!(
         verify_dir(&provider, &policy, &dir, &commit_dir, &config.model).is_err(),
         "a changed plan member is refused"
@@ -280,7 +342,7 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
     tampered.assembly = changed_target.encode().unwrap();
     let dir = broken.join("target");
     copy_proof(&proof_dir, &dir);
-    tampered.write_to(&dir).unwrap();
+    rewrite_manifest_file(&dir, CONSUMER_PROOF_FILE, &tampered.encode().unwrap());
     assert!(
         verify_dir(&provider, &policy, &dir, &commit_dir, &config.model).is_err(),
         "a changed plan target is refused"
@@ -292,7 +354,7 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
     tampered.assembly = changed_mask.encode().unwrap();
     let dir = broken.join("mask");
     copy_proof(&proof_dir, &dir);
-    tampered.write_to(&dir).unwrap();
+    rewrite_manifest_file(&dir, CONSUMER_PROOF_FILE, &tampered.encode().unwrap());
     assert!(
         verify_dir(&provider, &policy, &dir, &commit_dir, &config.model).is_err(),
         "a changed mask root is refused"
@@ -304,7 +366,7 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
     tampered.assembly = changed_raw.encode().unwrap();
     let dir = broken.join("raw");
     copy_proof(&proof_dir, &dir);
-    tampered.write_to(&dir).unwrap();
+    rewrite_manifest_file(&dir, CONSUMER_PROOF_FILE, &tampered.encode().unwrap());
     assert!(
         verify_dir(&provider, &policy, &dir, &commit_dir, &config.model).is_err(),
         "a changed raw root is refused"
@@ -315,14 +377,32 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
     bytes[last] ^= 1;
     let dir = broken.join("bytes");
     copy_proof(&proof_dir, &dir);
-    fs::write(dir.join(CONSUMER_PROOF_FILE), &bytes).unwrap();
+    rewrite_manifest_file(&dir, CONSUMER_PROOF_FILE, &bytes);
     assert!(
         verify_dir(&provider, &policy, &dir, &commit_dir, &config.model).is_err(),
         "a changed container byte is refused"
     );
 
+    // Qualification negatives: a missing key bundle and a byte-changed key
+    // bundle whose commit manifest is internally consistent. Both are refused
+    // by the production verify entry.
+    let broken_commit = broken.join("commit-missing-key");
+    copy_commit(&commit_dir, &broken_commit);
+    fs::remove_file(broken_commit.join(ASSET_KEY_BUNDLE)).unwrap();
+    let refused = verify_dir(&provider, &policy, &proof_dir, &broken_commit, &config.model).is_err();
+    assert!(refused, "a missing key bundle is refused");
+
+    let broken_commit = broken.join("commit-bad-key");
+    copy_commit(&commit_dir, &broken_commit);
+    let mut key_bytes = fs::read(broken_commit.join(ASSET_KEY_BUNDLE)).unwrap();
+    let last = key_bytes.len() - 1;
+    key_bytes[last] ^= 1;
+    rewrite_manifest_file(&broken_commit, ASSET_KEY_BUNDLE, &key_bytes);
+    let refused = verify_dir(&provider, &policy, &proof_dir, &broken_commit, &config.model).is_err();
+    assert!(refused, "a changed key bundle is refused");
+
     let evidence = format!(
-        "{{\n  \"case\": \"{}\",\n  \"commit_ms\": {},\n  \"prove_ms\": {},\n  \"verify_ms\": {},\n  \"trace_bytes\": {},\n  \"statement_bytes\": {},\n  \"consumer_proof_bytes\": {},\n  \"vmhwm_after_prove_kib\": {},\n  \"vmhwm_after_verify_kib\": {},\n  \"accepted\": true,\n  \"negatives\": 6\n}}\n",
+        "{{\n  \"case\": \"{}\",\n  \"commit_ms\": {},\n  \"prove_ms\": {},\n  \"verify_ms\": {},\n  \"trace_bytes\": {},\n  \"statement_bytes\": {},\n  \"consumer_proof_bytes\": {},\n  \"key_prove_ms\": {},\n  \"key_commit_verify_ms\": {},\n  \"key_request_verify_ms\": {},\n  \"key_file_bytes\": {},\n  \"vmhwm_after_prove_kib\": {},\n  \"vmhwm_after_verify_kib\": {},\n  \"accepted\": true,\n  \"negatives\": 8\n}}\n",
         config.case_id,
         commit_ms,
         prove_ms,
@@ -330,6 +410,10 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
         trace_bytes,
         statement_bytes,
         sidecar_bytes,
+        key_prove_ms,
+        key_commit_verify_ms,
+        key_request_verify_ms,
+        key_file_bytes,
         hwm_after_prove,
         hwm_after_verify,
     );
@@ -342,5 +426,6 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
     writeln!(log, "trace bytes {}", trace_bytes).unwrap();
     writeln!(log, "statement bytes {}", statement_bytes).unwrap();
     writeln!(log, "consumer proof bytes {}", sidecar_bytes).unwrap();
-    writeln!(log, "accepted; six negatives refused").unwrap();
+    writeln!(log, "key prove {} ms, commit verify {} ms, request verify {} ms, file {} bytes", key_prove_ms, key_commit_verify_ms, key_request_verify_ms, key_file_bytes).unwrap();
+    writeln!(log, "accepted; eight negatives refused").unwrap();
 }

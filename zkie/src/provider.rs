@@ -5,19 +5,20 @@
 //! proof. Verify reads only the public commitment/proof/inputs.
 
 use std::fs;
-use std::io::Cursor;
+use std::io::{Cursor, Read};
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
 use zkie_core::artifact::{
-    digest_bytes, ArtifactFile, ArtifactKind, ArtifactManifest, PrivacyMode,
+    digest_bytes, ArtifactFile, ArtifactKind, ArtifactManifest, PrivacyMode, Sha256Stream,
 };
 use zkie_core::error::{Error, Result};
 use zkie_core::progress::{ProgressEvent, ProgressKind, ProgressSink, RunOutcome};
 use zkie_core::types::Digest;
-use zkie_engine::artifact::ArtifactPublisher;
+use zkie_engine::artifact::{load_manifest, ArtifactPublisher};
 use zkie_models_gemma3::executor as gemma3;
 use zkie_models_gpt2::executor as gpt2;
 use zkie_models_timesfm::executor as timesfm;
@@ -29,6 +30,9 @@ use zkie_ops::proof::model_commitment::{
     verify_model_anchor_with_tables, verify_model_anchor_with_tables_on_identity,
     verify_shared_trace, verify_shared_trace_output,
     ModelCommitmentPublic, SharedTrace,
+};
+use zkie_ops::proof::asset_key::{
+    prove_asset_key, verify_asset_key, AssetKeyColumns, ASSET_KEY_BUNDLE,
 };
 use zkie_ops::proof::asset_table::{
     decode_asset_table_randomness_set, encode_asset_table_randomness_set,
@@ -224,6 +228,104 @@ fn commit_manifest(model: Digest, files: Vec<ArtifactFile>) -> ArtifactManifest 
     }
 }
 
+/// Loads one artifact manifest, requires its kind and the fixed protocol
+/// identity, and returns it. The artifact root's `COMPLETE` marker must carry
+/// the manifest digest.
+fn load_checked_manifest(root: &Path, kind: ArtifactKind) -> Result<ArtifactManifest> {
+    let manifest = load_manifest(root)?;
+    let privacy_ok = match kind {
+        ArtifactKind::Commit => manifest.privacy_mode == PrivacyMode::Hidden,
+        _ => manifest.privacy_mode == PrivacyMode::Public,
+    };
+    if manifest.artifact_kind != kind || !privacy_ok {
+        return Err(Error::StatementMismatch);
+    }
+    if manifest.protocol_id != PROTOCOL_ID
+        || manifest.protocol_version != 1
+        || manifest.backend_id != BACKEND_ID
+        || manifest.backend_format_version != 1
+        || manifest.parameters_digest != PARAMETERS_DIGEST
+        || manifest.model_config_digest != MODEL_CONFIG_DIGEST
+        || manifest.quantization_digest != QUANTIZATION_DIGEST
+        || manifest.tables_digest != TABLES_DIGEST
+    {
+        return Err(Error::UnsupportedVersion);
+    }
+    Ok(manifest)
+}
+
+/// Reads one manifest-listed file and requires its length and digest. The
+/// relative path is joined to the artifact root; the caller never reads a file
+/// the manifest does not name.
+fn checked_artifact_file(
+    root: &Path,
+    manifest: &ArtifactManifest,
+    relative_path: &str,
+) -> Result<Vec<u8>> {
+    let entry = manifest
+        .find_file(relative_path)
+        .ok_or(Error::IncompleteArtifact)?;
+    let bytes = fs::read(root.join(relative_path)).map_err(|_| Error::IncompleteArtifact)?;
+    if bytes.len() as u64 != entry.byte_length || digest_bytes(&bytes) != entry.content_digest {
+        return Err(Error::ArtifactIntegrityMismatch);
+    }
+    Ok(bytes)
+}
+
+/// Compares bytes already read with one manifest entry.
+fn check_manifest_bytes(
+    manifest: &ArtifactManifest,
+    relative_path: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    let entry = manifest
+        .find_file(relative_path)
+        .ok_or(Error::IncompleteArtifact)?;
+    if bytes.len() as u64 != entry.byte_length || digest_bytes(bytes) != entry.content_digest {
+        return Err(Error::ArtifactIntegrityMismatch);
+    }
+    Ok(())
+}
+
+/// Requires one proof input file to be the manifest's named file at the
+/// artifact root and its bytes to match the entry.
+fn check_proof_input(
+    path: &Path,
+    root: &Path,
+    manifest: &ArtifactManifest,
+    relative_path: &str,
+    bytes: &[u8],
+) -> Result<()> {
+    if path.parent() != Some(root)
+        || path.file_name().and_then(|name| name.to_str()) != Some(relative_path)
+    {
+        return Err(Error::StatementMismatch);
+    }
+    check_manifest_bytes(manifest, relative_path, bytes)
+}
+
+/// Hashes a large manifest-listed file in bounded chunks without loading it.
+fn checked_large_file(path: &Path, entry: &ArtifactFile) -> Result<()> {
+    let metadata = fs::metadata(path).map_err(|_| Error::IncompleteArtifact)?;
+    if metadata.len() != entry.byte_length {
+        return Err(Error::ArtifactIntegrityMismatch);
+    }
+    let mut file = fs::File::open(path).map_err(|_| Error::IncompleteArtifact)?;
+    let mut stream = Sha256Stream::new();
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let read = file.read(&mut buffer).map_err(|_| Error::Io)?;
+        if read == 0 {
+            break;
+        }
+        stream.update(&buffer[..read]);
+    }
+    if stream.finish() != entry.content_digest {
+        return Err(Error::ArtifactIntegrityMismatch);
+    }
+    Ok(())
+}
+
 fn proof_manifest(model: Digest, files: Vec<ArtifactFile>) -> ArtifactManifest {
     ArtifactManifest {
         artifact_schema_version: 1,
@@ -240,6 +342,32 @@ fn proof_manifest(model: Digest, files: Vec<ArtifactFile>) -> ArtifactManifest {
         privacy_mode: PrivacyMode::Public,
         files,
     }
+}
+
+/// The registered first projection table: its trusted parameters, its asset
+/// specification and the derived key-stage columns.
+fn gpt2_key_columns() -> Result<(
+    AssetTableParams,
+    zkie_ops::proof::model_commitment::ModelAssetSpec,
+    AssetKeyColumns,
+)> {
+    const FIRST_PROJECTION: &str = "gpt2/weights/L0_k_w_i32.bin";
+    let params = zkie_models_gpt2::plan::projection_table_params(FIRST_PROJECTION)
+        .ok_or(Error::UnsupportedPrimitive)?;
+    let spec = zkie_models_gpt2::plan::asset_specs()
+        .into_iter()
+        .find(|spec| spec.path == FIRST_PROJECTION)
+        .ok_or(Error::UnsupportedPrimitive)?;
+    let derived = zkie_models_gpt2::plan::derive_table_plan(
+        &zkie_models_gpt2::plan::TABLE_PLAN_CANDIDATE,
+    )?;
+    let columns = AssetKeyColumns {
+        key_columns: derived.one_time_columns,
+        instance_columns: derived.total_columns,
+        k_lo: zkie_models_gpt2::plan::TABLE_PLAN_CANDIDATE.k_lo,
+        lin_check: derived.lin_check,
+    };
+    Ok((params, spec, columns))
 }
 
 fn trusted_table_params(model: &str) -> Result<Vec<AssetTableParams>> {
@@ -318,6 +446,32 @@ impl PipelineProvider for ProductionProvider {
         let table_params = trusted_table_params(&config.model)?;
         let tables = sample_asset_table_inputs(&table_params)?;
         let commitment = build_commitment(&config, &tables)?;
+        // The one-time key qualification is proved once over this committed
+        // instance and published in the commit's public bundle. Every request
+        // re-verifies the same proof; the proof is never regenerated per
+        // request and re-verification does not spend the durable column budget.
+        let mut key_bundle: Option<Vec<u8>> = None;
+        if config.model == "gpt2" {
+            let (params, spec, columns) = gpt2_key_columns()?;
+            let identity = zkie_models_gpt2::plan::table_model_identity()?;
+            let meta = commitment
+                .tables
+                .iter()
+                .find(|meta| meta.path == params.path)
+                .ok_or(Error::IncompleteArtifact)?;
+            let input = tables
+                .iter()
+                .find(|table| table.params.path == params.path)
+                .ok_or(Error::IncompleteArtifact)?;
+            let started = Instant::now();
+            let bytes = prove_asset_key(&commitment, meta, &params, identity, &spec, input, columns)?;
+            ctx.metrics.record("key_prove_ms", started.elapsed().as_millis() as u64);
+            let started = Instant::now();
+            verify_asset_key(meta, &params, identity, &spec, columns, &bytes)?;
+            ctx.metrics.record("key_verify_ms", started.elapsed().as_millis() as u64);
+            ctx.metrics.record("key_bytes", bytes.len() as u64);
+            key_bundle = Some(bytes);
+        }
         let asset_units = commitment.assets.len() as u64;
         let mut progress_event =
             ProgressEvent::new("commit", "commit", ProgressKind::WorkAdvanced);
@@ -339,7 +493,7 @@ impl PipelineProvider for ProductionProvider {
         let parameters_digest = digest_bytes(&parameters_bytes);
         let tables_digest = digest_bytes(&tables_bytes);
         let randomness_digest = digest_bytes(&randomness_bytes);
-        let files: Vec<(&str, &[u8])> = vec![
+        let mut files: Vec<(&str, &[u8])> = vec![
             ("public/model-commitment.bin", commitment_bytes.as_slice()),
             ("public/provider-config.bin", config_bytes.as_slice()),
             ("public/protocol.bin", protocol_bytes.as_slice()),
@@ -347,7 +501,7 @@ impl PipelineProvider for ProductionProvider {
             ("private/parameters.bin", parameters_bytes.as_slice()),
             ("private/asset-table-randomness.bin", randomness_bytes.as_slice()),
         ];
-        let digests: Vec<(&str, Digest)> = vec![
+        let mut digests: Vec<(&str, Digest)> = vec![
             ("public/model-commitment.bin", commitment_digest),
             ("public/provider-config.bin", config_digest),
             ("public/protocol.bin", protocol_digest),
@@ -355,17 +509,21 @@ impl PipelineProvider for ProductionProvider {
             ("private/parameters.bin", parameters_digest),
             ("private/asset-table-randomness.bin", randomness_digest),
         ];
-        let manifest = commit_manifest(
-            model,
-            vec![
-                ArtifactFile::new("public/model-commitment.bin", commitment_bytes.len() as u64, commitment_digest),
-                ArtifactFile::new("public/provider-config.bin", config_bytes.len() as u64, config_digest),
-                ArtifactFile::new("public/protocol.bin", protocol_bytes.len() as u64, protocol_digest),
-                ArtifactFile::new("public/asset-tables.bin", tables_bytes.len() as u64, tables_digest),
-                ArtifactFile::new("private/parameters.bin", parameters_bytes.len() as u64, parameters_digest),
-                ArtifactFile::new("private/asset-table-randomness.bin", randomness_bytes.len() as u64, randomness_digest),
-            ],
-        );
+        let mut manifest_entries = vec![
+            ArtifactFile::new("public/model-commitment.bin", commitment_bytes.len() as u64, commitment_digest),
+            ArtifactFile::new("public/provider-config.bin", config_bytes.len() as u64, config_digest),
+            ArtifactFile::new("public/protocol.bin", protocol_bytes.len() as u64, protocol_digest),
+            ArtifactFile::new("public/asset-tables.bin", tables_bytes.len() as u64, tables_digest),
+            ArtifactFile::new("private/parameters.bin", parameters_bytes.len() as u64, parameters_digest),
+            ArtifactFile::new("private/asset-table-randomness.bin", randomness_bytes.len() as u64, randomness_digest),
+        ];
+        if let Some(bytes) = &key_bundle {
+            let digest = digest_bytes(bytes);
+            files.push((ASSET_KEY_BUNDLE, bytes.as_slice()));
+            digests.push((ASSET_KEY_BUNDLE, digest));
+            manifest_entries.push(ArtifactFile::new(ASSET_KEY_BUNDLE, bytes.len() as u64, digest));
+        }
+        let manifest = commit_manifest(model, manifest_entries);
         ArtifactPublisher::publish_with_digests(&request.output_dir, &manifest, &files, &digests)?;
         ctx.metrics.record("commit_bytes", commitment_bytes.len() as u64);
         Ok(CommitReceipt {
@@ -388,17 +546,47 @@ impl PipelineProvider for ProductionProvider {
                 .map_err(|_| Error::MissingCommitArtifact)?;
         let tables = decode_asset_table_randomness_set(&randomness_bytes, &table_params)?;
         let commitment = build_commitment(&config, &tables)?;
-        let published_tables: Vec<AssetTableMeta> =
-            match fs::read(request.commit_dir.join("public/asset-tables.bin")) {
-                Ok(bytes) => bincode::deserialize(&bytes).map_err(|_| Error::InvalidEncoding)?,
-                Err(_) => return Err(Error::MissingCommitArtifact),
-            };
+        let published_bytes = fs::read(request.commit_dir.join("public/asset-tables.bin"))
+            .map_err(|_| Error::MissingCommitArtifact)?;
+        let published_tables: Vec<AssetTableMeta> = bincode::deserialize(&published_bytes)
+            .map_err(|_| Error::InvalidEncoding)?;
         if published_tables != commitment.tables {
             return Err(Error::StatementMismatch);
         }
         let model = commitment.anchor.record.model_commitment;
         if request.expected_model_id != model {
             return Err(Error::StatementMismatch);
+        }
+        // The prover's inputs must be this artifact's entries: the commit
+        // manifest binds the public config, the public table metadata and the
+        // private randomness by length and digest. The key bundle is required
+        // and must verify over the same committed instance before the request
+        // is executed.
+        let commit_manifest = load_checked_manifest(&request.commit_dir, ArtifactKind::Commit)?;
+        if commit_manifest.model_commitment_id != model {
+            return Err(Error::StatementMismatch);
+        }
+        check_manifest_bytes(&commit_manifest, "public/provider-config.bin", &config_bytes)?;
+        check_manifest_bytes(&commit_manifest, "public/asset-tables.bin", &published_bytes)?;
+        check_manifest_bytes(
+            &commit_manifest,
+            "private/asset-table-randomness.bin",
+            &randomness_bytes,
+        )?;
+        if config.model == "gpt2" {
+            let (params, spec, columns) = gpt2_key_columns()?;
+            let identity = zkie_models_gpt2::plan::table_model_identity()?;
+            let meta = commitment
+                .tables
+                .iter()
+                .find(|meta| meta.path == params.path)
+                .ok_or(Error::IncompleteArtifact)?;
+            let bytes =
+                checked_artifact_file(&request.commit_dir, &commit_manifest, ASSET_KEY_BUNDLE)?;
+            let started = Instant::now();
+            verify_asset_key(meta, &params, identity, &spec, columns, &bytes)?;
+            ctx.metrics.record("key_verify_ms", started.elapsed().as_millis() as u64);
+            ctx.metrics.record("key_bytes", bytes.len() as u64);
         }
         let statement = StatementData {
             case_id: config.case_id.clone(),
@@ -467,21 +655,59 @@ impl PipelineProvider for ProductionProvider {
         let policy_bytes =
             fs::read(&request.expected_policy).map_err(|_| Error::IncompleteArtifact)?;
         let policy = crate::policy::parse(&policy_bytes)?;
-        let commitment_bytes = fs::read(request.public_bundle_dir.join("model-commitment.bin"))
-            .map_err(|_| Error::IncompleteArtifact)?;
+        // Both artifacts are read through their manifests: the commit public
+        // bundle and the request proof are bound by artifact kind, protocol
+        // identity, file length and content digest. A missing, swapped or
+        // truncated file is refused before any stage runs.
+        let commit_root = request
+            .public_bundle_dir
+            .parent()
+            .ok_or(Error::IncompleteArtifact)?;
+        if request.public_bundle_dir.file_name().and_then(|name| name.to_str())
+            != Some("public")
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let commit_manifest = load_checked_manifest(commit_root, ArtifactKind::Commit)?;
+        let commitment_bytes =
+            checked_artifact_file(commit_root, &commit_manifest, "public/model-commitment.bin")?;
         let public: ModelCommitmentPublic =
             deserialize_exact(&commitment_bytes, Error::ArtifactIntegrityMismatch)?;
         let statement_bytes = fs::read(&request.statement).map_err(|_| Error::IncompleteArtifact)?;
         let statement: StatementData =
             deserialize_exact(&statement_bytes, Error::InvalidProof)?;
+        let proof_dir = request.proof.parent().ok_or(Error::IncompleteArtifact)?;
+        let proof_manifest = load_checked_manifest(proof_dir, ArtifactKind::Proof)?;
+        check_proof_input(
+            &request.statement,
+            proof_dir,
+            &proof_manifest,
+            zkie_core::artifact::PROOF_STATEMENT_FILE,
+            &statement_bytes,
+        )?;
+        if request.proof.file_name().and_then(|name| name.to_str())
+            != Some(zkie_core::artifact::PROOF_FILE)
+        {
+            return Err(Error::StatementMismatch);
+        }
         let trace = read_proof_exact(&request.proof, ctx.runtime.memory_budget_bytes)?;
+        let proof_entry = proof_manifest
+            .find_file(zkie_core::artifact::PROOF_FILE)
+            .ok_or(Error::IncompleteArtifact)?;
+        checked_large_file(&request.proof, proof_entry)?;
         let public_inputs =
             fs::read(&request.public_inputs).map_err(|_| Error::IncompleteArtifact)?;
+        check_proof_input(
+            &request.public_inputs,
+            proof_dir,
+            &proof_manifest,
+            zkie_core::artifact::PROOF_PUBLIC_INPUTS_FILE,
+            &public_inputs,
+        )?;
+        let table_bytes =
+            checked_artifact_file(commit_root, &commit_manifest, "public/asset-tables.bin")?;
         let table_metas: Vec<AssetTableMeta> =
-            match fs::read(request.public_bundle_dir.join("asset-tables.bin")) {
-                Ok(bytes) => bincode::deserialize(&bytes).map_err(|_| Error::InvalidEncoding)?,
-                Err(_) => Vec::new(),
-            };
+            bincode::deserialize(&table_bytes).map_err(|_| Error::InvalidEncoding)?;
 
         let trusted = crate::policy::select(
             &policy,
@@ -493,6 +719,8 @@ impl PipelineProvider for ProductionProvider {
         if request.expected_model_id != model_id
             || statement.model_commitment != model_id
             || public.anchor.model_commitment != model_id
+            || commit_manifest.model_commitment_id != model_id
+            || proof_manifest.model_commitment_id != model_id
         {
             return Err(Error::StatementMismatch);
         }
@@ -500,8 +728,8 @@ impl PipelineProvider for ProductionProvider {
         // The public case config fixes the asset root that locates the fixed
         // public tables. It is public material from the bundle, not a weight
         // path and never a proof value.
-        let config_bytes = fs::read(request.public_bundle_dir.join("provider-config.bin"))
-            .map_err(|_| Error::IncompleteArtifact)?;
+        let config_bytes =
+            checked_artifact_file(commit_root, &commit_manifest, "public/provider-config.bin")?;
         let public_config: ProviderConfig =
             bincode::deserialize(&config_bytes).map_err(|_| Error::InvalidEncoding)?;
         let public_root = std::path::Path::new(&public_config.asset_root);
@@ -527,6 +755,47 @@ impl PipelineProvider for ProductionProvider {
                     &table_metas,
                     &table_params,
                 )?;
+                // The table's one-time qualification is re-verified per
+                // request from the commit's public key bundle into an
+                // in-memory accepted key; every accepted field is compared
+                // with this commit's table, record, range and plan before the
+                // request consumes the table. The key bytes and time are
+                // recorded separately.
+                let (key_params, key_spec, key_columns) = gpt2_key_columns()?;
+                let identity = zkie_models_gpt2::plan::table_model_identity()?;
+                let key_bytes =
+                    checked_artifact_file(commit_root, &commit_manifest, ASSET_KEY_BUNDLE)?;
+                let key_meta = table_metas
+                    .iter()
+                    .find(|meta| meta.path == key_params.path)
+                    .ok_or(Error::IncompleteArtifact)?;
+                let started = Instant::now();
+                verify_asset_key(
+                    key_meta,
+                    &key_params,
+                    identity,
+                    &key_spec,
+                    key_columns,
+                    &key_bytes,
+                )?;
+                ctx.metrics.record("key_verify_ms", started.elapsed().as_millis() as u64);
+                ctx.metrics.record("key_bytes", key_bytes.len() as u64);
+                // The request's own stages' auxiliary file is part of the same
+                // proof artifact: its manifest entry must exist and its bytes
+                // must match before it is decoded.
+                let sidecar_entry = proof_manifest
+                    .find_file(zkie_ops::proof::consumer_proof::CONSUMER_PROOF_FILE)
+                    .ok_or(Error::IncompleteArtifact)?;
+                let sidecar_bytes = fs::read(
+                    proof_dir.join(zkie_ops::proof::consumer_proof::CONSUMER_PROOF_FILE),
+                )
+                .map_err(|_| Error::IncompleteArtifact)?;
+                if sidecar_bytes.len() as u64 != sidecar_entry.byte_length
+                    || digest_bytes(&sidecar_bytes) != sidecar_entry.content_digest
+                {
+                    return Err(Error::ArtifactIntegrityMismatch);
+                }
+                let consumer = ConsumerProofFile::decode(&sidecar_bytes)?;
                 let outputs = zkie_ops::proof::model_commitment::verify_shared_trace_outputs(
                     &public,
                     &trace,
@@ -534,13 +803,6 @@ impl PipelineProvider for ProductionProvider {
                     &plan,
                     Some(public_root),
                 )?;
-                // The registered asset's consumer chain joins the same request
-                // before any output binding: the sidecar is required, its
-                // plans are rebuilt from the trusted model plan and the
-                // verified trace outputs, and the first, shared and second
-                // stages must all verify over the committed table.
-                let proof_dir = request.proof.parent().ok_or(Error::IncompleteArtifact)?;
-                let consumer = ConsumerProofFile::read_from(proof_dir)?;
                 let path = "gpt2/weights/L0_k_w_i32.bin";
                 let consumer_params =
                     zkie_models_gpt2::plan::projection_table_params(path)

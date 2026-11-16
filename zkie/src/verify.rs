@@ -93,6 +93,7 @@ pub fn run(args: &[String], provider: &dyn PipelineProvider) -> Result<VerifyRec
     }
     let mut services = PipelineServices::new(provider, progress.as_ref(), &mut metrics, &runtime);
     let result = pipeline::verify_request(&request, &mut services);
+    drop(services);
 
     let mut report = match &result {
         Ok(receipt) => RunReport::new(
@@ -148,6 +149,7 @@ pub fn run(args: &[String], provider: &dyn PipelineProvider) -> Result<VerifyRec
     report.last_event_seq = progress.last_event_seq();
     report.last_completed_stage = Some("verify".into());
     let _ = report.write(&request.run_dir);
+    let _ = crate::report::write_metrics(&request.run_dir, &metrics);
     let _ = crate::report::write_profile(&request.run_dir);
     result
 }

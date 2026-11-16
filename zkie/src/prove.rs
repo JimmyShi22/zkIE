@@ -62,6 +62,7 @@ pub fn run(args: &[String], provider: &dyn PipelineProvider) -> Result<ProofRece
     let runtime = RuntimeConfig::default();
     let mut services = PipelineServices::new(provider, progress.as_ref(), &mut metrics, &runtime);
     let result = pipeline::prove_request(&request, &mut services);
+    drop(services);
 
     let mut report = match &result {
         Ok(_) => RunReport::new("prove", RunOutcome::Passed),
@@ -84,6 +85,7 @@ pub fn run(args: &[String], provider: &dyn PipelineProvider) -> Result<ProofRece
     report.last_event_seq = progress.last_event_seq();
     report.last_completed_stage = Some("prove".into());
     let _ = report.write(&request.run_dir);
+    let _ = crate::report::write_metrics(&request.run_dir, &metrics);
     let _ = crate::report::write_profile(&request.run_dir);
     result
 }
