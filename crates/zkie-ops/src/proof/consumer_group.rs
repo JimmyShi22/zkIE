@@ -752,8 +752,15 @@ fn ceil_log2_u64(value: u64) -> u32 {
     }
 }
 
-fn mask_sample_row(
-    plan: &ConsumerGroupPlan,
+/// The mask-table sample row at one drawn seed: the eq coefficients over the
+/// mask cube, with the last entry scaled by beta, placed in the compact
+/// row-major table. The consumer group and the second own group share this
+/// one form.
+pub(crate) fn mask_sample_row_at(
+    oracle: u64,
+    group: u64,
+    mask_rows: u64,
+    mask_ell: u64,
     seed: &SampleSeed,
     bits: u32,
     target: Fp3,
@@ -761,8 +768,8 @@ fn mask_sample_row(
     if seed.z.len() < bits as usize || seed.beta == Fp3::ZERO {
         return Err(Error::ShapeMismatch);
     }
-    let ell = usize::try_from(plan.shapes.first_mask.ell).map_err(|_| Error::ResourceLimit)?;
-    let mask_rows = usize::try_from(plan.shapes.mask_rows).map_err(|_| Error::ResourceLimit)?;
+    let ell = usize::try_from(mask_ell).map_err(|_| Error::ResourceLimit)?;
+    let mask_rows = usize::try_from(mask_rows).map_err(|_| Error::ResourceLimit)?;
     let row_bits = ceil_log2_u64(mask_rows as u64);
     let stride = 1usize.checked_shl(row_bits).ok_or(Error::ResourceLimit)?;
     let point = &seed.z[..bits as usize];
@@ -782,13 +789,30 @@ fn mask_sample_row(
         mask[row * ell + place] = coefficient;
     }
     Ok(GuRelationRow {
-        oracle: plan.mask_oracle,
-        group: plan.group_id,
+        oracle,
+        group,
         kind: GuRelationKind::Sample,
         main: Vec::new(),
         mask,
         target,
     })
+}
+
+fn mask_sample_row(
+    plan: &ConsumerGroupPlan,
+    seed: &SampleSeed,
+    bits: u32,
+    target: Fp3,
+) -> Result<GuRelationRow> {
+    mask_sample_row_at(
+        plan.mask_oracle,
+        plan.group_id,
+        plan.shapes.mask_rows,
+        plan.shapes.first_mask.ell,
+        seed,
+        bits,
+        target,
+    )
 }
 
 fn sample_row(

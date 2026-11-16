@@ -16416,13 +16416,13 @@ pub(crate) struct SharedProveResult {
 }
 
 pub(crate) struct SharedWitness {
-    gu_message: Vec<Vec<Fp3>>,
-    gu_tails: Vec<Vec<Fp3>>,
-    omega_message: Vec<Fp3>,
-    omega_tails: Vec<Vec<Fp3>>,
-    omega_salts: Vec<Vec<u8>>,
+    pub(crate) gu_message: Vec<Vec<Fp3>>,
+    pub(crate) gu_tails: Vec<Vec<Fp3>>,
+    pub(crate) omega_message: Vec<Fp3>,
+    pub(crate) omega_tails: Vec<Vec<Fp3>>,
+    pub(crate) omega_salts: Vec<Vec<u8>>,
     /// The Omega tree's runtime opening count, shared with the second chain.
-    omega_opening: TreeOpeningCount,
+    pub(crate) omega_opening: TreeOpeningCount,
 }
 
 pub(crate) struct SharedPoints {
@@ -22446,7 +22446,7 @@ pub(crate) fn request_eval_row(
 /// The request's (Dot) row: the row weights against Omega plus the W at the
 /// shared point, against zero.
 #[allow(clippy::too_many_arguments)]
-fn request_dot_row(
+pub(crate) fn request_dot_row(
     omega: TableLayout,
     omega_columns: u64,
     omega_oracle: u64,
