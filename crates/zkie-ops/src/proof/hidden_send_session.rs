@@ -9924,7 +9924,7 @@ impl ProximityMemberProver {
 
 /// The public messages of one proximity test.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) pub(crate) struct ProximityMessages {
+pub(crate) struct ProximityMessages {
     fold_start: FoldStartMessage,
     fold_rounds: Vec<(Fp3, Fp3)>,
     tail: ProximityTail,
