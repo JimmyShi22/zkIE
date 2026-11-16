@@ -6,6 +6,7 @@ pub mod binding;
 pub mod column_session;
 pub mod committed_psc;
 pub mod consumer_psc;
+pub mod consumer_raw;
 pub mod consumer_request;
 pub mod cs_final_session;
 pub mod cs_multi_session;
