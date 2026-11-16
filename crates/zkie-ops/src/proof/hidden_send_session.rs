@@ -12995,6 +12995,36 @@ pub struct KeyProofParts {
     pub second: usize,
 }
 
+/// The private randomness of one key run: the master seed every run domain is
+/// derived from. Tests pass an explicit fixed seed; production draws the seed
+/// from the operating system generator. The seed is private: nothing here
+/// serializes it, logs it or returns it beside the proof.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyRunRandomness {
+    Fixed(Digest),
+    Private,
+}
+
+impl KeyRunRandomness {
+    /// The master seed of one run. The private variant samples fresh bytes
+    /// from the operating system generator; a zero draw is refused so every
+    /// domain derivation sees a real run seed.
+    pub fn seed(self) -> Result<Digest> {
+        let seed = match self {
+            Self::Fixed(seed) => seed,
+            Self::Private => {
+                let mut bytes = [0u8; 32];
+                getrandom::fill(&mut bytes).map_err(|_| Error::EntropyUnavailable)?;
+                Digest(bytes)
+            }
+        };
+        if seed == Digest::ZERO {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(seed)
+    }
+}
+
 /// Proves the complete key chain over the keeper and returns the public proof
 /// bytes. The keeper keeps the private material; nothing else is returned.
 #[allow(clippy::too_many_arguments)]
