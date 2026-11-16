@@ -1,0 +1,721 @@
+warning: unused variable: `number`
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1513:9
+     |
+1513 |         number: u32,
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_number`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:881:5
+    |
+881 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: field `target` is never read
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1118:5
+     |
+1112 | struct FoldOutputMeta {
+     |        -------------- field in this struct
+...
+1118 |     target: Fp3,
+     |     ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-engine` (lib) generated 4 warnings (run `cargo fix --lib -p zkie-engine` to apply 3 suggestions)
+warning: unused import: `MODULUS`
+   --> crates/zkie-ops/src/proof/bat_fold_session.rs:147:59
+    |
+147 | use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE, MODULUS};
+    |                                                           ^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `verify_last_base_proof_with_positions`
+  --> crates/zkie-ops/src/proof/multi_stage_iopp.rs:47:29
+   |
+47 |     encode_last_base_proof, verify_last_base_proof_with_positions, verify_last_base_proof_with_positions_and_chain, LastBaseProver,
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `PrimeCharacteristicRing`
+  --> crates/zkie-ops/src/proof/table_range.rs:26:32
+   |
+26 | use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+   |                                ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:603:13
+    |
+603 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reader`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:3073:5
+     |
+3073 |     reader: &IndexReader,
+     |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_reader`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `combinations`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:6736:17
+     |
+6736 |             let combinations = range_plan.combinations as usize;
+     |                 ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_combinations`
+
+warning: variable does not need to be mutable
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:11233:9
+      |
+11233 |     let mut chain = group_proof.chain;
+      |         ----^^^^^
+      |         |
+      |         help: remove this `mut`
+
+warning: unused variable: `plan`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:12833:5
+      |
+12833 |     plan: &KeyFirstPlan,
+      |     ^^^^ help: if this is intentional, prefix it with an underscore: `_plan`
+
+warning: unused variable: `bits_columns`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:22221:9
+      |
+22221 |     let bits_columns = planes
+      |         ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_bits_columns`
+
+warning: unused variable: `first`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:23761:5
+      |
+23761 |     first: &HiddenSendMessages,
+      |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_first`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:24567:9
+      |
+24567 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:24667:9
+      |
+24667 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: unused variable: `n`
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:218:9
+    |
+218 |     let n = word_n(word)?;
+    |         ^ help: if this is intentional, prefix it with an underscore: `_n`
+
+warning: value assigned to `serves_folded` is never read
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:2120:29
+     |
+2120 |     let mut serves_folded = false;
+     |                             ^^^^^ this value is reassigned later and never used
+...
+2159 |         serves_folded = folded_step.1;
+     |         ----------------------------- `serves_folded` is overwritten here before the previous value is read
+     |
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `serves_omega` is never read
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:2121:28
+     |
+2121 |     let mut serves_omega = false;
+     |                            ^^^^^ this value is reassigned later and never used
+...
+2160 |         serves_omega = omega_step.map_or(false, |step| step.1);
+     |         ------------------------------------------------------ `serves_omega` is overwritten here before the previous value is read
+
+warning: value assigned to `serves_own` is never read
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:2122:26
+     |
+2122 |     let mut serves_own = false;
+     |                          ^^^^^ this value is reassigned later and never used
+...
+2161 |         serves_own = own_step.1;
+     |         ----------------------- `serves_own` is overwritten here before the previous value is read
+
+warning: type `KeyFirstMessages` is more private than the item `encode_key_proof`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:12972:1
+      |
+12972 | / pub fn encode_key_proof(
+12973 | |     plan: &KeyFirstPlan,
+12974 | |     first: &KeyFirstMessages,
+12975 | |     shared: &HiddenSharedMessages,
+12976 | |     second: &KeySecondMessages,
+12977 | | ) -> Result<Vec<u8>> {
+      | |____________________^ function `encode_key_proof` is reachable at visibility `pub`
+      |
+note: but type `KeyFirstMessages` is only usable at visibility `pub(crate)`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:10921:1
+      |
+10921 | pub(crate) struct KeyFirstMessages {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+      = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `KeySecondMessages` is more private than the item `encode_key_proof`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:12972:1
+      |
+12972 | / pub fn encode_key_proof(
+12973 | |     plan: &KeyFirstPlan,
+12974 | |     first: &KeyFirstMessages,
+12975 | |     shared: &HiddenSharedMessages,
+12976 | |     second: &KeySecondMessages,
+12977 | | ) -> Result<Vec<u8>> {
+      | |____________________^ function `encode_key_proof` is reachable at visibility `pub`
+      |
+note: but type `KeySecondMessages` is only usable at visibility `pub(crate)`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:12182:1
+      |
+12182 | pub(crate) struct KeySecondMessages {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ProximityProof` is more private than the item `table_key_group_prove`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:13854:1
+      |
+13854 | / pub(crate) fn table_key_group_prove(
+13855 | |     chain: Chain,
+13856 | |     group: &TableKeyGroup<'_>,
+13857 | |     trees: Vec<(u64, Arc<RuntimeTree>)>,
+13858 | |     run_seed: Digest,
+13859 | | ) -> Result<ProximityProof> {
+      | |___________________________^ function `table_key_group_prove` is reachable at visibility `pub(crate)`
+      |
+note: but type `ProximityProof` is only usable at visibility `pub(self)`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:9992:1
+      |
+ 9992 | struct ProximityProof {
+      | ^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ProximityVerification` is more private than the item `table_key_group_verify`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:13885:1
+      |
+13885 | / pub(crate) fn table_key_group_verify(
+13886 | |     chain: Chain,
+13887 | |     group: &TableKeyGroup<'_>,
+13888 | |     messages: &ProximityMessages,
+13889 | | ) -> Result<ProximityVerification> {
+      | |__________________________________^ function `table_key_group_verify` is reachable at visibility `pub(crate)`
+      |
+note: but type `ProximityVerification` is only usable at visibility `pub(self)`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:9951:1
+      |
+ 9951 | struct ProximityVerification {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:201:5
+    |
+195 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+201 |     plan: RuntimeTreePlan,
+    |     ^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `stack_hiding` is never read
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:7456:5
+     |
+7454 | struct SegmentSlotLayout {
+     |        ----------------- field in this struct
+7455 |     token_hiding: usize,
+7456 |     stack_hiding: usize,
+     |     ^^^^^^^^^^^^
+
+warning: fields `lookup`, `member`, and `eval_row` are never read
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:10941:9
+      |
+10938 | pub(crate) struct KeyFirstWitness {
+      |                   --------------- fields in this struct
+...
+10941 |     pub lookup: KeyLookupProof,
+      |         ^^^^^^
+...
+10947 |     pub member: crate::proof::hidden_member::PendingRow,
+      |         ^^^^^^
+10948 |     pub eval_row: BatRow,
+      |         ^^^^^^^^
+
+warning: fields `samples` and `index_answer` are never read
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:10991:9
+      |
+10987 | pub(crate) struct KeyFirstVerified {
+      |                   ---------------- fields in this struct
+...
+10991 |     pub samples: [KeySample; 2],
+      |         ^^^^^^^
+...
+10994 |     pub index_answer: Fp3,
+      |         ^^^^^^^^^^^^
+
+warning: fields `omega`, `gu_seeds`, `gu_answers`, `claims`, and `base` are never read
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:11978:9
+      |
+11972 | pub(crate) struct KeySharedVerified {
+      |                   ----------------- fields in this struct
+...
+11978 |     pub omega: OmegaShapePlan,
+      |         ^^^^^
+11979 |     pub gu_root: Digest,
+11980 |     pub gu_seeds: Vec<zkie_engine::pcs::request::table::SampleSeed>,
+      |         ^^^^^^^^
+11981 |     pub gu_answers: Vec<Fp3>,
+      |         ^^^^^^^^^^
+...
+11987 |     pub claims: Vec<GuRelationRow>,
+      |         ^^^^^^
+11988 |     pub base: ProximityBaseOutcome,
+      |         ^^^^
+      |
+      = note: `KeySharedVerified` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: fields `w_seeds`, `w_answers`, `claims`, and `base` are never read
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:12196:9
+      |
+12194 | pub(crate) struct KeySecondVerified {
+      |                   ----------------- fields in this struct
+12195 |     pub seal: Digest,
+12196 |     pub w_seeds: Vec<SampleSeed>,
+      |         ^^^^^^^
+12197 |     pub w_answers: Vec<Fp3>,
+      |         ^^^^^^^^^
+12198 |     pub claims: Vec<GuRelationRow>,
+      |         ^^^^^^
+12199 |     pub base: ProximityBaseOutcome,
+      |         ^^^^
+      |
+      = note: `KeySecondVerified` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `derive_key_group_plan` is never used
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:13592:15
+      |
+13592 | pub(crate) fn derive_key_group_plan(
+      |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `m` is never read
+  --> crates/zkie-ops/src/proof/proximity_planner.rs:57:5
+   |
+52 | struct Proximity {
+   |        --------- field in this struct
+...
+57 |     m: u64,
+   |     ^
+   |
+   = note: `Proximity` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `batched_rows` is never used
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:2684:4
+     |
+2684 | fn batched_rows(word: &Word) -> u64 {
+     |    ^^^^^^^^^^^^
+
+warning: `zkie-ops` (lib) generated 29 warnings (run `cargo fix --lib -p zkie-ops` to apply 12 suggestions)
+warning: unused variable: `m`
+   --> models/gemma3/src/executor.rs:309:5
+    |
+309 |     m: usize,
+    |     ^ help: if this is intentional, prefix it with an underscore: `_m`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_rot_step`
+   --> models/gemma3/src/executor.rs:443:21
+    |
+443 |         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
+    |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_rot_step`
+
+warning: unused import: `zkie_engine::pcs::request::field::E_DEGREE`
+  --> models/gpt2/src/lm_head_plan.rs:11:5
+   |
+11 | use zkie_engine::pcs::request::field::E_DEGREE;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `CodeParams`
+  --> models/gpt2/src/plan.rs:10:56
+   |
+10 | use zkie_engine::pcs::request::code::{build_code_plan, CodeParams};
+   |                                                        ^^^^^^^^^^
+
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:405:21
+    |
+405 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+warning: `zkie-models-gpt2` (lib) generated 3 warnings (run `cargo fix --lib -p zkie-models-gpt2` to apply 3 suggestions)
+warning: unused import: `digest_to_hex`
+  --> zkie/src/policy.rs:12:58
+   |
+12 | use zkie_core::artifact::{digest_bytes, digest_from_hex, digest_to_hex};
+   |                                                          ^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `VecTableSource` and `commit_table_streaming`
+  --> zkie/src/lm_head_key.rs:58:5
+   |
+58 |     commit_table_streaming, verify_columns, ColumnOpening, IndexReader, IndexShape, SampleSeed,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+59 |     EncodedRowStore, StreamingHolder, TableRowSource, VecTableSource,
+   |                                                       ^^^^^^^^^^^^^^
+
+warning: unused import: `zkie_core::common::field::PrimeCharacteristicRing`
+  --> zkie/src/lm_head_key.rs:15:5
+   |
+15 | use zkie_core::common::field::PrimeCharacteristicRing;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> zkie/src/bounded_trace.rs:705:9
+    |
+705 |     let mut file = fs::File::open(path).map_err(|_| Error::IncompleteArtifact)?;
+    |         ----^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `mask_oracle`
+    --> zkie/src/lm_head_key.rs:3415:9
+     |
+3415 |     let mask_oracle = MaskOracle {
+     |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_oracle`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+    --> zkie/src/lm_head_key.rs:4281:9
+     |
+4281 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ----^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: unused variable: `mask_tail`
+    --> zkie/src/lm_head_key.rs:4281:9
+     |
+4281 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_tail`
+
+warning: variable does not need to be mutable
+   --> zkie/src/lm_head_stage.rs:288:9
+    |
+288 |     let mut options = if private {
+    |         ----^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: field `tree` is never read
+    --> zkie/src/lm_head_key.rs:1534:5
+     |
+1530 | pub struct LmHeadOmegaProvider {
+     |            ------------------- field in this struct
+...
+1534 |     tree: RuntimeTreePlan,
+     |     ^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie` (lib) generated 9 warnings (run `cargo fix --lib -p zkie` to apply 7 suggestions)
+   Compiling zkie v0.1.0 (/data/zkIE/zkie)
+    Finished `release` profile [optimized] target(s) in 0.39s
+     Running tests/key_chain_evidence.rs (target/release/deps/key_chain_evidence-1db284a7a7ff6486)
+
+running 1 test
+test the_complete_key_chain_over_the_registered_instance has been running for over 60 seconds
+PROBE first: claim id point=20 masks=2 hash=c294bc6a65433b5
+PROBE first: eval match=true psi=10 masks=2
+PROBE prox: enter members=3 sample_rows=3 plain=74 k=11 h=4 main=(18,16384,65) mask=(18,256,66) iopp=true
+PROBE prox: end ok d=256 mu=256 fresh=256
+PROBE prox: handoff ok k=11 h=4 main=(18,16384,65) mask=(18,256,66) main_claim=16384 mask_claim=256 fresh_claim=256 members=3 layout_members=3 gamma=11
+PROBE folded_tails: enter members=3 layout_members=3 fresh_tails=16 k=11 h=4 main_r=65 mask_r=66
+PROBE folded_tails: member[0] oracle=0 layout=(Some(2048),Some(0)) tails=2048 tail0=Some(65) mask_tails=0 mask_tail0=None main_code=(18,16384,65) mask_code=(18,256,66)
+PROBE folded_tails: member[1] oracle=1 layout=(Some(0),Some(8)) tails=0 tail0=None mask_tails=8 mask_tail0=Some(66) main_code=(18,16384,65) mask_code=(18,256,66)
+PROBE folded_tails: member[2] oracle=2 layout=(Some(0),Some(1)) tails=0 tail0=None mask_tails=1 mask_tail0=Some(66) main_code=(18,16384,65) mask_code=(18,256,66)
+PROBE folded_tails: fresh expected=Some(16) row0=Some(66)
+PROBE prox: tails ok main_tail=65 mask_tail=66 fresh_tail=66
+PROBE prox: fresh tree ok rows=16 log_n=18
+PROBE prox: member trees ok count=3 main_rows=[2048, 0, 0] mask_rows=[0, 8, 1]
+PROBE prox: private ok switches=2 stage_folds=1 stages=3
+PROBE prox: stage[0] main=(18,16384,65) mask=(18,256,66) k=11 h=4 positions=65 target_main_rows=0 target_mask_rows=0
+PROBE prox: stage[1] main=(14,1024,66) mask=(13,128,66) k=4 h=3 positions=66 target_main_rows=16 target_mask_rows=8
+PROBE prox: stage[2] main=(15,1024,53) mask=(15,512,53) k=0 h=0 positions=53 target_main_rows=1 target_mask_rows=1
+PROBE prox: switch[0] main_tails=16 main_tail0=Some(66) mask_tails=8 mask_tail0=Some(66)
+PROBE prox: switch[1] main_tails=1 main_tail0=Some(53) mask_tails=1 mask_tail0=Some(53)
+PROBE prox: iopp entry main=16384 masks=[256, 256] mask_tails=[66, 66] mask_claims=[256, 256] target_claim=16384
+PROBE iopp: entry stages=3 switches=2 stage_folds=1
+PROBE iopp: validate_stage_zero ok
+PROBE iopp: stage_zero_ids ok
+PROBE iopp: stage[1] start main=(14,1024,66) mask=(13,128,66) k=4 h=3 positions=66 target_main_rows=16 target_mask_rows=8 main_tails=16 mask_tails=8 pad_zero=false
+PROBE iopp: stage[1] prover ok main_rows=16 mask_rows=8 code=(14,1024,66)
+PROBE iopp: stage[1] session ok
+PROBE iopp: stage[1] declarations ok
+PROBE iopp: stage[1] answer ok
+PROBE iopp: stage[1] positions ok count=65
+PROBE iopp: stage[1] openings ok
+PROBE iopp: stage[1] authenticated main=16384 mask=1024
+PROBE iopp: stage[1] fold ok
+PROBE iopp: stage[2] start main=(15,1024,53) mask=(15,512,53) k=0 h=0 positions=53 target_main_rows=1 target_mask_rows=1 main_tails=1 mask_tails=1 pad_zero=false
+PROBE iopp: stage[2] prover ok main_rows=1 mask_rows=1 code=(15,1024,53)
+PROBE iopp: stage[2] session ok
+PROBE iopp: stage[2] declarations ok
+PROBE iopp: stage[2] answer ok
+PROBE iopp: stage[2] positions ok count=66
+PROBE iopp: stage[2] openings ok
+PROBE iopp: stage[2] authenticated main=1024 mask=512
+PROBE iopp: last base rows ok main=1024 main_tail=53 masks=[512] mask_tails=[53] mask_claims=[512]
+PROBE iopp: last base prover ok
+PROBE iopp: last base session ok
+PROBE iopp: last base openings ok
+PROBE first: group proof ok
+PROBE prove_key: first prove ok
+PROBE verify: lookup ok
+PROBE verify: claim id point=20 masks=2 hash=c294bc6a65433b5
+PROBE verify: w root ok
+PROBE verify: pending row ok point=10 masks=2 psi_match=true target_match=true
+PROBE verify: member point ok
+PROBE verify prox: bat ok
+PROBE verify prox: fold start ok
+PROBE verify prox: fold rounds ok k=11 h=4
+PROBE verify prox: fold output ok
+PROBE verify iopp: stage_zero ok
+PROBE verify iopp: stage sequence ok
+PROBE verify iopp: stage[1] declarations ok
+PROBE verify iopp: stage[1] answer ok
+PROBE verify iopp: stage[1] authenticated main=16384 mask=1024
+PROBE verify iopp: stage[1] fold ok
+PROBE verify iopp: stage[2] declarations ok
+PROBE verify iopp: stage[2] answer ok
+PROBE verify iopp: stage[2] authenticated main=1024 mask=512
+PROBE verify iopp: last rows ok main=1024 main_tail=53 masks=[512]
+PROBE verify iopp: last base session ok
+PROBE verify iopp: last base verify ok
+PROBE verify prox: iopp ok
+PROBE verify: group proximity ok
+PROBE verify: seal ok
+PROBE prove_key: first verify ok
+PROBE shared prove: pre shape_match=true config_match=true reader_root_match=true identity_match=Ok(true) keeper_root_match=true charge_columns=52 charge_expected=52 charge_table_match=true
+PROBE shared prove: enter shape_match=true config_match=true reader_root_match=true identity_match=Ok(true) keeper_root_match=true charge_columns=52 charge_table_match=true
+PROBE shared prove: charge ok
+PROBE shared prove: chain ok
+PROBE shared prove: stage ok draws=52 budget=52 base_positions=66 k_lo=0 matrix_rows=1024
+PROBE shared prove: iopp ok
+PROBE shared: entry draws=52 budget=52 base_positions=66
+PROBE shared: fold table ok folded=2048 tail=128
+PROBE shared: entry shapes index_match=true code_match=true answers=1 charge_columns=52 charge_table=true base_positions=66
+PROBE shared: gu commit ok rows=1
+PROBE shared: gu samples ok
+PROBE shared: columns drawn positions=52 unique=52
+PROBE shared: relation rows record=1 column=52
+PROBE shared: omega entry code_match=true k_lo_match=true rows_match=true matrix_rows=1024
+PROBE shared: omega commit ok rows=1 messages=1
+PROBE shared: proximity start members=2 samples=2 plain=54 k=1 h=0 base_positions=66
+PROBE prox: enter members=2 sample_rows=2 plain=54 k=1 h=0 main=(18,16384,130) mask=(18,256,66) iopp=true
+PROBE prox: end ok d=256 mu=256 fresh=256
+PROBE prox: handoff ok k=1 h=0 main=(18,16384,130) mask=(18,256,66) main_claim=16384 mask_claim=256 fresh_claim=256 members=2 layout_members=2 gamma=1
+PROBE folded_tails: enter members=2 layout_members=2 fresh_tails=1 k=1 h=0 main_r=130 mask_r=66
+PROBE folded_tails: member[0] oracle=0 layout=(Some(1),Some(0)) tails=1 tail0=Some(130) mask_tails=0 mask_tail0=None main_code=(18,16384,130) mask_code=(18,256,66)
+PROBE folded_tails: member[1] oracle=1 layout=(Some(1),Some(0)) tails=1 tail0=Some(130) mask_tails=0 mask_tail0=None main_code=(18,16384,130) mask_code=(18,256,66)
+PROBE folded_tails: fresh expected=Some(1) row0=Some(66)
+PROBE prox: tails ok main_tail=130 mask_tail=66 fresh_tail=66
+PROBE prox: fresh tree ok rows=1 log_n=18
+PROBE prox: member trees ok count=2 main_rows=[1, 1] mask_rows=[0, 0]
+PROBE prox: private ok switches=2 stage_folds=1 stages=3
+PROBE prox: stage[0] main=(18,16384,130) mask=(18,256,66) k=1 h=0 positions=65 target_main_rows=0 target_mask_rows=0
+PROBE prox: stage[1] main=(14,1024,71) mask=(12,256,71) k=4 h=2 positions=71 target_main_rows=16 target_mask_rows=4
+PROBE prox: stage[2] main=(14,1024,66) mask=(14,1024,66) k=0 h=0 positions=66 target_main_rows=1 target_mask_rows=1
+PROBE prox: switch[0] main_tails=16 main_tail0=Some(71) mask_tails=4 mask_tail0=Some(71)
+PROBE prox: switch[1] main_tails=1 main_tail0=Some(66) mask_tails=1 mask_tail0=Some(66)
+PROBE prox: iopp entry main=16384 masks=[256, 256] mask_tails=[66, 66] mask_claims=[256, 256] target_claim=16384
+PROBE iopp: entry stages=3 switches=2 stage_folds=1
+PROBE iopp: validate_stage_zero ok
+PROBE iopp: stage_zero_ids ok
+PROBE iopp: stage[1] start main=(14,1024,71) mask=(12,256,71) k=4 h=2 positions=71 target_main_rows=16 target_mask_rows=4 main_tails=16 mask_tails=4 pad_zero=false
+PROBE iopp: stage[1] prover ok main_rows=16 mask_rows=4 code=(14,1024,71)
+PROBE iopp: stage[1] session ok
+PROBE iopp: stage[1] declarations ok
+PROBE iopp: stage[1] answer ok
+PROBE iopp: stage[1] positions ok count=65
+PROBE iopp: stage[1] openings ok
+PROBE iopp: stage[1] authenticated main=16384 mask=1024
+PROBE iopp: stage[1] fold ok
+PROBE iopp: stage[2] start main=(14,1024,66) mask=(14,1024,66) k=0 h=0 positions=66 target_main_rows=1 target_mask_rows=1 main_tails=1 mask_tails=1 pad_zero=false
+PROBE iopp: stage[2] prover ok main_rows=1 mask_rows=1 code=(14,1024,66)
+PROBE iopp: stage[2] session ok
+PROBE iopp: stage[2] declarations ok
+PROBE iopp: stage[2] answer ok
+PROBE iopp: stage[2] positions ok count=71
+PROBE iopp: stage[2] openings ok
+PROBE iopp: stage[2] authenticated main=1024 mask=1024
+PROBE iopp: last base rows ok main=1024 main_tail=66 masks=[1024] mask_tails=[66] mask_claims=[1024]
+PROBE iopp: last base prover ok
+PROBE iopp: last base session ok
+PROBE iopp: last base openings ok
+PROBE shared: proximity ok
+PROBE prove_key: shared prove ok
+PROBE verify prox: bat ok
+PROBE verify prox: fold start ok
+PROBE verify prox: fold rounds ok k=1 h=0
+PROBE verify prox: fold output ok
+PROBE verify iopp: stage_zero ok
+PROBE verify iopp: stage sequence ok
+PROBE verify iopp: stage[1] declarations ok
+PROBE verify iopp: stage[1] answer ok
+PROBE verify iopp: stage[1] authenticated main=16384 mask=1024
+PROBE verify iopp: stage[1] fold ok
+PROBE verify iopp: stage[2] declarations ok
+PROBE verify iopp: stage[2] answer ok
+PROBE verify iopp: stage[2] authenticated main=1024 mask=1024
+PROBE verify iopp: last rows ok main=1024 main_tail=66 masks=[1024]
+PROBE verify iopp: last base session ok
+PROBE verify iopp: last base verify ok
+PROBE verify prox: iopp ok
+PROBE prove_key: shared verify ok
+PROBE prox: enter members=3 sample_rows=3 plain=2 k=1 h=0 main=(18,16384,130) mask=(18,256,66) iopp=true
+PROBE prox: end ok d=256 mu=256 fresh=256
+PROBE prox: handoff ok k=1 h=0 main=(18,16384,130) mask=(18,256,66) main_claim=16384 mask_claim=256 fresh_claim=256 members=3 layout_members=3 gamma=1
+PROBE folded_tails: enter members=3 layout_members=3 fresh_tails=1 k=1 h=0 main_r=130 mask_r=66
+PROBE folded_tails: member[0] oracle=0 layout=(Some(1),Some(0)) tails=1 tail0=Some(130) mask_tails=0 mask_tail0=None main_code=(18,16384,130) mask_code=(18,256,66)
+PROBE folded_tails: member[1] oracle=1 layout=(Some(1),Some(0)) tails=1 tail0=Some(130) mask_tails=0 mask_tail0=None main_code=(18,16384,130) mask_code=(18,256,66)
+PROBE folded_tails: member[2] oracle=2 layout=(Some(0),Some(1)) tails=0 tail0=None mask_tails=1 mask_tail0=Some(66) main_code=(18,16384,130) mask_code=(18,256,66)
+PROBE folded_tails: fresh expected=Some(1) row0=Some(66)
+PROBE prox: tails ok main_tail=130 mask_tail=66 fresh_tail=66
+PROBE prox: fresh tree ok rows=1 log_n=18
+PROBE prox: member trees ok count=3 main_rows=[1, 1, 0] mask_rows=[0, 0, 1]
+PROBE prox: private ok switches=2 stage_folds=1 stages=3
+PROBE prox: stage[0] main=(18,16384,130) mask=(18,256,66) k=1 h=0 positions=65 target_main_rows=0 target_mask_rows=0
+PROBE prox: stage[1] main=(14,1024,66) mask=(13,128,66) k=4 h=3 positions=66 target_main_rows=16 target_mask_rows=8
+PROBE prox: stage[2] main=(15,1024,53) mask=(15,512,53) k=0 h=0 positions=53 target_main_rows=1 target_mask_rows=1
+PROBE prox: switch[0] main_tails=16 main_tail0=Some(66) mask_tails=8 mask_tail0=Some(66)
+PROBE prox: switch[1] main_tails=1 main_tail0=Some(53) mask_tails=1 mask_tail0=Some(53)
+PROBE prox: iopp entry main=16384 masks=[256, 256] mask_tails=[66, 66] mask_claims=[256, 256] target_claim=16384
+PROBE iopp: entry stages=3 switches=2 stage_folds=1
+PROBE iopp: validate_stage_zero ok
+PROBE iopp: stage_zero_ids ok
+PROBE iopp: stage[1] start main=(14,1024,66) mask=(13,128,66) k=4 h=3 positions=66 target_main_rows=16 target_mask_rows=8 main_tails=16 mask_tails=8 pad_zero=false
+PROBE iopp: stage[1] prover ok main_rows=16 mask_rows=8 code=(14,1024,66)
+PROBE iopp: stage[1] session ok
+PROBE iopp: stage[1] declarations ok
+PROBE iopp: stage[1] answer ok
+PROBE iopp: stage[1] positions ok count=65
+PROBE iopp: stage[1] openings ok
+PROBE iopp: stage[1] authenticated main=16384 mask=1024
+PROBE iopp: stage[1] fold ok
+PROBE iopp: stage[2] start main=(15,1024,53) mask=(15,512,53) k=0 h=0 positions=53 target_main_rows=1 target_mask_rows=1 main_tails=1 mask_tails=1 pad_zero=false
+PROBE iopp: stage[2] prover ok main_rows=1 mask_rows=1 code=(15,1024,53)
+PROBE iopp: stage[2] session ok
+PROBE iopp: stage[2] declarations ok
+PROBE iopp: stage[2] answer ok
+PROBE iopp: stage[2] positions ok count=66
+PROBE iopp: stage[2] openings ok
+PROBE iopp: stage[2] authenticated main=1024 mask=512
+PROBE iopp: last base rows ok main=1024 main_tail=53 masks=[512] mask_tails=[53] mask_claims=[512]
+PROBE iopp: last base prover ok
+PROBE iopp: last base session ok
+PROBE iopp: last base openings ok
+PROBE prove_key: second prove ok
+PROBE verify: lookup ok
+PROBE verify: claim id point=20 masks=2 hash=c294bc6a65433b5
+PROBE verify: w root ok
+PROBE verify: pending row ok point=10 masks=2 psi_match=true target_match=true
+PROBE verify: member point ok
+PROBE verify prox: bat ok
+PROBE verify prox: fold start ok
+PROBE verify prox: fold rounds ok k=11 h=4
+PROBE verify prox: fold output ok
+PROBE verify iopp: stage_zero ok
+PROBE verify iopp: stage sequence ok
+PROBE verify iopp: stage[1] declarations ok
+PROBE verify iopp: stage[1] answer ok
+PROBE verify iopp: stage[1] authenticated main=16384 mask=1024
+PROBE verify iopp: stage[1] fold ok
+PROBE verify iopp: stage[2] declarations ok
+PROBE verify iopp: stage[2] answer ok
+PROBE verify iopp: stage[2] authenticated main=1024 mask=512
+PROBE verify iopp: last rows ok main=1024 main_tail=53 masks=[512]
+PROBE verify iopp: last base session ok
+PROBE verify iopp: last base verify ok
+PROBE verify prox: iopp ok
+PROBE verify: group proximity ok
+PROBE verify: seal ok
+PROBE verify prox: bat ok
+PROBE verify prox: fold start ok
+PROBE verify prox: fold rounds ok k=1 h=0
+PROBE verify prox: fold output ok
+PROBE verify iopp: stage_zero ok
+PROBE verify iopp: stage sequence ok
+PROBE verify iopp: stage[1] declarations ok
+PROBE verify iopp: stage[1] answer ok
+PROBE verify iopp: stage[1] authenticated main=16384 mask=1024
+PROBE verify iopp: stage[1] fold ok
+PROBE verify iopp: stage[2] declarations ok
+PROBE verify iopp: stage[2] answer ok
+PROBE verify iopp: stage[2] authenticated main=1024 mask=1024
+PROBE verify iopp: last rows ok main=1024 main_tail=66 masks=[1024]
+PROBE verify iopp: last base session ok
+PROBE verify iopp: last base verify ok
+PROBE verify prox: iopp ok
+PROBE verify prox: bat ok
+PROBE verify prox: fold start ok
+PROBE verify prox: fold rounds ok k=1 h=0
+PROBE verify prox: fold output ok
+PROBE verify iopp: stage_zero ok
+PROBE verify iopp: stage sequence ok
+PROBE verify iopp: stage[1] declarations ok
+PROBE verify iopp: stage[1] answer ok
+PROBE verify iopp: stage[1] authenticated main=16384 mask=1024
+PROBE verify iopp: stage[1] fold ok
+PROBE verify iopp: stage[2] declarations ok
+PROBE verify iopp: stage[2] answer ok
+PROBE verify iopp: stage[2] authenticated main=1024 mask=512
+PROBE verify iopp: last rows ok main=1024 main_tail=53 masks=[512]
+PROBE verify iopp: last base session ok
+PROBE verify iopp: last base verify ok
+PROBE verify prox: iopp ok
+PROBE verify: lookup ok
+PROBE verify: claim id point=20 masks=2 hash=c294bc6a65433b5
+PROBE verify: w root ok
+PROBE verify: pending row ok point=10 masks=2 psi_match=true target_match=true
+PROBE verify: member point ok
+PROBE verify prox: bat ok
+PROBE verify prox: fold start ok
+PROBE verify prox: fold rounds ok k=11 h=4
+PROBE verify prox: fold output ok
+PROBE verify iopp: stage_zero ok
+PROBE verify iopp: stage sequence ok
+PROBE verify iopp: stage[1] declarations ok
+PROBE verify iopp: stage[1] answer ok
+PROBE verify iopp: stage[1] authenticated main=16384 mask=1024
+PROBE verify iopp: stage[1] fold ok
+PROBE verify iopp: stage[2] declarations ok
+PROBE verify iopp: stage[2] answer ok
+PROBE verify iopp: stage[2] authenticated main=1024 mask=512
+PROBE verify iopp: last rows ok main=1024 main_tail=53 masks=[512]
+PROBE verify iopp: last base session ok
+PROBE verify iopp: last base verify ok
+PROBE verify prox: iopp ok
+PROBE verify: group proximity ok
+PROBE verify: seal ok
+KEY CHAIN EVIDENCE {"plan_digest":"e432b62e56fd613616b2f7ad2b9633508aeb672417b3721a2abcf7fc7ca118e1","table_identity":"06f285b7a896f549a9a685ef637eca9a273e1c3d21e26586a932b7a99689e2fa","table_root":"b23748a2fd1adce9c55e9e1b194186fe3574652368a5575f645ca35b8ba49088","proof_bytes":4549416,"first_bytes":3551120,"shared_bytes":712200,"second_bytes":286064,"prove_ms":189230,"verify_ms":59403,"vmhwm_prove_kib":35430220,"vmhwm_verify_kib":35430220,"ledger_before":0,"ledger_after":52,"summary":KeyPlanSummary { plan_digest: Digest([228, 50, 182, 46, 86, 253, 97, 54, 22, 178, 247, 173, 43, 150, 51, 80, 138, 235, 103, 36, 23, 179, 114, 26, 42, 188, 247, 252, 124, 161, 24, 225]), table_identity: Digest([6, 242, 133, 183, 168, 150, 245, 73, 169, 166, 133, 239, 99, 126, 202, 154, 39, 62, 28, 61, 33, 226, 101, 134, 169, 50, 183, 169, 150, 137, 226, 250]), table_configuration: Digest([144, 23, 221, 26, 201, 82, 146, 97, 34, 85, 56, 31, 96, 195, 64, 11, 206, 22, 116, 66, 94, 4, 60, 183, 10, 171, 145, 94, 157, 245, 36, 223]), matrix_rows: 1024, k_lo: 0, columns: 1024, shared_code: CodeParams { log_n: 18, ell: 16384, r: 130 }, shared_mask_code: CodeParams { log_n: 18, ell: 256, r: 66 }, own_code: CodeParams { log_n: 18, ell: 16384, r: 130 }, own_mask_code: CodeParams { log_n: 18, ell: 256, r: 66 }, shared_stages: 3, own_stages: 3, shared_base_positions: 66, own_base_positions: 53, index_rows: 1, lookup_bits_oracle: 21, lookup_mask_oracle: 22, w_oracle: 20, index_oracle: 60, group: 7, bits_bat: 0, mask_bat: 1, index_bat: 2, group_fresh: 3, group_mask_tree: 204, shared_fresh: 2, shared_mask_tree: 200, own_fresh: 8, own_mask_tree: 201, gu_oracle: 10, omega_oracle: 11, column_draws: 52, column_budget: 52 }}
+test the_complete_key_chain_over_the_registered_instance ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 280.47s
+
