@@ -1,0 +1,8 @@
+case gpt2-seq16
+commit 3882 ms
+prove 34605 ms
+verify 17188 ms
+trace bytes 1887836942
+statement bytes 214
+consumer proof bytes 2306616
+accepted; six negatives refused
