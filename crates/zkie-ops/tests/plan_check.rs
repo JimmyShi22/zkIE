@@ -2189,3 +2189,188 @@ fn shared_softmax_table_replacement_is_rejected_by_the_relation() {
         .to_owned();
     assert_eq!(code, "invalid_proof");
 }
+
+/// A two-step production-form fixture: an activation step and one consumer
+/// step whose weight input is the consumer-authenticated asset. The trace can
+/// be built with or without the old asset opening, and the plan with or
+/// without the consumer promotion.
+#[allow(clippy::too_many_arguments)]
+fn consumer_trace_fixture(
+    opcode: OpCode,
+    layout: PlanLayout,
+    with_opening: bool,
+    consumer_source: bool,
+    promote: bool,
+) -> Fixture {
+    let root = temp_dir();
+    write_i32(&root.join("table_i32.bin"), &[1, 2, 3, 4]);
+    let specs = vec![ModelAssetSpec {
+        asset_id: 0,
+        path: "table_i32.bin".into(),
+        element_count: 4,
+        row_width: 2,
+        encoding: "i32-le".into(),
+    }];
+    let commitment = commit_assets(&root, Digest([1; 32]), Digest([2; 32]), &specs).unwrap();
+    let public = ModelCommitmentPublic::from_commitment(&commitment);
+    let mut assets = AssetStore::open(&commitment).unwrap().open_all().unwrap();
+    if !with_opening {
+        assets.clear();
+    }
+    let tokens = vec![1u32];
+    let token_values: Vec<i64> = tokens.iter().map(|value| *value as i64).collect();
+    let (embed_step, embed_out) = make_step(
+        &EmbeddingIndexOp { hidden: 2, vocab: 4 },
+        &[token_values],
+        &[2, 4],
+        &[],
+        vec![None],
+        vec![None],
+    );
+    let matrix = vec![1, 2, 2, 16, 0];
+    let weight = vec![1, 2, 3, 4];
+    let sources = vec![Some((0, 0)), None];
+    let (consumer_step, consumer_out) = match opcode {
+        OpCode::Projection => {
+            let op = zkie_ops::projection::ProjectionOp {
+                m: 1,
+                n: 2,
+                k: 2,
+                shift: 16,
+                bias: None,
+            };
+            make_step(
+                &op,
+                &[embed_out[0].clone(), weight],
+                &matrix,
+                &[],
+                vec![None, None],
+                sources,
+            )
+        }
+        OpCode::MatMul => {
+            let op = zkie_ops::matmul::MatMulOp {
+                m: 1,
+                n: 2,
+                k: 2,
+                shift: 16,
+            };
+            make_step(
+                &op,
+                &[embed_out[0].clone(), weight],
+                &matrix,
+                &[],
+                vec![None, None],
+                sources,
+            )
+        }
+        _ => unreachable!(),
+    };
+    let trace = SharedTrace {
+        tokens: tokens.clone(),
+        assets,
+        steps: vec![embed_step, consumer_step],
+        argmax: Vec::new(),
+        output: consumer_out[0].clone(),
+    };
+    let mut builder = PlanBuilder::new();
+    let embed = builder.step(
+        OpCode::EmbeddingIndex,
+        config(vec![2, 4]),
+        vec![PlanSource::Constant(PlanConstant::Tokens)],
+        1,
+    );
+    let weight_source = if consumer_source {
+        PlanSource::consumer_asset_slice("table_i32.bin", layout)
+    } else {
+        PlanSource::asset_slice("table_i32.bin", layout)
+    };
+    let consumer = builder.step(
+        opcode,
+        config(vec![1, 2, 2, 16, 0]),
+        vec![PlanSource::prev(embed, 0), weight_source],
+        1,
+    );
+    builder.final_output(consumer, 0);
+    let mut plan = builder.finish();
+    if promote {
+        zkie_ops::proof::plan::promote_consumer_assets(&mut plan, &["table_i32.bin"]).unwrap();
+    }
+    Fixture {
+        public,
+        trace,
+        tokens,
+        plan,
+    }
+}
+
+#[test]
+fn consumer_asset_input_needs_no_trace_opening() {
+    let fixture = consumer_trace_fixture(
+        OpCode::Projection,
+        PlanLayout::columns(2, 0, 2),
+        false,
+        false,
+        true,
+    );
+    let output = zkie_ops::proof::model_commitment::verify_shared_trace_output(
+        &fixture.public,
+        &fixture.trace,
+        &fixture.tokens,
+        &fixture.plan,
+        None,
+    )
+    .unwrap();
+    assert_eq!(output, fixture.trace.output);
+}
+
+#[test]
+fn residual_consumer_asset_opening_is_rejected() {
+    let fixture = consumer_trace_fixture(
+        OpCode::Projection,
+        PlanLayout::columns(2, 0, 2),
+        true,
+        false,
+        true,
+    );
+    assert_eq!(rejection_code(&fixture), "statement_mismatch");
+}
+
+#[test]
+fn prover_supplied_consumer_opening_is_rejected() {
+    let mut fixture = consumer_trace_fixture(
+        OpCode::Projection,
+        PlanLayout::columns(2, 0, 2),
+        false,
+        false,
+        true,
+    );
+    fixture.trace.steps[1].external[1] = Some(0);
+    assert_eq!(rejection_code(&fixture), "statement_mismatch");
+}
+
+#[test]
+fn consumer_source_in_a_non_projection_step_is_rejected() {
+    let fixture =
+        consumer_trace_fixture(OpCode::MatMul, PlanLayout::columns(2, 0, 2), false, false, true);
+    assert_eq!(rejection_code(&fixture), "invalid_config");
+}
+
+#[test]
+fn consumer_source_requires_the_columns_form() {
+    let fixture =
+        consumer_trace_fixture(OpCode::Projection, PlanLayout::Flat, false, true, false);
+    assert_eq!(rejection_code(&fixture), "invalid_config");
+}
+
+#[test]
+fn unpromoted_asset_source_needs_its_opening() {
+    let fixture = consumer_trace_fixture(
+        OpCode::Projection,
+        PlanLayout::columns(2, 0, 2),
+        false,
+        false,
+        false,
+    );
+    assert_eq!(rejection_code(&fixture), "statement_mismatch");
+}

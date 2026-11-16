@@ -242,23 +242,23 @@ impl ConsumerObligation {
             }
             _ => return Err(Error::InvalidConfig),
         }
-        let (path, places, start, count) = match &step.inputs[1] {
-            PlanSource::Asset {
-                path,
-                layout:
-                    PlanLayout::Columns {
-                        row_width,
-                        start,
-                        count,
-                    },
-            } => (
-                path,
-                u64::try_from(*row_width).map_err(|_| Error::InvalidConfig)?,
-                u64::try_from(*start).map_err(|_| Error::InvalidConfig)?,
-                u64::try_from(*count).map_err(|_| Error::InvalidConfig)?,
-            ),
+        let (path, layout) = match &step.inputs[1] {
+            PlanSource::Asset { path, layout } | PlanSource::ConsumerAsset { path, layout } => {
+                (path, layout)
+            }
             _ => return Err(Error::InvalidConfig),
         };
+        let PlanLayout::Columns {
+            row_width,
+            start,
+            count,
+        } = layout
+        else {
+            return Err(Error::InvalidConfig);
+        };
+        let places = u64::try_from(*row_width).map_err(|_| Error::InvalidConfig)?;
+        let start = u64::try_from(*start).map_err(|_| Error::InvalidConfig)?;
+        let count = u64::try_from(*count).map_err(|_| Error::InvalidConfig)?;
         if path != &table.path || count != head_width || head_width == 0 {
             return Err(Error::InvalidConfig);
         }

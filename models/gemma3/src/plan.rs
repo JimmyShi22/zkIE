@@ -533,7 +533,9 @@ mod tests {
 
     fn asset_paths(source: &PlanSource, out: &mut Vec<String>) {
         match source {
-            PlanSource::Asset { path, .. } => out.push(path.clone()),
+            PlanSource::Asset { path, .. } | PlanSource::ConsumerAsset { path, .. } => {
+                out.push(path.clone())
+            }
             PlanSource::PublicTable { table, .. } => out.push(table.locator.clone()),
             PlanSource::Concat(parts) | PlanSource::HeadConcat { parts, .. } => {
                 for part in parts {

@@ -260,18 +260,21 @@ fn registered_steps(plan: &TracePlan, table: &ConsumerTableBinding) -> Result<Ve
         if step.opcode != OpCode::Projection || step.config.len() != 5 || step.inputs.len() != 2 {
             continue;
         }
-        let (path, row_width, start, count) = match &step.inputs[1] {
-            PlanSource::Asset {
-                path,
-                layout:
-                    PlanLayout::Columns {
-                        row_width,
-                        start,
-                        count,
-                    },
-            } => (path, *row_width, *start, *count),
+        let (path, layout) = match &step.inputs[1] {
+            PlanSource::Asset { path, layout } | PlanSource::ConsumerAsset { path, layout } => {
+                (path, layout)
+            }
             _ => continue,
         };
+        let PlanLayout::Columns {
+            row_width,
+            start,
+            count,
+        } = layout
+        else {
+            continue;
+        };
+        let (row_width, start, count) = (*row_width, *start, *count);
         if path != &table.path {
             continue;
         }

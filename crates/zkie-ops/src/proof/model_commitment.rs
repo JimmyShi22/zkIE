@@ -1013,6 +1013,29 @@ fn verify_shared_trace_steps(
         .assets
         .par_iter()
         .try_for_each(|opening| public.verify_opening(opening))?;
+    // A consumer-authenticated asset has no trace opening: its values come from
+    // the request consumer chain over the committed table. Any residual opening
+    // for such an asset is refused, so the old proof carrier form cannot
+    // coexist with the deferred form.
+    let consumer_paths = crate::proof::plan::consumer_asset_paths(plan);
+    if !consumer_paths.is_empty() {
+        let consumer_ids: BTreeSet<u64> = public
+            .assets
+            .iter()
+            .filter(|asset| consumer_paths.contains(asset.path.as_str()))
+            .map(|asset| asset.asset_id)
+            .collect();
+        if consumer_ids.len() != consumer_paths.len() {
+            return Err(Error::AssetMismatch);
+        }
+        if trace
+            .assets
+            .iter()
+            .any(|opening| consumer_ids.contains(&opening.asset_id))
+        {
+            return Err(Error::StatementMismatch);
+        }
+    }
     let mut outputs: Vec<Vec<Vec<i64>>> = Vec::with_capacity(trace.steps.len());
     let assets = crate::proof::plan::AssetView::new(public, trace, plan, public_root);
     for (step_index, step) in trace.steps.iter().enumerate() {
@@ -1058,21 +1081,29 @@ fn verify_shared_trace_steps(
             output_oracles,
         };
         crate::proof::plan::check_shared_input_form(step)?;
-        let materialized = crate::proof::plan::verify_step(
+        match crate::proof::plan::verify_step(
             step,
             plan_step,
             &outputs,
             &assets,
             expected_tokens,
-        )?;
-        let external_values: Vec<Option<Vec<i64>>> =
-            materialized.into_iter().map(Some).collect();
-        crate::proof::relations::verify_op_relation_shared_with_external(
-            &public_relation,
-            &step.message.proof,
-            &step.message.config,
-            &external_values,
-        )?;
+        )? {
+            crate::proof::plan::StepVerification::Materialized(materialized) => {
+                let external_values: Vec<Option<Vec<i64>>> =
+                    materialized.into_iter().map(Some).collect();
+                crate::proof::relations::verify_op_relation_shared_with_external(
+                    &public_relation,
+                    &step.message.proof,
+                    &step.message.config,
+                    &external_values,
+                )?;
+            }
+            crate::proof::plan::StepVerification::ConsumerDeferred => {
+                // The request consumer chain closes this step's operator
+                // relation over the committed table; the caller must verify
+                // that chain before accepting anything built on these outputs.
+            }
+        }
         outputs.push(crate::proof::relations::proof_output_values(&step.message.proof)?);
     }
     crate::proof::plan::verify_outputs(trace, plan, &outputs, &assets)?;

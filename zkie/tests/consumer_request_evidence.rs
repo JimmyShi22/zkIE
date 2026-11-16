@@ -9,9 +9,11 @@
 //! consumer witness from the executed trace and writes the request proof file
 //! beside the proof artifact; verify rebuilds the request plans from the
 //! trusted model plan and the verified trace outputs and runs the first,
-//! shared and second stages before it accepts. The negatives tamper the
-//! auxiliary file and the key bundle and require the production verify entry
-//! to refuse.
+//! shared and second stages before it accepts. The trace carries no opening
+//! for the consumer-authenticated weight: the consumer chain is its actual
+//! proof, and a residual opening or a changed deferred output is refused. The
+//! negatives tamper the auxiliary file, the trace and the key bundle and
+//! require the production verify entry to refuse.
 
 use std::fs;
 use std::io::Write;
@@ -29,8 +31,10 @@ use zkie_ops::pipeline::{
 };
 use zkie_engine::artifact::load_manifest;
 use zkie_ops::proof::asset_key::ASSET_KEY_BUNDLE;
+use zkie_ops::proof::asset_table::decode_asset_table_randomness_set;
 use zkie_ops::proof::consumer_proof::{ConsumerProofFile, CONSUMER_PROOF_FILE};
-use zkie_ops::proof::model_commitment::ModelCommitmentPublic;
+use zkie_ops::proof::model_commitment::{AssetStore, ModelCommitmentPublic, SharedTrace};
+use zkie_ops::proof::plan::PlanSource;
 
 struct Quiet;
 
@@ -311,8 +315,68 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
     let (hwm_after_verify, _) = memory_kib();
     assert!(accepted, "the request with its consumer chain is accepted");
 
+    // The trace carries no opening for the consumer-authenticated weight. The
+    // opening is rebuilt from the same commit to record the exact bytes the
+    // deletion removed, so the before/after comparison stays on one basis.
+    let trace_file_bytes = fs::read(proof_dir.join("proof.bin")).unwrap();
+    let trace: SharedTrace = bincode::deserialize(&trace_file_bytes).unwrap();
+    let consumer_path = "gpt2/weights/L0_k_w_i32.bin";
+    let consumer_meta = public
+        .assets
+        .iter()
+        .find(|asset| asset.path == consumer_path)
+        .unwrap();
+    assert!(
+        !trace
+            .assets
+            .iter()
+            .any(|opening| opening.asset_id == consumer_meta.asset_id),
+        "the trace carries no opening for the consumer asset"
+    );
+    let table_params = zkie_models_gpt2::plan::asset_table_params().unwrap();
+    let randomness_bytes =
+        fs::read(commit_dir.join("private/asset-table-randomness.bin")).unwrap();
+    let tables = decode_asset_table_randomness_set(&randomness_bytes, &table_params).unwrap();
+    let commitment = zkie_models_gpt2::executor::build_commitment(
+        Path::new(&config.asset_root),
+        &config.tokens,
+        &tables,
+    )
+    .unwrap();
+    assert_eq!(
+        trace.assets.len(),
+        commitment.assets.len()
+            - zkie_models_gpt2::plan::public_table_paths().len()
+            - zkie_models_gpt2::plan::consumer_asset_paths().len(),
+        "the trace omits exactly the public tables and the consumer asset"
+    );
+    let consumer_index = commitment
+        .assets
+        .iter()
+        .position(|asset| asset.path == consumer_path)
+        .unwrap();
+    let removed_opening = AssetStore::open(&commitment)
+        .unwrap()
+        .open_asset(consumer_index)
+        .unwrap();
+    let removed_opening_bytes = bincode::serialize(&removed_opening).unwrap().len() as u64;
+    let deferred: Vec<usize> = zkie_models_gpt2::plan::trace_plan_public(config.tokens.len())
+        .unwrap()
+        .steps
+        .iter()
+        .enumerate()
+        .filter(|(_, step)| {
+            step.inputs
+                .iter()
+                .any(|source| matches!(source, PlanSource::ConsumerAsset { .. }))
+        })
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(deferred.len(), 12, "twelve deferred projection steps");
+
     // Negatives: the production verify entry refuses a missing or changed
-    // auxiliary file before it can report an accepted request.
+    // auxiliary file, a residual opening and a changed deferred output before
+    // it can report an accepted request.
     let broken = run.join("broken");
     fs::create_dir_all(&broken).unwrap();
 
@@ -383,6 +447,47 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
         "a changed container byte is refused"
     );
 
+    // Deletion negatives: the removed opening put back into the trace, and one
+    // deferred step's output changed. Each proof file is rewritten with an
+    // internally consistent manifest, so the refusal comes from the trace and
+    // consumer checks, not from the container digest.
+    let mut residual = trace.clone();
+    residual.assets.push(removed_opening);
+    let residual_bytes = bincode::serialize(&residual).unwrap();
+    let dir = broken.join("residual-opening");
+    copy_proof(&proof_dir, &dir);
+    rewrite_manifest_file(&dir, "proof.bin", &residual_bytes);
+    assert!(
+        verify_dir(&provider, &policy, &dir, &commit_dir, &config.model).is_err(),
+        "a residual consumer asset opening is refused"
+    );
+
+    // The same residue with a changed row is refused as well, so neither a
+    // valid nor a tampered leftover opening can re-enter the proof.
+    residual.assets.last_mut().unwrap().rows[0].values[0] ^= 1;
+    let tampered_residual_bytes = bincode::serialize(&residual).unwrap();
+    let dir = broken.join("residual-opening-row");
+    copy_proof(&proof_dir, &dir);
+    rewrite_manifest_file(&dir, "proof.bin", &tampered_residual_bytes);
+    assert!(
+        verify_dir(&provider, &policy, &dir, &commit_dir, &config.model).is_err(),
+        "a tampered residual consumer asset opening is refused"
+    );
+
+    let mut changed_trace = trace.clone();
+    let opening = changed_trace.steps[deferred[0]].message.proof.outputs[0]
+        .first_mut()
+        .unwrap();
+    opening.values[0] ^= 1;
+    let changed_bytes = bincode::serialize(&changed_trace).unwrap();
+    let dir = broken.join("deferred-output");
+    copy_proof(&proof_dir, &dir);
+    rewrite_manifest_file(&dir, "proof.bin", &changed_bytes);
+    assert!(
+        verify_dir(&provider, &policy, &dir, &commit_dir, &config.model).is_err(),
+        "a changed deferred output is refused by the consumer chain"
+    );
+
     // Qualification negatives: a missing key bundle and a byte-changed key
     // bundle whose commit manifest is internally consistent. Both are refused
     // by the production verify entry.
@@ -402,12 +507,15 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
     assert!(refused, "a changed key bundle is refused");
 
     let evidence = format!(
-        "{{\n  \"case\": \"{}\",\n  \"commit_ms\": {},\n  \"prove_ms\": {},\n  \"verify_ms\": {},\n  \"trace_bytes\": {},\n  \"statement_bytes\": {},\n  \"consumer_proof_bytes\": {},\n  \"key_prove_ms\": {},\n  \"key_commit_verify_ms\": {},\n  \"key_request_verify_ms\": {},\n  \"key_file_bytes\": {},\n  \"vmhwm_after_prove_kib\": {},\n  \"vmhwm_after_verify_kib\": {},\n  \"accepted\": true,\n  \"negatives\": 8\n}}\n",
+        "{{\n  \"case\": \"{}\",\n  \"commit_ms\": {},\n  \"prove_ms\": {},\n  \"verify_ms\": {},\n  \"trace_bytes\": {},\n  \"trace_assets\": {},\n  \"removed_opening_bytes\": {},\n  \"trace_with_opening_bytes\": {},\n  \"statement_bytes\": {},\n  \"consumer_proof_bytes\": {},\n  \"key_prove_ms\": {},\n  \"key_commit_verify_ms\": {},\n  \"key_request_verify_ms\": {},\n  \"key_file_bytes\": {},\n  \"vmhwm_after_prove_kib\": {},\n  \"vmhwm_after_verify_kib\": {},\n  \"accepted\": true,\n  \"negatives\": 11\n}}\n",
         config.case_id,
         commit_ms,
         prove_ms,
         verify_ms,
         trace_bytes,
+        trace.assets.len(),
+        removed_opening_bytes,
+        trace_bytes + removed_opening_bytes,
         statement_bytes,
         sidecar_bytes,
         key_prove_ms,
@@ -423,9 +531,9 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
     writeln!(log, "commit {} ms", commit_ms).unwrap();
     writeln!(log, "prove {} ms", prove_ms).unwrap();
     writeln!(log, "verify {} ms", verify_ms).unwrap();
-    writeln!(log, "trace bytes {}", trace_bytes).unwrap();
+    writeln!(log, "trace bytes {} ({} assets; {} bytes of the consumer opening removed; with opening {})", trace_bytes, trace.assets.len(), removed_opening_bytes, trace_bytes + removed_opening_bytes).unwrap();
     writeln!(log, "statement bytes {}", statement_bytes).unwrap();
     writeln!(log, "consumer proof bytes {}", sidecar_bytes).unwrap();
     writeln!(log, "key prove {} ms, commit verify {} ms, request verify {} ms, file {} bytes", key_prove_ms, key_commit_verify_ms, key_request_verify_ms, key_file_bytes).unwrap();
-    writeln!(log, "accepted; eight negatives refused").unwrap();
+    writeln!(log, "accepted; eleven negatives refused").unwrap();
 }

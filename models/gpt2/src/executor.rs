@@ -108,9 +108,16 @@ impl<'a> Assets<'a> {
     fn load(commitment: &'a ModelCommitment, public_tables: bool) -> Result<Self> {
         let store = AssetStore::open(commitment)?;
         let public_paths = crate::plan::public_table_paths();
+        let consumer_paths = crate::plan::consumer_asset_paths();
         let mut trace_assets = Vec::with_capacity(commitment.assets.len());
         for (index, asset) in commitment.assets.iter().enumerate() {
-            if public_tables && public_paths.contains(&asset.path.as_str()) {
+            // The production trace carries no opening for a public table and
+            // none for a consumer-authenticated asset: both values are supplied
+            // by their own trusted sources.
+            if public_tables
+                && (public_paths.contains(&asset.path.as_str())
+                    || consumer_paths.contains(&asset.path.as_str()))
+            {
                 continue;
             }
             trace_assets.push(store.open_asset(index)?);
@@ -307,16 +314,6 @@ pub fn execute_shared_with_progress(
     progress: Option<&dyn ProgressSink>,
 ) -> Result<SharedTrace> {
     execute_shared_inner(commitment, tokens, progress, false, None).map(|(trace, _)| trace)
-}
-
-/// The production trace: the migrated public tables are not carried as trace
-/// assets and their inputs take no external pool.
-pub fn execute_shared_with_progress_public(
-    commitment: &ModelCommitment,
-    tokens: &[i64],
-    progress: Option<&dyn ProgressSink>,
-) -> Result<SharedTrace> {
-    execute_shared_inner(commitment, tokens, progress, true, None).map(|(trace, _)| trace)
 }
 
 /// The production trace together with the request's consumer proof over the

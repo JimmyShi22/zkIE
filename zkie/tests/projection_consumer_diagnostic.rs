@@ -148,7 +148,10 @@ fn projection_consumers(
         if step.opcode != OpCode::Projection {
             continue;
         }
-        let Some(PlanSource::Asset { path, .. }) = step.inputs.get(1) else {
+        let Some(
+            PlanSource::Asset { path, .. } | PlanSource::ConsumerAsset { path, .. },
+        ) = step.inputs.get(1)
+        else {
             continue;
         };
         if path != "gpt2/weights/L0_k_w_i32.bin" {
@@ -2426,7 +2429,7 @@ fn the_registered_instance_feeds_the_local_table_check_prefix() {
     )
     .unwrap();
 
-    let trace_plan = zkie_models_gpt2::plan::trace_plan_public(statement.tokens.len()).unwrap();
+    let trace_plan = zkie_models_gpt2::plan::trace_plan(statement.tokens.len()).unwrap();
     let outputs =
         verify_shared_trace_outputs(&public, &trace, &statement.tokens, &trace_plan, Some(Path::new(&config.asset_root))).unwrap();
     let (activation_step, _consumers) = projection_consumers(&trace_plan);

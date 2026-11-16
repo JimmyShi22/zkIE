@@ -32,6 +32,11 @@ pub enum PlanSource {
     /// A trusted public table: the values are read from the fixed public file
     /// under the trusted identity, never from the proof.
     PublicTable { table: PublicTable, layout: PlanLayout },
+    /// A model asset whose values are supplied by the request consumer chain
+    /// over the committed table, never by a trace opening. The step's operator
+    /// relation is deferred to that chain; a trace that still carries the
+    /// asset's opening is refused.
+    ConsumerAsset { path: String, layout: PlanLayout },
     /// A trusted constant derived from public configuration.
     Constant(PlanConstant),
     /// Values concatenated from several sources.
@@ -68,6 +73,13 @@ impl PlanSource {
 
     pub fn asset_slice(path: impl Into<String>, layout: PlanLayout) -> Self {
         Self::Asset {
+            path: path.into(),
+            layout,
+        }
+    }
+
+    pub fn consumer_asset_slice(path: impl Into<String>, layout: PlanLayout) -> Self {
+        Self::ConsumerAsset {
             path: path.into(),
             layout,
         }
@@ -669,6 +681,11 @@ fn put_source(bytes: &mut Vec<u8>, source: &PlanSource) {
             put_source(bytes, inner);
             put_layout(bytes, layout);
         }
+        PlanSource::ConsumerAsset { path, layout } => {
+            put_word(bytes, 7);
+            put_text(bytes, path);
+            put_layout(bytes, layout);
+        }
         PlanSource::PublicTable { table, layout } => {
             put_word(bytes, 6);
             put_text(bytes, &table.locator);
@@ -887,7 +904,79 @@ fn promote_source(source: &mut PlanSource, tables: &[(String, PublicTable)]) {
         PlanSource::Layout(inner, _) => promote_source(inner, tables),
         PlanSource::Prev { .. }
         | PlanSource::Constant(_)
-        | PlanSource::PublicTable { .. } => {}
+        | PlanSource::PublicTable { .. }
+        | PlanSource::ConsumerAsset { .. } => {}
+    }
+}
+
+/// Replaces every direct asset source that names one of `paths` with the
+/// consumer-authenticated source over the same path and layout. The trusted
+/// model plan calls this for the registered consumer assets; every path must
+/// occur in the plan, so a plan that no longer consumes the asset cannot
+/// silently keep the old opening form.
+pub fn promote_consumer_assets(plan: &mut TracePlan, paths: &[&str]) -> Result<()> {
+    let mut found = BTreeSet::new();
+    for step in &mut plan.steps {
+        for source in &mut step.inputs {
+            promote_consumer_source(source, paths, &mut found);
+        }
+    }
+    for path in paths {
+        if !found.contains(*path) {
+            return Err(Error::InvalidConfig);
+        }
+    }
+    Ok(())
+}
+
+/// Only a direct step input can be consumer-authenticated: a nested source
+/// cannot be deferred as a whole, so a path that occurs only nested is not
+/// found and the promotion fails closed.
+fn promote_consumer_source(
+    source: &mut PlanSource,
+    paths: &[&str],
+    found: &mut BTreeSet<String>,
+) {
+    if let PlanSource::Asset { path, layout } = source {
+        if paths.iter().any(|candidate| candidate == path) {
+            found.insert(path.clone());
+            let layout = layout.clone();
+            *source = PlanSource::ConsumerAsset {
+                path: path.clone(),
+                layout,
+            };
+        }
+    }
+}
+
+/// The consumer-authenticated asset paths of the plan, collected recursively.
+pub(crate) fn consumer_asset_paths(plan: &TracePlan) -> BTreeSet<&str> {
+    let mut paths = BTreeSet::new();
+    for step in &plan.steps {
+        for source in &step.inputs {
+            collect_consumer_paths(source, &mut paths);
+        }
+    }
+    paths
+}
+
+fn collect_consumer_paths<'a>(source: &'a PlanSource, paths: &mut BTreeSet<&'a str>) {
+    match source {
+        PlanSource::ConsumerAsset { path, .. } => {
+            paths.insert(path.as_str());
+        }
+        PlanSource::Concat(parts) => {
+            for part in parts {
+                collect_consumer_paths(part, paths);
+            }
+        }
+        PlanSource::HeadConcat { parts, .. } => {
+            for part in parts {
+                collect_consumer_paths(part, paths);
+            }
+        }
+        PlanSource::Layout(inner, _) => collect_consumer_paths(inner, paths),
+        _ => {}
     }
 }
 
@@ -907,7 +996,10 @@ fn count_source(source: &PlanSource, counts: &mut BTreeMap<(String, PlanLayout),
             }
         }
         PlanSource::Layout(inner, _) => count_source(inner, counts),
-        PlanSource::Prev { .. } | PlanSource::Constant(_) | PlanSource::PublicTable { .. } => {}
+        PlanSource::Prev { .. }
+        | PlanSource::Constant(_)
+        | PlanSource::PublicTable { .. }
+        | PlanSource::ConsumerAsset { .. } => {}
     }
 }
 
@@ -1140,6 +1232,9 @@ fn materialize<'a>(
         PlanSource::Asset { path, layout } => {
             Ok(Materialized::Owned(assets.source_values(path, layout)?))
         }
+        // The consumer asset has no trace opening by construction; a plan that
+        // still asks to materialize it is refused.
+        PlanSource::ConsumerAsset { .. } => Err(Error::InvalidConfig),
         PlanSource::PublicTable { table, layout } => Ok(Materialized::Owned(
             assets.public_values(table, layout)?,
         )),
@@ -1199,6 +1294,7 @@ enum SourceKind {
     },
     Asset,
     Public,
+    Consumer,
     Other,
 }
 
@@ -1215,6 +1311,7 @@ fn source_kind(source: &PlanSource) -> SourceKind {
         },
         PlanSource::Asset { .. } => SourceKind::Asset,
         PlanSource::PublicTable { .. } => SourceKind::Public,
+        PlanSource::ConsumerAsset { .. } => SourceKind::Consumer,
         PlanSource::Constant(_) => SourceKind::Other,
         PlanSource::Concat(_) => SourceKind::Other,
         PlanSource::HeadConcat { .. } => SourceKind::Other,
@@ -1261,27 +1358,66 @@ pub(crate) fn verify_step_structure(
     Ok(())
 }
 
-pub(crate) fn verify_step(
+/// What one trace step's plan check established.
+pub(crate) enum StepVerification {
+    /// Every input was materialized from the trusted plan and the caller
+    /// verifies the operator relation over them.
+    Materialized(Vec<Vec<i64>>),
+    /// The step's weight input is a registered consumer asset. Its operator
+    /// relation is closed by the request consumer chain, which the caller
+    /// verifies separately; nothing is materialized here. A trace that still
+    /// carries the asset's opening is refused by the caller's residual check.
+    ConsumerDeferred,
+}
+
+/// Checks one input port against its trusted plan source form. This does not
+/// materialize values; it only constrains the proof's external/source slots.
+fn check_port_form(
     step: &SharedTraceStep,
-    plan_step: &PlanStep,
-    verified_outputs: &[Vec<Vec<i64>>],
     assets: &AssetView<'_>,
-    tokens: &[u32],
-) -> Result<Vec<Vec<i64>>> {
-    verify_step_structure(step, plan_step, assets)?;
-    let output_count = step.message.proof.lengths.outputs.len();
-    let mut inputs = Vec::with_capacity(plan_step.inputs.len());
-    for (port, source) in plan_step.inputs.iter().enumerate() {
-        let external = step.external.get(port).copied().flatten();
-        let edge = step.sources.get(port).copied().flatten();
-        if matches!(source_kind(source), SourceKind::Public)
-            && (external.is_some() || edge.is_some())
-        {
-            return Err(Error::StatementMismatch);
+    port: usize,
+    source: &PlanSource,
+) -> Result<()> {
+    let external = step.external.get(port).copied().flatten();
+    let edge = step.sources.get(port).copied().flatten();
+    match source_kind(source) {
+        SourceKind::Prev {
+            step: at,
+            output,
+            flat,
+        } => {
+            if external.is_some() {
+                return Err(Error::StatementMismatch);
+            }
+            if flat {
+                if edge != Some((at, output)) {
+                    return Err(Error::StatementMismatch);
+                }
+            } else if edge.is_some() {
+                return Err(Error::StatementMismatch);
+            }
         }
-        if matches!(source_kind(source), SourceKind::Asset) && external.is_some() {
+        SourceKind::Asset => {
             if edge.is_some() {
                 return Err(Error::StatementMismatch);
+            }
+            if let Some(pool) = external {
+                let plan_asset = assets.asset_id(match source {
+                    PlanSource::Asset { path, .. } => path,
+                    PlanSource::Layout(inner, _) => match inner.as_ref() {
+                        PlanSource::Asset { path, .. } => path,
+                        _ => return Err(Error::StatementMismatch),
+                    },
+                    _ => return Err(Error::StatementMismatch),
+                })?;
+                let opening = assets
+                    .trace
+                    .assets
+                    .get(pool)
+                    .ok_or(Error::StatementMismatch)?;
+                if opening.asset_id != plan_asset {
+                    return Err(Error::StatementMismatch);
+                }
             }
             if let Some(path) = external_flat_path(source) {
                 let pool = external.ok_or(Error::StatementMismatch)?;
@@ -1307,65 +1443,78 @@ pub(crate) fn verify_step(
                 }
             }
         }
-        let expected = materialize(source, verified_outputs, assets, tokens)?;
-        match source_kind(source) {
-            SourceKind::Prev {
-                step,
-                output,
-                flat,
-            } => {
-                if external.is_some() {
-                    return Err(Error::StatementMismatch);
-                }
-                if flat {
-                    if edge != Some((step, output)) {
-                        return Err(Error::StatementMismatch);
-                    }
-                } else if edge.is_some() {
-                    return Err(Error::StatementMismatch);
-                }
-            }
-            SourceKind::Asset => {
-                if edge.is_some() {
-                    return Err(Error::StatementMismatch);
-                }
-                if let Some(pool) = external {
-                    let plan_asset = assets.asset_id(match source {
-                        PlanSource::Asset { path, .. } => path,
-                        PlanSource::Layout(inner, _) => match inner.as_ref() {
-                            PlanSource::Asset { path, .. } => path,
-                            _ => return Err(Error::StatementMismatch),
-                        },
-                        _ => return Err(Error::StatementMismatch),
-                    })?;
-                    let opening = assets
-                        .trace
-                        .assets
-                        .get(pool)
-                        .ok_or(Error::StatementMismatch)?;
-                    if opening.asset_id != plan_asset {
-                        return Err(Error::StatementMismatch);
-                    }
-                }
-            }
-            SourceKind::Public => {
-                if external.is_some() || edge.is_some() {
-                    return Err(Error::StatementMismatch);
-                }
-            }
-            SourceKind::Other => {
-                if external.is_some() || edge.is_some() {
-                    return Err(Error::StatementMismatch);
-                }
+        SourceKind::Public => {
+            if external.is_some() || edge.is_some() {
+                return Err(Error::StatementMismatch);
             }
         }
+        SourceKind::Consumer => {
+            // The consumer source is authenticated by the request chain, never
+            // by a proof-supplied opening or an edge.
+            if external.is_some() || edge.is_some() {
+                return Err(Error::StatementMismatch);
+            }
+        }
+        SourceKind::Other => {
+            if external.is_some() || edge.is_some() {
+                return Err(Error::StatementMismatch);
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn verify_step(
+    step: &SharedTraceStep,
+    plan_step: &PlanStep,
+    verified_outputs: &[Vec<Vec<i64>>],
+    assets: &AssetView<'_>,
+    tokens: &[u32],
+) -> Result<StepVerification> {
+    verify_step_structure(step, plan_step, assets)?;
+    let consumer_ports: Vec<usize> = plan_step
+        .inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, source)| matches!(source, PlanSource::ConsumerAsset { .. }))
+        .map(|(port, _)| port)
+        .collect();
+    if consumer_ports.len() > 1 {
+        return Err(Error::InvalidConfig);
+    }
+    if let Some(&port) = consumer_ports.first() {
+        // Only the weight input of a projection can be deferred to the request
+        // consumer chain, and it must be the column slice form the registered
+        // obligations have. Every port still passes the trusted form check.
+        if plan_step.opcode != OpCode::Projection
+            || port != 1
+            || !matches!(
+                plan_step.inputs.get(1),
+                Some(PlanSource::ConsumerAsset {
+                    layout: PlanLayout::Columns { .. },
+                    ..
+                })
+            )
+        {
+            return Err(Error::InvalidConfig);
+        }
+        for (port, source) in plan_step.inputs.iter().enumerate() {
+            check_port_form(step, assets, port, source)?;
+        }
+        return Ok(StepVerification::ConsumerDeferred);
+    }
+    let output_count = step.message.proof.lengths.outputs.len();
+    let mut inputs = Vec::with_capacity(plan_step.inputs.len());
+    for (port, source) in plan_step.inputs.iter().enumerate() {
+        check_port_form(step, assets, port, source)?;
+        let expected = materialize(source, verified_outputs, assets, tokens)?;
         inputs.push(expected.as_slice().to_vec());
     }
     let outputs = proof_output_values(&step.message.proof)?;
     if outputs.len() != output_count {
         return Err(Error::ShapeMismatch);
     }
-    Ok(inputs)
+    Ok(StepVerification::Materialized(inputs))
 }
 
 /// Version of the shared-trace input binding. Version 2 materializes every
@@ -1512,6 +1661,57 @@ mod tests {
         let keys = cache_keys(&plan);
         assert!(keys.contains(&("reused.bin".to_owned(), PlanLayout::Flat)));
         assert!(!keys.contains(&("once.bin".to_owned(), PlanLayout::Flat)));
+    }
+
+    #[test]
+    fn consumer_promotion_replaces_only_the_named_direct_inputs() {
+        let mut builder = PlanBuilder::new();
+        builder.step(
+            OpCode::TableLookup,
+            Vec::new(),
+            vec![PlanSource::asset("first.bin"), PlanSource::asset("second.bin")],
+            1,
+        );
+        builder.step(
+            OpCode::TableLookup,
+            Vec::new(),
+            vec![
+                PlanSource::asset("wrapped.bin").with_layout(PlanLayout::Flat),
+                PlanSource::prev(0, 0),
+            ],
+            1,
+        );
+        builder.step(
+            OpCode::TableLookup,
+            Vec::new(),
+            vec![PlanSource::asset("first.bin"), PlanSource::prev(1, 0)],
+            1,
+        );
+        let mut plan = builder.finish();
+        assert!(cache_keys(&plan).contains(&("first.bin".to_owned(), PlanLayout::Flat)));
+        promote_consumer_assets(&mut plan, &["first.bin"]).unwrap();
+        assert!(matches!(
+            plan.steps[0].inputs[0],
+            PlanSource::ConsumerAsset { .. }
+        ));
+        assert!(matches!(plan.steps[0].inputs[1], PlanSource::Asset { .. }));
+        assert_eq!(
+            consumer_asset_paths(&plan).into_iter().collect::<Vec<_>>(),
+            vec!["first.bin"]
+        );
+        assert!(cache_keys(&plan)
+            .iter()
+            .all(|(path, _)| path != "first.bin"));
+        // A path that occurs only inside a wrapper is not a direct input, so
+        // the promotion refuses it instead of deferring a partial source.
+        assert!(matches!(
+            promote_consumer_assets(&mut plan, &["wrapped.bin"]),
+            Err(Error::InvalidConfig)
+        ));
+        assert!(matches!(
+            promote_consumer_assets(&mut plan, &["absent.bin"]),
+            Err(Error::InvalidConfig)
+        ));
     }
 
     #[test]

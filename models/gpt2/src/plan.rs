@@ -458,11 +458,20 @@ pub fn public_table_paths() -> &'static [&'static str] {
     &[EXP, RSQRT, GELU]
 }
 
-/// The production plan: the four migrated tables are trusted public files,
-/// not traced assets. Component tests keep `trace_plan`.
+/// The consumer-authenticated assets of this model: the first projection
+/// weight is proved by the request consumer chain over the committed table,
+/// never by a trace opening.
+pub fn consumer_asset_paths() -> &'static [&'static str] {
+    &[FIRST_PROJECTION]
+}
+
+/// The production plan: the migrated tables are trusted public files, not
+/// traced assets, and the first projection weight is consumer-authenticated.
+/// Component tests keep `trace_plan`.
 pub fn trace_plan_public(m: usize) -> Result<TracePlan> {
     let mut plan = trace_plan(m)?;
     zkie_ops::proof::plan::promote_public_tables(&mut plan, &public_tables());
+    zkie_ops::proof::plan::promote_consumer_assets(&mut plan, consumer_asset_paths())?;
     Ok(plan)
 }
 
