@@ -678,17 +678,18 @@ pub fn shared_lin_plan_fault(fault: SharedLinPlanFault, code: CodeParams) -> Res
     Ok(())
 }
 
-/// The largest table distance (multiplicity) whose one-time fold point and
-/// record sample meet the target, with the given sharing and point variables.
-/// Only the table distance is derived; the fold round count and the hiding
-/// polynomial are not.
-pub fn recorded_table_distance(
+/// The largest table distance whose fold point and (optionally) record sample
+/// meet the same target. The one-time rule checks the record sample as well;
+/// the later rule does not repeat that check. The point bound always uses the
+/// caller's sharing count and the same security target of the plan's mode.
+fn largest_table_m(
     code: CodeParams,
     v: u32,
     answers: u32,
     point_variables: u32,
     sharing: u64,
     work_bits: u32,
+    with_record: bool,
 ) -> Result<u64> {
     if v == 0 || answers == 0 || sharing == 0 || point_variables == 0 {
         return Err(Error::InvalidConfig);
@@ -710,6 +711,9 @@ pub fn recorded_table_distance(
             .mul(&field_error(u64::from(point_variables)))
             .add(&Bound::from_u64(2).mul(&table_fold_error(v, &mca_error(&at), &at.list)));
         let point_ok = surely_le(&Bound::from_real(point.error()), &goal(work_bits));
+        if !with_record {
+            return point_ok;
+        }
         let sample = sample_error(&at.list, cube_bits, answers);
         let sample_ok = surely_le(&Bound::from_real(sample.error()), &goal(0));
         point_ok && sample_ok
@@ -738,6 +742,130 @@ pub fn recorded_table_distance(
         }
     }
     Ok(low)
+}
+
+/// The largest one-time table distance whose fold point and record sample meet
+/// the target, with the given sharing and point variables.
+pub fn recorded_table_distance(
+    code: CodeParams,
+    v: u32,
+    answers: u32,
+    point_variables: u32,
+    sharing: u64,
+    work_bits: u32,
+) -> Result<u64> {
+    largest_table_m(
+        code,
+        v,
+        answers,
+        point_variables,
+        sharing,
+        work_bits,
+        true,
+    )
+}
+
+/// The largest later table distance at the same point goal with `requests`
+/// sharing and no repeated record check. The caller caps it at the one-time
+/// distance; the later test is only defined for a table that already passed
+/// the one-time test at the same geometry.
+pub fn later_table_distance(
+    code: CodeParams,
+    v: u32,
+    answers: u32,
+    point_variables: u32,
+    requests: u64,
+    work_bits: u32,
+) -> Result<u64> {
+    if requests == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    largest_table_m(
+        code,
+        v,
+        answers,
+        point_variables,
+        requests,
+        work_bits,
+        false,
+    )
+}
+
+/// The derived later-parameter candidate of one declared table: the later
+/// distance capped at the one-time one, the later column count, the batch
+/// capacity of the random tail and the declared one-batch total. The tail is
+/// shared with the one-time columns already spent; the capacity is not a
+/// licence to run more batches than the declaration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LaterTableCandidate {
+    pub m_once: u64,
+    pub m_later: u64,
+    pub one_time_columns: u64,
+    pub later_columns: u64,
+    /// The one-time columns already spent from the table's random tail.
+    pub spent: u64,
+    /// floor((tail - spent) / later_columns); not the declared batch count.
+    pub capacity_batches: u64,
+    /// spent + one declared later batch's columns.
+    pub total_columns_one_batch: u64,
+}
+
+/// Derives the later-parameter candidate from the same public geometry and
+/// security target as the one-time rule. The later distance is the later rule
+/// capped at `m_once`; the later columns are the smallest count meeting the
+/// column target at the later distance; the spent columns and the declared one
+/// batch must fit the table's random tail.
+#[allow(clippy::too_many_arguments)]
+pub fn derive_later_table_candidate(
+    shape: SharedLinShape,
+    code: CodeParams,
+    answers: u32,
+    point_variables: u32,
+    m_once: u64,
+    one_time_columns: u64,
+    table_tail: u64,
+    work_bits: u32,
+) -> Result<LaterTableCandidate> {
+    if m_once < 3
+        || one_time_columns == 0
+        || table_tail == 0
+        || shape.instances == 0
+        || shape.v == 0
+        || shape.rows_log == 0
+    {
+        return Err(Error::InvalidConfig);
+    }
+    let later_raw = later_table_distance(
+        code,
+        shape.v,
+        answers,
+        point_variables,
+        shape.instances,
+        work_bits,
+    )?;
+    let m_later = m_once.min(later_raw);
+    let later_columns = shared_lin_columns(shape, code, m_later, work_bits, work_bits)?;
+    if later_columns == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let spent = one_time_columns;
+    let remaining = table_tail.saturating_sub(spent);
+    let capacity_batches = remaining / later_columns;
+    let total_columns_one_batch = spent
+        .checked_add(later_columns)
+        .ok_or(Error::ResourceLimit)?;
+    if total_columns_one_batch > table_tail {
+        return Err(Error::ResourceLimit);
+    }
+    Ok(LaterTableCandidate {
+        m_once,
+        m_later,
+        one_time_columns,
+        later_columns,
+        spent,
+        capacity_batches,
+        total_columns_one_batch,
+    })
 }
 
 fn stage_cube_bits(group: &GroupShape) -> u32 {
@@ -4033,5 +4161,51 @@ mod single_group_stage_tests {
         let main = build_code_plan(4, 8, 1).unwrap();
         let mask = build_code_plan(4, 8, 1).unwrap();
         assert!(solve_single_first_stage(main, mask, 16_384, 4, 5, false).is_err());
+    }
+
+    #[test]
+    fn the_later_rule_removes_only_the_record_check() {
+        let code = build_code_plan(12, 2048, 128).unwrap();
+        let once = recorded_table_distance(code, 10, 1, 10, 1, 0).unwrap();
+        let later = later_table_distance(code, 10, 1, 10, 1, 0).unwrap();
+        assert!(once >= 3);
+        assert!(
+            later >= once,
+            "the later rule drops only the record check"
+        );
+        // More sharing can only lower the largest point distance.
+        let shared = later_table_distance(code, 10, 1, 10, 12, 0).unwrap();
+        assert!(shared <= later);
+    }
+
+    #[test]
+    fn the_production_later_candidate_fits_one_declared_batch() {
+        let code = build_code_plan(12, 2048, 128).unwrap();
+        let shape = SharedLinShape {
+            v: 10,
+            k_lo: 0,
+            instances: 1,
+            rows_log: 10,
+        };
+        let m_once = recorded_table_distance(code, 10, 1, 10, 1, 0).unwrap();
+        let one_time_columns = shared_lin_columns(shape, code, m_once, 0, 0).unwrap();
+        let candidate = derive_later_table_candidate(
+            shape,
+            code,
+            1,
+            10,
+            m_once,
+            one_time_columns,
+            128,
+            0,
+        )
+        .unwrap();
+        eprintln!("later-table candidate: {:?}", candidate);
+        assert_eq!(candidate.m_once, m_once);
+        assert!(candidate.m_later <= candidate.m_once);
+        assert!(candidate.later_columns >= 1);
+        assert_eq!(candidate.spent, one_time_columns);
+        assert!(candidate.total_columns_one_batch <= 128);
+        assert!(candidate.capacity_batches >= 1);
     }
 }
