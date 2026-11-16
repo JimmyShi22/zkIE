@@ -1368,7 +1368,10 @@ mod tests {
             ranges(),
             Digest([0x41; 32]),
             Digest([0x42; 32]),
-            vec![obligation(0, 20), obligation(1, 21)],
+            vec![
+                obligation(0, 20),
+                obligation(1, 21),
+            ],
         )
         .unwrap();
         let activation_digest = consumer_activation_digest(&activation);
@@ -1381,7 +1384,10 @@ mod tests {
             ranges(),
             activation_digest,
             outputs_digest,
-            vec![obligation(0, 20), obligation(1, 21)],
+            vec![
+                obligation(0, 20),
+                obligation(1, 21),
+            ],
         )
         .unwrap();
         // Committed raw and bit messages.
@@ -2379,6 +2385,7 @@ mod tests {
         consumer_second_chain, consumer_total_acceptance, prove_consumer_own, ConsumerChainBinding,
         ConsumerOwnPlan, ConsumerOwnWitness,
     };
+    use crate::proof::consumer_proof::ConsumerProofFile;
     use crate::proof::consumer_shared::{
         consumer_shared_charge, prove_consumer_shared, verify_consumer_shared,
         ConsumerSharedGeometry, ConsumerSharedStage,
@@ -2478,8 +2485,7 @@ mod tests {
         let mut message_rows = vec![vec![Fp::ZERO; 16]; 16];
         for record in 0..16 {
             for place in 0..16 {
-                message_rows[record][place] =
-                    fp_from_signed_word(matrix_word(place, record) as u64);
+                message_rows[record][place] = fp_from_signed_word(matrix_word(place, record) as u64);
             }
         }
         let tails = vec![vec![Fp::ZERO; 1]; 16];
@@ -2507,10 +2513,7 @@ mod tests {
         (reader, keeper)
     }
 
-    fn composition_geometry(
-        plan: &ConsumerFirstPlan,
-        reader: &IndexReader,
-    ) -> ConsumerSharedGeometry {
+    fn composition_geometry(plan: &ConsumerFirstPlan, reader: &IndexReader) -> ConsumerSharedGeometry {
         let code = plan.draft.w_shape.code;
         let mask_code = plan
             .group
@@ -2605,7 +2608,10 @@ mod tests {
     fn the_consumer_composition_accepts_on_the_same_matrix() {
         let (reader, mut keeper) = composition_table();
         let table_identity = reader_table_identity(&reader).unwrap();
-        let mut fixture = group_fixture_with(table_with(table_identity, COMPOSITION_CONFIGURATION));
+        let mut fixture = group_fixture_with(table_with(
+            table_identity,
+            COMPOSITION_CONFIGURATION,
+        ));
         let (messages, _obligations) = prove_group(&mut fixture).unwrap();
         let plan = fixture.plan.clone();
         let geometry = composition_geometry(&plan, &reader);
@@ -2623,9 +2629,13 @@ mod tests {
         )
         .unwrap();
         let check_stage = ConsumerSharedStage::new(&shared_plan).unwrap();
-        let shared_verified =
-            verify_consumer_shared(&geometry, &check_stage, &reader, &shared_proof.messages)
-                .unwrap();
+        let shared_verified = verify_consumer_shared(
+            &geometry,
+            &check_stage,
+            &reader,
+            &shared_proof.messages,
+        )
+        .unwrap();
         // The W witness is the first stage's committed W rebuilt from the same
         // stored-column matrix view.
         let weights = pending_row_weights(&plan.member, plan.draft.matrix_rows).unwrap();
@@ -2710,6 +2720,21 @@ mod tests {
         assert_eq!(total.second_seal, own_proof.seal);
         assert!(!total.obligations.group_rows.is_empty());
         assert!(!plan.member.psi.is_empty());
+        // The auxiliary file assembles from the accepted results and decodes
+        // back to the same stage messages.
+        let file = ConsumerProofFile::assemble(
+            &plan,
+            &messages,
+            &shared_proof.messages,
+            &own_proof,
+            &total,
+        )
+        .unwrap();
+        let bytes = file.encode().unwrap();
+        let decoded = ConsumerProofFile::decode(&bytes).unwrap();
+        assert_eq!(decoded, file);
+        assert_eq!(decoded.own_proof().unwrap(), own_proof);
+        assert_eq!(decoded.totals.first_seal, total.first_seal);
     }
 
     #[test]
@@ -2717,7 +2742,10 @@ mod tests {
     fn the_composition_refuses_a_witness_on_the_wrong_axis() {
         let (reader, mut keeper) = composition_table();
         let table_identity = reader_table_identity(&reader).unwrap();
-        let mut fixture = group_fixture_with(table_with(table_identity, COMPOSITION_CONFIGURATION));
+        let mut fixture = group_fixture_with(table_with(
+            table_identity,
+            COMPOSITION_CONFIGURATION,
+        ));
         let (messages, _) = prove_group(&mut fixture).unwrap();
         let plan = fixture.plan.clone();
         let geometry = composition_geometry(&plan, &reader);
@@ -2734,9 +2762,13 @@ mod tests {
         )
         .unwrap();
         let check_stage = ConsumerSharedStage::new(&shared_plan).unwrap();
-        let shared_verified =
-            verify_consumer_shared(&geometry, &check_stage, &reader, &shared_proof.messages)
-                .unwrap();
+        let shared_verified = verify_consumer_shared(
+            &geometry,
+            &check_stage,
+            &reader,
+            &shared_proof.messages,
+        )
+        .unwrap();
         // The wrong-axis witness: places as rows, records as entries.
         let records = 16usize;
         let places = 16usize;

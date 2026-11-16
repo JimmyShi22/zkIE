@@ -27085,6 +27085,22 @@ fn get_tail(
     }
 }
 
+/// Encodes the shared stage messages with the wire layout the hidden and key
+/// paths use. The consumer chain shares the same message form.
+pub(crate) fn encode_shared_messages(message: &HiddenSharedMessages) -> Result<Vec<u8>> {
+    let mut writer = CanonicalWriter::new();
+    put_shared(&mut writer, message);
+    Ok(writer.into_bytes())
+}
+
+/// Decodes a shared stage message set on the single-stage tail path.
+pub(crate) fn decode_shared_messages(bytes: &[u8]) -> Result<HiddenSharedMessages> {
+    let mut reader = CanonicalReader::new(bytes, DecodeLimits::unlimited());
+    let message = get_shared_with_iopp(&mut reader, None)?;
+    reader.finish()?;
+    Ok(message)
+}
+
 fn get_shared(
     reader: &mut CanonicalReader<'_>,
     plan: &HiddenLinPlan,
