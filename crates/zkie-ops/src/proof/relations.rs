@@ -13,11 +13,12 @@ use zkie_core::types::Digest;
 
 use crate::op::OpCode;
 use crate::proof::binding::{
-    commit_rows_with_openings, oracle_leaf, verify_opening, OracleId, OracleOpening,
-    OracleRegistry,
+    commit_rows_with_openings, oracle_leaf, verify_opening, OracleId, OracleOpening, OracleRegistry,
+};
+use crate::registry::{
+    exp_profile_value, isqrt_u128, profile_rsqrt_index, round_div_half_up, PureForward,
 };
 use zkie_engine::compute::cpu::merkle_build;
-use crate::registry::{exp_profile_value, isqrt_u128, profile_rsqrt_index, round_div_half_up, PureForward};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RelationLengths {
@@ -72,7 +73,11 @@ fn clamp_config(clamp: Option<(i64, i64)>) -> Vec<i64> {
 
 impl RelationConfig for crate::affine_scale::AffineScaleOp {
     fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        let mut config = vec![self.multiplier as i64, self.addend as i64, self.shift as i64];
+        let mut config = vec![
+            self.multiplier as i64,
+            self.addend as i64,
+            self.shift as i64,
+        ];
         config.extend(clamp_config(self.clamp));
         Ok(config)
     }
@@ -104,7 +109,13 @@ impl RelationConfig for crate::matmul::MatMulOp {
 
 impl RelationConfig for crate::projection::ProjectionOp {
     fn relation_config(&self, _inputs: &[Vec<i64>]) -> Result<Vec<i64>> {
-        Ok(matrix_config(self.m, self.n, self.k, self.shift, self.bias.as_deref()))
+        Ok(matrix_config(
+            self.m,
+            self.n,
+            self.k,
+            self.shift,
+            self.bias.as_deref(),
+        ))
     }
 }
 
@@ -242,12 +253,10 @@ fn commit_group_width(
     if width == 0 || values.len() % width != 0 {
         return Err(Error::ShapeMismatch);
     }
-    let rows = pad(
-        values
-            .chunks_exact(width)
-            .map(|chunk| chunk.iter().map(|value| *value as u64).collect())
-            .collect(),
-    );
+    let rows = pad(values
+        .chunks_exact(width)
+        .map(|chunk| chunk.iter().map(|value| *value as u64).collect())
+        .collect());
     let (_, mut openings) = commit_rows_with_openings(registry, label, &rows)?;
     for opening in &mut openings {
         opening.path.clear();
@@ -415,7 +424,16 @@ fn output_widths(opcode: OpCode, config: &[i64], lengths: &[usize]) -> Vec<usize
             }
             return widths;
         }
-        OpCode::Add | OpCode::ProfileLayerNorm | OpCode::ProfileRmsNorm | OpCode::ProfileRope | OpCode::ProfileStandardize | OpCode::TableIndex | OpCode::Argmax | OpCode::EmbeddingIndex | OpCode::RowEmbeddingIndex | OpCode::TableLookup => {
+        OpCode::Add
+        | OpCode::ProfileLayerNorm
+        | OpCode::ProfileRmsNorm
+        | OpCode::ProfileRope
+        | OpCode::ProfileStandardize
+        | OpCode::TableIndex
+        | OpCode::Argmax
+        | OpCode::EmbeddingIndex
+        | OpCode::RowEmbeddingIndex
+        | OpCode::TableLookup => {
             for (index, length) in lengths.iter().enumerate() {
                 widths[index] = *length;
             }
@@ -666,9 +684,7 @@ pub(crate) fn verify_group(
         if !opening.path.is_empty() && opening.path.len() != depth {
             return Err(Error::InvalidProof);
         }
-        if position as u64 >= data_rows
-            && opening.values.iter().any(|value| *value != 0)
-        {
+        if position as u64 >= data_rows && opening.values.iter().any(|value| *value != 0) {
             return Err(Error::StatementMismatch);
         }
     }
@@ -740,7 +756,7 @@ fn decode_wide(openings: &[OracleOpening], len: usize) -> Result<Vec<i128>> {
     Ok(values)
 }
 
-fn rq(value: i128, shift: u32) -> Result<i128> {
+pub(crate) fn rq(value: i128, shift: u32) -> Result<i128> {
     if shift == 0 {
         return Ok(value);
     }
@@ -971,12 +987,8 @@ fn verify_op_relation_with_external_form(
             let from_y = *config.get(2).ok_or(Error::InvalidConfig)? as usize;
             let to_x = *config.get(3).ok_or(Error::InvalidConfig)? as usize;
             let to_y = *config.get(4).ok_or(Error::InvalidConfig)? as usize;
-            let cells = from_x
-                .checked_mul(from_y)
-                .ok_or(Error::ShapeMismatch)?;
-            let targets = to_x
-                .checked_mul(to_y)
-                .ok_or(Error::ShapeMismatch)?;
+            let cells = from_x.checked_mul(from_y).ok_or(Error::ShapeMismatch)?;
+            let targets = to_x.checked_mul(to_y).ok_or(Error::ShapeMismatch)?;
             if cells != targets
                 || inputs.len() != 1
                 || inputs[0].len() != cells
@@ -987,7 +999,11 @@ fn verify_op_relation_with_external_form(
             for row in 0..from_x {
                 for column in 0..from_y {
                     let source = row * from_y + column;
-                    let target = if kind == 0 { source } else { column * from_x + row };
+                    let target = if kind == 0 {
+                        source
+                    } else {
+                        column * from_x + row
+                    };
                     if inputs[0][source] != outputs[0][target] {
                         return Err(Error::InvalidProof);
                     }
@@ -1020,7 +1036,8 @@ fn verify_op_relation_with_external_form(
                 if !omit_raw && raw[0].get(index) != Some(&expected) {
                     return Err(Error::InvalidProof);
                 }
-                let quantized = i64::try_from(rq(expected, shift)?).map_err(|_| Error::BoundViolation)?;
+                let quantized =
+                    i64::try_from(rq(expected, shift)?).map_err(|_| Error::BoundViolation)?;
                 if outputs[0][index] != clamp_value(quantized, config, 3)? {
                     return Err(Error::InvalidProof);
                 }
@@ -1062,29 +1079,33 @@ fn verify_op_relation_with_external_form(
             }
             let bias = &config[5..bias_header];
             let computed = crate::registry::matmul_raw(&inputs[0], &inputs[1], m, n, k)?;
-            (0..output_len).into_par_iter().try_for_each(|slot| -> Result<()> {
-                let expected = computed[slot]
-                    .checked_add(if bias.is_empty() {
-                        0i128
-                    } else {
-                        bias[slot] as i128
-                    })
-                    .ok_or(Error::BoundViolation)?;
-                if (!omit_raw && raw[0][slot] != expected)
-                    || rq(expected, shift)? != outputs[0][slot] as i128
-                {
-                    return Err(Error::InvalidProof);
-                }
-                Ok(())
-            })?;
+            (0..output_len)
+                .into_par_iter()
+                .try_for_each(|slot| -> Result<()> {
+                    let expected = computed[slot]
+                        .checked_add(if bias.is_empty() {
+                            0i128
+                        } else {
+                            bias[slot] as i128
+                        })
+                        .ok_or(Error::BoundViolation)?;
+                    if (!omit_raw && raw[0][slot] != expected)
+                        || rq(expected, shift)? != outputs[0][slot] as i128
+                    {
+                        return Err(Error::InvalidProof);
+                    }
+                    Ok(())
+                })?;
         }
         OpCode::Add => {
-            if inputs.len() != 2 || outputs[0].len() != inputs[0].len() || inputs[0].len() != inputs[1].len() {
+            if inputs.len() != 2
+                || outputs[0].len() != inputs[0].len()
+                || inputs[0].len() != inputs[1].len()
+            {
                 return Err(Error::ShapeMismatch);
             }
             for index in 0..inputs[0].len() {
-                if outputs[0][index] as i128
-                    != inputs[0][index] as i128 + inputs[1][index] as i128
+                if outputs[0][index] as i128 != inputs[0][index] as i128 + inputs[1][index] as i128
                 {
                     return Err(Error::InvalidProof);
                 }
@@ -1095,7 +1116,10 @@ fn verify_op_relation_with_external_form(
                 return Err(Error::ShapeMismatch);
             }
             for (index, output) in inputs[1].iter().zip(&outputs[0]) {
-                if *index < 0 || *index as usize >= inputs[0].len() || inputs[0][*index as usize] != *output {
+                if *index < 0
+                    || *index as usize >= inputs[0].len()
+                    || inputs[0][*index as usize] != *output
+                {
                     return Err(Error::InvalidProof);
                 }
             }
@@ -1114,12 +1138,15 @@ fn verify_op_relation_with_external_form(
                 return Err(Error::ShapeMismatch);
             }
             let max = *inputs[0].iter().max().ok_or(Error::InvalidProof)?;
-            if aux.len() != 3 || aux[0] != vec![max] || aux[1].len() != length || aux[2].len() != 1 {
+            if aux.len() != 3 || aux[0] != vec![max] || aux[1].len() != length || aux[2].len() != 1
+            {
                 return Err(Error::InvalidProof);
             }
             let mut denominator = 0i128;
             for index in 0..length {
-                let distance = max.checked_sub(inputs[0][index]).ok_or(Error::BoundViolation)?;
+                let distance = max
+                    .checked_sub(inputs[0][index])
+                    .ok_or(Error::BoundViolation)?;
                 let entry = exp_profile_value(&inputs[1], distance)?;
                 if entry < 0 || aux[1][index] != entry {
                     return Err(Error::InvalidProof);
@@ -1137,7 +1164,8 @@ fn verify_op_relation_with_external_form(
                     .checked_mul(scale)
                     .ok_or(Error::BoundViolation)?;
                 if (!omit_raw && raw[0][index] != numerator)
-                    || outputs[0][index] as i128 != crate::registry::round_div_half_up(numerator, denominator)?
+                    || outputs[0][index] as i128
+                        != crate::registry::round_div_half_up(numerator, denominator)?
                 {
                     return Err(Error::InvalidProof);
                 }
@@ -1209,17 +1237,24 @@ fn verify_op_relation_with_external_form(
             let valid = *config.get(2).ok_or(Error::InvalidConfig)? as usize;
             let shift = *config.get(3).ok_or(Error::InvalidConfig)? as u32;
             let cells = rows.checked_mul(cols).ok_or(Error::ResourceLimit)?;
-            if valid == 0 || valid > cols || inputs.len() != 2
+            if valid == 0
+                || valid > cols
+                || inputs.len() != 2
                 || inputs[0].len() != cells
                 || inputs[1].len() != cells
                 || outputs[0].len() != cells
-                || raw.is_empty() || raw[0].len() != cells
+                || raw.is_empty()
+                || raw[0].len() != cells
             {
                 return Err(Error::ShapeMismatch);
             }
             let layer_norm = public.opcode == OpCode::LayerNorm;
             if layer_norm {
-                if aux.len() != 3 || aux[0].len() != rows || aux[1].len() != rows || aux[2].len() != rows {
+                if aux.len() != 3
+                    || aux[0].len() != rows
+                    || aux[1].len() != rows
+                    || aux[2].len() != rows
+                {
                     return Err(Error::InvalidProof);
                 }
             } else if aux.len() != 2 || aux[0].len() != rows || aux[1].len() != rows {
@@ -1254,7 +1289,9 @@ fn verify_op_relation_with_external_form(
                 if layer_norm {
                     for index in 0..valid {
                         let centered = inputs[0][start + index] as i128 - mean;
-                        let square = centered.checked_mul(centered).ok_or(Error::BoundViolation)?;
+                        let square = centered
+                            .checked_mul(centered)
+                            .ok_or(Error::BoundViolation)?;
                         variance = variance.checked_add(square).ok_or(Error::BoundViolation)?;
                     }
                     variance = variance.div_euclid(valid as i128).max(1);
@@ -1285,7 +1322,8 @@ fn verify_op_relation_with_external_form(
                     if raw[0][start + index] != image {
                         return Err(Error::InvalidProof);
                     }
-                    let quantized = i64::try_from(rq(image, shift)?).map_err(|_| Error::BoundViolation)?;
+                    let quantized =
+                        i64::try_from(rq(image, shift)?).map_err(|_| Error::BoundViolation)?;
                     if outputs[0][start + index] != clamp_value(quantized, config, 4)? {
                         return Err(Error::InvalidProof);
                     }
@@ -1298,7 +1336,12 @@ fn verify_op_relation_with_external_form(
                 return Err(Error::ShapeMismatch);
             }
             let pairs = inputs[0].len() / 2;
-            if inputs[1].len() != pairs || inputs[2].len() != pairs || outputs[0].len() != inputs[0].len() || raw.is_empty() || raw[0].len() != inputs[0].len() {
+            if inputs[1].len() != pairs
+                || inputs[2].len() != pairs
+                || outputs[0].len() != inputs[0].len()
+                || raw.is_empty()
+                || raw[0].len() != inputs[0].len()
+            {
                 return Err(Error::ShapeMismatch);
             }
             for pair in 0..pairs {
@@ -1306,8 +1349,14 @@ fn verify_op_relation_with_external_form(
                 let odd = inputs[0][2 * pair + 1] as i128;
                 let c = inputs[1][pair] as i128;
                 let s = inputs[2][pair] as i128;
-                let rotated_even = even.checked_mul(c).and_then(|v| v.checked_sub(odd.checked_mul(s)?)).ok_or(Error::BoundViolation)?;
-                let rotated_odd = even.checked_mul(s).and_then(|v| v.checked_add(odd.checked_mul(c)?)).ok_or(Error::BoundViolation)?;
+                let rotated_even = even
+                    .checked_mul(c)
+                    .and_then(|v| v.checked_sub(odd.checked_mul(s)?))
+                    .ok_or(Error::BoundViolation)?;
+                let rotated_odd = even
+                    .checked_mul(s)
+                    .and_then(|v| v.checked_add(odd.checked_mul(c)?))
+                    .ok_or(Error::BoundViolation)?;
                 if raw[0][2 * pair] != rotated_even
                     || raw[0][2 * pair + 1] != rotated_odd
                     || rq(rotated_even, shift)? != outputs[0][2 * pair] as i128
@@ -1327,7 +1376,11 @@ fn verify_op_relation_with_external_form(
                 return Err(Error::ShapeMismatch);
             }
             let mut order: Vec<usize> = (0..inputs[0].len()).collect();
-            order.sort_by(|left, right| inputs[0][*right].cmp(&inputs[0][*left]).then_with(|| left.cmp(right)));
+            order.sort_by(|left, right| {
+                inputs[0][*right]
+                    .cmp(&inputs[0][*left])
+                    .then_with(|| left.cmp(right))
+            });
             for slot in 0..k {
                 let index = order[slot];
                 if outputs[0][slot] != index as i64 || outputs[0][k + slot] != inputs[0][index] {
@@ -1368,7 +1421,11 @@ fn verify_op_relation_with_external_form(
                 return Err(Error::ShapeMismatch);
             }
             let mut order: Vec<usize> = (0..inputs[0].len()).collect();
-            order.sort_by(|left, right| inputs[0][*right].cmp(&inputs[0][*left]).then_with(|| left.cmp(right)));
+            order.sort_by(|left, right| {
+                inputs[0][*right]
+                    .cmp(&inputs[0][*left])
+                    .then_with(|| left.cmp(right))
+            });
             let selected: Vec<usize> = order
                 .into_iter()
                 .filter(|index| inputs[0][*index] >= threshold)
@@ -1378,9 +1435,18 @@ fn verify_op_relation_with_external_form(
                 return Err(Error::InvalidProof);
             }
             for slot in 0..top_k {
-                let expected_index = selected.get(slot).copied().map(|index| index as i64).unwrap_or(-1);
-                let expected_value = selected.get(slot).map(|index| inputs[0][*index]).unwrap_or(0);
-                if outputs[0][1 + slot] != expected_index || outputs[0][1 + top_k + slot] != expected_value {
+                let expected_index = selected
+                    .get(slot)
+                    .copied()
+                    .map(|index| index as i64)
+                    .unwrap_or(-1);
+                let expected_value = selected
+                    .get(slot)
+                    .map(|index| inputs[0][*index])
+                    .unwrap_or(0);
+                if outputs[0][1 + slot] != expected_index
+                    || outputs[0][1 + top_k + slot] != expected_value
+                {
                     return Err(Error::InvalidProof);
                 }
             }
@@ -1450,7 +1516,8 @@ fn verify_op_relation_with_external_form(
                 || inputs[0].len() != left
                 || inputs[1].len() != right
                 || outputs[0].len() != output_len
-                || raw.is_empty() || raw[0].len() != output_len
+                || raw.is_empty()
+                || raw[0].len() != output_len
             {
                 return Err(Error::ShapeMismatch);
             }
@@ -1467,7 +1534,9 @@ fn verify_op_relation_with_external_form(
                             expected = expected.checked_add(term).ok_or(Error::BoundViolation)?;
                         }
                         let slot = batch_index * m * n + row * n + column;
-                        if raw[0][slot] != expected || rq(expected, shift)? != outputs[0][slot] as i128 {
+                        if raw[0][slot] != expected
+                            || rq(expected, shift)? != outputs[0][slot] as i128
+                        {
                             return Err(Error::InvalidProof);
                         }
                     }
@@ -1486,10 +1555,7 @@ fn verify_op_relation_with_external_form(
                 return Err(Error::ShapeMismatch);
             }
             let rows = inputs[0].len() / cols;
-            let output_len = inputs[1]
-                .len()
-                .checked_mul(n)
-                .ok_or(Error::ResourceLimit)?;
+            let output_len = inputs[1].len().checked_mul(n).ok_or(Error::ResourceLimit)?;
             if outputs[0].len() != output_len || raw.is_empty() || raw[0].len() != output_len {
                 return Err(Error::ShapeMismatch);
             }
@@ -1506,7 +1572,9 @@ fn verify_op_relation_with_external_form(
                         expected = expected.checked_add(term).ok_or(Error::BoundViolation)?;
                     }
                     let position = slot * n + column;
-                    if raw[0][position] != expected || rq(expected, shift)? != outputs[0][position] as i128 {
+                    if raw[0][position] != expected
+                        || rq(expected, shift)? != outputs[0][position] as i128
+                    {
                         return Err(Error::InvalidProof);
                     }
                 }
@@ -1517,7 +1585,10 @@ fn verify_op_relation_with_external_form(
                 return Err(Error::ShapeMismatch);
             }
             for (slot, index) in inputs[0].iter().enumerate() {
-                if *index < 0 || *index as usize >= inputs[1].len() || outputs[0][slot] != inputs[1][*index as usize] {
+                if *index < 0
+                    || *index as usize >= inputs[1].len()
+                    || outputs[0][slot] != inputs[1][*index as usize]
+                {
                     return Err(Error::InvalidProof);
                 }
             }
@@ -1529,7 +1600,11 @@ fn verify_op_relation_with_external_form(
                 return Err(Error::ShapeMismatch);
             }
             for index in 0..inputs[0].len() {
-                let expected = if index < valid { inputs[0][index] } else { value };
+                let expected = if index < valid {
+                    inputs[0][index]
+                } else {
+                    value
+                };
                 if outputs[0][index] != expected {
                     return Err(Error::InvalidProof);
                 }
@@ -1574,10 +1649,7 @@ fn verify_op_relation_with_external_form(
             }
         }
         OpCode::DivRound => {
-            let doubled = inputs[0]
-                .len()
-                .checked_mul(2)
-                .ok_or(Error::ShapeMismatch)?;
+            let doubled = inputs[0].len().checked_mul(2).ok_or(Error::ShapeMismatch)?;
             if inputs.len() != 2
                 || inputs[0].len() != inputs[1].len()
                 || outputs[0].len() != doubled
@@ -1593,7 +1665,8 @@ fn verify_op_relation_with_external_form(
                 }
                 let quotient = quotients[0][index];
                 let remainder = outputs[0][inputs[0].len() + index];
-                if quotient as i128 * divisor as i128 + remainder as i128 != inputs[0][index] as i128
+                if quotient as i128 * divisor as i128 + remainder as i128
+                    != inputs[0][index] as i128
                     || remainder < 0
                     || remainder >= divisor
                     || outputs[0][index] != quotient
@@ -1621,20 +1694,21 @@ fn verify_op_relation_with_external_form(
             let width = *config.first().ok_or(Error::InvalidConfig)? as usize;
             let out_cols = *config.get(1).ok_or(Error::InvalidConfig)? as usize;
             let shift = *config.get(2).ok_or(Error::InvalidConfig)? as u32;
-            let table = width
-                .checked_mul(out_cols)
-                .ok_or(Error::ResourceLimit)?;
+            let table = width.checked_mul(out_cols).ok_or(Error::ResourceLimit)?;
             let expected_len = table
                 .checked_mul(2)
                 .and_then(|value| value.checked_add(3))
                 .ok_or(Error::ResourceLimit)?;
-            if width == 0 || out_cols == 0 || config.len() != expected_len
+            if width == 0
+                || out_cols == 0
+                || config.len() != expected_len
                 || inputs.len() != 2
                 || inputs[0].len() != width
                 || inputs[1].len() != width
                 || outputs[0].len() != out_cols
                 || raw.len() != 3
-                || raw.is_empty() || raw[0].len() != out_cols
+                || raw.is_empty()
+                || raw[0].len() != out_cols
                 || raw[1].len() != out_cols
                 || raw[2].len() != out_cols
             {
@@ -1690,8 +1764,16 @@ fn verify_op_relation_with_external_form(
             }
             for index in 0..total {
                 let slot = index / width;
-                let expected_key = if slot == position { inputs[2][index % width] } else { inputs[0][index] };
-                let expected_value = if slot == position { inputs[3][index % width] } else { inputs[1][index] };
+                let expected_key = if slot == position {
+                    inputs[2][index % width]
+                } else {
+                    inputs[0][index]
+                };
+                let expected_value = if slot == position {
+                    inputs[3][index % width]
+                } else {
+                    inputs[1][index]
+                };
                 if outputs[0][index] != expected_key || outputs[1][index] != expected_value {
                     return Err(Error::InvalidProof);
                 }
@@ -1699,7 +1781,11 @@ fn verify_op_relation_with_external_form(
         }
         OpCode::Patchify => {
             let patch = *config.first().ok_or(Error::InvalidConfig)? as usize;
-            if patch == 0 || inputs.len() != 1 || inputs[0].len() % patch != 0 || outputs[0] != inputs[0] {
+            if patch == 0
+                || inputs.len() != 1
+                || inputs[0].len() % patch != 0
+                || outputs[0] != inputs[0]
+            {
                 return Err(Error::InvalidProof);
             }
             let patches = inputs[0].len() / patch;
@@ -1713,7 +1799,9 @@ fn verify_op_relation_with_external_form(
             let valid = *config.get(2).ok_or(Error::InvalidConfig)? as usize;
             let output_shift = *config.get(3).ok_or(Error::InvalidConfig)? as u32;
             let cells = rows.checked_mul(cols).ok_or(Error::ResourceLimit)?;
-            if valid == 0 || valid > cols || inputs.len() != 4
+            if valid == 0
+                || valid > cols
+                || inputs.len() != 4
                 || inputs[0].len() != cells
                 || inputs[1].len() != cells
                 || inputs[2].len() != cells
@@ -1739,13 +1827,18 @@ fn verify_op_relation_with_external_form(
                 let mut squares = 0i128;
                 for index in 0..valid {
                     let centered = inputs[0][start + index] as i128 - mean;
-                    let square = centered.checked_mul(centered).ok_or(Error::BoundViolation)?;
+                    let square = centered
+                        .checked_mul(centered)
+                        .ok_or(Error::BoundViolation)?;
                     squares = squares.checked_add(square).ok_or(Error::BoundViolation)?;
                 }
                 let variance = round_div_half_up(squares, valid as i128)?;
                 let variance_i64 = i64::try_from(variance).map_err(|_| Error::BoundViolation)?;
                 let table_index = profile_rsqrt_index(variance_i64)?;
-                if table_index as usize >= inputs[3].len() || aux[0][row] as i128 != mean || aux[1][row] != variance_i64 {
+                if table_index as usize >= inputs[3].len()
+                    || aux[0][row] as i128 != mean
+                    || aux[1][row] != variance_i64
+                {
                     return Err(Error::InvalidProof);
                 }
                 let rstd = inputs[3][table_index as usize];
@@ -1779,9 +1872,7 @@ fn verify_op_relation_with_external_form(
                 return Err(Error::ShapeMismatch);
             }
             for (input, output) in inputs[0].iter().zip(&outputs[0]) {
-                let expected = input
-                    .saturating_add(offset)
-                    .clamp(0, table_len as i64 - 1);
+                let expected = input.saturating_add(offset).clamp(0, table_len as i64 - 1);
                 if *output != expected {
                     return Err(Error::InvalidProof);
                 }
@@ -1805,9 +1896,7 @@ fn verify_op_relation_with_external_form(
                     return Err(Error::InvalidProof);
                 }
                 for dimension in 0..hidden {
-                    if outputs[0][row * hidden + dimension]
-                        != (dimension * vocab) as i64 + *token
-                    {
+                    if outputs[0][row * hidden + dimension] != (dimension * vocab) as i64 + *token {
                         return Err(Error::InvalidProof);
                     }
                 }
@@ -1842,7 +1931,8 @@ fn verify_op_relation_with_external_form(
                     square = square.checked_add(term).ok_or(Error::BoundViolation)?;
                 }
                 let mean_square = round_div_half_up(square, valid as i128)?;
-                let mean_square_i64 = i64::try_from(mean_square).map_err(|_| Error::BoundViolation)?;
+                let mean_square_i64 =
+                    i64::try_from(mean_square).map_err(|_| Error::BoundViolation)?;
                 let table_index = profile_rsqrt_index(mean_square_i64)?;
                 let base_len = inputs[2].len();
                 let table_position = table_index as usize;
@@ -1890,7 +1980,9 @@ fn verify_op_relation_with_external_form(
         OpCode::ProfileRope => {
             let head_dim = *config.first().ok_or(Error::InvalidConfig)? as usize;
             let shift = *config.get(1).ok_or(Error::InvalidConfig)? as u32;
-            if head_dim == 0 || head_dim % 2 != 0 || inputs.len() != 3
+            if head_dim == 0
+                || head_dim % 2 != 0
+                || inputs.len() != 3
                 || inputs[0].len() % head_dim != 0
                 || inputs[1].len() != inputs[0].len() / 2
                 || inputs[2].len() != inputs[0].len() / 2
@@ -1907,13 +1999,20 @@ fn verify_op_relation_with_external_form(
                     let odd = inputs[0][row * head_dim + half + index] as i128;
                     let c = inputs[1][row * half + index] as i128;
                     let s = inputs[2][row * half + index] as i128;
-                    let rotated_even = even.checked_mul(c).and_then(|v| v.checked_sub(odd.checked_mul(s)?)).ok_or(Error::BoundViolation)?;
-                    let rotated_odd = even.checked_mul(s).and_then(|v| v.checked_add(odd.checked_mul(c)?)).ok_or(Error::BoundViolation)?;
+                    let rotated_even = even
+                        .checked_mul(c)
+                        .and_then(|v| v.checked_sub(odd.checked_mul(s)?))
+                        .ok_or(Error::BoundViolation)?;
+                    let rotated_odd = even
+                        .checked_mul(s)
+                        .and_then(|v| v.checked_add(odd.checked_mul(c)?))
+                        .ok_or(Error::BoundViolation)?;
                     if (!omit_raw
                         && (raw[0][row * head_dim + index] != rotated_even
                             || raw[0][row * head_dim + half + index] != rotated_odd))
                         || outputs[0][row * head_dim + index] as i128 != rq(rotated_even, shift)?
-                        || outputs[0][row * head_dim + half + index] as i128 != rq(rotated_odd, shift)?
+                        || outputs[0][row * head_dim + half + index] as i128
+                            != rq(rotated_odd, shift)?
                     {
                         return Err(Error::InvalidProof);
                     }
@@ -1928,9 +2027,7 @@ fn verify_op_relation_with_external_form(
             let source_row = *config.get(4).ok_or(Error::InvalidConfig)? as usize;
             let output_shift = *config.get(5).ok_or(Error::InvalidConfig)? as u32;
             let cells = rows.checked_mul(cols).ok_or(Error::ResourceLimit)?;
-            let out_cells = rows
-                .checked_mul(output_cols)
-                .ok_or(Error::ResourceLimit)?;
+            let out_cells = rows.checked_mul(output_cols).ok_or(Error::ResourceLimit)?;
             if (inputs.len() != 2 && inputs.len() != 3)
                 || rows == 0
                 || cols == 0
@@ -1960,7 +2057,9 @@ fn verify_op_relation_with_external_form(
             let mut squares = 0i128;
             for index in 0..valid {
                 let centered = inputs[0][source + index] as i128 - mean;
-                let square = centered.checked_mul(centered).ok_or(Error::BoundViolation)?;
+                let square = centered
+                    .checked_mul(centered)
+                    .ok_or(Error::BoundViolation)?;
                 squares = squares.checked_add(square).ok_or(Error::BoundViolation)?;
             }
             let variance = round_div_half_up(squares, valid as i128)?;
@@ -1993,7 +2092,8 @@ fn verify_op_relation_with_external_form(
                     let expected = i64::try_from(round_div_half_up(image, 1i128 << output_shift)?)
                         .map_err(|_| Error::BoundViolation)?;
                     if (!omit_raw && raw[0][row * output_cols + index] != image)
-                        || outputs[0][row * output_cols + index] != clamp_value(expected, config, 6)?
+                        || outputs[0][row * output_cols + index]
+                            != clamp_value(expected, config, 6)?
                     {
                         return Err(Error::InvalidProof);
                     }
@@ -2018,7 +2118,9 @@ fn verify_op_relation_with_external_form(
                     return Err(Error::InvalidProof);
                 }
                 for dimension in 0..hidden {
-                    if outputs[0][row * hidden + dimension] != *token * hidden as i64 + dimension as i64 {
+                    if outputs[0][row * hidden + dimension]
+                        != *token * hidden as i64 + dimension as i64
+                    {
                         return Err(Error::InvalidProof);
                     }
                 }
@@ -2029,7 +2131,13 @@ fn verify_op_relation_with_external_form(
             let head_dim = *config.get(1).ok_or(Error::InvalidConfig)? as usize;
             let shift = *config.get(2).ok_or(Error::InvalidConfig)? as u32;
             let cells = seq.checked_mul(head_dim).ok_or(Error::ResourceLimit)?;
-            if seq == 0 || head_dim == 0 || inputs.len() != 4 || outputs[0].len() != cells || raw.is_empty() || raw[0].len() != cells {
+            if seq == 0
+                || head_dim == 0
+                || inputs.len() != 4
+                || outputs[0].len() != cells
+                || raw.is_empty()
+                || raw[0].len() != cells
+            {
                 return Err(Error::ShapeMismatch);
             }
             if inputs[0].len() != cells || inputs[1].len() != cells || inputs[2].len() != cells {
@@ -2089,7 +2197,9 @@ fn verify_op_relation_with_external_form(
                     }
                     let scaled = numerator.checked_mul(scale).ok_or(Error::BoundViolation)?;
                     let slot = row * head_dim + index;
-                    if raw[0][slot] != scaled || outputs[0][slot] as i128 != scaled.div_euclid(denominator) {
+                    if raw[0][slot] != scaled
+                        || outputs[0][slot] as i128 != scaled.div_euclid(denominator)
+                    {
                         return Err(Error::InvalidProof);
                     }
                 }
@@ -2101,7 +2211,6 @@ fn verify_op_relation_with_external_form(
     }
     Ok(())
 }
-
 
 /// Input values recovered from a relation proof. The decode enforces
 /// coordinate order and full length, so reordered or duplicated openings are

@@ -3,17 +3,16 @@
 //! A real projection request consumes one table through every head slice of
 //! the layer. The request binding walks the head claims of one request in one
 //! chain: the request statement fixes the request, the table, the geometry,
-//! the mask source and the ordered head sources before any challenge; the
-//! position coefficients and the per-head column coefficients follow; then the
-//! prover fixes every head's raw target in the chain, one by one, and only
-//! after them the batch challenge combines the heads into one product-sumcheck
-//! claim over the whole consumed region.
+//! the mask source, the ordered head sources and the actual raw accumulator
+//! rows before any challenge; the position coefficients and the per-head
+//! column coefficients follow; then the batch challenge combines the heads
+//! into one product-sumcheck claim over the whole consumed region.
 //!
 //! With `J` registered heads the request performs the batch step (`J > 1`) or
 //! the direct step (`J = 1`):
 //!
 //! * every head has its own column coefficients `b_h` and its own raw target
-//!   `T_h = Σ_p Σ_j a[p] b_h[j] Y_h[p, j]`, fixed before the batch challenge;
+//!   `T_h = Σ_p Σ_j a[p] b_h[j] Y_h[p, j]`, derived from the head's raw rows;
 //! * the batch challenge `theta` combines the targets and the column
 //!   coefficients: `T = Σ_h theta^h T_h` and
 //!   `b = concat_h(theta^h b_h)`;
@@ -24,38 +23,43 @@
 //!   and turns the second end value into one pending row over the same matrix,
 //!   with the row weights covering exactly the consumed region.
 //!
-//! The first head target fixed before `theta` makes the batch binding: a
-//! request whose head relation fails fails the combined claim for the drawn
-//! challenge, exactly as the batch of `J` claims must. The per-head targets
-//! are registered as the request's raw obligation; closing them is the raw
-//! relation's duty, never this module's trust.
+//! The raw rows are the projection's integer accumulator, verified as public
+//! request inputs: every entry must satisfy the production rounding relation
+//! `out = rq(Y, shift)` of the head's projection step, and the relation is
+//! checked by both sides before any challenge. The verifier therefore derives
+//! the raw targets itself; the prover never supplies them. The raw relation
+//! quantity of every head is this exact accumulator, never its requantized
+//! output. What the verifier learns is exactly the accumulator the op-level
+//! relation already carries; the table itself never leaves the prover.
 
+use zkie_core::artifact::digest_bytes;
 use zkie_core::common::codec::DecodeLimits;
 use zkie_core::error::{Error, Result};
+use zkie_core::types::Digest;
 use zkie_engine::pcs::request::chain::Chain;
 use zkie_engine::pcs::request::field::Fp3;
 use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
 
+use crate::proof::column_session::fp_from_signed_word;
 use crate::proof::committed_psc::{
     get_psc_transcript, put_psc_transcript, PositionPscChallenges, PscTranscriptTags,
 };
 use crate::proof::consumer_psc::{
-    ConsumerMaskRow, ConsumerObligation, ConsumerPscMasks, ConsumerPscShape, ConsumerTable,
-    CONSUMER_PSC_VERSION,
+    ConsumerMaskRow, ConsumerMaskSource, ConsumerObligation, ConsumerPscMasks, ConsumerPscShape,
+    ConsumerTable, CONSUMER_PSC_VERSION,
 };
 use crate::proof::hidden_member::{stretch_weights, MaskTerm, PendingRow};
 use crate::proof::projection_claim::{activation_shown, consumer_reduction, raw_target};
 use crate::proof::psc::{
-    check_product_claims, hp_entries, multilinear_eval, prove_dot_sumcheck, psc_variables,
-    verify_psc_transcript, DotClaim, DotMaskEntries, DotOutput, DotProof, SHOWN_MAPS,
+    check_product_claims, multilinear_eval, prove_dot_sumcheck, verify_psc_transcript, DotClaim,
+    DotMaskEntries, DotOutput, DotProof, SHOWN_MAPS,
 };
+use crate::proof::relations::rq;
 
 /// Version of the request proof message and of its transcript messages.
 pub const CONSUMER_REQUEST_VERSION: u64 = 1;
 /// Transcript tag of the request statement.
 const CONSUMER_REQUEST_TAG: u64 = 86;
-/// Transcript tag of one head's raw target, before the batch challenge.
-const CONSUMER_HEAD_TARGET_TAG: u64 = 87;
 /// Transcript tags of the request's product sumcheck. The claim word is
 /// reserved: the plain product sumcheck carries no claim masks.
 pub const CONSUMER_REQUEST_PSC_TAGS: PscTranscriptTags = PscTranscriptTags {
@@ -66,6 +70,14 @@ pub const CONSUMER_REQUEST_PSC_TAGS: PscTranscriptTags = PscTranscriptTags {
     claim: 91,
 };
 
+fn push_digest(message: &mut zkie_engine::pcs::request::chain::ChainMessage, digest: &Digest) {
+    for word in digest.0.chunks_exact(8) {
+        message.push_u64(u64::from_le_bytes(
+            word.try_into().expect("eight-byte word"),
+        ));
+    }
+}
+
 /// The one-request consumer plan: the registered head obligations of a single
 /// request, their common table and the single product-sumcheck instance.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,7 +86,7 @@ pub struct ConsumerRequestPlan {
     pub table: ConsumerTable,
     pub shift: i64,
     pub shape: ConsumerPscShape,
-    pub mask: crate::proof::consumer_psc::ConsumerMaskSource,
+    pub mask: ConsumerMaskSource,
     pub head_width: u64,
     pub obligations: Vec<ConsumerObligation>,
 }
@@ -87,7 +99,7 @@ impl ConsumerRequestPlan {
     pub fn new(
         request: u64,
         table: ConsumerTable,
-        mask: crate::proof::consumer_psc::ConsumerMaskSource,
+        mask: ConsumerMaskSource,
         obligations: Vec<ConsumerObligation>,
     ) -> Result<Self> {
         if obligations.is_empty()
@@ -194,7 +206,7 @@ impl ConsumerRequestPlan {
         None
     }
 
-    fn absorb(&self, chain: &mut Chain) -> Result<()> {
+    fn absorb(&self, chain: &mut Chain, raw_digest: &Digest, output_digest: &Digest) -> Result<()> {
         let mut message = chain.message();
         message.push_u64(CONSUMER_REQUEST_VERSION);
         message.push_u64(CONSUMER_REQUEST_TAG);
@@ -214,6 +226,8 @@ impl ConsumerRequestPlan {
         message.push_u64(self.mask.oracle);
         message.push_u64(self.mask.hiding_base);
         message.push_u64(self.mask.shown_slot);
+        push_digest(&mut message, raw_digest);
+        push_digest(&mut message, output_digest);
         for obligation in &self.obligations {
             message.push_u64(u64::from(obligation.source_step));
             message.push_u64(u64::from(obligation.activation_step));
@@ -227,19 +241,75 @@ impl ConsumerRequestPlan {
     }
 }
 
-fn push_digest(
-    message: &mut zkie_engine::pcs::request::chain::ChainMessage,
-    digest: &zkie_core::types::Digest,
-) {
-    for word in digest.0.chunks_exact(8) {
-        message.push_u64(u64::from_le_bytes(
-            word.try_into().expect("eight-byte word"),
-        ));
+fn check_rows(value: &[Vec<i64>], heads: usize, positions: u32, width: u64) -> Result<()> {
+    if value.len() != heads {
+        return Err(Error::ShapeMismatch);
     }
+    let count = (positions as usize)
+        .checked_mul(usize::try_from(width).map_err(|_| Error::ResourceLimit)?)
+        .ok_or(Error::ResourceLimit)?;
+    if value.iter().any(|rows| rows.len() != count) {
+        return Err(Error::ShapeMismatch);
+    }
+    Ok(())
+}
+
+/// The rounding relation of the request, checked in the clear by both sides:
+/// every raw accumulator entry of every head must round to the head step's
+/// public output entry under the production rounding rule and shift. This is
+/// the real raw relation; a requantized output substituted for the raw
+/// accumulator fails it.
+pub fn check_consumer_raw_rounding(
+    plan: &ConsumerRequestPlan,
+    raw: &[Vec<i64>],
+    outputs: &[Vec<i64>],
+) -> Result<()> {
+    plan.fault().map_or(Ok(()), |_| Err(Error::InvalidConfig))?;
+    let heads = plan.obligations.len();
+    check_rows(raw, heads, plan.shape.positions, plan.head_width)?;
+    check_rows(outputs, heads, plan.shape.positions, plan.head_width)?;
+    let shift = u32::try_from(plan.shift).map_err(|_| Error::InvalidConfig)?;
+    for (raw_head, output_head) in raw.iter().zip(outputs) {
+        for (value, output) in raw_head.iter().zip(output_head) {
+            if rq(i128::from(*value), shift)? != i128::from(*output) {
+                return Err(Error::InvalidProof);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn rows_digest(plan: &ConsumerRequestPlan, value: &[Vec<i64>], tag: u64) -> Result<Digest> {
+    check_rows(
+        value,
+        plan.obligations.len(),
+        plan.shape.positions,
+        plan.head_width,
+    )?;
+    let mut writer = CanonicalWriter::new();
+    writer.put_u64(CONSUMER_REQUEST_VERSION);
+    writer.put_u64(tag);
+    writer.put_u64(value.len() as u64);
+    for head in value {
+        for entry in head {
+            writer.put_u64(*entry as u64);
+        }
+    }
+    Ok(digest_bytes(&writer.into_bytes()))
+}
+
+/// The digest of the actual raw accumulator rows of the request.
+pub fn consumer_raw_digest(plan: &ConsumerRequestPlan, raw: &[Vec<i64>]) -> Result<Digest> {
+    rows_digest(plan, raw, 1)
+}
+
+/// The digest of the head steps' public output rows.
+pub fn consumer_output_digest(plan: &ConsumerRequestPlan, outputs: &[Vec<i64>]) -> Result<Digest> {
+    rows_digest(plan, outputs, 2)
 }
 
 /// The transcript coefficients of one request: the common position
-/// coefficients, one column vector per head and, after the head targets, the
+/// coefficients, one column vector per head and, after the raw relation, the
 /// batch challenge.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsumerRequestCoefficients {
@@ -300,25 +370,87 @@ fn draw_coefficients(
     })
 }
 
-fn absorb_head_target(chain: &mut Chain, head: u32, target: Fp3) -> Result<()> {
-    let mut message = chain.message();
-    message.push_u64(CONSUMER_REQUEST_VERSION);
-    message.push_u64(CONSUMER_HEAD_TARGET_TAG);
-    message.push_u64(u64::from(head));
-    message.push_fp3(&target);
-    let prefix = message.prefix(zkie_engine::pcs::request::chain::KIND_ALGEBRAIC, 0)?;
-    if !chain.step(&prefix, 0)? {
-        return Err(Error::InvalidProof);
+/// The embedded raw rows of one head: the signed integer accumulator cells as
+/// field elements.
+pub fn consumer_raw_field_rows(raw: &[Vec<i64>]) -> Result<Vec<Vec<Fp3>>> {
+    let mut heads = Vec::with_capacity(raw.len());
+    for head in raw {
+        let mut rows = Vec::with_capacity(head.len());
+        for value in head {
+            rows.push(Fp3::from_base(fp_from_signed_word(*value as u64)));
+        }
+        heads.push(rows);
     }
-    Ok(())
+    Ok(heads)
 }
 
-/// The request proof message: every head's raw target (fixed before the batch
-/// challenge), the combined target and the one product-sumcheck transcript.
+/// The per-head raw targets from the actual raw rows: `T_h` of every head, in
+/// head order. Both sides call this, so the prover never supplies a target.
+pub fn consumer_head_targets(
+    plan: &ConsumerRequestPlan,
+    coefficients: &ConsumerRequestCoefficients,
+    raw: &[Vec<i64>],
+) -> Result<Vec<Fp3>> {
+    check_rows(
+        raw,
+        plan.obligations.len(),
+        plan.shape.positions,
+        plan.head_width,
+    )?;
+    if coefficients.position.len() != plan.shape.positions as usize
+        || coefficients.heads.len() != plan.obligations.len()
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let width = usize::try_from(plan.head_width).map_err(|_| Error::ResourceLimit)?;
+    let mut targets = Vec::with_capacity(raw.len());
+    for (head, rows) in raw.iter().enumerate() {
+        if coefficients.heads[head].len() != width {
+            return Err(Error::ShapeMismatch);
+        }
+        let field_row: Vec<Fp3> = rows
+            .iter()
+            .map(|value| Fp3::from_base(fp_from_signed_word(*value as u64)))
+            .collect();
+        targets.push(raw_target(
+            plan.shape.positions as usize,
+            width,
+            &field_row,
+            &coefficients.position,
+            &coefficients.heads[head],
+        )?);
+    }
+    Ok(targets)
+}
+
+fn combined_target(
+    coefficients: &ConsumerRequestCoefficients,
+    targets: &[Fp3],
+    heads: usize,
+) -> Result<Fp3> {
+    if targets.len() != heads || coefficients.heads.len() != heads {
+        return Err(Error::ShapeMismatch);
+    }
+    if heads > 1 && coefficients.batch.is_none() {
+        return Err(Error::InvalidConfig);
+    }
+    let mut total = Fp3::ZERO;
+    let mut power = Fp3::ONE;
+    for target in targets {
+        total = total.add(&power.mul(target));
+        power = match coefficients.batch {
+            Some(theta) => power.mul(&theta),
+            None => Fp3::ONE,
+        };
+    }
+    Ok(total)
+}
+
+/// The request proof message: the one product-sumcheck transcript and its
+/// masked point values. The targets are derived from the public raw rows, not
+/// sent.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsumerRequestProof {
-    pub head_targets: Vec<Fp3>,
-    pub target: Fp3,
     pub dot: DotProof,
     pub point_values: [Fp3; SHOWN_MAPS],
 }
@@ -328,11 +460,6 @@ impl ConsumerRequestProof {
         self.check(plan)?;
         let mut writer = CanonicalWriter::new();
         writer.put_u64(CONSUMER_REQUEST_VERSION);
-        writer.put_u64(self.head_targets.len() as u64);
-        for target in &self.head_targets {
-            writer.put_fp3(target);
-        }
-        writer.put_fp3(&self.target);
         put_psc_transcript(
             &mut writer,
             CONSUMER_PSC_VERSION,
@@ -348,15 +475,6 @@ impl ConsumerRequestProof {
         if reader.get_u64()? != CONSUMER_REQUEST_VERSION {
             return Err(Error::InvalidEncoding);
         }
-        let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-        if count != plan.obligations.len() {
-            return Err(Error::ShapeMismatch);
-        }
-        let mut head_targets = Vec::with_capacity(count);
-        for _ in 0..count {
-            head_targets.push(reader.get_fp3()?);
-        }
-        let target = reader.get_fp3()?;
         let (mut psc, point_values) = get_psc_transcript::<SHOWN_MAPS>(
             &mut reader,
             CONSUMER_PSC_VERSION,
@@ -372,21 +490,13 @@ impl ConsumerRequestProof {
             .into_iter()
             .next()
             .ok_or(Error::InvalidEncoding)?;
-        let proof = Self {
-            head_targets,
-            target,
-            dot,
-            point_values,
-        };
+        let proof = Self { dot, point_values };
         proof.check(plan)?;
         Ok(proof)
     }
 
     pub fn check(&self, plan: &ConsumerRequestPlan) -> Result<()> {
         plan.fault().map_or(Ok(()), |_| Err(Error::InvalidConfig))?;
-        if self.head_targets.len() != plan.obligations.len() {
-            return Err(Error::ShapeMismatch);
-        }
         let variables = plan.shape.variables()?;
         if self.dot.rounds.len() != variables
             || self.dot.y_round.coefficients.len() != 2
@@ -402,23 +512,26 @@ impl ConsumerRequestProof {
     }
 }
 
-/// The registered raw obligation of the request: every head's raw target was
-/// fixed before the batch challenge, the batch challenge combines them, and
-/// the combined target is the one the product sumcheck proves. The obligation
-/// closes on the real raw rows of the head steps; closing it inside the proof
-/// is the raw relation's duty.
+/// The closed raw obligation of the request: every head's target was derived
+/// from that head's actual raw accumulator, the batch challenge combines them,
+/// and the combined target is the one the product sumcheck proves. Both sides
+/// derive the whole obligation from the public raw rows; no target is trusted
+/// from the proof.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsumerRawBatchObligation {
     pub request: u64,
     pub activation_step: u32,
-    pub position_coefficients: Vec<Fp3>,
+    pub shift: i64,
     pub head_width: u64,
+    pub position_coefficients: Vec<Fp3>,
     pub heads: Vec<ConsumerRawHead>,
     pub batch: Option<Fp3>,
     pub target: Fp3,
+    pub raw_digest: Digest,
+    pub output_digest: Digest,
 }
 
-/// One head's registered raw claim: its source step, its slice and its target.
+/// One head's raw claim: its source step, its slice and its derived target.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsumerRawHead {
     pub head: u32,
@@ -429,21 +542,35 @@ pub struct ConsumerRawHead {
 }
 
 impl ConsumerRawBatchObligation {
-    /// The combined target on the real raw rows: the batch powers over the
-    /// head targets, each recomputed from its own raw rows.
-    pub fn value_on(&self, raw: &[Vec<Fp3>]) -> Result<Fp3> {
-        if raw.len() != self.heads.len() {
+    /// The combined target on the raw rows: the batch powers over the head
+    /// targets, each recomputed from its own raw rows.
+    pub fn value_on(&self, raw: &[i128]) -> Result<Fp3> {
+        if raw.len()
+            != self
+                .heads
+                .len()
+                .checked_mul(self.position_coefficients.len())
+                .and_then(|value| value.checked_mul(self.head_width as usize))
+                .ok_or(Error::ResourceLimit)?
+        {
             return Err(Error::ShapeMismatch);
         }
+        let width = usize::try_from(self.head_width).map_err(|_| Error::ResourceLimit)?;
+        let per_head = self.position_coefficients.len() * width;
         let mut total = Fp3::ZERO;
         let mut power = Fp3::ONE;
-        for (head, rows) in self.heads.iter().zip(raw) {
+        for (head, claim) in self.heads.iter().enumerate() {
+            let start = head.checked_mul(per_head).ok_or(Error::ResourceLimit)?;
+            let field: Vec<Fp3> = raw[start..start + per_head]
+                .iter()
+                .map(|value| Fp3::from_base(fp_from_signed_word(*value as u64)))
+                .collect();
             let target = raw_target(
                 self.position_coefficients.len(),
-                head.column_coefficients.len(),
-                rows,
+                width,
+                &field,
                 &self.position_coefficients,
-                &head.column_coefficients,
+                &claim.column_coefficients,
             )?;
             total = total.add(&power.mul(&target));
             power = match self.batch {
@@ -454,16 +581,33 @@ impl ConsumerRawBatchObligation {
         Ok(total)
     }
 
-    pub fn check_on(&self, raw: &[Vec<Fp3>]) -> Result<()> {
+    /// The target holds on the given flattened raw rows (head-major, then
+    /// position-major).
+    pub fn check_on(&self, raw: &[i128]) -> Result<()> {
         if self.value_on(raw)? != self.target {
             return Err(Error::InvalidProof);
+        }
+        Ok(())
+    }
+
+    /// The rounding relation on the same flattened raw rows and the public
+    /// output rows: every entry must satisfy `out = rq(Y, shift)`.
+    pub fn check_rounding(&self, raw: &[i128], outputs: &[i64]) -> Result<()> {
+        if raw.len() != outputs.len() || raw.is_empty() {
+            return Err(Error::ShapeMismatch);
+        }
+        let shift = u32::try_from(self.shift).map_err(|_| Error::InvalidConfig)?;
+        for (value, output) in raw.iter().zip(outputs) {
+            if rq(*value, shift)? != i128::from(*output) {
+                return Err(Error::InvalidProof);
+            }
         }
         Ok(())
     }
 }
 
 /// The checked outcome of one request: the sumcheck point, the one pending
-/// row over the matrix, the mask row and the registered raw obligation.
+/// row over the matrix, the mask row and the closed raw obligation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConsumerRequestOutcome {
     pub point: Vec<Fp3>,
@@ -476,16 +620,18 @@ pub struct ConsumerRequestOutcome {
 fn outcome(
     plan: &ConsumerRequestPlan,
     coefficients: &ConsumerRequestCoefficients,
-    head_targets: &[Fp3],
+    targets: &[Fp3],
     target: Fp3,
     output: &DotOutput,
+    raw_digest: Digest,
+    output_digest: Digest,
 ) -> Result<ConsumerRequestOutcome> {
     let shape = &plan.shape;
     let variables = shape.variables()?;
     if output.point.len() != variables
         || output.hiding_form.len() != shape.hiding_entries()?
         || output.ends.iter().any(|end| end.point != output.point)
-        || head_targets.len() != plan.obligations.len()
+        || targets.len() != plan.obligations.len()
     {
         return Err(Error::InvalidProof);
     }
@@ -509,7 +655,7 @@ fn outcome(
     let heads = plan
         .obligations
         .iter()
-        .zip(head_targets)
+        .zip(targets)
         .map(|(obligation, target)| ConsumerRawHead {
             head: obligation.head,
             source_step: obligation.source_step,
@@ -521,11 +667,14 @@ fn outcome(
     let raw = ConsumerRawBatchObligation {
         request: plan.request,
         activation_step: plan.obligations[0].activation_step,
-        position_coefficients: coefficients.position.clone(),
+        shift: plan.shift,
         head_width: plan.head_width,
+        position_coefficients: coefficients.position.clone(),
         heads,
         batch: coefficients.batch,
         target,
+        raw_digest,
+        output_digest,
     };
     Ok(ConsumerRequestOutcome {
         point: output.point.clone(),
@@ -536,67 +685,97 @@ fn outcome(
     })
 }
 
-/// Prover side of the request. One chain, one product-sumcheck instance over
-/// the whole consumed region. Every head's raw target is absorbed before the
-/// batch challenge; the batch challenge then combines the heads and the
-/// product sumcheck proves the combined claim. An honest prover refuses a raw
-/// target that is not its own reduction.
-pub fn prove_consumer_request(
+fn derive_targets(
+    plan: &ConsumerRequestPlan,
+    coefficients: &mut ConsumerRequestCoefficients,
     chain: &mut Chain,
+    raw: &[Vec<i64>],
+) -> Result<(Vec<Fp3>, Fp3)> {
+    if plan.obligations.len() > 1 {
+        let theta = chain.draw_e()?;
+        coefficients.batch = Some(theta);
+    }
+    let targets = consumer_head_targets(plan, coefficients, raw)?;
+    let target = combined_target(coefficients, &targets, plan.obligations.len())?;
+    Ok((targets, target))
+}
+
+fn combined_raw_rows(plan: &ConsumerRequestPlan, raw: &[Vec<i64>]) -> Result<Vec<Fp3>> {
+    let positions = plan.shape.positions as usize;
+    let width = usize::try_from(plan.head_width).map_err(|_| Error::ResourceLimit)?;
+    let hidden = usize::try_from(plan.shape.slice_len()?).map_err(|_| Error::ResourceLimit)?;
+    let mut combined = vec![Fp3::ZERO; positions * hidden];
+    for (head, rows) in raw.iter().enumerate() {
+        for position in 0..positions {
+            for index in 0..width {
+                combined[position * hidden + head * width + index] =
+                    Fp3::from_base(fp_from_signed_word(rows[position * width + index] as u64));
+            }
+        }
+    }
+    Ok(combined)
+}
+
+fn check_inputs(
     plan: &ConsumerRequestPlan,
     activation: &[Fp3],
-    raw_heads: &[Vec<Fp3>],
-    matrix_places: &[Vec<Fp3>],
-    masks: &ConsumerPscMasks,
-) -> Result<(ConsumerRequestProof, ConsumerRequestOutcome)> {
+    raw: &[Vec<i64>],
+    outputs: &[Vec<i64>],
+) -> Result<()> {
     plan.fault().map_or(Ok(()), |_| Err(Error::InvalidConfig))?;
-    masks.check(&plan.shape)?;
     let positions = plan.shape.positions as usize;
     let records = usize::try_from(plan.shape.records).map_err(|_| Error::ResourceLimit)?;
     if activation.len() != positions.checked_mul(records).ok_or(Error::ResourceLimit)? {
         return Err(Error::ShapeMismatch);
     }
+    check_rows(
+        raw,
+        plan.obligations.len(),
+        plan.shape.positions,
+        plan.head_width,
+    )?;
+    check_rows(
+        outputs,
+        plan.obligations.len(),
+        plan.shape.positions,
+        plan.head_width,
+    )?;
+    check_consumer_raw_rounding(plan, raw, outputs)
+}
+
+/// Prover side of the request. One chain, one product-sumcheck instance over
+/// the whole consumed region. The raw relation is checked first; the raw
+/// targets are derived from the same public rows the verifier uses; the batch
+/// challenge then combines the heads and the product sumcheck proves the
+/// combined claim. An honest prover refuses a raw row that does not round to
+/// the head's public output and refuses a relation inconsistent with its own
+/// matrix.
+pub fn prove_consumer_request(
+    chain: &mut Chain,
+    plan: &ConsumerRequestPlan,
+    activation: &[Fp3],
+    raw: &[Vec<i64>],
+    outputs: &[Vec<i64>],
+    matrix_places: &[Vec<Fp3>],
+    masks: &ConsumerPscMasks,
+) -> Result<(ConsumerRequestProof, ConsumerRequestOutcome)> {
+    check_inputs(plan, activation, raw, outputs)?;
+    masks.check(&plan.shape)?;
+    let positions = plan.shape.positions as usize;
+    let records = usize::try_from(plan.shape.records).map_err(|_| Error::ResourceLimit)?;
     if matrix_places.len()
         != usize::try_from(plan.shape.places).map_err(|_| Error::ResourceLimit)?
         || matrix_places.iter().any(|row| row.len() != records)
-        || raw_heads.len() != plan.obligations.len()
     {
         return Err(Error::ShapeMismatch);
     }
-    plan.absorb(chain)?;
+    let raw_digest = consumer_raw_digest(plan, raw)?;
+    let output_digest = consumer_output_digest(plan, outputs)?;
+    plan.absorb(chain, &raw_digest, &output_digest)?;
     let mut coefficients = draw_coefficients(chain, plan)?;
-    let mut head_targets = Vec::with_capacity(raw_heads.len());
-    let hidden = usize::try_from(plan.shape.slice_len()?).map_err(|_| Error::ResourceLimit)?;
-    let mut combined_raw = vec![Fp3::ZERO; positions * hidden];
-    for (head, rows) in raw_heads.iter().enumerate() {
-        let width = usize::try_from(plan.head_width).map_err(|_| Error::ResourceLimit)?;
-        if rows.len() != positions * width {
-            return Err(Error::ShapeMismatch);
-        }
-        let target = raw_target(
-            positions,
-            width,
-            rows,
-            &coefficients.position,
-            &coefficients.heads[head],
-        )?;
-        absorb_head_target(chain, head as u32, target)?;
-        head_targets.push(target);
-        // The consumed region's raw rows are the head rows in position-major
-        // order: position `p`, head `h`, offset `j` is the entry
-        // `p * hidden + h * width + j`.
-        for position in 0..positions {
-            for index in 0..width {
-                combined_raw[position * hidden + head * width + index] =
-                    rows[position * width + index];
-            }
-        }
-    }
-    if plan.obligations.len() > 1 {
-        let theta = chain.draw_e()?;
-        coefficients.batch = Some(theta);
-    }
+    let (targets, target) = derive_targets(plan, &mut coefficients, chain, raw)?;
     let combined = coefficients.combined()?;
+    let combined_raw = combined_raw_rows(plan, raw)?;
     let reduction = consumer_reduction(
         positions,
         plan.shape.records,
@@ -610,7 +789,7 @@ pub fn prove_consumer_request(
     let columns = reduction.column_values(matrix_places)?;
     let claim = DotClaim {
         masks: Vec::new(),
-        target: reduction.target,
+        target,
     };
     let mut challenges = PositionPscChallenges::new(chain, CONSUMER_REQUEST_PSC_TAGS, 0);
     let (dot, output) = prove_dot_sumcheck(
@@ -621,7 +800,15 @@ pub fn prove_consumer_request(
         &mut challenges,
     )?;
     check_product_claims(&output, &claim, &masks.entries, &reduction.shown, &columns)?;
-    let outcome = outcome(plan, &coefficients, &head_targets, claim.target, &output)?;
+    let outcome = outcome(
+        plan,
+        &coefficients,
+        &targets,
+        target,
+        &output,
+        raw_digest,
+        output_digest,
+    )?;
     crate::proof::hidden_member::check_pending(
         &outcome.pending,
         matrix_places,
@@ -634,53 +821,32 @@ pub fn prove_consumer_request(
         },
     )?;
     let proof = ConsumerRequestProof {
-        head_targets,
-        target: claim.target,
         point_values: [output.ends[0].value, output.ends[1].value],
         dot,
     };
     Ok((proof, outcome))
 }
 
-/// Verifier side of the request. The verifier draws the same coefficients,
-/// absorbs the same per-head targets from the proof, draws the same batch
-/// challenge, replays the product sumcheck and checks the public activation
-/// map at its own point. It never sees the matrix, the raw rows or the mask
-/// entries.
+/// Verifier side of the request. The verifier checks the raw rounding relation
+/// on the public rows, draws the same coefficients, derives the same targets
+/// and the same batch challenge, replays the product sumcheck and checks the
+/// public activation map at its own point. It never sees the matrix or the
+/// mask entries, and no prover-supplied target enters the transcript.
 pub fn verify_consumer_request(
     chain: &mut Chain,
     plan: &ConsumerRequestPlan,
     activation: &[Fp3],
+    raw: &[Vec<i64>],
+    outputs: &[Vec<i64>],
     proof: &ConsumerRequestProof,
 ) -> Result<ConsumerRequestOutcome> {
-    plan.fault().map_or(Ok(()), |_| Err(Error::InvalidConfig))?;
+    check_inputs(plan, activation, raw, outputs)?;
     proof.check(plan)?;
-    let positions = plan.shape.positions as usize;
-    let records = usize::try_from(plan.shape.records).map_err(|_| Error::ResourceLimit)?;
-    if activation.len() != positions.checked_mul(records).ok_or(Error::ResourceLimit)? {
-        return Err(Error::ShapeMismatch);
-    }
-    plan.absorb(chain)?;
+    let raw_digest = consumer_raw_digest(plan, raw)?;
+    let output_digest = consumer_output_digest(plan, outputs)?;
+    plan.absorb(chain, &raw_digest, &output_digest)?;
     let mut coefficients = draw_coefficients(chain, plan)?;
-    for (head, target) in proof.head_targets.iter().enumerate() {
-        absorb_head_target(chain, head as u32, *target)?;
-    }
-    let target = if plan.obligations.len() > 1 {
-        let theta = chain.draw_e()?;
-        coefficients.batch = Some(theta);
-        let mut total = Fp3::ZERO;
-        let mut power = Fp3::ONE;
-        for head_target in &proof.head_targets {
-            total = total.add(&power.mul(head_target));
-            power = power.mul(&theta);
-        }
-        total
-    } else {
-        proof.head_targets[0]
-    };
-    if target != proof.target {
-        return Err(Error::InvalidProof);
-    }
+    let (targets, target) = derive_targets(plan, &mut coefficients, chain, raw)?;
     let entries = DotMaskEntries {
         hiding: vec![Fp3::ZERO; plan.shape.hiding_entries()?],
         shown: [Fp3::ZERO; SHOWN_MAPS],
@@ -701,7 +867,7 @@ pub fn verify_consumer_request(
         return Err(Error::InvalidProof);
     }
     let shown = activation_shown(
-        positions,
+        plan.shape.positions as usize,
         plan.shape.records,
         activation,
         &coefficients.position,
@@ -709,16 +875,23 @@ pub fn verify_consumer_request(
     if multilinear_eval(&shown, &output.point)? != output.ends[0].value {
         return Err(Error::InvalidProof);
     }
-    outcome(plan, &coefficients, &proof.head_targets, target, &output)
+    outcome(
+        plan,
+        &coefficients,
+        &targets,
+        target,
+        &output,
+        raw_digest,
+        output_digest,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zkie_core::types::Digest;
     use zkie_engine::pcs::request::field::fp_from_u64;
 
-    use crate::proof::consumer_psc::{ConsumerMaskSource, ConsumerPscMasks};
+    use crate::proof::consumer_psc::ConsumerPscMasks;
 
     fn value(word: u64) -> Fp3 {
         Fp3::from_base(fp_from_u64(word))
@@ -771,43 +944,50 @@ mod tests {
         .unwrap()
     }
 
-    fn activation(shape: &ConsumerPscShape) -> Vec<Fp3> {
-        let count = shape.positions as usize * shape.records as usize;
+    /// The fixture keeps the integers small enough that the field embeddings
+    /// of the activation, the matrix and every accumulator are faithful.
+    fn activation_words(plan: &ConsumerRequestPlan) -> Vec<i64> {
+        let count = plan.shape.positions as usize * plan.shape.records as usize;
         (0..count)
-            .map(|index| value((index as u64 * 5 + 2) % 13))
+            .map(|index| ((index as i64 * 5 + 2) % 13) + 1)
             .collect()
     }
 
-    fn matrix(shape: &ConsumerPscShape) -> Vec<Vec<Fp3>> {
-        (0..shape.places as usize)
+    fn matrix_words(plan: &ConsumerRequestPlan) -> Vec<Vec<i64>> {
+        (0..plan.shape.places as usize)
             .map(|place| {
-                (0..shape.records as usize)
-                    .map(|record| value(((record as u64 * 7 + place as u64 * 3 + 1) % 19) as u64))
+                (0..plan.shape.records as usize)
+                    .map(|record| (((record as i64 * 7 + place as i64 * 3 + 1) % 19) + 1) * 3001)
                     .collect()
             })
             .collect()
     }
 
-    fn raw_heads(
+    fn embed(values: &[i64]) -> Vec<Fp3> {
+        values
+            .iter()
+            .map(|value| Fp3::from_base(fp_from_signed_word(*value as u64)))
+            .collect()
+    }
+
+    fn raw_words(
         plan: &ConsumerRequestPlan,
-        activation: &[Fp3],
-        matrix: &[Vec<Fp3>],
-    ) -> Vec<Vec<Fp3>> {
+        activation: &[i64],
+        matrix: &[Vec<i64>],
+    ) -> Vec<Vec<i64>> {
         let positions = plan.shape.positions as usize;
         let records = plan.shape.records as usize;
         let width = plan.head_width as usize;
         let mut heads = Vec::with_capacity(plan.obligations.len());
         for head in 0..plan.obligations.len() {
             let start = head * width;
-            let mut rows = vec![Fp3::ZERO; positions * width];
+            let mut rows = vec![0i64; positions * width];
             for position in 0..positions {
                 for index in 0..width {
-                    let mut sum = Fp3::ZERO;
+                    let mut sum = 0i64;
                     for record in 0..records {
-                        sum = sum.add(
-                            &activation[position * records + record]
-                                .mul(&matrix[start + index][record]),
-                        );
+                        sum +=
+                            activation[position * records + record] * matrix[start + index][record];
                     }
                     rows[position * width + index] = sum;
                 }
@@ -815,6 +995,17 @@ mod tests {
             heads.push(rows);
         }
         heads
+    }
+
+    fn output_words(plan: &ConsumerRequestPlan, raw: &[Vec<i64>]) -> Vec<Vec<i64>> {
+        let shift = u32::try_from(plan.shift).unwrap();
+        raw.iter()
+            .map(|head| {
+                head.iter()
+                    .map(|value| i64::try_from(rq(i128::from(*value), shift).unwrap()).unwrap())
+                    .collect()
+            })
+            .collect()
     }
 
     fn masks(shape: &ConsumerPscShape) -> ConsumerPscMasks {
@@ -835,6 +1026,27 @@ mod tests {
         .unwrap()
     }
 
+    fn fixture(
+        heads: u32,
+    ) -> (
+        ConsumerRequestPlan,
+        Vec<Fp3>,
+        Vec<Vec<Fp3>>,
+        Vec<Vec<i64>>,
+        Vec<Vec<i64>>,
+        ConsumerPscMasks,
+    ) {
+        let plan = plan(heads);
+        let activation_words = activation_words(&plan);
+        let matrix_words = matrix_words(&plan);
+        let raw = raw_words(&plan, &activation_words, &matrix_words);
+        let outputs = output_words(&plan, &raw);
+        let activation = embed(&activation_words);
+        let matrix = matrix_words.iter().map(|row| embed(row)).collect();
+        let masks = masks(&plan.shape);
+        (plan, activation, matrix, raw, outputs, masks)
+    }
+
     fn run(
         heads: u32,
     ) -> (
@@ -844,42 +1056,47 @@ mod tests {
         ConsumerRequestOutcome,
         Vec<Fp3>,
         Vec<Vec<Fp3>>,
-        Vec<Vec<Fp3>>,
+        Vec<Vec<i64>>,
+        Vec<Vec<i64>>,
         ConsumerPscMasks,
     ) {
-        let plan = plan(heads);
-        let activation = activation(&plan.shape);
-        let matrix = matrix(&plan.shape);
-        let raw = raw_heads(&plan, &activation, &matrix);
-        let masks = masks(&plan.shape);
-        let (proof, proven) =
-            prove_consumer_request(&mut chain(), &plan, &activation, &raw, &matrix, &masks)
+        let (plan, activation, matrix, raw, outputs, masks) = fixture(heads);
+        let (proof, proven) = prove_consumer_request(
+            &mut chain(),
+            &plan,
+            &activation,
+            &raw,
+            &outputs,
+            &matrix,
+            &masks,
+        )
+        .unwrap();
+        let verified =
+            verify_consumer_request(&mut chain(), &plan, &activation, &raw, &outputs, &proof)
                 .unwrap();
-        let verified = verify_consumer_request(&mut chain(), &plan, &activation, &proof).unwrap();
         (
-            plan, proof, proven, verified, activation, matrix, raw, masks,
+            plan, proof, proven, verified, activation, matrix, raw, outputs, masks,
         )
     }
 
     #[test]
     fn one_request_batches_every_head_into_one_pending() {
-        let (plan, proof, proven, verified, _activation, matrix, raw, masks) = run(3);
+        let (plan, proof, proven, verified, activation, matrix, raw, outputs, masks) = run(3);
         assert_eq!(proven, verified);
         let outcome = &verified;
         assert_eq!(plan.heads(), 3);
         assert_eq!(plan.consumed(), 12);
-        assert_eq!(proof.head_targets.len(), 3);
         assert!(outcome.coefficients.batch.is_some());
-        // One pending row, its weights over the whole consumed region only.
-        assert_eq!(outcome.pending.psi, outcome.point);
         assert_eq!(
             outcome.pending.weights,
             stretch_weights(4, 0, &outcome.coefficients.combined().unwrap()).unwrap()
         );
+        assert_eq!(outcome.pending.psi, outcome.point);
         assert_eq!(outcome.pending.masks.len(), 1);
         assert_eq!(outcome.pending.masks[0].oracle, plan.mask.oracle);
         assert_eq!(outcome.pending.masks[0].slot, plan.mask.shown_slot);
-        // The same-matrix row holds against the real matrix and shown entry.
+        // The same-matrix pending row holds against the real matrix and the
+        // one-time shown entry.
         crate::proof::hidden_member::check_pending(&outcome.pending, &matrix, &|oracle, slot| {
             if oracle == plan.mask.oracle && slot == plan.mask.shown_slot {
                 Ok(masks.entries.shown[1])
@@ -888,39 +1105,40 @@ mod tests {
             }
         })
         .unwrap();
-        // The per-head raw targets were fixed before the batch challenge and
-        // combine to the proven target.
-        let mut total = Fp3::ZERO;
-        let mut power = Fp3::ONE;
-        for target in &proof.head_targets {
-            total = total.add(&power.mul(target));
-            power = power.mul(&outcome.coefficients.batch.unwrap());
-        }
-        assert_eq!(total, proof.target);
-        // The registered raw obligation closes on the real raw rows.
-        outcome.raw.check_on(&raw).unwrap();
-        let mut changed = raw.clone();
-        changed[1][0] = changed[1][0].add(&value(1));
-        assert!(outcome.raw.check_on(&changed).is_err());
+        // The targets are derived from the public raw rows, and the raw
+        // relation closes on them.
+        let derived = consumer_head_targets(&plan, &outcome.coefficients, &raw).unwrap();
+        assert_eq!(derived.len(), 3);
+        let flat: Vec<i128> = raw
+            .iter()
+            .flat_map(|head| head.iter().map(|value| i128::from(*value)))
+            .collect();
+        outcome.raw.check_on(&flat).unwrap();
+        assert_eq!(
+            outcome.raw.raw_digest,
+            consumer_raw_digest(&plan, &raw).unwrap()
+        );
+        assert_eq!(
+            outcome.raw.output_digest,
+            consumer_output_digest(&plan, &outputs).unwrap()
+        );
+        let flat_outputs: Vec<i64> = outputs.iter().flat_map(|head| head.clone()).collect();
+        outcome.raw.check_rounding(&flat, &flat_outputs).unwrap();
         // The message round-trips and the decoded message verifies.
         let bytes = proof.encode(&plan).unwrap();
         let decoded = ConsumerRequestProof::decode(&plan, &bytes).unwrap();
         assert_eq!(decoded, proof);
-        verify_consumer_request(&mut chain(), &plan, &_activation, &decoded).unwrap();
+        verify_consumer_request(&mut chain(), &plan, &activation, &raw, &outputs, &decoded)
+            .unwrap();
     }
 
     #[test]
     fn one_head_takes_the_direct_step() {
-        let (plan, proof, proven, verified, _activation, matrix, raw, masks) = run(1);
+        let (plan, _proof, proven, verified, _activation, matrix, raw, outputs, masks) = run(1);
         assert_eq!(proven, verified);
         assert_eq!(plan.heads(), 1);
         assert!(verified.coefficients.batch.is_none());
-        assert_eq!(proof.target, proof.head_targets[0]);
-        assert_eq!(proof.head_targets.len(), 1);
-        assert_eq!(
-            verified.pending.weights,
-            stretch_weights(4, 0, &verified.coefficients.combined().unwrap()).unwrap()
-        );
+        assert_eq!(verified.raw.heads.len(), 1);
         crate::proof::hidden_member::check_pending(&verified.pending, &matrix, &|oracle, slot| {
             if oracle == plan.mask.oracle && slot == plan.mask.shown_slot {
                 Ok(masks.entries.shown[1])
@@ -929,55 +1147,141 @@ mod tests {
             }
         })
         .unwrap();
-        verified.raw.check_on(&raw).unwrap();
+        let flat: Vec<i128> = raw
+            .iter()
+            .flat_map(|head| head.iter().map(|value| i128::from(*value)))
+            .collect();
+        let flat_outputs: Vec<i64> = outputs.iter().flat_map(|head| head.clone()).collect();
+        verified.raw.check_on(&flat).unwrap();
+        verified.raw.check_rounding(&flat, &flat_outputs).unwrap();
     }
 
     #[test]
-    fn a_changed_head_target_or_batch_fails_the_request() {
-        let (plan, proof, _proven, _verified, activation, _matrix, _raw, _masks) = run(2);
-
-        let mut changed = proof.clone();
-        changed.head_targets[0] = changed.head_targets[0].add(&value(1));
-        changed.target = changed.target.add(&value(1));
-        assert!(verify_consumer_request(&mut chain(), &plan, &activation, &changed).is_err());
-
-        let mut changed = proof.clone();
-        changed.target = changed.target.add(&value(1));
-        assert!(verify_consumer_request(&mut chain(), &plan, &activation, &changed).is_err());
-
-        let mut changed = proof.clone();
-        changed.point_values[1] = changed.point_values[1].add(&value(1));
-        assert!(verify_consumer_request(&mut chain(), &plan, &activation, &changed).is_err());
-
-        let mut changed = proof;
-        changed.dot.rounds[0].coefficients[0] = value(7);
-        assert!(verify_consumer_request(&mut chain(), &plan, &activation, &changed).is_err());
-    }
-
-    #[test]
-    fn a_changed_raw_head_or_matrix_fails_the_prover() {
-        let plan = plan(2);
-        let activation = activation(&plan.shape);
-        let matrix = matrix(&plan.shape);
-        let raw = raw_heads(&plan, &activation, &matrix);
-        let masks = masks(&plan.shape);
-
-        let mut changed = raw.clone();
-        changed[1][0] = changed[1][0].add(&value(1));
+    fn the_raw_relation_replaces_the_requantized_output() {
+        let (plan, proof, _proven, _verified, activation, matrix, raw, outputs, masks) = run(2);
+        // The requantized output is not the raw accumulator: substituting it
+        // for the raw rows fails the rounding relation and the prover refuses.
+        let substituted: Vec<Vec<i64>> = outputs.clone();
+        assert!(check_consumer_raw_rounding(&plan, &substituted, &outputs).is_err());
         assert!(prove_consumer_request(
             &mut chain(),
             &plan,
             &activation,
-            &changed,
+            &substituted,
+            &outputs,
             &matrix,
             &masks
         )
         .is_err());
+        // A changed output row breaks the relation and the verification.
+        let mut changed_outputs = outputs.clone();
+        changed_outputs[0][0] += 1;
+        assert!(check_consumer_raw_rounding(&plan, &raw, &changed_outputs).is_err());
+        assert!(verify_consumer_request(
+            &mut chain(),
+            &plan,
+            &activation,
+            &raw,
+            &changed_outputs,
+            &proof
+        )
+        .is_err());
+    }
 
-        let mut changed = matrix.clone();
-        changed[4][0] = changed[4][0].add(&value(1));
+    #[test]
+    fn another_preimage_value_cannot_stand_for_the_accumulator() {
+        let (plan, activation, matrix, raw, outputs, masks) = fixture(1);
+        // Move one raw entry by one without changing its rounding: the raw
+        // relation still holds, but the derived target changes and the matrix
+        // relation no longer matches. The accumulator is not free inside its
+        // rounding interval.
+        let mut moved = raw.clone();
+        let entry = moved[0]
+            .iter()
+            .position(|value| {
+                rq(i128::from(*value), 16).unwrap() == rq(i128::from(*value) + 1, 16).unwrap()
+            })
+            .expect("a rounding interval of length above one");
+        moved[0][entry] += 1;
+        assert!(check_consumer_raw_rounding(&plan, &moved, &outputs).is_ok());
+        assert!(prove_consumer_request(
+            &mut chain(),
+            &plan,
+            &activation,
+            &moved,
+            &outputs,
+            &matrix,
+            &masks
+        )
+        .is_err());
+        // A proof made on the moved rows does not verify on the original rows.
+        let (proof, _outcome) = prove_consumer_request(
+            &mut chain(),
+            &plan,
+            &activation,
+            &raw,
+            &outputs,
+            &matrix,
+            &masks,
+        )
+        .unwrap();
+        assert!(verify_consumer_request(
+            &mut chain(),
+            &plan,
+            &activation,
+            &moved,
+            &outputs,
+            &proof
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_changed_proof_or_statement_is_refused() {
+        let (plan, proof, _proven, _verified, activation, _matrix, raw, outputs, _masks) = run(2);
+
+        let mut changed = proof.clone();
+        changed.point_values[1] = changed.point_values[1].add(&value(1));
+        assert!(verify_consumer_request(
+            &mut chain(),
+            &plan,
+            &activation,
+            &raw,
+            &outputs,
+            &changed
+        )
+        .is_err());
+
+        let mut changed = proof.clone();
+        changed.dot.rounds[0].coefficients[0] = value(7);
+        assert!(verify_consumer_request(
+            &mut chain(),
+            &plan,
+            &activation,
+            &raw,
+            &outputs,
+            &changed
+        )
+        .is_err());
+
+        // Another request source, another head source page or another table
+        // changes the statement and the challenges.
+        let mut other = plan.clone();
+        other.obligations[0].source_step += 1;
         assert!(
-            prove_consumer_request(&mut chain(), &plan, &activation, &raw, &changed, &masks)
+            verify_consumer_request(&mut chain(), &other, &activation, &raw, &outputs, &proof)
+                .is_err()
+        );
+        let mut other = plan.clone();
+        other.request += 1;
+        assert!(
+            verify_consumer_request(&mut chain(), &other, &activation, &raw, &outputs, &proof)
+                .is_err()
+        );
+        let mut other = plan;
+        other.table.root = Digest([0x77; 32]);
+        assert!(
+            verify_consumer_request(&mut chain(), &other, &activation, &raw, &outputs, &proof)
                 .is_err()
         );
     }
@@ -1016,7 +1320,7 @@ mod tests {
         )
         .is_err());
 
-        // A different mask source, request or shift is not the same request.
+        // A different mask source is not the same request.
         let mut other = obligation(1, 21);
         other.mask.shown_slot += 1;
         assert!(ConsumerRequestPlan::new(
