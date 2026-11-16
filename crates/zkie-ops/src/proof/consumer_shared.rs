@@ -6,6 +6,7 @@
 //! later run. The charge is the same primitive the table key stage uses.
 
 use zkie_core::error::{Error, Result};
+use zkie_engine::pcs::request::field::E_DEGREE;
 use zkie_engine::pcs::request::read::HidingCharge;
 
 use crate::proof::consumer_request::ConsumerSharedPlan;
@@ -253,6 +254,137 @@ impl ConsumerSharedGeometry {
             return Err(Error::StatementMismatch);
         }
         Ok(())
+    }
+}
+
+/// The fixed identifiers and tree geometry of one consumer shared stage.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConsumerSharedIds {
+    pub group: u64,
+    pub gu_oracle: u64,
+    pub omega_oracle: u64,
+    pub gu_tree: u64,
+    pub omega_tree: u64,
+    pub mask_tree: u64,
+    pub fresh: u64,
+    pub base_positions: usize,
+    pub column_work_bits: u8,
+}
+
+fn shared_domain(label: &[u8], parameters: &Digest) -> Digest {
+    let mut writer = zkie_engine::primitives::codec::CanonicalWriter::new();
+    writer.put_bytes(label);
+    writer.put_digest(parameters);
+    zkie_core::artifact::digest_bytes(&writer.into_bytes())
+}
+
+impl ConsumerSharedGeometry {
+    /// Derives the shared stage geometry from the first plan and the real
+    /// table. The Gu and Omega codes are the first stage's W code, so the own
+    /// group later joins W and Omega under one main code; the mask code is the
+    /// first group's mask code. The trees, the fresh mask and the BASE size are
+    /// the fixed plan identifiers in `ids`; their run and configuration
+    /// digests are derived from the stage parameters, never random.
+    #[allow(clippy::too_many_arguments)]
+    pub fn derive(
+        first_plan: &crate::proof::consumer_first::ConsumerFirstPlan,
+        table_identity: Digest,
+        table_configuration: Digest,
+        table_shape: IndexShape,
+        binding_root: crate::proof::lin_binding::LinBindingRoot,
+        parameters: Digest,
+        statement: Vec<u8>,
+        record: Vec<u8>,
+        ids: ConsumerSharedIds,
+    ) -> Result<Self> {
+        let code = first_plan.draft.w_shape.code;
+        let group = first_plan.group.as_ref().ok_or(Error::InvalidConfig)?;
+        let mask_code = group.shapes.first_mask;
+        let columns = first_plan.draft.columns;
+        let k_lo = first_plan.draft.k_lo;
+        if columns == 0
+            || !columns.is_power_of_two()
+            || k_lo.checked_add(table_shape.v) != Some(columns.trailing_zeros())
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let tree = |tree_number: u64, label: &[u8], run_label: &[u8]| {
+            zkie_engine::pcs::request::runtime_tree::RuntimeTreePlan {
+                tree_number,
+                leaf_class: 2,
+                log_n: code.log_n,
+                log_n_zk: mask_code.log_n,
+                parts: vec![zkie_engine::pcs::request::runtime_tree::RuntimeTreePart {
+                    main_symbols: E_DEGREE as u64,
+                    mask_symbols: 0,
+                }],
+                salt_bytes: 40,
+                run: shared_domain(run_label, &parameters),
+                configuration: shared_domain(label, &parameters),
+            }
+        };
+        let oracle = zkie_engine::pcs::request::gu::GuOracleShape {
+            code,
+            main_rows: 1,
+            main_deg: E_DEGREE as u32,
+            mask_rows: 0,
+            mask_code: None,
+            answers: 1,
+        };
+        let geometry = Self {
+            binding_root,
+            table_identity,
+            table_configuration,
+            table_shape,
+            matrix_rows: first_plan.draft.matrix_rows,
+            k_lo,
+            columns,
+            code,
+            mask_code,
+            mask_tree: MaskTreePlan {
+                tree_number: ids.mask_tree,
+                leaf_class: 4,
+                log_n: mask_code.log_n,
+                mask_rows: 1,
+                salt_bytes: 40,
+                run: shared_domain(b"consumer-shared-mask-run", &parameters),
+                configuration: shared_domain(b"consumer-shared-mask-config", &parameters),
+            },
+            fresh: ids.fresh,
+            base_positions: ids.base_positions,
+            gu: GuShape {
+                oracle: ids.gu_oracle,
+                group: ids.group,
+                tree: tree(
+                    ids.gu_tree,
+                    b"consumer-shared-gu-config",
+                    b"consumer-shared-gu-run",
+                ),
+                part: 0,
+                rows_high: true,
+                u: oracle.clone(),
+                index: table_shape,
+            },
+            omega: OmegaShapePlan {
+                oracle: ids.omega_oracle,
+                group: ids.group,
+                tree: tree(
+                    ids.omega_tree,
+                    b"consumer-shared-omega-config",
+                    b"consumer-shared-omega-run",
+                ),
+                u: oracle,
+                rows_high: true,
+                matrix_rows: first_plan.draft.matrix_rows,
+                k_lo,
+            },
+            column_work_bits: ids.column_work_bits,
+            parameters,
+            statement,
+            record,
+        };
+        geometry.check()?;
+        Ok(geometry)
     }
 }
 

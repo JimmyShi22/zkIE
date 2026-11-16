@@ -1368,10 +1368,7 @@ mod tests {
             ranges(),
             Digest([0x41; 32]),
             Digest([0x42; 32]),
-            vec![
-                obligation(0, 20),
-                obligation(1, 21),
-            ],
+            vec![obligation(0, 20), obligation(1, 21)],
         )
         .unwrap();
         let activation_digest = consumer_activation_digest(&activation);
@@ -1384,10 +1381,7 @@ mod tests {
             ranges(),
             activation_digest,
             outputs_digest,
-            vec![
-                obligation(0, 20),
-                obligation(1, 21),
-            ],
+            vec![obligation(0, 20), obligation(1, 21)],
         )
         .unwrap();
         // Committed raw and bit messages.
@@ -2381,14 +2375,14 @@ mod tests {
         commit_table_streaming, IndexReader, IndexShape, StreamingTable, VecTableSource,
     };
 
+    use crate::proof::consumer_proof::ConsumerProofFile;
     use crate::proof::consumer_second::{
         consumer_second_chain, consumer_total_acceptance, prove_consumer_own, ConsumerChainBinding,
         ConsumerOwnPlan, ConsumerOwnWitness,
     };
-    use crate::proof::consumer_proof::ConsumerProofFile;
     use crate::proof::consumer_shared::{
         consumer_shared_charge, prove_consumer_shared, verify_consumer_shared,
-        ConsumerSharedGeometry, ConsumerSharedStage,
+        ConsumerSharedGeometry, ConsumerSharedIds, ConsumerSharedStage,
     };
     use crate::proof::hidden_send_session::HiddenTableProver;
     use crate::proof::lin_binding::LinBindingRoot;
@@ -2485,7 +2479,8 @@ mod tests {
         let mut message_rows = vec![vec![Fp::ZERO; 16]; 16];
         for record in 0..16 {
             for place in 0..16 {
-                message_rows[record][place] = fp_from_signed_word(matrix_word(place, record) as u64);
+                message_rows[record][place] =
+                    fp_from_signed_word(matrix_word(place, record) as u64);
             }
         }
         let tails = vec![vec![Fp::ZERO; 1]; 16];
@@ -2513,83 +2508,35 @@ mod tests {
         (reader, keeper)
     }
 
-    fn composition_geometry(plan: &ConsumerFirstPlan, reader: &IndexReader) -> ConsumerSharedGeometry {
-        let code = plan.draft.w_shape.code;
-        let mask_code = plan
-            .group
-            .as_ref()
-            .expect("the first plan carries its group")
-            .shapes
-            .first_mask;
-        let table_shape = reader.shape;
-        let tree = |tree_number: u64, run: u8, configuration: u8| RuntimeTreePlan {
-            tree_number,
-            leaf_class: 2,
-            log_n: code.log_n,
-            log_n_zk: mask_code.log_n,
-            parts: vec![RuntimeTreePart {
-                main_symbols: E_DEGREE as u64,
-                mask_symbols: 0,
-            }],
-            salt_bytes: 40,
-            run: Digest([run; 32]),
-            configuration: Digest([configuration; 32]),
-        };
-        let oracle = GuOracleShape {
-            code,
-            main_rows: 1,
-            main_deg: E_DEGREE as u32,
-            mask_rows: 0,
-            mask_code: None,
-            answers: 1,
-        };
-        ConsumerSharedGeometry {
-            binding_root: LinBindingRoot {
+    fn composition_geometry(
+        plan: &ConsumerFirstPlan,
+        reader: &IndexReader,
+    ) -> ConsumerSharedGeometry {
+        ConsumerSharedGeometry::derive(
+            plan,
+            reader_table_identity(reader).unwrap(),
+            COMPOSITION_CONFIGURATION,
+            reader.shape,
+            LinBindingRoot {
                 digest: Digest([0x91; 32]),
                 places: 1,
             },
-            table_identity: reader_table_identity(reader).unwrap(),
-            table_configuration: COMPOSITION_CONFIGURATION,
-            table_shape,
-            matrix_rows: plan.draft.matrix_rows,
-            k_lo: plan.draft.k_lo,
-            columns: plan.draft.columns,
-            code,
-            mask_code,
-            mask_tree: MaskTreePlan {
-                tree_number: 970,
-                leaf_class: 4,
-                log_n: mask_code.log_n,
-                mask_rows: 1,
-                salt_bytes: 40,
-                run: Digest([0x92; 32]),
-                configuration: Digest([0x93; 32]),
-            },
-            fresh: 980,
-            base_positions: 1,
-            gu: GuShape {
-                oracle: 960,
+            Digest([0x98; 32]),
+            b"consumer composition".to_vec(),
+            reader.name(),
+            ConsumerSharedIds {
                 group: 9,
-                tree: tree(971, 0x94, 0x95),
-                part: 0,
-                rows_high: true,
-                u: oracle,
-                index: table_shape,
+                gu_oracle: 960,
+                omega_oracle: 961,
+                gu_tree: 971,
+                omega_tree: 972,
+                mask_tree: 970,
+                fresh: 980,
+                base_positions: 1,
+                column_work_bits: 0,
             },
-            omega: OmegaShapePlan {
-                oracle: 961,
-                group: 9,
-                tree: tree(972, 0x96, 0x97),
-                u: oracle,
-                rows_high: true,
-                matrix_rows: plan.draft.matrix_rows,
-                k_lo: plan.draft.k_lo,
-            },
-            column_work_bits: 0,
-            parameters: Digest([0x98; 32]),
-            statement: b"consumer composition".to_vec(),
-            record: reader.name(),
-        }
+        )
+        .unwrap()
     }
 
     fn composition_shared_plan() -> ConsumerSharedPlan {
@@ -2608,10 +2555,7 @@ mod tests {
     fn the_consumer_composition_accepts_on_the_same_matrix() {
         let (reader, mut keeper) = composition_table();
         let table_identity = reader_table_identity(&reader).unwrap();
-        let mut fixture = group_fixture_with(table_with(
-            table_identity,
-            COMPOSITION_CONFIGURATION,
-        ));
+        let mut fixture = group_fixture_with(table_with(table_identity, COMPOSITION_CONFIGURATION));
         let (messages, _obligations) = prove_group(&mut fixture).unwrap();
         let plan = fixture.plan.clone();
         let geometry = composition_geometry(&plan, &reader);
@@ -2629,13 +2573,9 @@ mod tests {
         )
         .unwrap();
         let check_stage = ConsumerSharedStage::new(&shared_plan).unwrap();
-        let shared_verified = verify_consumer_shared(
-            &geometry,
-            &check_stage,
-            &reader,
-            &shared_proof.messages,
-        )
-        .unwrap();
+        let shared_verified =
+            verify_consumer_shared(&geometry, &check_stage, &reader, &shared_proof.messages)
+                .unwrap();
         // The W witness is the first stage's committed W rebuilt from the same
         // stored-column matrix view.
         let weights = pending_row_weights(&plan.member, plan.draft.matrix_rows).unwrap();
@@ -2742,10 +2682,7 @@ mod tests {
     fn the_composition_refuses_a_witness_on_the_wrong_axis() {
         let (reader, mut keeper) = composition_table();
         let table_identity = reader_table_identity(&reader).unwrap();
-        let mut fixture = group_fixture_with(table_with(
-            table_identity,
-            COMPOSITION_CONFIGURATION,
-        ));
+        let mut fixture = group_fixture_with(table_with(table_identity, COMPOSITION_CONFIGURATION));
         let (messages, _) = prove_group(&mut fixture).unwrap();
         let plan = fixture.plan.clone();
         let geometry = composition_geometry(&plan, &reader);
@@ -2762,13 +2699,9 @@ mod tests {
         )
         .unwrap();
         let check_stage = ConsumerSharedStage::new(&shared_plan).unwrap();
-        let shared_verified = verify_consumer_shared(
-            &geometry,
-            &check_stage,
-            &reader,
-            &shared_proof.messages,
-        )
-        .unwrap();
+        let shared_verified =
+            verify_consumer_shared(&geometry, &check_stage, &reader, &shared_proof.messages)
+                .unwrap();
         // The wrong-axis witness: places as rows, records as entries.
         let records = 16usize;
         let places = 16usize;
