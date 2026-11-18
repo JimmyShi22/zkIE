@@ -1,0 +1,49 @@
+evidence: /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece
+== CASE gpt2-seq512
+  commit: outcome=PASS wall=243792 ms (base 243839, -0.019%) hwm=27295588 KiB (base 27295484, +0.000%) proof_bytes=None auth=None elems=None
+  prove: outcome=PASS wall=165428 ms (base 165761, -0.201%) hwm=27346148 KiB (base 27660200, -1.135%) proof_bytes=6794079509 auth=None elems=None
+  verify: outcome=PASS wall=103699 ms (base 102688, +0.985%) hwm=14477400 KiB (base 14476448, +0.007%) proof_bytes=None auth=eac0949d6463927eb9a961d61d618fb703e4b02169e89db10dbada94a5f0dfdd elems=512
+  proof_bytes: 6794079509 base 6794103744 delta -24235 (-0.000357%)
+  proof_bin_deleted: 6790541622 base 6790541622 delta 0 (+0.000000%)
+  anchor: 898ad20bd3b346c3ed9cab49effb61c8bb3573aeb4be8b15c4499a627eaac239
+  model: 6d35b05739f33e2d2c969f55fafd79c22a96d2264683a4d9a63ecb842438d271
+  output_check: digest_ok True elements 512
+  auth_file_sha_eq_gt: True bytes 2048
+  proof_dir_composition: {'statement.bin': 4183, 'public-inputs.bin': 2056, 'manifest.json': 4151, 'consumer_proof.bin': 3527432, 'COMPLETE': 65} sum_without_proof_bin 3537887
+  policy: case_id = "gpt2-seq512"
+  policy: sequence_length = 512
+  policy: anchor_id = "898ad20bd3b346c3ed9cab49effb61c8bb3573aeb4be8b15c4499a627eaac239"
+  policy: model_id = "6d35b05739f33e2d2c969f55fafd79c22a96d2264683a4d9a63ecb842438d271"
+  policy: expected_output_sha256 = "eac0949d6463927eb9a961d61d618fb703e4b02169e89db10dbada94a5f0dfdd"
+  policy: case_id = "gpt2-seq512"
+  policy: anchor_id = "898ad20bd3b346c3ed9cab49effb61c8bb3573aeb4be8b15c4499a627eaac239"
+  policy: model_id = "6d35b05739f33e2d2c969f55fafd79c22a96d2264683a4d9a63ecb842438d271"
+  commit_manifest_files: [('public/model-commitment.bin', 42493), ('public/provider-config.bin', 4224), ('public/protocol.bin', 45565), ('public/asset-tables.bin', 24823), ('private/parameters.bin', 17), ('private/asset-table-randomness.bin', 1253408), ('public/asset-key.bin', 4547680)]
+  proof_manifest_files: [('statement.bin', 4183), ('proof.bin', 6790541622), ('public-inputs.bin', 2056), ('consumer_proof.bin', 3527432)]
+== CASE gemma3-seq512
+  commit: outcome=PASS wall=9292 ms (base 9305, -0.140%) hwm=1086116 KiB (base 1086100, +0.001%) proof_bytes=None auth=None elems=None
+  prove: outcome=PASS wall=87500 ms (base 87421, +0.090%) hwm=40278696 KiB (base 40278252, +0.001%) proof_bytes=10316824499 auth=None elems=None
+  verify: outcome=PASS wall=68368 ms (base 68609, -0.351%) hwm=22044924 KiB (base 22043232, +0.008%) proof_bytes=None auth=6d1df6b50c20d02db715fd14b12b9134623739375c44a029dd15b6b30bd9344c elems=512
+  proof_bytes: 10316824499 base 10316824499 delta 0 (+0.000000%)
+  proof_bin_deleted: 10316814558 base 10316814558 delta 0 (+0.000000%)
+  anchor: fef99a167d1d31b80c4f8baf1ee746be18d279f7113c4e77e015bff1fa623216
+  model: d5114631bccfb6e029cfeb1ad2c7b2a65d8a23827551f69424b07f87cbe332ec
+  output_check: digest_ok True elements 512
+  auth_file_sha_eq_gt: True bytes 2048
+  proof_dir_composition: {'statement.bin': 4187, 'public-inputs.bin': 2056, 'manifest.json': 3633, 'COMPLETE': 65} sum_without_proof_bin 9941
+  policy: case_id = "gemma3-seq512"
+  policy: sequence_length = 512
+  policy: anchor_id = "fef99a167d1d31b80c4f8baf1ee746be18d279f7113c4e77e015bff1fa623216"
+  policy: model_id = "d5114631bccfb6e029cfeb1ad2c7b2a65d8a23827551f69424b07f87cbe332ec"
+  policy: expected_output_sha256 = "6d1df6b50c20d02db715fd14b12b9134623739375c44a029dd15b6b30bd9344c"
+  commit_manifest_files: [('public/model-commitment.bin', 55039), ('public/provider-config.bin', 4221), ('public/protocol.bin', 57150), ('public/asset-tables.bin', 8), ('private/parameters.bin', 17), ('private/asset-table-randomness.bin', 8)]
+  proof_manifest_files: [('statement.bin', 4187), ('proof.bin', 10316814558), ('public-inputs.bin', 2056)]
+== MONITOR
+  disk_samples: 68 min_free_G: 280 max_free_G: 290
+  process_samples: 134 max_threads: 66 max_vmhwm_kib: 40279632
+  sample: 2026-11-18T13:05:36+08:00 threads 1 vmhwm_kib 1476
+  sample: 2026-11-18T13:05:36+08:00 threads 2 vmhwm_kib 3151168
+  sample: 2026-11-18T13:05:46+08:00 threads 1 vmhwm_kib 1476
+  sample: 2026-11-18T13:16:28+08:00 threads 66 vmhwm_kib 15897892
+  sample: 2026-11-18T13:16:38+08:00 threads 1 vmhwm_kib 1464
+  sample: 2026-11-18T13:16:38+08:00 threads 66 vmhwm_kib 20995140

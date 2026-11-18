@@ -1,0 +1,202 @@
+2026-11-18T13:05:26+08:00 df=290G free, 86% used
+2026-11-18T13:05:36+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=2 vmhwm_kib=3151168 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:05:46+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=2 vmhwm_kib=5700936 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:05:56+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=2 vmhwm_kib=8250704 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:06:06+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=2 vmhwm_kib=10806616 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:06:16+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=2 vmhwm_kib=13356384 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:06:26+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=2 vmhwm_kib=16862552 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:06:36+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=2 vmhwm_kib=21569824 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:06:46+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=2 vmhwm_kib=26313556 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:06:56+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=2 vmhwm_kib=27295588 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:07:06+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=2 vmhwm_kib=27295588 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:07:16+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=2 vmhwm_kib=27295588 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:07:26+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=66 vmhwm_kib=27295588 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:07:36+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=66 vmhwm_kib=27295588 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:07:46+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=66 vmhwm_kib=27295588 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:07:56+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=66 vmhwm_kib=27295588 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:08:06+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=66 vmhwm_kib=27295588 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:08:16+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=66 vmhwm_kib=27295588 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:08:26+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=66 vmhwm_kib=27295588 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:08:36+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=66 vmhwm_kib=27295588 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:08:46+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=66 vmhwm_kib=27295588 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:08:56+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=66 vmhwm_kib=27295588 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:09:06+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=66 vmhwm_kib=27295588 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:09:16+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=66 vmhwm_kib=27295588 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:09:26+08:00 df=290G free, 86% used
+  pid=1942053 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchm
+  pid=1942054 threads=66 vmhwm_kib=27295588 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gpt2/case.toml --assets-manifest /data/zkIE/models/gpt2/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq5
+2026-11-18T13:09:36+08:00 df=290G free, 86% used
+  pid=1942987 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /
+  pid=1942988 threads=66 vmhwm_kib=3614060 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /data/zkIE/models/gpt2/case.toml --mo
+2026-11-18T13:09:47+08:00 df=290G free, 86% used
+  pid=1942987 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /
+  pid=1942988 threads=66 vmhwm_kib=5576888 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /data/zkIE/models/gpt2/case.toml --mo
+2026-11-18T13:09:57+08:00 df=290G free, 86% used
+  pid=1942987 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /
+  pid=1942988 threads=66 vmhwm_kib=5576888 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /data/zkIE/models/gpt2/case.toml --mo
+2026-11-18T13:10:07+08:00 df=290G free, 86% used
+  pid=1942987 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /
+  pid=1942988 threads=66 vmhwm_kib=5576888 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /data/zkIE/models/gpt2/case.toml --mo
+2026-11-18T13:10:17+08:00 df=290G free, 86% used
+  pid=1942987 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /
+  pid=1942988 threads=66 vmhwm_kib=5576888 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /data/zkIE/models/gpt2/case.toml --mo
+2026-11-18T13:10:27+08:00 df=290G free, 86% used
+  pid=1942987 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /
+  pid=1942988 threads=66 vmhwm_kib=5576888 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /data/zkIE/models/gpt2/case.toml --mo
+2026-11-18T13:10:37+08:00 df=290G free, 86% used
+  pid=1942987 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /
+  pid=1942988 threads=66 vmhwm_kib=5576888 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /data/zkIE/models/gpt2/case.toml --mo
+2026-11-18T13:10:47+08:00 df=290G free, 86% used
+  pid=1942987 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /
+  pid=1942988 threads=66 vmhwm_kib=9550868 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /data/zkIE/models/gpt2/case.toml --mo
+2026-11-18T13:10:57+08:00 df=290G free, 86% used
+  pid=1942987 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /
+  pid=1942988 threads=66 vmhwm_kib=14559604 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /data/zkIE/models/gpt2/case.toml --mo
+2026-11-18T13:11:07+08:00 df=290G free, 86% used
+  pid=1942987 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /
+  pid=1942988 threads=66 vmhwm_kib=15974076 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /data/zkIE/models/gpt2/case.toml --mo
+2026-11-18T13:11:17+08:00 df=290G free, 86% used
+  pid=1942987 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /
+  pid=1942988 threads=66 vmhwm_kib=17825488 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /data/zkIE/models/gpt2/case.toml --mo
+2026-11-18T13:11:27+08:00 df=290G free, 86% used
+  pid=1942987 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /
+  pid=1942988 threads=66 vmhwm_kib=19676896 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /data/zkIE/models/gpt2/case.toml --mo
+2026-11-18T13:11:37+08:00 df=290G free, 86% used
+  pid=1942987 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /
+  pid=1942988 threads=66 vmhwm_kib=21065452 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /data/zkIE/models/gpt2/case.toml --mo
+2026-11-18T13:11:47+08:00 df=290G free, 86% used
+  pid=1942987 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /
+  pid=1942988 threads=66 vmhwm_kib=21615592 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /data/zkIE/models/gpt2/case.toml --mo
+2026-11-18T13:11:57+08:00 df=290G free, 86% used
+  pid=1942987 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /
+  pid=1942988 threads=66 vmhwm_kib=23479396 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /data/zkIE/models/gpt2/case.toml --mo
+2026-11-18T13:12:07+08:00 df=283G free, 86% used
+  pid=1942987 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /
+  pid=1942988 threads=66 vmhwm_kib=27347512 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit --input /data/zkIE/models/gpt2/case.toml --mo
+2026-11-18T13:12:17+08:00 df=283G free, 86% used
+  pid=1943614 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public -
+  pid=1943615 threads=2 vmhwm_kib=2201724 cmd=/data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public --statement /data/zkIE/docs/benchmark
+2026-11-18T13:12:27+08:00 df=283G free, 86% used
+  pid=1943614 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public -
+  pid=1943615 threads=66 vmhwm_kib=9976576 cmd=/data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public --statement /data/zkIE/docs/benchmark
+2026-11-18T13:12:37+08:00 df=283G free, 86% used
+  pid=1943614 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public -
+  pid=1943615 threads=66 vmhwm_kib=12767592 cmd=/data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public --statement /data/zkIE/docs/benchmark
+2026-11-18T13:12:47+08:00 df=283G free, 86% used
+  pid=1943614 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public -
+  pid=1943615 threads=66 vmhwm_kib=12767592 cmd=/data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public --statement /data/zkIE/docs/benchmark
+2026-11-18T13:12:57+08:00 df=283G free, 86% used
+  pid=1943614 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public -
+  pid=1943615 threads=66 vmhwm_kib=12767592 cmd=/data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public --statement /data/zkIE/docs/benchmark
+2026-11-18T13:13:07+08:00 df=283G free, 86% used
+  pid=1943614 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public -
+  pid=1943615 threads=66 vmhwm_kib=12767592 cmd=/data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public --statement /data/zkIE/docs/benchmark
+2026-11-18T13:13:17+08:00 df=283G free, 86% used
+  pid=1943614 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public -
+  pid=1943615 threads=66 vmhwm_kib=12767592 cmd=/data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public --statement /data/zkIE/docs/benchmark
+2026-11-18T13:13:27+08:00 df=283G free, 86% used
+  pid=1943614 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public -
+  pid=1943615 threads=66 vmhwm_kib=12767592 cmd=/data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public --statement /data/zkIE/docs/benchmark
+2026-11-18T13:13:37+08:00 df=283G free, 86% used
+  pid=1943614 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public -
+  pid=1943615 threads=66 vmhwm_kib=12767592 cmd=/data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public --statement /data/zkIE/docs/benchmark
+2026-11-18T13:13:47+08:00 df=283G free, 86% used
+  pid=1943614 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public -
+  pid=1943615 threads=66 vmhwm_kib=13909336 cmd=/data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public --statement /data/zkIE/docs/benchmark
+2026-11-18T13:13:57+08:00 df=283G free, 86% used
+  pid=1943614 threads=1 vmhwm_kib=1476 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public -
+  pid=1943615 threads=66 vmhwm_kib=14477400 cmd=/data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit/public --statement /data/zkIE/docs/benchmark
+2026-11-18T13:14:07+08:00 df=290G free, 86% used
+  pid=1944068 threads=1 vmhwm_kib=1460 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie commit --case /data/zkIE/models/gemma3/case.toml --assets-manifest /data/zkIE/models/gemma3/case.toml --parameters /data/zkIE/docs/be
+  pid=1944069 threads=2 vmhwm_kib=1086116 cmd=/data/zkIE/target/release/zkie commit --case /data/zkIE/models/gemma3/case.toml --assets-manifest /data/zkIE/models/gemma3/case.toml --parameters /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-
+2026-11-18T13:14:17+08:00 df=290G free, 86% used
+  pid=1944105 threads=1 vmhwm_kib=1464 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit --input
+  pid=1944106 threads=2 vmhwm_kib=1086160 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit --input /data/zkIE/models/gemma3/case.toml 
+2026-11-18T13:14:27+08:00 df=290G free, 86% used
+  pid=1944105 threads=1 vmhwm_kib=1464 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit --input
+  pid=1944106 threads=66 vmhwm_kib=12689324 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit --input /data/zkIE/models/gemma3/case.toml 
+2026-11-18T13:14:37+08:00 df=290G free, 86% used
+  pid=1944105 threads=1 vmhwm_kib=1464 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit --input
+  pid=1944106 threads=66 vmhwm_kib=18942876 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit --input /data/zkIE/models/gemma3/case.toml 
+2026-11-18T13:14:48+08:00 df=290G free, 86% used
+  pid=1944105 threads=1 vmhwm_kib=1464 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit --input
+  pid=1944106 threads=66 vmhwm_kib=25233492 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit --input /data/zkIE/models/gemma3/case.toml 
+2026-11-18T13:14:58+08:00 df=290G free, 86% used
+  pid=1944105 threads=1 vmhwm_kib=1464 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit --input
+  pid=1944106 threads=66 vmhwm_kib=34253140 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit --input /data/zkIE/models/gemma3/case.toml 
+2026-11-18T13:15:08+08:00 df=290G free, 86% used
+  pid=1944105 threads=1 vmhwm_kib=1464 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit --input
+  pid=1944106 threads=66 vmhwm_kib=36606808 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit --input /data/zkIE/models/gemma3/case.toml 
+2026-11-18T13:15:18+08:00 df=290G free, 86% used
+  pid=1944105 threads=1 vmhwm_kib=1464 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit --input
+  pid=1944106 threads=66 vmhwm_kib=40279568 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit --input /data/zkIE/models/gemma3/case.toml 
+2026-11-18T13:15:28+08:00 df=280G free, 86% used
+  pid=1944105 threads=1 vmhwm_kib=1464 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit --input
+  pid=1944106 threads=66 vmhwm_kib=40279632 cmd=/data/zkIE/target/release/zkie prove --commit /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit --input /data/zkIE/models/gemma3/case.toml 
+2026-11-18T13:15:38+08:00 df=280G free, 86% used
+  pid=1944459 threads=1 vmhwm_kib=1464 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit/public
+  pid=1944460 threads=2 vmhwm_kib=546536 cmd=/data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit/public --statement /data/zkIE/docs/benchma
+2026-11-18T13:15:48+08:00 df=280G free, 86% used
+  pid=1944459 threads=1 vmhwm_kib=1464 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit/public
+  pid=1944460 threads=2 vmhwm_kib=11680664 cmd=/data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit/public --statement /data/zkIE/docs/benchma
+2026-11-18T13:15:58+08:00 df=280G free, 86% used
+  pid=1944459 threads=1 vmhwm_kib=1464 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit/public
+  pid=1944460 threads=66 vmhwm_kib=15897892 cmd=/data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit/public --statement /data/zkIE/docs/benchma
+2026-11-18T13:16:08+08:00 df=280G free, 86% used
+  pid=1944459 threads=1 vmhwm_kib=1464 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit/public
+  pid=1944460 threads=66 vmhwm_kib=15897892 cmd=/data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit/public --statement /data/zkIE/docs/benchma
+2026-11-18T13:16:18+08:00 df=280G free, 86% used
+  pid=1944459 threads=1 vmhwm_kib=1464 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit/public
+  pid=1944460 threads=66 vmhwm_kib=15897892 cmd=/data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit/public --statement /data/zkIE/docs/benchma
+2026-11-18T13:16:28+08:00 df=280G free, 86% used
+  pid=1944459 threads=1 vmhwm_kib=1464 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit/public
+  pid=1944460 threads=66 vmhwm_kib=15897892 cmd=/data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit/public --statement /data/zkIE/docs/benchma
+2026-11-18T13:16:38+08:00 df=280G free, 86% used
+  pid=1944459 threads=1 vmhwm_kib=1464 cmd=/usr/bin/timeout --signal=KILL 1800 /data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit/public
+  pid=1944460 threads=66 vmhwm_kib=20995140 cmd=/data/zkIE/target/release/zkie verify --public /data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gemma3-seq512/round-1/commit/public --statement /data/zkIE/docs/benchma

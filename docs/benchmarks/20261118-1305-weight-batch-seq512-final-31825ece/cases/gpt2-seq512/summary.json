@@ -1,0 +1,61 @@
+{
+  "case_id": "gpt2-seq512",
+  "model": "gpt2",
+  "rounds": [
+    {
+      "anchor_id": "898ad20bd3b346c3ed9cab49effb61c8bb3573aeb4be8b15c4499a627eaac239",
+      "commit": {
+        "authenticated_output_digest": null,
+        "authenticated_output_elements": null,
+        "command": "commit",
+        "error_code": null,
+        "last_completed_stage": "commit",
+        "last_event_seq": 51,
+        "outcome": "PASS",
+        "output_binding": null,
+        "progress_path": "/data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/commit-run/progress.jsonl",
+        "proof_bytes": null,
+        "protocol_wall_ms": 243792,
+        "run_id": "commit",
+        "stage_wall_ms": 243792,
+        "vmhwm_kib": 27295588
+      },
+      "model_id": "6d35b05739f33e2d2c969f55fafd79c22a96d2264683a4d9a63ecb842438d271",
+      "proof_bin_deleted_bytes": 6790541622,
+      "proof_bytes": 6794079509,
+      "prove": {
+        "authenticated_output_digest": null,
+        "authenticated_output_elements": null,
+        "command": "prove",
+        "error_code": null,
+        "last_completed_stage": "prove",
+        "last_event_seq": 80,
+        "outcome": "PASS",
+        "output_binding": null,
+        "progress_path": "/data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/prove-run/progress.jsonl",
+        "proof_bytes": 6794079509,
+        "protocol_wall_ms": 165428,
+        "run_id": "prove",
+        "stage_wall_ms": 165428,
+        "vmhwm_kib": 27346148
+      },
+      "round": 1,
+      "verify": {
+        "authenticated_output_digest": "eac0949d6463927eb9a961d61d618fb703e4b02169e89db10dbada94a5f0dfdd",
+        "authenticated_output_elements": 512,
+        "command": "verify",
+        "error_code": null,
+        "last_completed_stage": "verify",
+        "last_event_seq": 23,
+        "outcome": "PASS",
+        "output_binding": "expected",
+        "progress_path": "/data/zkIE/docs/benchmarks/20261118-1305-weight-batch-seq512-final-31825ece/cases/gpt2-seq512/round-1/verify-run/progress.jsonl",
+        "proof_bytes": null,
+        "protocol_wall_ms": 103699,
+        "run_id": "verify",
+        "stage_wall_ms": 103699,
+        "vmhwm_kib": 14477400
+      }
+    }
+  ]
+}
