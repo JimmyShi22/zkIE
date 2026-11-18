@@ -9456,7 +9456,10 @@ impl HiddenLinPlan {
             let norm = self.norm.as_ref().ok_or(Error::InvalidConfig)?;
             let output = norm.output.as_ref().ok_or(Error::InvalidConfig)?;
             let out = &output.out;
-            if u64::from(norm.shape.valid) != self.send.matrix_rows
+            // The norm may carry zero padding columns: the valid statistical
+            // columns are at most the matrix rows, and the padded columns are
+            // bound column by column through the output tail padding rows.
+            if u64::from(norm.shape.valid) > self.send.matrix_rows
                 || norm.columns < self.send.matrix_rows
                 || out.columns != norm.columns
                 || out.oracle_base == 0
