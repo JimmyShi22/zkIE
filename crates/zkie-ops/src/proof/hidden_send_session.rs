@@ -21153,7 +21153,7 @@ fn norm_pointwise_maps(
 /// Resolves the key cells of the norm digit lookup across the committed
 /// rounding and tail messages. The key groups name the message each source
 /// addresses; the caller supplies the unencoded message rows of both groups.
-fn norm_lookup_key_values(
+pub(crate) fn norm_lookup_key_values(
     plan: &NormPlan,
     lookup: &crate::proof::hidden_norm_psc::NormLookupPlan,
     round_rows: &[Vec<Vec<Fp3>>],
@@ -36024,6 +36024,7 @@ mod merged_tests {
             out: group(93, 20_300, 61_300),
             shift: 3,
             clamp: Some((-1_000, 1_000)),
+            no_op_clamp: false,
             tail: Some(crate::proof::hidden_norm_psc::NormOutputTailPlan {
                 group: NormGroupPlan {
                     shape: WShape::new(

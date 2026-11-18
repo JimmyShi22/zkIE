@@ -48,6 +48,14 @@ pub const RSTD_FIRST_VALUE: i64 = 65_536_000;
 pub const GAIN_MAX: i64 = 1_141_592;
 /// The observed largest absolute centered input row entry, for the record.
 pub const CENTERED_OBSERVED: i64 = 22_823_876;
+/// The trusted no-op clamp interval of the segment: the registered model has
+/// no clamp, and the chain proves the clamp rows over the symmetric interval
+/// `[-CLAMP_BOUND, CLAMP_BOUND]`. The observed largest absolute pre-clamp
+/// value is 14,562,155, below the bound, so the clamp is the identity on the
+/// honest range; the equivalence is carried by the trusted input contract.
+pub const CLAMP_BOUND: i64 = 1 << 24;
+/// The observed largest absolute pre-clamp value, for the record.
+pub const PRE_CLAMP_OBSERVED: i64 = 14_562_155;
 
 /// The public content root of the frozen rstd table, the same digest the
 /// model plan already freezes for the shared rsqrt table.
@@ -121,7 +129,16 @@ pub fn segment_profile(
         valid: VALID,
         columns: u64::from(HIDDEN_PAD),
         shift: OUTPUT_SHIFT,
-        clamp: None,
+        clamp: Some((-CLAMP_BOUND, CLAMP_BOUND)),
+        clamp_widths: Some(zkie_ops::proof::hidden_norm_psc::NormClampWidths {
+            low: 4,
+            high: 4,
+            low_strict: 4,
+            low_nonstrict: 4,
+            high_strict: 4,
+            high_nonstrict: 4,
+        }),
+        no_op_clamp: true,
         input_bound: INPUT_BOUND,
         sum_offset: SUM_OFFSET,
         mean_offset: MEAN_OFFSET,
@@ -162,6 +179,15 @@ mod tests {
         ] {
             assert!(value < half);
         }
+    }
+
+    #[test]
+    fn the_no_op_clamp_bound_covers_the_honest_range() {
+        assert!(PRE_CLAMP_OBSERVED.abs() < CLAMP_BOUND);
+        let profile = segment_profile(16, zkie_core::types::Digest([0x91; 32])).unwrap();
+        assert!(profile.no_op_clamp);
+        assert_eq!(profile.clamp, Some((-CLAMP_BOUND, CLAMP_BOUND)));
+        assert!(profile.clamp_widths.is_some());
     }
 
     #[test]

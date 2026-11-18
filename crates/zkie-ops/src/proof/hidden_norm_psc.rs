@@ -4049,6 +4049,11 @@ pub struct NormOutputPlan {
     pub shift: u32,
     /// The optional clamp interval of the runtime op.
     pub clamp: Option<(i64, i64)>,
+    /// Marks the trusted no-op clamp contract form: the registered model has
+    /// no clamp, the plan fixes a symmetric interval `[-B, B]` that covers the
+    /// honest pre-clamp range, and the equivalence is carried by the trusted
+    /// input contract, not by a model clamp.
+    pub no_op_clamp: bool,
     /// The committed witness rows of the rounding, bias and clamp tail.
     pub tail: Option<NormOutputTailPlan>,
 }
@@ -4077,6 +4082,12 @@ impl NormOutputPlan {
         if let Some((low, high)) = self.clamp {
             if low > high {
                 return Err(Error::InvalidConfig);
+            }
+        }
+        if self.no_op_clamp {
+            match self.clamp {
+                Some((low, high)) if low < 0 && low == -high => {}
+                _ => return Err(Error::InvalidConfig),
             }
         }
         let mut bases = [
@@ -4119,6 +4130,7 @@ impl NormOutputPlan {
             }
             None => writer.put_u64(0),
         }
+        writer.put_u64(u64::from(self.no_op_clamp));
         match &self.tail {
             Some(tail) => {
                 writer.put_u64(1);
@@ -6885,6 +6897,7 @@ mod tests {
             out: group(703, 7300),
             shift: 4,
             clamp: Some((-5, 5)),
+            no_op_clamp: false,
             tail: None,
         };
         let digest = plan.digest();

@@ -24,11 +24,14 @@ use crate::proof::hidden_norm_psc::{
     norm_pointwise_masks, norm_tail_mask_masks, NormGroupPlan, NormGroupWitness,
     commit_norm_mask, norm_mask_entries, NormMaskPlan, NormMaskWitness, NormOutputPlan,
     NormOutputTailPlan, NormOutputTailWidths, NormPlan, NormRoundLayout, NormRoundPlan,
-    NormRoundWidths, NormRstdParams, NormRstdPlan, NormWitness, NormOutputTailWitness,
-    NormOutputWitness, NormParamWitness, NORM_OUTPUT_TAIL_RELATIONS,
+    NormClampWidths, NormLookupParams, NormLookupPlan, NormLookupWitness, NormRoundWidths, NormRstdParams,
+    NormRstdPlan, NormWitness, NormOutputTailWitness, NormOutputWitness, NormParamWitness,
+    NORM_OUTPUT_TAIL_RELATIONS,
 };
 use crate::proof::hidden_send_session::WShape;
 use crate::proof::lookup_table::TableConfig;
+use crate::proof::hidden_send_session::norm_lookup_key_values;
+use crate::proof::lookup::{LookupPlan, BYTE_TABLE_IDENTITY};
 use crate::proof::norm_param_table::NormParamTablesPlan;
 use crate::proof::output_closure::commit_value_group;
 use crate::proof::psc::{hp_entries, psc_variables, SHOWN_MAPS};
@@ -71,6 +74,8 @@ pub struct NormSegmentProfile {
     pub columns: u64,
     pub shift: u32,
     pub clamp: Option<(i64, i64)>,
+    pub clamp_widths: Option<NormClampWidths>,
+    pub no_op_clamp: bool,
     pub input_bound: u64,
     pub sum_offset: u64,
     pub mean_offset: u64,
@@ -606,6 +611,147 @@ pub fn attach_output_witness(
     Ok(())
 }
 
+
+/// The oracle/tree and code space of the committed byte lookup over the
+/// rounding and tail digit rows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LookupSpace {
+    pub bits_oracle: u64,
+    pub mask_oracle: u64,
+    pub bits_tree: u64,
+    pub mask_tree: u64,
+    pub code: CodeParams,
+    pub mask_code: CodeParams,
+}
+
+/// Attaches the byte lookup over every committed rounding and tail digit
+/// cell. The key map is the canonical one derived from the rounding and tail
+/// plans; a plan that drops or redirects a digit cell fails closed.
+pub fn attach_lookup(
+    plan: &mut NormPlan,
+    space: &NormSegmentSpace,
+    lookup: &LookupSpace,
+) -> Result<()> {
+    let round = plan.round.as_ref().ok_or(Error::InvalidConfig)?;
+    let tail = plan
+        .output
+        .as_ref()
+        .and_then(|output| output.tail.as_ref())
+        .ok_or(Error::InvalidConfig)?;
+    let params = NormLookupParams {
+        code: lookup.code,
+        mask_code: lookup.mask_code,
+        group: space.group,
+        bits_oracle: lookup.bits_oracle,
+        mask_oracle: lookup.mask_oracle,
+        bits_tree: lookup.bits_tree,
+        mask_tree: lookup.mask_tree,
+        leaf_class: space.leaf_class,
+        salt_bytes: space.salt_bytes,
+        run: space.run,
+        configuration: space.configuration,
+        padding_byte: 0,
+        table_identity: BYTE_TABLE_IDENTITY,
+    };
+    let plan_lookup =
+        NormLookupPlan::from_round_and_tail(round, tail, plan.columns, plan.shape.positions, &params)?;
+    plan.lookup = Some(plan_lookup);
+    plan.validate()
+}
+
+fn counts_to_bits(plan: &LookupPlan, counts: &[u64]) -> Result<Vec<Fp3>> {
+    let planes = plan.planes()?;
+    let rows = plan.table_rows()?;
+    if counts.len() != rows {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut bits = vec![Fp3::ZERO; planes.checked_mul(rows).ok_or(Error::ResourceLimit)?];
+    for row in 0..rows {
+        for plane in 0..planes {
+            if (counts[row] >> plane) & 1 == 1 {
+                bits[plane + planes * row] = Fp3::ONE;
+            }
+        }
+    }
+    Ok(bits)
+}
+
+fn key_occurrence_bits(plan: &LookupPlan, keys: &[Fp3]) -> Result<Vec<Fp3>> {
+    let rows = plan.table_rows()?;
+    let mut counts = vec![0u64; rows];
+    for key in keys {
+        let mut found = false;
+        for (row, count) in counts.iter_mut().enumerate() {
+            if *key == Fp3::from_u64(row as u64) {
+                *count += 1;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            return Err(Error::BoundViolation);
+        }
+    }
+    counts_to_bits(plan, &counts)
+}
+
+fn fp3_row(value: &Fp3, rows: usize) -> Result<usize> {
+    if value.c[1].as_canonical_u64() != 0 || value.c[2].as_canonical_u64() != 0 {
+        return Err(Error::BoundViolation);
+    }
+    let row = usize::try_from(value.c[0].as_canonical_u64()).map_err(|_| Error::ResourceLimit)?;
+    if row >= rows {
+        return Err(Error::BoundViolation);
+    }
+    Ok(row)
+}
+
+/// Fills the committed byte lookup witness from the committed rounding and
+/// tail messages.
+pub fn attach_lookup_witness(witness: &mut NormWitness, plan: &NormPlan) -> Result<()> {
+    let lookup = plan.lookup.as_ref().ok_or(Error::InvalidConfig)?;
+    let round = witness.round.as_ref().ok_or(Error::ShapeMismatch)?;
+    let tail = witness
+        .output
+        .as_ref()
+        .and_then(|output| output.tail.as_ref())
+        .ok_or(Error::ShapeMismatch)?;
+    let keys = norm_lookup_key_values(plan, lookup, &round.messages, &tail.committed.messages)?;
+    let bits = key_occurrence_bits(&lookup.lookup, &keys)?;
+    witness.lookup = Some(NormLookupWitness {
+        bits,
+        messages: None,
+    });
+    Ok(())
+}
+
+/// Fills the frozen-table lookup witness from the committed rounding slots.
+pub fn attach_rstd_witness(witness: &mut NormWitness, plan: &NormPlan) -> Result<()> {
+    let rstd = plan.rstd.as_ref().ok_or(Error::InvalidConfig)?;
+    let round = witness.round.as_ref().ok_or(Error::ShapeMismatch)?;
+    let columns = rstd.key.read_columns(&rstd.lookup, &round.messages)?;
+    if columns.len() != 2 {
+        return Err(Error::ShapeMismatch);
+    }
+    let rows = usize::try_from(rstd.lookup.table_rows()?).map_err(|_| Error::ResourceLimit)?;
+    let mut counts = vec![0u64; rows];
+    let entries = rstd.key.sources.len() / 2;
+    for key in 0..entries {
+        let index = fp3_row(&columns[0][key], rows)?;
+        counts[index] += 1;
+    }
+    let keys = rstd.lookup.key_count()?;
+    for _ in entries..keys {
+        counts[0] += 1;
+    }
+    let bits = counts_to_bits(&rstd.lookup, &counts)?;
+    witness.rstd = Some(NormLookupWitness {
+        bits,
+        messages: None,
+    });
+    Ok(())
+}
+
 /// The oracle/tree pair of the frozen-table lookup messages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RstdSpace {
@@ -684,12 +830,17 @@ pub fn attach_output(
     space: &NormSegmentSpace,
     groups: &OutputGroups,
 ) -> Result<()> {
-    let tail_columns = profile.tail_widths.columns(profile.columns)?;
     let group = |columns: u64, ids: GroupIds| group_plan(space, profile, columns, ids);
+    let provisional = NormOutputTailPlan {
+        group: group(profile.columns, groups.tail)?,
+        widths: profile.tail_widths,
+        clamp: profile.clamp_widths,
+    };
+    let tail_columns = provisional.columns(profile.columns)?;
     let tail = NormOutputTailPlan {
         group: group(tail_columns, groups.tail)?,
         widths: profile.tail_widths,
-        clamp: None,
+        clamp: profile.clamp_widths,
     };
     plan.output = Some(NormOutputPlan {
         broadcast: group(profile.columns, groups.broadcast)?,
@@ -698,6 +849,7 @@ pub fn attach_output(
         out: group(profile.columns, groups.out)?,
         shift: profile.shift,
         clamp: profile.clamp,
+        no_op_clamp: profile.no_op_clamp,
         tail: Some(tail),
     });
     if let Some(mask) = plan.mask.as_mut() {
@@ -746,7 +898,16 @@ mod tests {
             valid: 768,
             columns: 1024,
             shift: 32,
-            clamp: None,
+            clamp: Some((-(1 << 24), 1 << 24)),
+            clamp_widths: Some(NormClampWidths {
+                low: 4,
+                high: 4,
+                low_strict: 4,
+                low_nonstrict: 4,
+                high_strict: 4,
+                high_nonstrict: 4,
+            }),
+            no_op_clamp: true,
             input_bound: 1 << 25,
             sum_offset: 1 << 25,
             mean_offset: 1 << 16,
@@ -869,6 +1030,17 @@ mod tests {
         }
     }
 
+    fn lookup_space() -> LookupSpace {
+        LookupSpace {
+            bits_oracle: 9900,
+            mask_oracle: 9901,
+            bits_tree: 60980,
+            mask_tree: 60981,
+            code: build_code_plan(12, 2049, 4).unwrap(),
+            mask_code: build_code_plan(17, 512, 256).unwrap(),
+        }
+    }
+
     fn rstd_space() -> RstdSpace {
         RstdSpace {
             bits_oracle: 9800,
@@ -976,8 +1148,43 @@ mod tests {
         let bias = vec![0i64; profile.columns as usize];
         attach_params_witness(&mut witness, &gain, &bias).unwrap();
         attach_output_witness(&mut witness, &plan, &profile, &gain, &bias, &rstd).unwrap();
+        attach_lookup(&mut plan, &space, &lookup_space()).unwrap();
+        attach_lookup_witness(&mut witness, &plan).unwrap();
+        attach_rstd_witness(&mut witness, &plan).unwrap();
         assert!(witness.output.is_some());
         assert!(witness.params.is_some());
+        assert!(witness.lookup.is_some());
+        assert!(witness.rstd.is_some());
+    }
+
+    #[test]
+    fn a_changed_no_op_clamp_constant_is_rejected() {
+        use crate::proof::norm_param_table::{NormParamKind, NormParamTablesPlan};
+        let profile = real_profile();
+        let space = space();
+        let x_rows = vec![vec![0i64; profile.hidden as usize]; profile.positions as usize];
+        let mut plan = build_core_plan(&space, &profile, &x_rows).unwrap();
+        let gain_reader = param_table(&vec![1i64; profile.columns as usize]);
+        let bias_reader = param_table(&vec![0i64; profile.columns as usize]);
+        let params = NormParamTablesPlan {
+            gain_claim: Some(param_claim(NormParamKind::Gain, gain_reader.shape, space.code)),
+            bias_claim: Some(param_claim(NormParamKind::Bias, bias_reader.shape, space.code)),
+            gain: param_identity(NormParamKind::Gain, gain_reader, profile.columns),
+            bias: param_identity(NormParamKind::Bias, bias_reader, profile.columns),
+            column_draws: 2,
+            seed_budget: 1,
+        };
+        attach_params(&mut plan, params).unwrap();
+        let (table, first_value) = rstd_table();
+        attach_rstd(&mut plan, &space, &rstd_space(), table, first_value, 8_192).unwrap();
+        attach_output(&mut plan, &profile, &space, &output_groups()).unwrap();
+        let digest = plan.digest();
+        plan.output.as_mut().unwrap().clamp = Some((-(1 << 24), (1 << 24) + 1));
+        assert!(plan.validate().is_err());
+        plan.output.as_mut().unwrap().clamp = Some((-(1 << 24), 1 << 24));
+        assert_eq!(plan.digest(), digest);
+        plan.output.as_mut().unwrap().clamp = Some((-(1 << 25), 1 << 25));
+        assert_ne!(plan.digest(), digest);
     }
 
     #[test]
