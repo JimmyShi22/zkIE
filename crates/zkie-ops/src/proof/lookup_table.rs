@@ -241,6 +241,13 @@ impl<S: TableRowSource> RangeTable<S> {
             .ok_or(Error::ResourceLimit)
     }
 
+    /// Reads one row through the trusted source. The caller has already
+    /// opened the table against its fixed configuration.
+    pub fn row_value(&self, row: usize) -> Result<i64> {
+        let values = self.read_rows_raw(row, 1)?;
+        values.first().copied().ok_or(Error::ShapeMismatch)
+    }
+
     fn read_rows_raw(&self, start: usize, count: usize) -> Result<Vec<i64>> {
         let rows = self.source.read_rows(start, count)?;
         if rows.len() != count {
