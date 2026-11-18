@@ -121,3 +121,16 @@ performed in this round.
 - This is a rollback regression check against the closure baseline, not a
   performance sign-off. The seq512 cases are outside this round's scope and
   were not run.
+
+## Abandoned-theme binary disposal
+
+- The gitignored binaries of the terminated weight-batch theme were disposed
+  on 2026-11-18 after the rollback verification closed: the scratch run
+  directories under /data (wb-b2..b21, wb-cost-a/b/c, wb-e2e, wb-smoke,
+  wb-k2..k4, zkie-consumer-ev) and the gitignored binaries inside the
+  weight-batch benchmark directories (20261117-1710, 20261117-1716,
+  20261118-0148, 20261118-0220, 20261118-0710). Their committed textual
+  evidence remains reachable in the dangling weight-batch git objects.
+- Disk before the disposal: 215 GiB free (89 percent used). After: 290 GiB
+  free (86 percent used). The rollback evidence of this directory was not
+  touched; nothing disposed is referenced by this verification.
