@@ -87,6 +87,81 @@ pub trait TableRowSource {
     fn read_rows(&self, start: usize, count: usize) -> Result<Vec<i64>>;
 }
 
+
+/// A public table view over the trusted frozen file on disk. Every read goes
+/// through the file at the trusted path; the configuration pins the identity,
+/// the content root, the real length and the encoding.
+#[derive(Clone, Debug)]
+pub struct PublicFileTable {
+    path: std::path::PathBuf,
+    config: TableConfig,
+}
+
+impl PublicFileTable {
+    pub fn new(path: std::path::PathBuf, config: TableConfig) -> Result<Self> {
+        if config.identity == Digest::ZERO
+            || config.content_root == Digest::ZERO
+            || config.real_len == 0
+        {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(Self { path, config })
+    }
+}
+
+impl TableRowSource for PublicFileTable {
+    fn identity(&self) -> Digest {
+        self.config.identity
+    }
+
+    fn content_root(&self) -> Digest {
+        self.config.content_root
+    }
+
+    fn real_len(&self) -> usize {
+        self.config.real_len
+    }
+
+    fn encoding(&self) -> TableEncoding {
+        self.config.encoding
+    }
+
+    fn read_rows(&self, start: usize, count: usize) -> Result<Vec<i64>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let end = start.checked_add(count).ok_or(Error::ResourceLimit)?;
+        if end > self.config.real_len {
+            return Err(Error::ShapeMismatch);
+        }
+        let width = self.config.encoding.width();
+        let mut file = std::fs::File::open(&self.path).map_err(|_| Error::Io)?;
+        file.seek(SeekFrom::Start(
+            (start as u64)
+                .checked_mul(width as u64)
+                .ok_or(Error::ResourceLimit)?,
+        ))
+        .map_err(|_| Error::Io)?;
+        let mut bytes = vec![0u8; count.checked_mul(width).ok_or(Error::ResourceLimit)?];
+        file.read_exact(&mut bytes).map_err(|_| Error::Io)?;
+        let mut rows = Vec::with_capacity(count);
+        match self.config.encoding {
+            TableEncoding::I32Le => {
+                for chunk in bytes.chunks_exact(4) {
+                    rows.push(i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as i64);
+                }
+            }
+            TableEncoding::I64Le => {
+                for chunk in bytes.chunks_exact(8) {
+                    rows.push(i64::from_le_bytes([
+                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
+                        chunk[7],
+                    ]));
+                }
+            }
+        }
+        Ok(rows)
+    }
+}
+
 /// The canonical content digest of a row sequence in the given encoding.
 pub fn content_digest(encoding: TableEncoding, rows: &[i64]) -> Result<Digest> {
     let mut bytes = Vec::with_capacity(rows.len().saturating_mul(encoding.width()));
