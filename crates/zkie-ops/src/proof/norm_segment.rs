@@ -23,9 +23,11 @@ use crate::proof::hidden_norm::NormShape;
 use crate::proof::hidden_norm_psc::{
     norm_pointwise_masks, norm_tail_mask_masks, NormGroupPlan, NormGroupWitness,
     NormMaskPlan, NormOutputPlan, NormOutputTailPlan, NormOutputTailWidths,
-    NormPlan, NormRoundLayout, NormRoundPlan, NormRoundWidths, NORM_OUTPUT_TAIL_RELATIONS,
+    NormPlan, NormRoundLayout, NormRoundPlan, NormRoundWidths, NormRstdParams, NormRstdPlan,
+    NORM_OUTPUT_TAIL_RELATIONS,
 };
 use crate::proof::hidden_send_session::WShape;
+use crate::proof::lookup_table::TableConfig;
 use crate::proof::norm_param_table::NormParamTablesPlan;
 use crate::proof::output_closure::commit_value_group;
 use crate::proof::psc::{hp_entries, psc_variables, SHOWN_MAPS};
@@ -337,6 +339,59 @@ pub fn build_core_plan(
 }
 
 
+
+/// The oracle/tree pair of the frozen-table lookup messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RstdSpace {
+    pub bits_oracle: u64,
+    pub mask_oracle: u64,
+    pub bits_tree: u64,
+    pub mask_tree: u64,
+    /// The code of the bits message; its length must cover the table rows.
+    pub code: CodeParams,
+    /// The mask code of the lookup mask message.
+    pub mask_code: CodeParams,
+}
+
+/// Attaches the frozen-table lookup over the existing public rsqrt table.
+/// The table view is a trusted plan value; its content root is the public
+/// table digest already frozen for the model. The value bound is the trusted
+/// maximum of the rstd entries used by this segment, recorded with its
+/// derivation evidence and absorbed into the plan digest.
+pub fn attach_rstd(
+    plan: &mut NormPlan,
+    space: &NormSegmentSpace,
+    rstd: &RstdSpace,
+    table: TableConfig,
+    first_value: Fp3,
+    value_bound: u64,
+) -> Result<()> {
+    let round = plan.round.as_ref().ok_or(Error::InvalidConfig)?.clone();
+    let params = NormRstdParams {
+        code: rstd.code,
+        mask_code: rstd.mask_code,
+        group: space.group,
+        bits_oracle: rstd.bits_oracle,
+        mask_oracle: rstd.mask_oracle,
+        bits_tree: rstd.bits_tree,
+        mask_tree: rstd.mask_tree,
+        leaf_class: space.leaf_class,
+        salt_bytes: space.salt_bytes,
+        run: space.run,
+        configuration: space.configuration,
+    };
+    let rstd_plan = NormRstdPlan::from_round(
+        &round,
+        plan.shape.positions,
+        table,
+        first_value,
+        value_bound,
+        &params,
+    )?;
+    plan.rstd = Some(rstd_plan);
+    plan.validate()
+}
+
 /// The trusted shape space of the four output rows and the tail message.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct OutputGroups {
@@ -548,6 +603,32 @@ mod tests {
         }
     }
 
+    fn rstd_space() -> RstdSpace {
+        RstdSpace {
+            bits_oracle: 9800,
+            mask_oracle: 9801,
+            bits_tree: 60900,
+            mask_tree: 60901,
+            code: build_code_plan(17, 65539, 8192).unwrap(),
+            mask_code: build_code_plan(17, 512, 256).unwrap(),
+        }
+    }
+
+    fn rstd_table() -> (TableConfig, Fp3) {
+        use crate::proof::lookup_table::{TableEncoding, TABLE_ENCODING_VERSION};
+        let table = TableConfig {
+            identity: Digest([0x82; 32]),
+            content_root: Digest([
+                124, 186, 106, 124, 136, 5, 59, 153, 17, 44, 18, 113, 162, 213, 147, 225, 20,
+                122, 75, 59, 74, 146, 254, 16, 145, 193, 72, 226, 227, 53, 115, 237,
+            ]),
+            real_len: 7_340_032,
+            encoding: TableEncoding::I32Le,
+            version: TABLE_ENCODING_VERSION,
+        };
+        (table, Fp3::from_u64(65_536_000))
+    }
+
     fn output_groups() -> OutputGroups {
         OutputGroups {
             broadcast: GroupIds { oracle: 20000, tree: 61000 },
@@ -558,14 +639,7 @@ mod tests {
         }
     }
 
-    // The production profile cannot pass the accepted tail no-wrap check: the
-    // check bounds the image by `valid * 2*input_bound * rsqrt * gain`, and
-    // the rsqrt relation bound is about 2^49 at the required variance width,
-    // so the product exceeds p/2 by many orders of magnitude even though the
-    // measured image maximum is about 2^56. This is recorded for the expert
-    // decision; the builder itself is exercised by the core plan tests.
     #[test]
-    #[ignore = "the accepted tail no-wrap bound is infeasible at the production profile"]
     fn the_real_shape_output_plan_is_admitted() {
         use crate::proof::norm_param_table::{NormParamKind, NormParamTablesPlan};
         let profile = real_profile();
@@ -583,12 +657,37 @@ mod tests {
             seed_budget: 1,
         };
         attach_params(&mut plan, params).unwrap();
+        let (table, first_value) = rstd_table();
+        attach_rstd(&mut plan, &space, &rstd_space(), table, first_value, 8_192).unwrap();
         attach_output(&mut plan, &profile, &space, &output_groups()).unwrap();
         assert!(plan.output.is_some());
         assert!(plan.params.is_some());
         let mask = plan.mask.as_ref().unwrap();
         assert_eq!(mask.pointwise, 2);
         assert_eq!(mask.tail, NORM_OUTPUT_TAIL_RELATIONS);
+    }
+
+    #[test]
+    fn an_image_bound_over_half_the_modulus_is_rejected() {
+        use crate::proof::norm_param_table::{NormParamKind, NormParamTablesPlan};
+        let profile = real_profile();
+        let space = space();
+        let x_rows = vec![vec![0i64; profile.hidden as usize]; profile.positions as usize];
+        let mut plan = build_core_plan(&space, &profile, &x_rows).unwrap();
+        let gain_reader = param_table(&vec![1i64; profile.columns as usize]);
+        let bias_reader = param_table(&vec![0i64; profile.columns as usize]);
+        let params = NormParamTablesPlan {
+            gain_claim: Some(param_claim(NormParamKind::Gain, gain_reader.shape, space.code)),
+            bias_claim: Some(param_claim(NormParamKind::Bias, bias_reader.shape, space.code)),
+            gain: param_identity(NormParamKind::Gain, gain_reader, profile.columns),
+            bias: param_identity(NormParamKind::Bias, bias_reader, profile.columns),
+            column_draws: 2,
+            seed_budget: 1,
+        };
+        attach_params(&mut plan, params).unwrap();
+        let (table, first_value) = rstd_table();
+        attach_rstd(&mut plan, &space, &rstd_space(), table, first_value, 1u64 << 32).unwrap();
+        assert!(attach_output(&mut plan, &profile, &space, &output_groups()).is_err());
     }
 
     #[test]

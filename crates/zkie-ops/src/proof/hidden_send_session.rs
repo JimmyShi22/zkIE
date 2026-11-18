@@ -30215,6 +30215,7 @@ mod merged_tests {
             POSITIONS,
             config,
             Fp3::from_u64(values[0] as u64),
+            1000,
             &params,
         )
         .unwrap();

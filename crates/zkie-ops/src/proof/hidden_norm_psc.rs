@@ -1291,6 +1291,10 @@ pub struct NormRstdPlan {
     pub commit: LookupCommitPlan,
     pub key: crate::proof::lookup::LookupKeyPlan,
     pub table: TableConfig,
+    /// The trusted maximum magnitude of the table entries used by this
+    /// segment. It is a plan value derived from the pinned table content and
+    /// the segment index domain, recorded with its derivation evidence.
+    pub value_bound: u64,
 }
 
 impl NormRstdPlan {
@@ -1313,6 +1317,7 @@ impl NormRstdPlan {
             || self.table.real_len > rows
             || self.key.table_identity != self.table.identity
             || self.key.padding_values.len() != 2
+            || self.value_bound == 0
         {
             return Err(Error::InvalidConfig);
         }
@@ -1354,6 +1359,7 @@ impl NormRstdPlan {
         writer.put_digest(&self.table.content_root);
         writer.put_u64(self.table.real_len as u64);
         writer.put_u64(self.table.version);
+        writer.put_u64(self.value_bound);
         writer.put_u64(match self.table.encoding {
             crate::proof::lookup_table::TableEncoding::I32Le => 4,
             crate::proof::lookup_table::TableEncoding::I64Le => 8,
@@ -1369,10 +1375,12 @@ impl NormRstdPlan {
         positions: u32,
         table: TableConfig,
         first_value: Fp3,
+        value_bound: u64,
         params: &NormRstdParams,
     ) -> Result<Self> {
         if positions == 0
             || table.real_len == 0
+            || value_bound == 0
             || table.version != TABLE_ENCODING_VERSION
             || table.identity == Digest::ZERO
             || table.content_root == Digest::ZERO
@@ -1488,6 +1496,7 @@ impl NormRstdPlan {
             commit,
             key,
             table,
+            value_bound,
         };
         plan.validate()?;
         Ok(plan)
@@ -2333,14 +2342,19 @@ impl NormPlan {
         let centered = (round.input_bound as u128)
             .checked_mul(2)
             .ok_or(Error::ResourceLimit)?;
-        // The normalized image: the centered input times the reciprocal
-        // standard deviation and the gain, at the committed fixed-point
-        // scale. The scale division only shrinks the true value, so the
-        // product of the three published magnitudes plus the rounding term
-        // is a safe integer bound over the tile.
-        let image = (self.shape.valid as u128)
-            .checked_mul(centered)
-            .and_then(|value| value.checked_mul(round_bounds.rsqrt))
+        // The image is the pointwise product pinned by the product-sumcheck;
+        // the prover has no free choice over it. The per-column bound uses the
+        // trusted input contract and the pinned table magnitudes: the centered
+        // amplitude (twice the input bound), the rstd value bound of the
+        // frozen-table plan when present, and the gain bound. The valid-column
+        // count is not a factor: the claim target is field arithmetic and the
+        // image carries no per-row sum.
+        let rstd_bound = match &self.rstd {
+            Some(rstd) => u128::from(rstd.value_bound),
+            None => round_bounds.rsqrt,
+        };
+        let image = centered
+            .checked_mul(rstd_bound)
             .and_then(|value| value.checked_mul(gain))
             .and_then(|value| value.checked_add(1))
             .ok_or(Error::ResourceLimit)?;
@@ -6183,7 +6197,7 @@ mod tests {
             run: Digest([0x73; 32]),
             configuration: Digest([0x74; 32]),
         };
-        let plan = NormRstdPlan::from_round(&round, 2, table, Fp3::from_u64(100), &params)
+        let plan = NormRstdPlan::from_round(&round, 2, table, Fp3::from_u64(100), 1000, &params)
             .unwrap();
         assert_eq!(plan.lookup.columns, 2);
         assert_eq!(plan.lookup.table_log, 3);
@@ -6201,7 +6215,7 @@ mod tests {
 
         let mut bad = table;
         bad.identity = Digest::ZERO;
-        assert!(NormRstdPlan::from_round(&round, 2, bad, Fp3::ZERO, &params).is_err());
+        assert!(NormRstdPlan::from_round(&round, 2, bad, Fp3::ZERO, 1000, &params).is_err());
         let mut bad = plan.clone();
         bad.lookup.columns = 1;
         assert!(bad.validate().is_err());
