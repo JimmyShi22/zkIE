@@ -5226,17 +5226,32 @@ fn hd_activation_identity(
             return Err(Error::StatementMismatch);
         }
     }
+    let roots: Vec<Digest> = entries.iter().map(|entry| entry.root).collect();
+    hd_activation_root(plan, &roots)
+}
+
+/// The activation identity of the norm hidden-output object derived from the
+/// committed out group roots. The verifier re-commits the materialized output
+/// rows with the plan-fixed public coins and compares this identity with the
+/// chain statement.
+pub fn hd_activation_root(plan: &HiddenLinPlan, roots: &[Digest]) -> Result<Digest> {
+    let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
+    let output = norm.output.as_ref().ok_or(Error::InvalidConfig)?;
+    let group = &output.out;
+    if roots.len() != plan.send.positions() as usize || roots.iter().any(|root| *root == Digest::ZERO) {
+        return Err(Error::ShapeMismatch);
+    }
     let mut writer = CanonicalWriter::new();
     writer.put_u64(HD_ACTIVATION_IDENTITY_VERSION);
     writer.put_u64(group.oracle_base);
     writer.put_u64(group.group);
     writer.put_u64(group.columns);
     group.shape.encode_into(&mut writer);
-    writer.put_u64(entries.len() as u64);
-    for entry in entries {
-        writer.put_u64(entry.position as u64);
-        writer.put_u64(entry.oracle);
-        writer.put_digest(&entry.root);
+    writer.put_u64(roots.len() as u64);
+    for (position, root) in roots.iter().enumerate() {
+        writer.put_u64(position as u64);
+        writer.put_u64(group.oracle_base + position as u64);
+        writer.put_digest(root);
     }
     hash_labeled(tag_word(PARAMETERS, 7), 0, None, &writer.into_bytes())
 }
