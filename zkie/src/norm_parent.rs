@@ -914,16 +914,34 @@ pub fn read_rstd_values(
     Ok(values)
 }
 
-/// Builds the norm plan and its private witness at the production shape.
-pub fn build_norm_segment(
+/// The plan-fixed public seed of the norm segment's x group commitment. The
+/// prover and the verifier derive it from the model identity and the position
+/// count; the prover cannot choose the x roots.
+pub fn segment_x_seed(model: Digest, positions: usize) -> Digest {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"zkie/norm-segment/x/v1");
+    bytes.extend_from_slice(&model.0);
+    bytes.extend_from_slice(&(positions as u64).to_le_bytes());
+    zkie_core::artifact::digest_bytes(&bytes)
+}
+
+/// The plan-fixed public session seed of the output-head hidden session.
+pub fn segment_session_seed(model: Digest, positions: usize) -> Digest {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"zkie/norm-segment/session/v1");
+    bytes.extend_from_slice(&model.0);
+    bytes.extend_from_slice(&(positions as u64).to_le_bytes());
+    zkie_core::artifact::digest_bytes(&bytes)
+}
+
+/// Builds the norm plan at the production shape. The verifier rebuilds the
+/// same plan from the materialized trace rows and the trusted constants.
+pub fn build_norm_plan(
     profile: &NormSegmentProfile,
     configuration: Digest,
     metas: &[AssetTableMeta],
     x_rows: &[Vec<i64>],
-    gain: &[i64],
-    bias: &[i64],
-    rstd: &[i64],
-) -> Result<(NormPlan, zkie_ops::proof::hidden_norm_psc::NormWitness)> {
+) -> Result<NormPlan> {
     let space = norm_segment_space(configuration);
     let mut plan = build_core_plan(&space, profile, x_rows)?;
     attach_params(&mut plan, param_identities(metas)?)?;
@@ -937,10 +955,39 @@ pub fn build_norm_segment(
     )?;
     attach_output(&mut plan, profile, &space, &norm_output_groups())?;
     attach_lookup(&mut plan, &space, &norm_lookup_space())?;
-    let mut witness = build_core_witness(&plan, profile, &space, x_rows, rstd)?;
+    Ok(plan)
+}
+
+/// Builds the private witness of the plan. Prover side only.
+pub fn build_norm_witness(
+    plan: &NormPlan,
+    profile: &NormSegmentProfile,
+    configuration: Digest,
+    x_rows: &[Vec<i64>],
+    gain: &[i64],
+    bias: &[i64],
+    rstd: &[i64],
+) -> Result<zkie_ops::proof::hidden_norm_psc::NormWitness> {
+    let space = norm_segment_space(configuration);
+    let mut witness = build_core_witness(plan, profile, &space, x_rows, rstd)?;
     attach_params_witness(&mut witness, gain, bias)?;
-    attach_output_witness(&mut witness, &plan, profile, gain, bias, rstd)?;
-    attach_lookup_witness(&mut witness, &plan)?;
-    attach_rstd_witness(&mut witness, &plan)?;
+    attach_output_witness(&mut witness, plan, profile, gain, bias, rstd)?;
+    attach_lookup_witness(&mut witness, plan)?;
+    attach_rstd_witness(&mut witness, plan)?;
+    Ok(witness)
+}
+
+/// Builds the norm plan and its private witness at the production shape.
+pub fn build_norm_segment(
+    profile: &NormSegmentProfile,
+    configuration: Digest,
+    metas: &[AssetTableMeta],
+    x_rows: &[Vec<i64>],
+    gain: &[i64],
+    bias: &[i64],
+    rstd: &[i64],
+) -> Result<(NormPlan, zkie_ops::proof::hidden_norm_psc::NormWitness)> {
+    let plan = build_norm_plan(profile, configuration, metas, x_rows)?;
+    let witness = build_norm_witness(&plan, profile, configuration, x_rows, gain, bias, rstd)?;
     Ok((plan, witness))
 }
