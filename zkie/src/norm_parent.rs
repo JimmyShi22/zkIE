@@ -902,25 +902,95 @@ pub fn final_norm_rows(
     Ok((index, split(&x), split(&hd)))
 }
 
-/// Reads the two final-norm parameter vectors from the read-only assets.
-pub fn read_norm_params(asset_root: &std::path::Path) -> Result<(Vec<i64>, Vec<i64>)> {
-    let read = |name: &str| -> Result<Vec<i64>> {
-        let bytes = std::fs::read(asset_root.join("gpt2/weights").join(name))
-            .map_err(|_| Error::AssetMismatch)?;
-        if bytes.len() % 4 != 0 {
-            return Err(Error::AssetMismatch);
+/// Reads the two final-norm parameter vectors from the anchored assets. The
+/// file values are decoded through the same encoding as the commitment
+/// builder and the recomputed row-leaf root must equal the public leaf
+/// record, so only authenticated values reach the checks.
+pub fn read_anchored_params(
+    asset_root: &std::path::Path,
+    assets: &[zkie_ops::proof::model_commitment::AssetMeta],
+) -> Result<(Vec<i64>, Vec<i64>)> {
+    let specs = zkie_models_gpt2::plan::asset_specs();
+    let read = |path: &str| -> Result<Vec<i64>> {
+        let spec = specs
+            .iter()
+            .find(|spec| spec.path == path)
+            .ok_or(Error::InvalidConfig)?;
+        let meta = assets
+            .iter()
+            .find(|asset| asset.path == path)
+            .ok_or(Error::AssetMismatch)?;
+        let (values, root) =
+            zkie_ops::proof::model_commitment::read_asset_values_with_root(asset_root, spec)?;
+        if root != meta.leaf_record.leaf_root
+            || meta.element_count != spec.element_count
+            || meta.row_width != spec.row_width
+        {
+            return Err(Error::StatementMismatch);
         }
-        Ok(bytes
-            .chunks_exact(4)
-            .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as i64)
-            .collect())
+        Ok(values)
     };
-    let gain = read("ln_f_w_i32.bin")?;
-    let bias = read("ln_f_b_i32.bin")?;
+    let gain = read("gpt2/weights/ln_f_w_i32.bin")?;
+    let bias = read("gpt2/weights/ln_f_b_i32.bin")?;
     if gain.len() != 1024 || bias.len() != 1024 {
         return Err(Error::AssetMismatch);
     }
     Ok((gain, bias))
+}
+
+/// The authenticated value checks behind the segment's trusted bounds. The
+/// bounds are plan values; the checked values come only from authenticated
+/// objects: the materialized trace rows, the anchored parameter assets and
+/// the frozen public rstd table. Both the prover and the verifier run it.
+pub fn check_authenticated_bounds(
+    plan: &NormPlan,
+    profile: &NormSegmentProfile,
+    x_rows: &[Vec<i64>],
+    gain: &[i64],
+    bias: &[i64],
+    table: &zkie_ops::proof::lookup_table::RangeTable<
+        zkie_ops::proof::lookup_table::PublicFileTable,
+    >,
+) -> Result<()> {
+    let round = plan.round.as_ref().ok_or(Error::InvalidConfig)?;
+    let params = plan.params.as_ref().ok_or(Error::InvalidConfig)?;
+    let rstd = plan.rstd.as_ref().ok_or(Error::InvalidConfig)?;
+    // The table read must be the frozen content, not merely a file at the
+    // expected path.
+    zkie_ops::proof::lookup::LookupTable::check_content(table)?;
+    if gain.len() != profile.columns as usize
+        || bias.len() != profile.columns as usize
+        || x_rows.len() != profile.positions as usize
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    for value in gain {
+        if *value < params.gain.valid_min || *value > params.gain.valid_max {
+            return Err(Error::BoundViolation);
+        }
+    }
+    for value in bias {
+        if *value < params.bias.valid_min || *value > params.bias.valid_max {
+            return Err(Error::BoundViolation);
+        }
+    }
+    let bound = i64::try_from(round.input_bound).map_err(|_| Error::ResourceLimit)?;
+    for row in x_rows {
+        if row.len() != profile.hidden as usize {
+            return Err(Error::ShapeMismatch);
+        }
+        if row.iter().any(|value| *value < -bound || *value > bound) {
+            return Err(Error::BoundViolation);
+        }
+        let core = NormCoreRow::from_values(row, profile.valid as usize)?;
+        let index = zkie_ops::registry::profile_rsqrt_index(core.variance)?;
+        let value = table
+            .row_value(usize::try_from(index).map_err(|_| Error::ResourceLimit)?)?;
+        if value < 0 || value as u64 > rstd.value_bound {
+            return Err(Error::BoundViolation);
+        }
+    }
+    Ok(())
 }
 
 /// Reads the frozen-table rstd value of every position by index.

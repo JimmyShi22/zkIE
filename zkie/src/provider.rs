@@ -42,8 +42,8 @@ use zkie_ops::proof::consumer_proof::ConsumerProofFile;
 use zkie_ops::proof::consumer_request::ConsumerSharedPlan;
 use zkie_ops::proof::consumer_session::verify_consumer_request;
 use crate::norm_parent::{
-    build_norm_plan, build_norm_segment, build_segment_plan, final_norm_rows, read_norm_params,
-    read_rstd_values, segment_session_seed, segment_x_seed,
+    build_norm_plan, build_norm_segment, build_segment_plan, check_authenticated_bounds,
+    final_norm_rows, read_anchored_params, read_rstd_values, segment_session_seed, segment_x_seed,
 };
 use crate::norm_segment_provider::{
     build_param_tables, build_segment_table, configuration_for, lm_head_asset, plan_identifier,
@@ -507,7 +507,7 @@ fn prove_norm_segment(
         return Err(Error::StatementMismatch);
     }
     let asset_root = Path::new(&config.asset_root);
-    let (gain, bias) = read_norm_params(asset_root)?;
+    let (gain, bias) = read_anchored_params(asset_root, &public.assets)?;
     let rstd = read_rstd_values(asset_root, &profile, &x_rows)?;
     let (norm_plan, witness) = build_norm_segment(
         &profile,
@@ -517,6 +517,15 @@ fn prove_norm_segment(
         &gain,
         &bias,
         &rstd,
+    )?;
+    let rstd_table = rstd_table_view(asset_root)?;
+    check_authenticated_bounds(
+        &norm_plan,
+        &profile,
+        &x_rows,
+        &gain,
+        &bias,
+        &rstd_table,
     )?;
     let key = segment_table_key(request_plan.table_shape()?);
     let asset = lm_head_asset(commitment, &matmul.weight_path)?;
@@ -653,6 +662,7 @@ fn verify_norm_segment(
         return Err(Error::StatementMismatch);
     }
     let norm_plan = build_norm_plan(&profile, configuration, table_metas, &x_rows)?;
+    let (gain, bias) = read_anchored_params(asset_root, &public.assets)?;
     let session_seed = segment_session_seed(model, positions);
     let plan = build_segment_plan(
         &trace_plan,
@@ -666,6 +676,7 @@ fn verify_norm_segment(
         session_seed,
     )?;
     let rstd = rstd_table_view(asset_root)?;
+    check_authenticated_bounds(&norm_plan, &profile, &x_rows, &gain, &bias, &rstd)?;
     let started = Instant::now();
     let outcome = verify_segment_bytes(&plan, reader, &carrier.messages, &rstd)?;
     ctx.metrics
