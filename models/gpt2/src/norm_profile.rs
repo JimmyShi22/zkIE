@@ -48,12 +48,13 @@ pub const RSTD_FIRST_VALUE: i64 = 65_536_000;
 pub const GAIN_MAX: i64 = 1_141_592;
 /// The observed largest absolute centered input row entry, for the record.
 pub const CENTERED_OBSERVED: i64 = 22_823_876;
-/// The trusted no-op clamp interval of the segment: the registered model has
-/// no clamp, and the chain proves the clamp rows over the symmetric interval
-/// `[-CLAMP_BOUND, CLAMP_BOUND]`. The observed largest absolute pre-clamp
-/// value is 14,562,155, below the bound, so the clamp is the identity on the
-/// honest range; the equivalence is carried by the trusted input contract.
-pub const CLAMP_BOUND: i64 = 1 << 24;
+/// The clamp interval of the segment is the signed-offset domain of the
+/// four-byte pre-clamp cell. Every reachable pre-clamp value lies strictly
+/// inside it, so the clamp selectors are forced to zero by the chain's own
+/// sign relations and the output equals the pre-clamp value in-chain. This is
+/// a width bound, not a measured no-op.
+pub const CLAMP_LOW: i64 = -(1 << 31);
+pub const CLAMP_HIGH: i64 = (1 << 31) - 1;
 /// The observed largest absolute pre-clamp value, for the record.
 pub const PRE_CLAMP_OBSERVED: i64 = 14_562_155;
 
@@ -76,13 +77,21 @@ pub fn round_widths() -> NormRoundWidths {
 /// The output-tail digit widths of the final norm profile with the output
 /// shift fixed to `2^32`.
 pub fn tail_widths() -> NormOutputTailWidths {
+    // The quotient, shifted and pre-clamp cells are offset-encoded, so a
+    // width of `w` bytes covers `[-2^(8w-1), 2^(8w-1) - 1]`. The registered
+    // case's measured maxima are quotient and shifted 14,079,265 and pre-clamp
+    // 14,562,155, all above 2^23 and below 2^24: they need four bytes. The
+    // remainder, doubled remainder and tie cells are non-negative and fit
+    // their widths directly. The clamp distance rows keep four bytes: the
+    // pre-clamp distance is bounded by the half range plus the clamp bound,
+    // not by the full pre-clamp capacity.
     NormOutputTailWidths {
-        quotient: 3,
+        quotient: 4,
         remainder: 4,
         doubled_remainder: 5,
         tie_slack: 4,
-        shifted: 3,
-        pre_clamp: 3,
+        shifted: 4,
+        pre_clamp: 4,
     }
 }
 
@@ -129,10 +138,15 @@ pub fn segment_profile(
         valid: VALID,
         columns: u64::from(HIDDEN_PAD),
         shift: OUTPUT_SHIFT,
-        clamp: Some((-CLAMP_BOUND, CLAMP_BOUND)),
+        clamp: Some((CLAMP_LOW, CLAMP_HIGH)),
+        // The clamp distance rows carry `pre - bound + half`; with the
+        // interval equal to the signed-offset domain of the pre-clamp cell,
+        // the distance reaches 2^32 - 1, so the low/high rows take five
+        // bytes. The strict and non-strict slack rows stay in the smaller
+        // non-negative distance domains and keep four bytes.
         clamp_widths: Some(zkie_ops::proof::hidden_norm_psc::NormClampWidths {
-            low: 4,
-            high: 4,
+            low: 5,
+            high: 5,
             low_strict: 4,
             low_nonstrict: 4,
             high_strict: 4,
@@ -182,12 +196,17 @@ mod tests {
     }
 
     #[test]
-    fn the_no_op_clamp_bound_covers_the_honest_range() {
-        assert!(PRE_CLAMP_OBSERVED.abs() < CLAMP_BOUND);
+    fn the_clamp_interval_is_the_pre_cell_domain() {
+        assert!(PRE_CLAMP_OBSERVED > CLAMP_LOW && PRE_CLAMP_OBSERVED <= CLAMP_HIGH);
         let profile = segment_profile(16, zkie_core::types::Digest([0x91; 32])).unwrap();
         assert!(profile.no_op_clamp);
-        assert_eq!(profile.clamp, Some((-CLAMP_BOUND, CLAMP_BOUND)));
-        assert!(profile.clamp_widths.is_some());
+        assert_eq!(profile.clamp, Some((CLAMP_LOW, CLAMP_HIGH)));
+        let widths = profile.clamp_widths.expect("the clamp rows");
+        assert_eq!(profile.tail_widths.pre_clamp, 4);
+        let half = 1i64 << (8 * profile.tail_widths.pre_clamp as u32 - 1);
+        assert_eq!(CLAMP_LOW, -half);
+        assert_eq!(CLAMP_HIGH, half - 1);
+        assert_eq!((widths.low, widths.high), (5, 5));
     }
 
     #[test]

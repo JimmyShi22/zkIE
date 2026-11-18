@@ -2283,11 +2283,14 @@ impl NormPlan {
         Ok(())
     }
 
-    /// The plan-level no-wrap derivation of the output tail. Every integer
-    /// magnitude is bounded from the trusted widths, the shift, the input
-    /// bound and the published parameter ranges; each reconstruction and
-    /// relation term must stay below half the base modulus. The witness-level
-    /// bound is not a substitute for this plan check.
+    /// The plan-level no-wrap derivation of the output tail. It works over
+    /// the full byte ranges the lookups enforce and the trusted value bounds:
+    /// every relation's integer residual interval must contain no nonzero
+    /// multiple of the base modulus. Relation 0 is checked as a window cover
+    /// (image bound plus the quotient/remainder reconstruction window below
+    /// the modulus), which makes a modular zero an integer zero and fixes the
+    /// quotient and remainder; the other relations keep their term bounds.
+    /// The witness-level bound is not a substitute for this plan check.
     fn tail_no_wrap(&self) -> Result<()> {
         let output = self.output.as_ref().ok_or(Error::InvalidConfig)?;
         let tail = output.tail.as_ref().ok_or(Error::InvalidConfig)?;
@@ -2367,14 +2370,23 @@ impl NormPlan {
         if shifted >= half || bias_sum >= half || image >= half {
             return Err(Error::InvalidConfig);
         }
-        // Relation 0: image plus the quotient and remainder reconstruction.
-        let reconstruction = (q_cap - 1)
+        // Relation 0: the image minus the quotient/remainder reconstruction.
+        // The byte lookups force the encoded quotient into
+        // [-q_half, q_half) and the remainder into [0, r_cap); the
+        // reconstruction window has width (q_half - 1) * divisor + (r_cap - 1).
+        // When the image bound plus this window stays below the modulus, a
+        // modular zero is an integer zero and the quotient and remainder are
+        // unique inside the window. This is a window-cover check, not a sum
+        // of independent absolute values.
+        let reconstruction = (q_half - 1)
             .checked_mul(divisor)
             .and_then(|value| value.checked_add(r_cap - 1))
-            .and_then(|value| value.checked_add(divisor.checked_mul(q_half)?))
-            .and_then(|value| value.checked_add(image))
             .ok_or(Error::ResourceLimit)?;
-        if reconstruction >= half {
+        if image
+            .checked_add(reconstruction)
+            .filter(|value| *value < MODULUS as u128)
+            .is_none()
+        {
             return Err(Error::InvalidConfig);
         }
         // Relation 1: shifted value from the quotient and the half selector.
@@ -3391,9 +3403,12 @@ impl NormOutputTailPlan {
                         return Err(Error::InvalidConfig);
                     }
                 }
-                let pre_capacity = 1u128 << (8 * self.widths.pre_clamp as u32);
+                // The pre-clamp distance is bounded by the pre-clamp half
+                // range plus the clamp bound (the pre value is half-offset
+                // encoded), not by the full pre-clamp capacity.
+                let pre_half = 1u128 << (8 * self.widths.pre_clamp as u32 - 1);
                 let bound = (low.unsigned_abs() as u128).max(high.unsigned_abs() as u128);
-                let span = pre_capacity
+                let span = pre_half
                     .checked_add(bound)
                     .ok_or(Error::InvalidConfig)?;
                 if digit_bound(clamp.low).map_err(|_| Error::InvalidConfig)? + 1 < span
@@ -4085,8 +4100,16 @@ impl NormOutputPlan {
             }
         }
         if self.no_op_clamp {
+            // The no-op form is the signed-offset domain of the pre-clamp
+            // cell: every reachable pre-clamp value lies inside it, so the
+            // comparison selectors are forced to zero by the chain's own sign
+            // relations and the output equals the pre-clamp value in-chain.
+            let tail = self.tail.as_ref().ok_or(Error::InvalidConfig)?;
+            let half = 1i64
+                .checked_shl(8 * tail.widths.pre_clamp as u32 - 1)
+                .ok_or(Error::InvalidConfig)?;
             match self.clamp {
-                Some((low, high)) if low < 0 && low == -high => {}
+                Some((low, high)) if low == -half && high == half - 1 => {}
                 _ => return Err(Error::InvalidConfig),
             }
         }
@@ -7038,6 +7061,30 @@ mod tests {
             .unwrap()
             .widths
             .quotient = 8;
+        assert!(changed.validate().is_err());
+
+        let mut changed = with_tail.clone();
+        changed
+            .output
+            .as_mut()
+            .unwrap()
+            .tail
+            .as_mut()
+            .unwrap()
+            .widths
+            .remainder = 0;
+        assert!(changed.validate().is_err());
+
+        let mut changed = with_tail.clone();
+        changed
+            .output
+            .as_mut()
+            .unwrap()
+            .tail
+            .as_mut()
+            .unwrap()
+            .widths
+            .tie_slack = 0;
         assert!(changed.validate().is_err());
 
         assert_eq!(widths.slots().unwrap(), 16);

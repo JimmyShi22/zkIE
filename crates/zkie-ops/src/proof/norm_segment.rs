@@ -925,10 +925,10 @@ mod tests {
             valid: 768,
             columns: 1024,
             shift: 32,
-            clamp: Some((-(1 << 24), 1 << 24)),
+            clamp: Some((-(1 << 31), (1 << 31) - 1)),
             clamp_widths: Some(NormClampWidths {
-                low: 4,
-                high: 4,
+                low: 5,
+                high: 5,
                 low_strict: 4,
                 low_nonstrict: 4,
                 high_strict: 4,
@@ -946,12 +946,12 @@ mod tests {
                 offset: 2,
             },
             tail_widths: NormOutputTailWidths {
-                quotient: 3,
+                quotient: 4,
                 remainder: 4,
                 doubled_remainder: 5,
                 tie_slack: 4,
-                shifted: 3,
-                pre_clamp: 3,
+                shifted: 4,
+                pre_clamp: 4,
             },
             table_real_len: 7_340_032,
             x_seed: Digest([0x91; 32]),
@@ -1219,12 +1219,94 @@ mod tests {
         attach_rstd(&mut plan, &space, &rstd_space(), table, first_value, 8_192).unwrap();
         attach_output(&mut plan, &profile, &space, &output_groups()).unwrap();
         let digest = plan.digest();
-        plan.output.as_mut().unwrap().clamp = Some((-(1 << 24), (1 << 24) + 1));
+        plan.output.as_mut().unwrap().clamp = Some((-(1 << 31), 1 << 31));
         assert!(plan.validate().is_err());
-        plan.output.as_mut().unwrap().clamp = Some((-(1 << 24), 1 << 24));
+        plan.output.as_mut().unwrap().clamp = Some((-(1 << 31), (1 << 31) - 1));
         assert_eq!(plan.digest(), digest);
-        plan.output.as_mut().unwrap().clamp = Some((-(1 << 25), 1 << 25));
+        plan.output.as_mut().unwrap().clamp = Some((-(1 << 30), (1 << 30) - 1));
+        assert!(plan.validate().is_err());
         assert_ne!(plan.digest(), digest);
+    }
+
+    #[test]
+    fn the_tail_widths_cover_the_real_shift() {
+        use crate::proof::norm_param_table::{NormParamKind, NormParamTablesPlan};
+        let profile = real_profile();
+        let space = space();
+        let x_rows = vec![vec![0i64; profile.hidden as usize]; profile.positions as usize];
+        let mut plan = build_core_plan(&space, &profile, &x_rows).unwrap();
+        let gain_reader = param_table(&vec![1i64; profile.columns as usize]);
+        let bias_reader = param_table(&vec![0i64; profile.columns as usize]);
+        let params = NormParamTablesPlan {
+            gain_claim: Some(param_claim(NormParamKind::Gain, gain_reader.shape, space.code)),
+            bias_claim: Some(param_claim(NormParamKind::Bias, bias_reader.shape, space.code)),
+            gain: param_identity(NormParamKind::Gain, gain_reader, profile.columns),
+            bias: param_identity(NormParamKind::Bias, bias_reader, profile.columns),
+            column_draws: 2,
+            seed_budget: 1,
+        };
+        attach_params(&mut plan, params).unwrap();
+        let (table, first_value) = rstd_table();
+        attach_rstd(&mut plan, &space, &rstd_space(), table, first_value, 8_192).unwrap();
+        attach_output(&mut plan, &profile, &space, &output_groups()).unwrap();
+        assert!(plan.validate().is_ok());
+        for (name, width) in [("remainder", 2usize), ("tie", 2usize)] {
+            let mut changed = plan.clone();
+            let tail = changed.output.as_mut().unwrap().tail.as_mut().unwrap();
+            if name == "remainder" {
+                tail.widths.remainder = width;
+            } else {
+                tail.widths.tie_slack = width;
+            }
+            assert!(changed.validate().is_err(), "{name} width was admitted");
+        }
+    }
+
+    #[test]
+    fn the_real_magnitude_tail_row_is_committed() {
+        use crate::proof::norm_param_table::{NormParamKind, NormParamTablesPlan};
+        let profile = real_profile();
+        let space = space();
+        let x_rows = vec![vec![0i64; profile.hidden as usize]; profile.positions as usize];
+        let mut plan = build_core_plan(&space, &profile, &x_rows).unwrap();
+        let gain_reader = param_table(&vec![1i64; profile.columns as usize]);
+        let bias_reader = param_table(&vec![0i64; profile.columns as usize]);
+        let params = NormParamTablesPlan {
+            gain_claim: Some(param_claim(NormParamKind::Gain, gain_reader.shape, space.code)),
+            bias_claim: Some(param_claim(NormParamKind::Bias, bias_reader.shape, space.code)),
+            gain: param_identity(NormParamKind::Gain, gain_reader, profile.columns),
+            bias: param_identity(NormParamKind::Bias, bias_reader, profile.columns),
+            column_draws: 2,
+            seed_budget: 1,
+        };
+        attach_params(&mut plan, params).unwrap();
+        let (table, first_value) = rstd_table();
+        attach_rstd(&mut plan, &space, &rstd_space(), table, first_value, 8_192).unwrap();
+        attach_output(&mut plan, &profile, &space, &output_groups()).unwrap();
+        let tail = plan.output.as_ref().unwrap().tail.as_ref().unwrap();
+        let columns = profile.columns as usize;
+        let mut row = crate::proof::hidden_norm::NormOutputRow {
+            rstd: 5_078,
+            shift: profile.shift,
+            clamp: profile.clamp,
+            broadcast: vec![5_078; columns],
+            product: vec![5_798_000_000; columns],
+            image: vec![60_469_830_945_683_544; columns],
+            quotient: vec![14_079_265; columns],
+            remainder: vec![4_294_889_424; columns],
+            selector: vec![true; columns],
+            shifted: vec![14_079_265; columns],
+            pre_clamp: vec![14_562_155; columns],
+            out: vec![14_562_155; columns],
+        };
+        let values = tail.values(&row, profile.columns).unwrap();
+        assert_eq!(values.len() as u64, tail.group.columns);
+        let mut out_of_half = row.clone();
+        out_of_half.quotient[0] = 1 << 31;
+        assert!(tail.values(&out_of_half, profile.columns).is_err());
+        let mut out_of_pre = row.clone();
+        out_of_pre.pre_clamp[0] = 1 << 31;
+        assert!(tail.values(&out_of_pre, profile.columns).is_err());
     }
 
     #[test]
