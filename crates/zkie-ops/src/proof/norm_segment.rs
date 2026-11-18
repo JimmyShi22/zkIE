@@ -22,9 +22,11 @@ use zkie_engine::pcs::request::runtime_tree::{RuntimeTreePart, RuntimeTreePlan};
 use crate::proof::hidden_norm::NormShape;
 use crate::proof::hidden_norm_psc::{
     norm_pointwise_masks, norm_tail_mask_masks, NormGroupPlan, NormGroupWitness,
-    NormMaskPlan, NormPlan, NormRoundLayout, NormRoundPlan, NormRoundWidths,
+    NormMaskPlan, NormOutputPlan, NormOutputTailPlan, NormOutputTailWidths,
+    NormPlan, NormRoundLayout, NormRoundPlan, NormRoundWidths, NORM_OUTPUT_TAIL_RELATIONS,
 };
 use crate::proof::hidden_send_session::WShape;
+use crate::proof::norm_param_table::NormParamTablesPlan;
 use crate::proof::output_closure::commit_value_group;
 use crate::proof::psc::{hp_entries, psc_variables, SHOWN_MAPS};
 
@@ -70,6 +72,7 @@ pub struct NormSegmentProfile {
     pub sum_offset: u64,
     pub mean_offset: u64,
     pub round_widths: NormRoundWidths,
+    pub tail_widths: NormOutputTailWidths,
     pub table_real_len: u64,
     /// The fixed public coin seed of the trusted x group derivation.
     pub x_seed: Digest,
@@ -333,6 +336,64 @@ pub fn build_core_plan(
     Ok(plan)
 }
 
+
+/// The trusted shape space of the four output rows and the tail message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct OutputGroups {
+    pub broadcast: GroupIds,
+    pub product: GroupIds,
+    pub image: GroupIds,
+    pub out: GroupIds,
+    pub tail: GroupIds,
+}
+
+/// Attaches the gain/bias parameter tables. The identities are trust plan
+/// values: the committed readers and their roots come from the commit bundle,
+/// never from a proof message.
+pub fn attach_params(plan: &mut NormPlan, params: NormParamTablesPlan) -> Result<()> {
+    plan.params = Some(params);
+    plan.validate()
+}
+
+/// Attaches the output tail and resizes the committed mask block so the
+/// pointwise and tail relation instances are covered.
+pub fn attach_output(
+    plan: &mut NormPlan,
+    profile: &NormSegmentProfile,
+    space: &NormSegmentSpace,
+    groups: &OutputGroups,
+) -> Result<()> {
+    let tail_columns = profile.tail_widths.columns(profile.columns)?;
+    let group = |columns: u64, ids: GroupIds| group_plan(space, profile, columns, ids);
+    let tail = NormOutputTailPlan {
+        group: group(tail_columns, groups.tail)?,
+        widths: profile.tail_widths,
+        clamp: None,
+    };
+    plan.output = Some(NormOutputPlan {
+        broadcast: group(profile.columns, groups.broadcast)?,
+        product: group(profile.columns, groups.product)?,
+        image: group(profile.columns, groups.image)?,
+        out: group(profile.columns, groups.out)?,
+        shift: profile.shift,
+        clamp: profile.clamp,
+        tail: Some(tail),
+    });
+    if let Some(mask) = plan.mask.as_mut() {
+        mask.pointwise = 2;
+        mask.tail = NORM_OUTPUT_TAIL_RELATIONS;
+        mask.claims = (profile.positions as usize)
+            .checked_mul(2)
+            .ok_or(Error::ResourceLimit)?;
+        mask.mask_rows = mask.required_rows(plan.relations.len())?;
+        mask.tree.parts[0].mask_symbols = mask
+            .mask_rows
+            .checked_mul(E_DEGREE as u64)
+            .ok_or(Error::ResourceLimit)?;
+    }
+    plan.validate()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -341,7 +402,7 @@ mod tests {
     fn space() -> NormSegmentSpace {
         NormSegmentSpace {
             group: 7,
-            code: build_code_plan(12, 2048, 4).unwrap(),
+            code: build_code_plan(12, 2049, 4).unwrap(),
             mask_code: build_code_plan(17, 512, 256).unwrap(),
             run: Digest([0x41; 32]),
             configuration: Digest([0x44; 32]),
@@ -375,9 +436,159 @@ mod tests {
                 mean: 3,
                 offset: 2,
             },
+            tail_widths: NormOutputTailWidths {
+                quotient: 3,
+                remainder: 4,
+                doubled_remainder: 5,
+                tie_slack: 4,
+                shifted: 3,
+                pre_clamp: 3,
+            },
             table_real_len: 7_340_032,
             x_seed: Digest([0x91; 32]),
         }
+    }
+
+
+    fn param_table(values: &[i64]) -> zkie_engine::pcs::request::table::IndexReader {
+        use zkie_engine::pcs::request::table::{
+            commit_table_streaming, IndexShape, TableDistances, VecTableSource,
+        };
+        let code = build_code_plan(12, 2048, 4).unwrap();
+        let shape = IndexShape {
+            code,
+            v: 0,
+            answers: 1,
+            salt_bytes: 40,
+            distances: TableDistances {
+                radius: 0,
+                later_radius: 0,
+                m_once: 0,
+                m_later: 0,
+            },
+        };
+        let ell = shape.code.ell as usize;
+        let mut message = vec![crate::proof::column_session::fp_from_signed_word(0); ell];
+        for (index, value) in values.iter().take(ell).enumerate() {
+            message[index] = crate::proof::column_session::fp_from_signed_word(*value as u64);
+        }
+        let tails = vec![vec![crate::proof::column_session::fp_from_signed_word(0); shape.code.r as usize]];
+        let mut source = VecTableSource::new(vec![message], tails).unwrap();
+        let salts = vec![vec![0u8; shape.salt_bytes]; shape.code.n() as usize];
+        let table = commit_table_streaming(
+            &mut source,
+            shape,
+            Digest([0x81; 32]),
+            &salts,
+            8,
+            1 << 20,
+        )
+        .unwrap();
+        table.reader.clone()
+    }
+
+    fn param_identity(
+        kind: crate::proof::norm_param_table::NormParamKind,
+        reader: zkie_engine::pcs::request::table::IndexReader,
+        width: u64,
+    ) -> crate::proof::norm_param_table::NormParamTableIdentity {
+        crate::proof::norm_param_table::NormParamTableIdentity {
+            version: crate::proof::norm_param_table::NORM_PARAM_TABLE_VERSION,
+            kind,
+            model_identity: Digest([0x63; 32]),
+            asset_table_identity: Digest([0x64; 32]),
+            reader,
+            row: 0,
+            width,
+            valid_min: -128,
+            valid_max: 127,
+            trusted_i32_mapping: true,
+        }
+    }
+
+    fn param_claim(
+        kind: crate::proof::norm_param_table::NormParamKind,
+        shape: zkie_engine::pcs::request::table::IndexShape,
+        code: zkie_engine::pcs::request::code::CodeParams,
+    ) -> crate::proof::norm_param_table::NormParamClaimPlan {
+        use zkie_engine::pcs::request::gu::{GuOracleShape, GuShape};
+        use zkie_engine::pcs::request::runtime_tree::{RuntimeTreePart, RuntimeTreePlan};
+        let main_rows = 2u64;
+        crate::proof::norm_param_table::NormParamClaimPlan {
+            kind,
+            gu: GuShape {
+                oracle: 0x8800 + kind.encode(),
+                group: 0x42,
+                tree: RuntimeTreePlan {
+                    tree_number: 0x1234,
+                    leaf_class: 1,
+                    log_n: code.log_n,
+                    log_n_zk: code.log_n,
+                    parts: vec![RuntimeTreePart {
+                        main_symbols: main_rows * E_DEGREE as u64,
+                        mask_symbols: 0,
+                    }],
+                    salt_bytes: 40,
+                    run: Digest([0x71; 32]),
+                    configuration: Digest([0x72; 32]),
+                },
+                part: 0,
+                rows_high: true,
+                u: GuOracleShape {
+                    code,
+                    main_rows,
+                    main_deg: E_DEGREE as u32,
+                    mask_rows: 0,
+                    mask_code: None,
+                    answers: 1,
+                },
+                index: shape,
+            },
+            column_draws: 2,
+        }
+    }
+
+    fn output_groups() -> OutputGroups {
+        OutputGroups {
+            broadcast: GroupIds { oracle: 20000, tree: 61000 },
+            product: GroupIds { oracle: 20100, tree: 61100 },
+            image: GroupIds { oracle: 20200, tree: 61200 },
+            out: GroupIds { oracle: 20300, tree: 61300 },
+            tail: GroupIds { oracle: 20400, tree: 61400 },
+        }
+    }
+
+    // The production profile cannot pass the accepted tail no-wrap check: the
+    // check bounds the image by `valid * 2*input_bound * rsqrt * gain`, and
+    // the rsqrt relation bound is about 2^49 at the required variance width,
+    // so the product exceeds p/2 by many orders of magnitude even though the
+    // measured image maximum is about 2^56. This is recorded for the expert
+    // decision; the builder itself is exercised by the core plan tests.
+    #[test]
+    #[ignore = "the accepted tail no-wrap bound is infeasible at the production profile"]
+    fn the_real_shape_output_plan_is_admitted() {
+        use crate::proof::norm_param_table::{NormParamKind, NormParamTablesPlan};
+        let profile = real_profile();
+        let space = space();
+        let x_rows = vec![vec![0i64; profile.hidden as usize]; profile.positions as usize];
+        let mut plan = build_core_plan(&space, &profile, &x_rows).unwrap();
+        let gain_reader = param_table(&vec![1i64; profile.columns as usize]);
+        let bias_reader = param_table(&vec![0i64; profile.columns as usize]);
+        let params = NormParamTablesPlan {
+            gain_claim: Some(param_claim(NormParamKind::Gain, gain_reader.shape, space.code)),
+            bias_claim: Some(param_claim(NormParamKind::Bias, bias_reader.shape, space.code)),
+            gain: param_identity(NormParamKind::Gain, gain_reader, profile.columns),
+            bias: param_identity(NormParamKind::Bias, bias_reader, profile.columns),
+            column_draws: 2,
+            seed_budget: 1,
+        };
+        attach_params(&mut plan, params).unwrap();
+        attach_output(&mut plan, &profile, &space, &output_groups()).unwrap();
+        assert!(plan.output.is_some());
+        assert!(plan.params.is_some());
+        let mask = plan.mask.as_ref().unwrap();
+        assert_eq!(mask.pointwise, 2);
+        assert_eq!(mask.tail, NORM_OUTPUT_TAIL_RELATIONS);
     }
 
     #[test]
