@@ -440,7 +440,7 @@ fn transcript_digest(tag: u64, data: &[u8]) -> Result<Digest> {
     )
 }
 
-pub const MODEL_VERSION: u32 = 1;
+pub const MODEL_VERSION: u32 = 2;
 
 pub fn valid_vocab() -> usize {
     config::VOCAB

@@ -592,8 +592,22 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
     let refused = verify_dir(&provider, &policy, &proof_dir, &broken_commit, &config.model).is_err();
     assert!(refused, "a changed key bundle is refused");
 
+    // Version negative: a policy written before the committed table identity
+    // became mandatory is refused by the production entry.
+    let old_policy = run.join("old-policy.toml");
+    let policy_text = fs::read_to_string(&policy).unwrap();
+    let cut = policy_text
+        .find("[case.limited_table_identity]")
+        .unwrap_or(policy_text.len());
+    fs::write(&old_policy, &policy_text[..cut]).unwrap();
+    let refused = verify_dir(&provider, &old_policy, &proof_dir, &commit_dir, &config.model).is_err();
+    assert!(
+        refused,
+        "a policy without the committed table identity is refused"
+    );
+
     let evidence = format!(
-        "{{\n  \"case\": \"{}\",\n  \"commit_ms\": {},\n  \"prove_ms\": {},\n  \"verify_ms\": {},\n  \"trace_bytes\": {},\n  \"trace_assets\": {},\n  \"removed_opening_bytes\": {},\n  \"trace_with_opening_bytes\": {},\n  \"statement_bytes\": {},\n  \"consumer_proof_bytes\": {},\n  \"key_prove_ms\": {},\n  \"key_commit_verify_ms\": {},\n  \"key_request_verify_ms\": {},\n  \"key_file_bytes\": {},\n  \"vmhwm_after_prove_kib\": {},\n  \"vmhwm_after_verify_kib\": {},\n  \"accepted\": true,\n  \"negatives\": 12\n}}\n",
+        "{{\n  \"case\": \"{}\",\n  \"commit_ms\": {},\n  \"prove_ms\": {},\n  \"verify_ms\": {},\n  \"trace_bytes\": {},\n  \"trace_assets\": {},\n  \"removed_opening_bytes\": {},\n  \"trace_with_opening_bytes\": {},\n  \"statement_bytes\": {},\n  \"consumer_proof_bytes\": {},\n  \"key_prove_ms\": {},\n  \"key_commit_verify_ms\": {},\n  \"key_request_verify_ms\": {},\n  \"key_file_bytes\": {},\n  \"vmhwm_after_prove_kib\": {},\n  \"vmhwm_after_verify_kib\": {},\n  \"accepted\": true,\n  \"negatives\": 13,\n  \"consumer_matrix_negatives\": 12,\n  \"version_negatives\": 1\n}}\n",
         config.case_id,
         commit_ms,
         prove_ms,
@@ -621,5 +635,5 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
     writeln!(log, "statement bytes {}", statement_bytes).unwrap();
     writeln!(log, "consumer proof bytes {}", sidecar_bytes).unwrap();
     writeln!(log, "key prove {} ms, commit verify {} ms, request verify {} ms, file {} bytes", key_prove_ms, key_commit_verify_ms, key_request_verify_ms, key_file_bytes).unwrap();
-    writeln!(log, "accepted; twelve negatives refused").unwrap();
+    writeln!(log, "accepted; twelve consumer-matrix negatives and one version negative refused").unwrap();
 }
