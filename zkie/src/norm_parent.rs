@@ -107,7 +107,6 @@ pub fn build_segment_plan(
         return Err(Error::UnsupportedPrimitive);
     }
     let output_plan = build_output_head_output_plan(trace_plan, expected_argmax)?;
-    eprintln!("stage output plan");
     let code = build_code_plan(17, OUTPUT_HEAD_COLUMNS as u64, 8192)?;
     let mask_code = build_code_plan(17, 512, 256)?;
     let tree = |tree_number: u64, run: Digest, main_rows: u64| -> Result<RuntimeTreePlan> {
@@ -127,7 +126,6 @@ pub fn build_segment_plan(
             configuration: table_configuration,
         })
     };
-    eprintln!("stage codes");
     let w = WShape::new(
         OUTPUT_HEAD_COLUMNS as u64,
         code,
@@ -140,7 +138,6 @@ pub fn build_segment_plan(
         table_configuration,
     )?;
     let main_rows = w.main_rows;
-    eprintln!("stage w");
     let proximity = HiddenProximityPlan {
         gu: zkie_engine::pcs::request::gu::GuShape {
             oracle: GU_ORACLE,
@@ -232,7 +229,6 @@ pub fn build_segment_plan(
         planner_checked: false,
         lin_check: None,
     };
-    eprintln!("stage proximity");
     let index_mask = IndexMaskPlan {
         oracle: INDEX_MASK_ORACLE,
         group: GROUP,
@@ -308,7 +304,6 @@ pub fn build_segment_plan(
         hiding: hp_entries(&closure_variables)?,
         shown: 5,
     };
-    eprintln!("stage index mask");
     let closure_setup = OutputClosureSetup {
         slack: closure_slack,
         slack_oracle_base: SLACK_ORACLE_BASE,
@@ -334,7 +329,6 @@ pub fn build_segment_plan(
     let activation_salts: Vec<Vec<u8>> = (0..OUTPUT_HEAD_POSITIONS)
         .map(|position| vec![(position as u8).wrapping_mul(11) ^ 0x3C; SALT])
         .collect();
-    eprintln!("stage closure");
     let setup = OutputHeadLinSetup {
         asset_path: OUTPUT_HEAD_ASSET_PATH.to_string(),
         send: HiddenSendPlan {
@@ -407,21 +401,15 @@ pub fn build_segment_plan(
         activation: placeholder,
         output: output_plan,
     };
-    eprintln!("stage setup");
     let mut plan = build_output_head_hidden_plan(
         output_head_shape()?,
         &setup,
         table_reader,
         &trusted,
     )?;
-    eprintln!("stage base plan");
-    eprintln!("np base");
     plan.norm = Some(norm_plan.clone());
     plan.send.activation_source = ActivationSource::NormHd;
-    eprintln!("stage norm set");
-    eprintln!("np norm");
     let roots = out_group_roots(norm_plan, profile, hd_rows)?;
-    eprintln!("np roots");
     let root = hd_activation_root(&plan, &roots)?;
     plan.send.activation = ActivationShape::new(
         OUTPUT_HEAD_POSITIONS as u32,
@@ -430,7 +418,6 @@ pub fn build_segment_plan(
     )?;
     plan.send.activation_configuration = table_configuration;
     plan.send.activation_root = root;
-    eprintln!("np root derived");
     let index_rows = match plan.send.index_mask.as_ref() {
         Some(index) => index.tree_rows()?,
         None => 0,
@@ -443,12 +430,9 @@ pub fn build_segment_plan(
         .checked_add(lookup_mask_rows)
         .and_then(|value| value.checked_add(rstd_mask_rows))
         .ok_or(Error::ResourceLimit)?;
-    eprintln!("np mask rows");
     plan.proximity.own_mask_tree.mask_rows =
         zkie_ops::proof::hidden_norm_psc::norm_own_mask_rows(index_rows, total_mask_rows)?;
-    eprintln!("stage activation");
     plan.validate()?;
-    eprintln!("stage validated");
     Ok(plan)
 }
 
