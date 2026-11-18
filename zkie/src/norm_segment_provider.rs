@@ -41,8 +41,8 @@ use crate::lm_head_key::{
 use crate::s7_context::LmHeadAsset;
 
 /// The proof-dir carrier of the segment: the published public reader and the
-/// canonical session messages. The name and version are provisional until the
-/// operator reserves them.
+/// canonical session messages. The name and the version are the reserved
+/// carrier identity; the proof manifest binds the file by length and digest.
 pub const NORM_SEGMENT_CARRIER_FILE: &str = "norm-segment-carrier.bin";
 pub const NORM_SEGMENT_CARRIER_VERSION: u64 = 1;
 
