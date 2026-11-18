@@ -528,7 +528,7 @@ fn execute_shared_inner(
         .ok_or(Error::IncompleteArtifact)?
         .clone();
     let (out_proj, out_step) = project(
-        &mut builder, activation, activation_step, pro_out_weight, Some(pool(&pro_out_path)?),
+        &mut builder, activation, activation_step, pro_out_weight, None,
         SEQ, H_PAD, H_PAD, 16,
     )?;
     let (out_proj, out_step) = add_bias(
