@@ -19,12 +19,13 @@ use zkie_engine::pcs::request::field::{Fp3, E_DEGREE};
 use zkie_engine::pcs::request::fold::{ByteMaskCoins, MaskCoins};
 use zkie_engine::pcs::request::runtime_tree::{RuntimeTreePart, RuntimeTreePlan};
 
-use crate::proof::hidden_norm::{NormCoreRow, NormShape, RsqrtRow};
+use crate::proof::hidden_norm::{NormCoreRow, NormOutputRow, NormShape, RsqrtRow};
 use crate::proof::hidden_norm_psc::{
     norm_pointwise_masks, norm_tail_mask_masks, NormGroupPlan, NormGroupWitness,
     commit_norm_mask, norm_mask_entries, NormMaskPlan, NormMaskWitness, NormOutputPlan,
     NormOutputTailPlan, NormOutputTailWidths, NormPlan, NormRoundLayout, NormRoundPlan,
-    NormRoundWidths, NormRstdParams, NormRstdPlan, NormWitness, NORM_OUTPUT_TAIL_RELATIONS,
+    NormRoundWidths, NormRstdParams, NormRstdPlan, NormWitness, NormOutputTailWitness,
+    NormOutputWitness, NormParamWitness, NORM_OUTPUT_TAIL_RELATIONS,
 };
 use crate::proof::hidden_send_session::WShape;
 use crate::proof::lookup_table::TableConfig;
@@ -492,6 +493,119 @@ pub fn build_core_witness(
     })
 }
 
+
+/// Fills the private gain and bias vectors of the parameter tables.
+pub fn attach_params_witness(
+    witness: &mut NormWitness,
+    gain: &[i64],
+    bias: &[i64],
+) -> Result<()> {
+    if gain.len() != bias.len() || gain.is_empty() {
+        return Err(Error::ShapeMismatch);
+    }
+    witness.params = Some(NormParamWitness {
+        gain: gain.to_vec(),
+        bias: bias.to_vec(),
+        gain_claim: None,
+        bias_claim: None,
+    });
+    Ok(())
+}
+
+fn signed_column(values: &[i128]) -> Result<Vec<Fp3>> {
+    values
+        .iter()
+        .map(|value| crate::proof::output_closure::fp3_signed(*value))
+        .collect()
+}
+
+/// Commits the output tail, the broadcast row, the gain product, the image and
+/// the final output row of every position. The rows consume the same rstd
+/// values the frozen-table witness proves.
+pub fn attach_output_witness(
+    witness: &mut NormWitness,
+    plan: &NormPlan,
+    profile: &NormSegmentProfile,
+    gain: &[i64],
+    bias: &[i64],
+    rstd_values: &[i64],
+) -> Result<()> {
+    let output = plan.output.as_ref().ok_or(Error::InvalidConfig)?;
+    let tail_plan = output.tail.as_ref().ok_or(Error::InvalidConfig)?;
+    if gain.len() != profile.columns as usize
+        || bias.len() != profile.columns as usize
+        || rstd_values.len() != witness.rows.len()
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut rows = Vec::with_capacity(witness.rows.len());
+    for ((row, core), rstd) in witness
+        .rows
+        .iter()
+        .zip(&witness.core)
+        .zip(rstd_values)
+    {
+        let mut padded = row.clone();
+        padded.resize(profile.columns as usize, 0);
+        rows.push(NormOutputRow::from_core(
+            core,
+            &padded,
+            *rstd,
+            gain,
+            bias,
+            profile.valid as usize,
+            output.shift,
+            output.clamp,
+        )?);
+    }
+    let tail = NormOutputTailWitness {
+        committed: commit_group(
+            &tail_plan.group,
+            &rows
+                .iter()
+                .map(|row| tail_plan.values(row, profile.columns))
+                .collect::<Result<Vec<_>>>()?,
+            group_seed(b"tail"),
+        )?,
+    };
+    let mut commit_rows = |group: &crate::proof::hidden_norm_psc::NormGroupPlan,
+                           values: Vec<Vec<Fp3>>,
+                           label: &[u8]| {
+        commit_group(group, &values, group_seed(label))
+    };
+    let broadcast = commit_rows(
+        &output.broadcast,
+        rows.iter().map(|row| signed_column(&row.broadcast.iter().map(|value| *value as i128).collect::<Vec<_>>())).collect::<Result<Vec<_>>>()?,
+        b"broadcast",
+    )?;
+    let product = commit_rows(
+        &output.product,
+        rows.iter().map(|row| signed_column(&row.product.iter().map(|value| *value as i128).collect::<Vec<_>>())).collect::<Result<Vec<_>>>()?,
+        b"product",
+    )?;
+    let image = commit_rows(
+        &output.image,
+        rows.iter().map(|row| signed_column(&row.image.iter().map(|value| *value as i128).collect::<Vec<_>>())).collect::<Result<Vec<_>>>()?,
+        b"image",
+    )?;
+    let out = commit_rows(
+        &output.out,
+        rows.iter()
+            .map(|row| signed_column(&row.out.iter().map(|value| *value as i128).collect::<Vec<_>>()))
+            .collect::<Result<Vec<_>>>()?,
+        b"out",
+    )?;
+    witness.output = Some(NormOutputWitness {
+        tail: Some(tail),
+        broadcast,
+        product,
+        image,
+        out,
+        rows,
+    });
+    Ok(())
+}
+
 /// The oracle/tree pair of the frozen-table lookup messages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RstdSpace {
@@ -831,6 +945,39 @@ mod tests {
         assert_eq!(witness.x.committed.roots, plan.x_roots);
         assert!(witness.mask.is_some());
         assert!(witness.round.is_some());
+    }
+
+    #[test]
+    fn the_output_witness_is_committed_at_the_real_shape() {
+        use crate::proof::norm_param_table::{NormParamKind, NormParamTablesPlan};
+        let profile = real_profile();
+        let space = space();
+        let mut x_rows = vec![vec![1i64; profile.hidden as usize]; profile.positions as usize];
+        x_rows[0][0] = 11;
+        let mut plan = build_core_plan(&space, &profile, &x_rows).unwrap();
+        let gain_reader = param_table(&vec![1i64; profile.columns as usize]);
+        let bias_reader = param_table(&vec![0i64; profile.columns as usize]);
+        let params = NormParamTablesPlan {
+            gain_claim: Some(param_claim(NormParamKind::Gain, gain_reader.shape, space.code)),
+            bias_claim: Some(param_claim(NormParamKind::Bias, bias_reader.shape, space.code)),
+            gain: param_identity(NormParamKind::Gain, gain_reader, profile.columns),
+            bias: param_identity(NormParamKind::Bias, bias_reader, profile.columns),
+            column_draws: 2,
+            seed_budget: 1,
+        };
+        attach_params(&mut plan, params).unwrap();
+        let (table, first_value) = rstd_table();
+        attach_rstd(&mut plan, &space, &rstd_space(), table, first_value, 8_192).unwrap();
+        attach_output(&mut plan, &profile, &space, &output_groups()).unwrap();
+        let rstd = vec![1i64; profile.positions as usize];
+        let mut witness =
+            build_core_witness(&plan, &profile, &space, &x_rows, &rstd).unwrap();
+        let gain = vec![1i64; profile.columns as usize];
+        let bias = vec![0i64; profile.columns as usize];
+        attach_params_witness(&mut witness, &gain, &bias).unwrap();
+        attach_output_witness(&mut witness, &plan, &profile, &gain, &bias, &rstd).unwrap();
+        assert!(witness.output.is_some());
+        assert!(witness.params.is_some());
     }
 
     #[test]
