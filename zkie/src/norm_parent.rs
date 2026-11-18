@@ -613,8 +613,7 @@ mod tests {
         plan
     }
 
-    #[test]
-    fn the_real_parent_plan_is_admitted() {
+    fn real_parent_plan() -> HiddenLinPlan {
         let profile = zkie_models_gpt2::norm_profile::segment_profile(16, Digest([0x91; 32])).unwrap();
         let plan_norm = norm_plan(&profile);
         let trace_plan = zkie_models_gpt2::plan::trace_plan(16).unwrap();
@@ -633,7 +632,7 @@ mod tests {
         };
         let hd_rows = vec![vec![1i64; profile.columns as usize]; profile.positions as usize];
         let argmax = vec![0u32; 16];
-        let plan = build_segment_plan(
+        build_segment_plan(
             &trace_plan,
             &argmax,
             &table_reader,
@@ -644,12 +643,45 @@ mod tests {
             &hd_rows,
             Digest([0x72; 32]),
         )
-        .unwrap();
+        .unwrap()
+    }
+
+    #[test]
+    fn the_real_parent_plan_is_admitted() {
+        let plan = real_parent_plan();
         assert!(plan.norm.is_some());
         assert!(plan.send.activation_source.is_norm_hd());
-        let roots = out_group_roots(&plan_norm, &profile, &hd_rows).unwrap();
-        assert_eq!(plan.send.activation_root, hd_activation_root(&plan, &roots).unwrap());
+        plan.validate().unwrap();
     }
+
+    /// The norm may carry zero padding columns: the valid columns are at most
+    /// the matrix rows, and the padded columns are bound through the output
+    /// tail padding rows.
+    #[test]
+    fn a_valid_count_above_the_matrix_rows_is_rejected() {
+        let mut plan = real_parent_plan();
+        plan.validate().unwrap();
+        let matrix_rows = plan.send.matrix_rows;
+        plan.norm.as_mut().unwrap().shape.valid = (matrix_rows + 1) as u32;
+        assert!(plan.validate().is_err());
+        plan.norm.as_mut().unwrap().shape.valid = matrix_rows as u32;
+        plan.validate().unwrap();
+    }
+
+    /// The norm width must cover the matrix rows; a narrower norm leaves the
+    /// MatMul with columns no committed row carries.
+    #[test]
+    fn a_norm_width_below_the_matrix_rows_is_rejected() {
+        let mut plan = real_parent_plan();
+        plan.validate().unwrap();
+        let matrix_rows = plan.send.matrix_rows;
+        let columns = plan.norm.as_ref().unwrap().columns;
+        plan.norm.as_mut().unwrap().columns = matrix_rows - 1;
+        assert!(plan.validate().is_err());
+        plan.norm.as_mut().unwrap().columns = columns;
+        plan.validate().unwrap();
+    }
+
 }
 
 use std::fs::File;
