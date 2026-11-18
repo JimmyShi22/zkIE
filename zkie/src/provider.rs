@@ -506,9 +506,9 @@ fn prove_norm_segment(
     if matmul.activation_step != norm_index {
         return Err(Error::StatementMismatch);
     }
-    let asset_root = Path::new(&config.asset_root).join("models");
-    let (gain, bias) = read_norm_params(&asset_root)?;
-    let rstd = read_rstd_values(&asset_root, &profile, &x_rows)?;
+    let asset_root = Path::new(&config.asset_root);
+    let (gain, bias) = read_norm_params(asset_root)?;
+    let rstd = read_rstd_values(asset_root, &profile, &x_rows)?;
     let (norm_plan, witness) = build_norm_segment(
         &profile,
         configuration,
@@ -524,7 +524,7 @@ fn prove_norm_segment(
     std::fs::create_dir_all(&work_dir).map_err(|_| Error::Io)?;
     let started = Instant::now();
     let mut table = build_segment_table(
-        &asset_root,
+        asset_root,
         &asset,
         &request_plan,
         configuration,
@@ -665,7 +665,7 @@ fn verify_norm_segment(
         &hd_rows,
         session_seed,
     )?;
-    let rstd = rstd_table_view(&asset_root.join("models"))?;
+    let rstd = rstd_table_view(asset_root)?;
     let started = Instant::now();
     let outcome = verify_segment_bytes(&plan, reader, &carrier.messages, &rstd)?;
     ctx.metrics
