@@ -36,6 +36,7 @@ use zkie_ops::proof::asset_key::{
 };
 use zkie_ops::proof::asset_table::{
     decode_asset_table_randomness_set, encode_asset_table_randomness_set,
+    sample_asset_table_randomness, sample_asset_table_randomness_public,
     sample_asset_table_inputs, AssetTableInput, AssetTableMeta, AssetTableParams,
 };
 use zkie_ops::proof::consumer_proof::ConsumerProofFile;
@@ -370,6 +371,37 @@ fn gpt2_key_columns() -> Result<(
     Ok((params, spec, columns))
 }
 
+
+/// Samples the commit's table material. The two final-norm parameter tables
+/// use a plan-fixed public seed, so their roots are a reproducible function of
+/// the trusted asset and the public derivation; the projection table keeps
+/// fresh material.
+fn sample_production_tables(params: &[AssetTableParams]) -> Result<Vec<AssetTableInput>> {
+    let mut tables = Vec::with_capacity(params.len());
+    for params in params {
+        let randomness = if params.path.ends_with("ln_f_w_i32.bin")
+            || params.path.ends_with("ln_f_b_i32.bin")
+        {
+            sample_asset_table_randomness_public(params, norm_param_seed(params))?
+        } else {
+            sample_asset_table_randomness(params)?
+        };
+        tables.push(AssetTableInput {
+            params: params.clone(),
+            randomness,
+        });
+    }
+    Ok(tables)
+}
+
+fn norm_param_seed(params: &AssetTableParams) -> zkie_core::types::Digest {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"zkie/norm-param-table/v1");
+    bytes.extend_from_slice(&params.asset_id.to_le_bytes());
+    bytes.extend_from_slice(params.path.as_bytes());
+    zkie_core::artifact::digest_bytes(&bytes)
+}
+
 fn trusted_table_params(model: &str) -> Result<Vec<AssetTableParams>> {
     match model {
         "gpt2" => zkie_models_gpt2::plan::asset_table_params(),
@@ -444,7 +476,7 @@ impl PipelineProvider for ProductionProvider {
     ) -> Result<CommitReceipt> {
         let config = parse_case(&request.case_config)?;
         let table_params = trusted_table_params(&config.model)?;
-        let tables = sample_asset_table_inputs(&table_params)?;
+        let tables = sample_production_tables(&table_params)?;
         let commitment = build_commitment(&config, &tables)?;
         // The one-time key qualification is proved once over this committed
         // instance and published in the commit's public bundle. Every request
