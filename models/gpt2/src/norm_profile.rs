@@ -36,6 +36,19 @@ pub const RSTD_TABLE_REAL_LEN: u64 = 7_340_032;
 /// Row-count bit width of the frozen public rstd table view.
 pub const RSTD_TABLE_LOG: u32 = 23;
 
+/// The trusted maximum of the rstd table entries used by the registered
+/// case. Measured evidence: the used table index range is 1,055,139 through
+/// 1,070,937 and the largest entry in that range is 5,078; the plan bound is
+/// the next power of two, 8,192. It is a trusted plan constant, not a proof
+/// value.
+pub const RSTD_VALUE_BOUND: u64 = 8_192;
+/// The first table row value, the lookup padding pair's value entry.
+pub const RSTD_FIRST_VALUE: i64 = 65_536_000;
+/// The largest absolute gain entry of the registered final norm asset.
+pub const GAIN_MAX: i64 = 1_141_592;
+/// The observed largest absolute centered input row entry, for the record.
+pub const CENTERED_OBSERVED: i64 = 22_823_876;
+
 /// The public content root of the frozen rstd table, the same digest the
 /// model plan already freezes for the shared rsqrt table.
 const RSTD_CONTENT_ROOT: &str =
@@ -86,6 +99,39 @@ pub fn rstd_table_identity() -> Digest {
     rstd_content_root()
 }
 
+/// The trusted frozen-table configuration of the rstd lookup view.
+pub fn rstd_table_config() -> zkie_ops::proof::lookup_table::TableConfig {
+    zkie_ops::proof::lookup_table::TableConfig {
+        identity: rstd_table_identity(),
+        content_root: rstd_content_root(),
+        real_len: RSTD_TABLE_REAL_LEN as usize,
+        encoding: zkie_ops::proof::lookup_table::TableEncoding::I32Le,
+        version: zkie_ops::proof::lookup_table::TABLE_ENCODING_VERSION,
+    }
+}
+
+/// The trusted segment profile of one request shape.
+pub fn segment_profile(
+    positions: u32,
+    x_seed: Digest,
+) -> zkie_core::error::Result<zkie_ops::proof::norm_segment::NormSegmentProfile> {
+    Ok(zkie_ops::proof::norm_segment::NormSegmentProfile {
+        positions,
+        hidden: HIDDEN_PAD,
+        valid: VALID,
+        columns: u64::from(HIDDEN_PAD),
+        shift: OUTPUT_SHIFT,
+        clamp: None,
+        input_bound: INPUT_BOUND,
+        sum_offset: SUM_OFFSET,
+        mean_offset: MEAN_OFFSET,
+        round_widths: round_widths(),
+        tail_widths: tail_widths(),
+        table_real_len: RSTD_TABLE_REAL_LEN,
+        x_seed,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +162,16 @@ mod tests {
         ] {
             assert!(value < half);
         }
+    }
+
+    #[test]
+    fn the_segment_profile_and_rstd_view_are_consistent() {
+        let profile = segment_profile(16, zkie_core::types::Digest([0x91; 32])).unwrap();
+        profile.validate().unwrap();
+        let table = rstd_table_config();
+        assert_eq!(table.real_len as u64, RSTD_TABLE_REAL_LEN);
+        assert_eq!(table.content_root, rstd_content_root());
+        assert_eq!(table.identity, rstd_table_identity());
     }
 
     #[test]
