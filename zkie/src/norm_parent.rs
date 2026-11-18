@@ -905,7 +905,7 @@ pub fn final_norm_rows(
 /// Reads the two final-norm parameter vectors from the read-only assets.
 pub fn read_norm_params(asset_root: &std::path::Path) -> Result<(Vec<i64>, Vec<i64>)> {
     let read = |name: &str| -> Result<Vec<i64>> {
-        let bytes = std::fs::read(asset_root.join("models/gpt2/weights").join(name))
+        let bytes = std::fs::read(asset_root.join("gpt2/weights").join(name))
             .map_err(|_| Error::AssetMismatch)?;
         if bytes.len() % 4 != 0 {
             return Err(Error::AssetMismatch);
@@ -929,7 +929,7 @@ pub fn read_rstd_values(
     profile: &NormSegmentProfile,
     x_rows: &[Vec<i64>],
 ) -> Result<Vec<i64>> {
-    let path = asset_root.join("models/gpt2/weights/rsqrt_table_i32.bin");
+    let path = asset_root.join("gpt2/weights/rsqrt_table_i32.bin");
     let mut file = File::open(path).map_err(|_| Error::AssetMismatch)?;
     let mut values = Vec::with_capacity(x_rows.len());
     for row in x_rows {

@@ -351,7 +351,7 @@ pub fn verify_segment_bytes(
 pub fn rstd_table_view(asset_root: &Path) -> Result<RangeTable<PublicFileTable>> {
     let config = zkie_models_gpt2::norm_profile::rstd_table_config();
     let source = PublicFileTable::new(
-        asset_root.join("models/gpt2/weights/rsqrt_table_i32.bin"),
+        asset_root.join("gpt2/weights/rsqrt_table_i32.bin"),
         config.clone(),
     )?;
     RangeTable::open(
