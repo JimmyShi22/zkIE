@@ -492,7 +492,7 @@ fn prove_norm_segment(
     }
     let model = commitment.anchor.record.model_commitment;
     let public = ModelCommitmentPublic::from_commitment(commitment);
-    let trace_plan = zkie_models_gpt2::plan::trace_plan_public(positions)?;
+    let trace_plan = zkie_models_gpt2::plan::trace_plan(positions)?;
     let matmul = crate::s7_context::find_lm_head_matmul(&trace_plan)?;
     let identifier = plan_identifier(&public, &trace_plan, matmul.index)?;
     let request_plan = zkie_models_gpt2::lm_head_plan::lm_head_plan()?;
@@ -607,7 +607,7 @@ fn verify_norm_segment(
     {
         return Err(Error::StatementMismatch);
     }
-    let trace_plan = zkie_models_gpt2::plan::trace_plan_public(positions)?;
+    let trace_plan = zkie_models_gpt2::plan::trace_plan(positions)?;
     let matmul = crate::s7_context::find_lm_head_matmul(&trace_plan)?;
     let specs = zkie_models_gpt2::plan::asset_specs();
     let spec = specs
