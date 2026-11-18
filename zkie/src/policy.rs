@@ -768,7 +768,7 @@ fn validate_document(document: &PolicyDocument) -> Result<()> {
                 identity.validate()?;
                 let anchor_id = digest_from_hex(&case.anchor_id)?;
                 let model_id = digest_from_hex(&case.model_id)?;
-                if document.model != "gpt2"
+                if !matches!(document.model.as_str(), "gpt2" | "gemma3" | "timesfm")
                     || identity.model != document.model
                     || identity.model_version != document.model_version
                     || identity.case_id != case.case_id
@@ -779,7 +779,7 @@ fn validate_document(document: &PolicyDocument) -> Result<()> {
                 }
             }
             None => {
-                if document.model == "gpt2" {
+                if matches!(document.model.as_str(), "gpt2" | "gemma3" | "timesfm") {
                     return Err(Error::InvalidConfig);
                 }
             }
@@ -916,15 +916,26 @@ pub fn select(
             })
         }
         "timesfm" => {
-            if case.limited_table_identity.is_some() {
-                return Err(Error::InvalidConfig);
-            }
             if case.sequence_length.is_some() {
                 return Err(Error::InvalidConfig);
             }
             let raw = case.raw_input_length.ok_or(Error::InvalidConfig)?;
             let patches = case.patch_tokens.ok_or(Error::InvalidConfig)?;
             if raw != TIMESFM_RAW_POINTS || patches != TIMESFM_PATCH_TOKENS || raw != input_len {
+                return Err(Error::StatementMismatch);
+            }
+            let anchor_id = digest_from_hex(&case.anchor_id)?;
+            let model_id = digest_from_hex(&case.model_id)?;
+            let identity = case
+                .limited_table_identity
+                .clone()
+                .ok_or(Error::InvalidConfig)?;
+            if identity.model != document.model
+                || identity.model_version != document.model_version
+                || identity.case_id != case.case_id
+                || identity.anchor_id != anchor_id
+                || identity.model_id != model_id
+            {
                 return Err(Error::StatementMismatch);
             }
             let output = select_output(case, OutputKind::IntOutput, None)?;
@@ -935,10 +946,10 @@ pub fn select(
                 sequence_length: None,
                 raw_input_length: Some(raw),
                 patch_tokens: Some(patches),
-                anchor_id: digest_from_hex(&case.anchor_id)?,
-                model_id: digest_from_hex(&case.model_id)?,
+                anchor_id,
+                model_id,
                 output,
-                limited_table_identity: None,
+                limited_table_identity: Some(identity),
                 activation_commitment: None,
             })
         }
@@ -1074,13 +1085,17 @@ mod tests {
     #[test]
     fn parses_and_selects_timesfm_case() {
         let text = format!(
-            "policy_version = 1\nmodel = \"timesfm\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"timesfm-16patch\"\nraw_input_length = 512\npatch_tokens = 16\nanchor_id = \"{A}\"\nmodel_id = \"{B}\"\noutput_mode = \"none\"\n"
+            "policy_version = 1\nmodel = \"timesfm\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"timesfm-16patch\"\nraw_input_length = 512\npatch_tokens = 16\nanchor_id = \"{A}\"\nmodel_id = \"{B}\"\noutput_mode = \"none\"\n{}",
+            identity_block("timesfm-16patch", A, B)
+                .replace("model = \"gpt2\"", "model = \"timesfm\"")
         );
         let document = parse(text.as_bytes()).unwrap();
         let selected = select(&document, "timesfm-16patch", "timesfm", 512).unwrap();
         assert_eq!(selected.raw_input_length, Some(512));
         assert_eq!(selected.patch_tokens, Some(16));
-        assert!(selected.limited_table_identity.is_none());
+        let identity = selected.trusted_limited_table_identity().unwrap();
+        assert_eq!(identity.case_id, "timesfm-16patch");
+        assert_eq!(identity.table_root.0, [0x44; 32]);
     }
 
     #[test]
@@ -1195,13 +1210,24 @@ mod tests {
     }
 
     #[test]
-    fn a_timesfm_case_rejects_an_identity() {
+    fn a_timesfm_case_requires_an_identity() {
+        let text = format!(
+            "policy_version = 1\nmodel = \"timesfm\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"timesfm-16patch\"\nraw_input_length = 512\npatch_tokens = 16\nanchor_id = \"{A}\"\nmodel_id = \"{B}\"\noutput_mode = \"none\"\n"
+        );
+        assert!(parse(text.as_bytes()).is_err());
+
         let text = format!(
             "policy_version = 1\nmodel = \"timesfm\"\nmodel_version = 1\n\n[[case]]\ncase_id = \"timesfm-16patch\"\nraw_input_length = 512\npatch_tokens = 16\nanchor_id = \"{A}\"\nmodel_id = \"{B}\"\noutput_mode = \"none\"\n{}",
             identity_block("timesfm-16patch", A, B)
                 .replace("model = \"gpt2\"", "model = \"timesfm\"")
         );
-        assert!(parse(text.as_bytes()).is_err());
+        let document = parse(text.as_bytes()).unwrap();
+        let selected = select(&document, "timesfm-16patch", "timesfm", 512).unwrap();
+        assert!(selected.limited_table_identity.is_some());
+
+        let mut document = document;
+        document.case[0].limited_table_identity = None;
+        assert!(encode_document(&document).is_err());
     }
 
     #[test]

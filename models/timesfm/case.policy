@@ -1,6 +1,6 @@
 policy_version = 1
 model = "timesfm"
-model_version = 1
+model_version = 2
 
 [[case]]
 case_id = "timesfm-16patch"

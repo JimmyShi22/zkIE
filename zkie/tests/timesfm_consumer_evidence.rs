@@ -70,12 +70,43 @@ fn case_path() -> PathBuf {
         })
 }
 
-fn write_policy(path: &Path, anchor_id: &str, model_id: &str) {
+fn write_policy(path: &Path, anchor_id: &str, model_id: &str, identity: &str) {
     let text = format!(
-        "policy_version = 1\nmodel = \"timesfm\"\nmodel_version = {}\n\n[[case]]\ncase_id = \"timesfm-16patch\"\nraw_input_length = 512\npatch_tokens = 16\nanchor_id = \"{anchor_id}\"\nmodel_id = \"{model_id}\"\noutput_mode = \"expected\"\nexpected_output_sha256 = \"cc72805b7a845cb2b8505d6092dbb79477d083394a03c99cdac7f5665de56ba3\"\noutput_digest_algorithm = \"sha256\"\noutput_type = \"int_output\"\noutput_encoding = \"i32-le\"\noutput_elements = 32768\n",
+        "policy_version = 1\nmodel = \"timesfm\"\nmodel_version = {}\n\n[[case]]\ncase_id = \"timesfm-16patch\"\nraw_input_length = 512\npatch_tokens = 16\nanchor_id = \"{anchor_id}\"\nmodel_id = \"{model_id}\"\noutput_mode = \"expected\"\nexpected_output_sha256 = \"cc72805b7a845cb2b8505d6092dbb79477d083394a03c99cdac7f5665de56ba3\"\noutput_digest_algorithm = \"sha256\"\noutput_type = \"int_output\"\noutput_encoding = \"i32-le\"\noutput_elements = 32768\n{identity}",
         zkie_models_timesfm::plan::MODEL_VERSION
     );
     fs::write(path, text).unwrap();
+}
+
+fn table_identity_text(
+    anchor_id: &str,
+    model_id: &str,
+    meta: &zkie_ops::proof::asset_table::AssetTableMeta,
+) -> String {
+    let model = "timesfm";
+    let model_version = zkie_models_timesfm::plan::MODEL_VERSION;
+    let case_id = "timesfm-16patch";
+    format!(
+        "\n[case.limited_table_identity]\nversion = 1\nmodel = \"{model}\"\nmodel_version = {model_version}\ncase_id = \"{case_id}\"\nanchor_id = \"{anchor_id}\"\nmodel_id = \"{model_id}\"\nasset_id = {}\nasset_table_identity = \"{}\"\ntable_root = \"{}\"\ntable_record_digest = \"{}\"\ntable_configuration = \"{}\"\ncode_log_n = {}\ncode_ell = {}\ncode_r = {}\ntable_v = {}\nanswers = {}\nsalt_bytes = {}\ndistance_radius = {}\ndistance_later_radius = {}\ndistance_m_once = {}\ndistance_m_later = {}\nmatrix_rows_log = {}\nk_lo = 0\nk_col = {}\nprotocol_identity = \"{}\"\n",
+        meta.asset_id,
+        digest_to_hex(&meta.identity),
+        digest_to_hex(&meta.root),
+        digest_to_hex(&digest_bytes(&meta.record.encode())),
+        digest_to_hex(&meta.configuration),
+        meta.shape.code.log_n,
+        meta.shape.code.ell,
+        meta.shape.code.r,
+        meta.shape.v,
+        meta.shape.answers,
+        meta.shape.salt_bytes,
+        meta.shape.distances.radius,
+        meta.shape.distances.later_radius,
+        meta.shape.distances.m_once,
+        meta.shape.distances.m_later,
+        meta.shape.v,
+        meta.shape.v,
+        digest_to_hex(&zkie_core::types::Digest([0x5A; 32])),
+    )
 }
 
 fn copy_proof(src: &Path, dst: &Path) {
@@ -221,11 +252,29 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
         &fs::read(commit_dir.join("public/provider-config.bin")).unwrap(),
     )
     .unwrap();
+    let metas: Vec<zkie_ops::proof::asset_table::AssetTableMeta> = bincode::deserialize(
+        &fs::read(commit_dir.join("public/asset-tables.bin")).unwrap(),
+    )
+    .unwrap();
+    let meta = metas.first().expect("the commit publishes one table");
+    let anchor_id = digest_to_hex(&public.anchor.anchor_id);
+    let model_id = digest_to_hex(&public.anchor.model_commitment);
+    let identity = table_identity_text(&anchor_id, &model_id, meta);
     let policy = run.join("policy.toml");
-    write_policy(
-        &policy,
-        &digest_to_hex(&public.anchor.anchor_id),
-        &digest_to_hex(&public.anchor.model_commitment),
+    write_policy(&policy, &anchor_id, &model_id, &identity);
+
+    let weight_path =
+        Path::new(&config.asset_root).join(zkie_models_timesfm::plan::FIRST_PROJECTION);
+    let weight_bytes = fs::read(&weight_path).unwrap();
+    let (pro_out_min, pro_out_max) = weight_bytes
+        .chunks_exact(4)
+        .map(|chunk| i32::from_le_bytes(chunk.try_into().unwrap()))
+        .fold((i32::MAX, i32::MIN), |(lo, hi), value| {
+            (lo.min(value), hi.max(value))
+        });
+    assert!(
+        pro_out_min >= -131_072 && pro_out_max <= 131_071,
+        "the committed weight fits the declared signed column range"
     );
 
     let proof_dir = run.join("proof");
@@ -465,8 +514,22 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
     let refused = verify_dir(&provider, &policy, &proof_dir, &broken_commit, &config.model).is_err();
     assert!(refused, "a changed key bundle is refused");
 
+    // Version negative: a policy written before the committed table identity
+    // became mandatory is refused by the production entry.
+    let old_policy = run.join("old-policy.toml");
+    let policy_text = fs::read_to_string(&policy).unwrap();
+    let cut = policy_text
+        .find("[case.limited_table_identity]")
+        .unwrap_or(policy_text.len());
+    fs::write(&old_policy, &policy_text[..cut]).unwrap();
+    let refused = verify_dir(&provider, &old_policy, &proof_dir, &commit_dir, &config.model).is_err();
+    assert!(
+        refused,
+        "a policy without the committed table identity is refused"
+    );
+
     let evidence = format!(
-        "{{\n  \"case\": \"{}\",\n  \"commit_ms\": {},\n  \"prove_ms\": {},\n  \"verify_ms\": {},\n  \"trace_bytes\": {},\n  \"trace_assets\": {},\n  \"removed_opening_bytes\": {},\n  \"trace_with_opening_bytes\": {},\n  \"statement_bytes\": {},\n  \"consumer_proof_bytes\": {},\n  \"key_prove_ms\": {},\n  \"key_commit_verify_ms\": {},\n  \"key_request_verify_ms\": {},\n  \"key_file_bytes\": {},\n  \"vmhwm_after_commit_kib\": {},\n  \"vmhwm_after_prove_kib\": {},\n  \"vmhwm_after_verify_kib\": {},\n  \"accepted\": true,\n  \"negatives\": 12\n}}\n",
+        "{{\n  \"case\": \"{}\",\n  \"commit_ms\": {},\n  \"prove_ms\": {},\n  \"verify_ms\": {},\n  \"trace_bytes\": {},\n  \"trace_assets\": {},\n  \"removed_opening_bytes\": {},\n  \"trace_with_opening_bytes\": {},\n  \"statement_bytes\": {},\n  \"consumer_proof_bytes\": {},\n  \"key_prove_ms\": {},\n  \"key_commit_verify_ms\": {},\n  \"key_request_verify_ms\": {},\n  \"key_file_bytes\": {},\n  \"pro_out_w_min\": {},\n  \"pro_out_w_max\": {},\n  \"pro_out_w_declared_min\": -131072,\n  \"pro_out_w_declared_max\": 131071,\n  \"vmhwm_after_commit_kib\": {},\n  \"vmhwm_after_prove_kib\": {},\n  \"vmhwm_after_verify_kib\": {},\n  \"accepted\": true,\n  \"negatives\": 13,\n  \"consumer_matrix_negatives\": 12,\n  \"version_negatives\": 1\n}}\n",
         config.case_id,
         commit_ms,
         prove_ms,
@@ -481,6 +544,8 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
         key_commit_verify_ms,
         key_request_verify_ms,
         key_file_bytes,
+        pro_out_min,
+        pro_out_max,
         hwm_after_commit,
         hwm_after_prove,
         hwm_after_verify,
@@ -496,5 +561,6 @@ fn the_request_consumer_chain_runs_through_the_production_pipeline() {
     writeln!(log, "statement bytes {}", statement_bytes).unwrap();
     writeln!(log, "consumer proof bytes {}", sidecar_bytes).unwrap();
     writeln!(log, "key prove {} ms, commit verify {} ms, request verify {} ms, file {} bytes", key_prove_ms, key_commit_verify_ms, key_request_verify_ms, key_file_bytes).unwrap();
-    writeln!(log, "accepted; twelve negatives refused").unwrap();
+    writeln!(log, "pro_out_w extrema [{}, {}] within declared [-131072, 131071]", pro_out_min, pro_out_max).unwrap();
+    writeln!(log, "accepted; twelve consumer-matrix negatives and one version negative refused").unwrap();
 }

@@ -799,7 +799,7 @@ fn transcript_digest(tag: u64, data: &[u8]) -> Result<Digest> {    zkie_engine::
     )
 }
 
-pub const MODEL_VERSION: u32 = 1;
+pub const MODEL_VERSION: u32 = 2;
 
 pub fn output_elements(patches: usize) -> Result<usize> {
     if patches != config::PATCH_TOKENS {
