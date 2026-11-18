@@ -621,13 +621,13 @@ warning: field `tree` is never read
 
 warning: `zkie` (lib) generated 9 warnings (run `cargo fix --lib -p zkie` to apply 7 suggestions)
    Compiling zkie v0.1.0 (/data/a01-gemma3/zkie)
-    Finished `release` profile [optimized] target(s) in 0.65s
+    Finished `release` profile [optimized] target(s) in 0.63s
      Running tests/acceptance_rounds.rs (target/release/deps/acceptance_rounds-f672b8188307457b)
 
 running 1 test
 test acceptance_rounds has been running for over 60 seconds
-ROUND 1 commit=246215 prove=109121 verify=95499 proof_bytes=5718769568
+ROUND 1 commit=248988 prove=109556 verify=95750 proof_bytes=5718779573
 test acceptance_rounds ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 451.61s
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 455.07s
 

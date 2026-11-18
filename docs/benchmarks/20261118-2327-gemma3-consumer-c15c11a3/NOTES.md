@@ -4,7 +4,7 @@
   registered consumer-authenticated asset. The request consumer chain proves
   the projection over the committed encoded table; the trace carries no
   opening for that weight.
-- Code: `103c4560`; effective baseline `31825ece`.
+- Code: `c15c11a3`; effective baseline `31825ece`; Gemma 3 model version 2.
 - Selected asset: `models/gemma3/weights/L0_q_w_i32.bin`, a square 1024 by
   1024 registered weight consumed by the four per-head query projection steps.
   The layer-0 key and value projections are rectangular (1024 rows by 256
@@ -29,33 +29,36 @@
 | Raw weighted rows are bound | committed raw messages under the request coefficients | raw root changed refused | negatives |
 | Target fixed before the first challenge | fixed PSC prefix | plan target changed refused | negatives |
 | Residual consumer opening refused | public plan promotes the asset; trace opening check | residual opening and tampered row refused | negatives |
-| Negative matrix | twelve executions over the eleven accepted classes plus one plan-member-target variant | all refused by the production verify entry | consumer-evidence.json `negatives: 12` |
-| Byte accounting | opening removal, consumer sidecar and key bundle accounted separately | artifact delta -6,567,956 B; opening removal -8,413,688 B | table below |
+| Policy version discipline | Gemma 3 model version 2; the policy must carry the committed table identity | a policy without the identity is refused | version negative |
+| Negative matrix | twelve executions over the eleven accepted classes plus one plan-member-target variant | all refused by the production verify entry | consumer-evidence.json |
+| Byte accounting | opening removal, consumer sidecar and key bundle accounted separately | artifact delta -6,557,951 B; opening removal +8,413,688 B | table below |
 | Real three-stage run | production commit/prove/verify | gemma3-seq16 PASS, GT digest `8683f5e22e51d1405fe3efcc7487a9a4df2e694c5d9f0bed64e921810d77c562` | acceptance-summary.json |
 
 ## Byte accounting
 
+The sidecar account uses the three-stage proof artifact only. The
+`consumer_proof_bytes` field of the consumer-evidence run is telemetry from a
+different randomized instance; it is not used in this byte account.
+
 | item | value |
 |---|---|
-| proof artifact (three-stage) | 5,718,769,568 B |
+| proof artifact (three-stage) | 5,718,779,573 B |
 | previous gemma3-seq16 artifact | 5,725,337,524 B |
-| artifact delta | -6,567,956 B |
+| artifact delta | -6,557,951 B |
 | proof.bin (three-stage) | 5,716,919,862 B |
 | previous proof.bin | 5,725,333,550 B |
 | proof.bin delta | -8,413,688 B |
 | removed consumer opening | 8,413,688 B |
 | trace with that opening | 5,725,333,550 B |
-| consumer sidecar (evidence run) | 1,857,544 B |
-| consumer sidecar (three-stage proof) | 1,845,216 B |
-| statement / public inputs / manifest / COMPLETE | 218 / 72 / 4,135 / 65 B |
-| key bundle | 4,551,344 B |
-| commit | 246,215 ms |
-| prove | 109,121 ms |
-| verify | 95,499 ms |
-| VmHWM commit/prove/verify | 27,314,244 / 12,992,936 / 11,226,792 KiB |
-| consumer evidence commit/prove/verify | 261,015 / 106,075 / 92,624 ms |
-| key prove / commit verify / request verify | 191,715 / 59,096 / 59,550 ms |
-| negatives refused | 12 executions covering 11 classes |
+| consumer sidecar (three-stage) | 1,855,208 B |
+| key bundle | 4,543,544 B |
+| commit | 248,988 ms |
+| prove | 109,556 ms |
+| verify | 95,750 ms |
+| VmHWM commit/prove/verify | 27,313,884 / 12,993,296 / 11,227,624 KiB |
+| consumer evidence commit/prove/verify | 258,660 / 105,974 / 92,516 ms |
+| key prove / commit verify / request verify | 189,456 / 58,745 / 59,379 ms |
+| negatives refused | 13 executions (12 consumer-matrix + 1 version) |
 
 The opening deletion is a deletion increment, not the end-to-end net gain of
 the asset-substitution work. The consumer sidecar and the key bundle are
@@ -81,16 +84,21 @@ eleven classes of the accepted chain plus one plan-member-target variant:
 11. changed key bundle;
 12. changed plan member target (the added variant of the plan-member class).
 
+A thirteenth execution writes a policy without the committed table identity
+and requires the production entry to refuse it. This is the version-discipline
+negative for the model version 2 policy.
+
 ## Policy and harness notes
 
-- The Gemma 3 policy now requires the committed limited table identity; the
-  first registered asset id 0 is admitted as a real id. Old Gemma 3 policies
-  without the identity are not accepted by this version. Whether the policy
-  or model version should be bumped is reserved for review.
+- Gemma 3 model version 2 makes the committed limited table identity
+  mandatory. The first registered asset id 0 is admitted as a real id. Older
+  Gemma 3 policies without the identity are refused by this version.
+- The version-1 evidence directory was superseded by this version-2 run and is
+  removed from the tree; its run remains historical.
 - The consumer evidence harness copies the whole proof directory for every
-  negative. With the larger Gemma 3 proof (about 5.7 GB) that is expensive
-  disk I/O; it does not affect the result, but the harness should reuse the
-  unchanged proof file in a later round.
+  matrix negative. With the larger Gemma 3 proof (about 5.7 GB) that is
+  expensive disk I/O; it does not affect the result, but the harness should
+  reuse the unchanged proof file in a later round.
 
 ## Boundaries
 
