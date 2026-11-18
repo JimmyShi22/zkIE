@@ -1,16 +1,17 @@
 # On-disk sizes for this evidence directory
-date: 2026-11-18T09:19:50+08:00
+date: 2026-11-18T09:32:08+08:00
 
 ## Directory sizes
 37M	docs/benchmarks/20261118-0842-weight-batch-rollback-31825ece
 4.0K	docs/benchmarks/20261118-0842-weight-batch-rollback-31825ece/DRIVER_DONE
+8.0K	docs/benchmarks/20261118-0842-weight-batch-rollback-31825ece/NOTES.md
 172K	docs/benchmarks/20261118-0842-weight-batch-rollback-31825ece/attempt1-failed-invocation
 28K	docs/benchmarks/20261118-0842-weight-batch-rollback-31825ece/build.log
 37M	docs/benchmarks/20261118-0842-weight-batch-rollback-31825ece/cases
 80K	docs/benchmarks/20261118-0842-weight-batch-rollback-31825ece/driver.log
 4.0K	docs/benchmarks/20261118-0842-weight-batch-rollback-31825ece/file-sizes.txt
 4.0K	docs/benchmarks/20261118-0842-weight-batch-rollback-31825ece/summary-table.md
-160K	docs/benchmarks/20261118-0842-weight-batch-rollback-31825ece/workspace-tests.log
+172K	docs/benchmarks/20261118-0842-weight-batch-rollback-31825ece/workspace-tests.log
 
 ## Per-case sizes
 992K	docs/benchmarks/20261118-0842-weight-batch-rollback-31825ece/cases/gemma3-seq16
@@ -31,9 +32,9 @@ date: 2026-11-18T09:19:50+08:00
    1253408  docs/benchmarks/20261118-0842-weight-batch-rollback-31825ece/cases/gpt2-seq16/round-2/commit/private/asset-table-randomness.bin
    1253408  docs/benchmarks/20261118-0842-weight-batch-rollback-31825ece/cases/gpt2-seq16/round-1/commit/private/asset-table-randomness.bin
 
-## Text footprint (files not ending in .bin)
-text files: 202
-text bytes: 911513
+## Text footprint (files not ending in .bin), including this NOTES file
+text files: 203
+text bytes: 930005
 
 ## Terminated theme leftovers on disk (gitignored, not part of this round; no deletion performed)
 42G	docs/benchmarks/20261118-0220-weight-batch-r2-recheck-fa31b965-2d686b0b

@@ -110,8 +110,8 @@ three-case baseline check.
 ## File sizes
 
 `file-sizes.txt` lists the on-disk sizes. The directory is 37 MiB on disk and
-202 text files carry 911,513 bytes; the `.bin` artifacts stay on disk and are
-gitignored. The 42 GiB of gitignored binaries left by the terminated theme
+203 text files carry 930,199 bytes; the `.bin` artifacts stay on
+disk and are gitignored. The 42 GiB of gitignored binaries left by the terminated theme
 (`20261118-0220-weight-batch-r2-recheck-...`) remain on disk; no deletion was
 performed in this round.
 
