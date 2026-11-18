@@ -38,7 +38,7 @@ Driver: zkie/tests/acceptance_rounds.rs, 4 rounds per case (round 1 cold, rounds
 | gemma3-seq16 | 5,725,337,524 / 5,725,337,524 | 9,309 | 9,296 | 34,031 | 33,840 | 12,166,540 | 29,742 | 29,682 | 10,383,084 |
 | timesfm-16patch | 3,647,375,061 / 3,647,375,061 | 5,506 | 5,397 | 23,275 | 23,395 | 7,859,444 | 23,314 | 23,254 | 4,037,228 |
 
-## Comparison against the W05 closure baseline (gpt2-seq16)
+## Comparison against the asset-consume closure baseline (gpt2-seq16)
 
 - baseline prove warm median 92,652 ms; this run warm median 93136 ms (delta +0.5224%); ±3% band [89872, 95432] ms -> WITHIN
 - baseline proof artifact 1,881,722,126 B; this run warm median 1881759600 B (delta +0.0020%); ±3% band [1825270462, 1938173789] B -> WITHIN
