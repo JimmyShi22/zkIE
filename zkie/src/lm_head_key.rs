@@ -8,6 +8,7 @@
 //! caller's private values; the builder checks their sizes and binds them
 //! before the table's root is computed.
 
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
@@ -72,7 +73,7 @@ use zkie_ops::proof::fold_handoff::{FoldHandoff, FoldHandoffAnchor};
 use zkie_ops::proof::session_baseline::SESSION_PROTOCOL_IDENTITY;
 
 use crate::policy::LimitedTableIdentity;
-use crate::s7_context::LmHeadContext;
+use crate::s7_context::{LmHeadAsset, LmHeadContext};
 
 /// One LIN request declaration of the output-head relation. It names the
 /// trusted MatMul step, its activation source and its output consumer, binds
@@ -195,6 +196,40 @@ pub struct LmHeadKeyRandomness {
     pub salts: Vec<Vec<u8>>,
     pub pads: Vec<Vec<Fp>>,
 }
+
+/// The plan-fixed public key material of the output-head table. The prover
+/// and the verifier use the same derivation, so the table root is a
+/// reproducible function of the trusted asset and the public parameters; the
+/// prover never chooses the table randomness.
+pub fn fixed_lm_head_key_randomness(
+    shape: zkie_engine::pcs::request::table::IndexShape,
+) -> LmHeadKeyRandomness {
+    let rows = shape.rows() as usize;
+    let n = shape.code.n() as usize;
+    let tail_len = shape.code.r as usize;
+    let pads_len = E_DEGREE * shape.answers as usize;
+    let word = |seed: u64| Fp::from_u64(seed % 1021 + 1);
+    LmHeadKeyRandomness {
+        tails: (0..rows)
+            .map(|row| {
+                (0..tail_len)
+                    .map(|entry| word(row as u64 * 31 + entry as u64))
+                    .collect()
+            })
+            .collect(),
+        salts: (0..n)
+            .map(|position| vec![(position as u8) ^ 0x5A; 40])
+            .collect(),
+        pads: (0..rows)
+            .map(|row| {
+                (0..pads_len)
+                    .map(|entry| word(row as u64 * 7 + entry as u64))
+                    .collect()
+            })
+            .collect(),
+    }
+}
+
 
 /// The committed table and its public reader.
 pub struct LmHeadKey {
@@ -2378,6 +2413,32 @@ impl LmHeadAssetSource {
         window_bytes: u64,
         total_bytes: u64,
     ) -> Result<Self> {
+        Self::open_with_asset(
+            &context.asset_root,
+            &context.asset,
+            plan,
+            configuration,
+            randomness,
+            cap_bytes,
+            window_bytes,
+            total_bytes,
+        )
+    }
+
+    /// Opens the read-only row source from the trusted asset identity without
+    /// the policy context. The prover uses this entry; every value it reads is
+    /// bound by the committed anchor before the proof is accepted.
+    #[allow(clippy::too_many_arguments)]
+    pub fn open_with_asset(
+        asset_root: &Path,
+        asset: &LmHeadAsset,
+        plan: &RequestPlan,
+        configuration: Digest,
+        randomness: &LmHeadKeyRandomness,
+        cap_bytes: u64,
+        window_bytes: u64,
+        total_bytes: u64,
+    ) -> Result<Self> {
         plan.validate()?;
         if configuration == Digest::ZERO || cap_bytes == 0 {
             return Err(Error::InvalidConfig);
@@ -2392,9 +2453,9 @@ impl LmHeadAssetSource {
         let columns = 1u64
             .checked_shl(plan.lin.k_col)
             .ok_or(Error::InvalidConfig)?;
-        if context.asset.rows != shape.rows()
-            || context.asset.row_width < columns
-            || context.asset.element_count != context.asset.rows.saturating_mul(context.asset.row_width)
+        if asset.rows != shape.rows()
+            || asset.row_width < columns
+            || asset.element_count != asset.rows.saturating_mul(asset.row_width)
             || matrix_rows != shape.rows()
             || factor
                 .checked_mul(matrix_rows)
@@ -2420,8 +2481,7 @@ impl LmHeadAssetSource {
         {
             return Err(Error::ShapeMismatch);
         }
-        let bytes = context
-            .asset
+        let bytes = asset
             .element_count
             .checked_mul(4)
             .ok_or(Error::ResourceLimit)?;
@@ -2434,9 +2494,9 @@ impl LmHeadAssetSource {
             ..MemoryRequest::default()
         })?;
         let reader = BoundedAssetReader::open(
-            context.asset_root.join(&context.asset.path),
-            TensorSpec::new(DType::I32, vec![context.asset.element_count]),
-            context.asset.start,
+            asset_root.join(&asset.path),
+            TensorSpec::new(DType::I32, vec![asset.element_count]),
+            asset.start,
             permit,
             window_bytes,
             total_bytes,
@@ -2448,7 +2508,7 @@ impl LmHeadAssetSource {
             shape,
             matrix_rows,
             factor,
-            row_width: context.asset.row_width,
+            row_width: asset.row_width,
             plain,
             pads: randomness.pads.clone(),
             tails: randomness.tails.clone(),
@@ -2540,10 +2600,44 @@ pub fn build_lm_head_holder(
     window_bytes: u64,
     total_bytes: u64,
 ) -> Result<StreamingHolder<LmHeadAssetSource>> {
+    build_lm_head_holder_from_asset(
+        &context.asset_root,
+        &context.asset,
+        plan,
+        configuration,
+        key_randomness,
+        store,
+        panel_columns,
+        max_bytes,
+        cap_bytes,
+        window_bytes,
+        total_bytes,
+    )
+}
+
+/// Commits the output-head table from the trusted asset fields directly. The
+/// prover uses this entry; the verifier rebuilds the same table from the same
+/// asset and the plan-fixed public randomness and pins its identity to the
+/// policy.
+#[allow(clippy::too_many_arguments)]
+pub fn build_lm_head_holder_from_asset(
+    asset_root: &Path,
+    asset: &LmHeadAsset,
+    plan: &RequestPlan,
+    configuration: Digest,
+    key_randomness: &LmHeadKeyRandomness,
+    store: &mut dyn EncodedRowStore,
+    panel_columns: u64,
+    max_bytes: u64,
+    cap_bytes: u64,
+    window_bytes: u64,
+    total_bytes: u64,
+) -> Result<StreamingHolder<LmHeadAssetSource>> {
     let shape = plan.table_shape()?;
     let _profile_open = zkie_engine::profile::Scope::new("table.open");
-    let mut source = LmHeadAssetSource::open(
-        context,
+    let mut source = LmHeadAssetSource::open_with_asset(
+        asset_root,
+        asset,
         plan,
         configuration,
         key_randomness,
