@@ -573,10 +573,20 @@ fn verify_norm_segment(
     table_metas: &[AssetTableMeta],
     ctx: &mut PipelineContext<'_>,
 ) -> Result<()> {
+    let applies =
+        statement.tokens.len() == zkie_ops::proof::output_head_lin::OUTPUT_HEAD_POSITIONS;
     let entry = match proof_manifest.find_file(NORM_SEGMENT_CARRIER_FILE) {
         Some(entry) => entry,
-        None => return Ok(()),
+        None => {
+            if applies {
+                return Err(Error::IncompleteArtifact);
+            }
+            return Ok(());
+        }
     };
+    if !applies {
+        return Err(Error::StatementMismatch);
+    }
     let bytes = fs::read(proof_dir.join(NORM_SEGMENT_CARRIER_FILE))
         .map_err(|_| Error::IncompleteArtifact)?;
     if bytes.len() as u64 != entry.byte_length
