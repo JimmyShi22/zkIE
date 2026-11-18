@@ -1,0 +1,2 @@
+{"completed_units":0,"elapsed_ms":0,"error_code":"asset_mismatch","event_seq":0,"kind":"stage_failed","last_completed_stage":null,"outcome":null,"parent_instance":null,"run_id":"pipeline","schema_version":1,"stage_id":"commit","stage_instance":0,"total_units":null,"unit":null}
+{"completed_units":0,"elapsed_ms":0,"error_code":"asset_mismatch","event_seq":1,"kind":"run_finished","last_completed_stage":"commit","outcome":"BLOCKED","parent_instance":null,"run_id":"commit","schema_version":1,"stage_id":"commit","stage_instance":0,"total_units":null,"unit":null}
