@@ -19,12 +19,12 @@ use zkie_engine::pcs::request::field::{Fp3, E_DEGREE};
 use zkie_engine::pcs::request::fold::{ByteMaskCoins, MaskCoins};
 use zkie_engine::pcs::request::runtime_tree::{RuntimeTreePart, RuntimeTreePlan};
 
-use crate::proof::hidden_norm::NormShape;
+use crate::proof::hidden_norm::{NormCoreRow, NormShape, RsqrtRow};
 use crate::proof::hidden_norm_psc::{
     norm_pointwise_masks, norm_tail_mask_masks, NormGroupPlan, NormGroupWitness,
-    NormMaskPlan, NormOutputPlan, NormOutputTailPlan, NormOutputTailWidths,
-    NormPlan, NormRoundLayout, NormRoundPlan, NormRoundWidths, NormRstdParams, NormRstdPlan,
-    NORM_OUTPUT_TAIL_RELATIONS,
+    commit_norm_mask, norm_mask_entries, NormMaskPlan, NormMaskWitness, NormOutputPlan,
+    NormOutputTailPlan, NormOutputTailWidths, NormPlan, NormRoundLayout, NormRoundPlan,
+    NormRoundWidths, NormRstdParams, NormRstdPlan, NormWitness, NORM_OUTPUT_TAIL_RELATIONS,
 };
 use crate::proof::hidden_send_session::WShape;
 use crate::proof::lookup_table::TableConfig;
@@ -339,6 +339,158 @@ pub fn build_core_plan(
 }
 
 
+
+
+/// The public derivation label of every non-x group commitment. The x group
+/// uses the profile seed because its roots are plan values.
+const SEGMENT_DERIVATION: &[u8] = b"zkie/norm-segment/v1";
+
+fn group_seed(label: &[u8]) -> Digest {
+    let mut bytes = Vec::with_capacity(SEGMENT_DERIVATION.len() + label.len());
+    bytes.extend_from_slice(SEGMENT_DERIVATION);
+    bytes.extend_from_slice(label);
+    zkie_core::artifact::digest_bytes(&bytes)
+}
+
+fn scalar_values(rows: &[NormCoreRow], value: impl Fn(&NormCoreRow) -> i128) -> Result<Vec<Vec<Fp3>>> {
+    rows.iter()
+        .map(|row| Ok(vec![crate::proof::output_closure::fp3_signed(value(row))?]))
+        .collect()
+}
+
+/// Commits the mask-only message and derives its entry list.
+fn commit_mask(
+    plan: &NormMaskPlan,
+    relations: usize,
+    seed: Digest,
+) -> Result<NormMaskWitness> {
+    let mut coins = ByteMaskCoins::new(seed)?;
+    let mask_rows = usize::try_from(plan.mask_rows).map_err(|_| Error::ResourceLimit)?;
+    let ell = usize::try_from(plan.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
+    let mut values = Vec::with_capacity(mask_rows);
+    for _ in 0..mask_rows {
+        values.push((0..ell).map(|_| coins.draw().unwrap().0).collect::<Vec<_>>());
+    }
+    let mut pad = Fp3::ZERO;
+    for _ in 0..64 {
+        pad = coins.draw().unwrap().0;
+        if pad != Fp3::ZERO {
+            break;
+        }
+    }
+    if pad == Fp3::ZERO || mask_rows == 0 || ell == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    values[mask_rows - 1][ell - 1] = pad;
+    let tails = (0..mask_rows)
+        .map(|_| {
+            (0..plan.mask_code.r as usize)
+                .map(|_| coins.draw().unwrap().0)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    let salts = (0..plan.tree.columns() as usize)
+        .map(|_| {
+            let mut salt = Vec::with_capacity(plan.tree.salt_bytes);
+            while salt.len() < plan.tree.salt_bytes {
+                let (value, _) = coins.draw().unwrap();
+                for coefficient in value.c {
+                    salt.extend_from_slice(
+                        &PrimeField64::as_canonical_u64(&coefficient).to_le_bytes(),
+                    );
+                }
+            }
+            salt.truncate(plan.tree.salt_bytes);
+            salt
+        })
+        .collect::<Vec<_>>();
+    let committed = commit_norm_mask(plan, values, tails, salts)?;
+    let entries = norm_mask_entries(plan, &committed, relations)?;
+    Ok(NormMaskWitness { committed, entries })
+}
+
+/// Builds the private witness of the core groups, the rounding group, the
+/// rsqrt rows, the committed mask and the interval x group. The caller passes
+/// the rstd value of every position; the chain verifies them against the
+/// frozen table.
+pub fn build_core_witness(
+    plan: &NormPlan,
+    profile: &NormSegmentProfile,
+    space: &NormSegmentSpace,
+    x_rows: &[Vec<i64>],
+    rstd_values: &[i64],
+) -> Result<NormWitness> {
+    if x_rows.len() != profile.positions as usize
+        || rstd_values.len() != profile.positions as usize
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut rows = Vec::with_capacity(x_rows.len());
+    let mut core = Vec::with_capacity(x_rows.len());
+    for row in x_rows {
+        if row.len() != profile.hidden as usize {
+            return Err(Error::ShapeMismatch);
+        }
+        rows.push(row.clone());
+        core.push(NormCoreRow::from_values(row, profile.valid as usize)?);
+    }
+    let rsqrt = core
+        .iter()
+        .zip(rstd_values)
+        .map(|(row, rstd)| RsqrtRow::from_variance(row.variance, profile.table_real_len, *rstd))
+        .collect::<Result<Vec<_>>>()?;
+    let x = commit_x(space, profile, x_rows)?;
+    if x.committed.roots != plan.x_roots {
+        return Err(Error::StatementMismatch);
+    }
+    let sum = commit_group(&plan.sum, &scalar_values(&core, |row| row.sum)?, group_seed(b"sum"))?;
+    let squares = commit_group(
+        &plan.squares,
+        &scalar_values(&core, |row| row.squares)?,
+        group_seed(b"squares"),
+    )?;
+    let mean = commit_group(&plan.mean, &scalar_values(&core, |row| row.mean as i128)?, group_seed(b"mean"))?;
+    let variance = commit_group(
+        &plan.variance,
+        &scalar_values(&core, |row| row.variance as i128)?,
+        group_seed(b"variance"),
+    )?;
+    let round = match &plan.round {
+        Some(round) => {
+            let values = core
+                .iter()
+                .zip(&rsqrt)
+                .map(|(row, rsqrt)| {
+                    round
+                        .layout
+                        .values_with_rsqrt(row, rsqrt, round.group.columns)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Some(commit_group(&round.group, &values, group_seed(b"round"))?)
+        }
+        None => None,
+    };
+    let mask = match &plan.mask {
+        Some(mask) => Some(commit_mask(mask, plan.relations.len(), group_seed(b"mask"))?),
+        None => None,
+    };
+    Ok(NormWitness {
+        rows,
+        core,
+        x,
+        sum,
+        squares,
+        mean,
+        variance,
+        round,
+        rsqrt: Some(rsqrt),
+        mask,
+        lookup: None,
+        rstd: None,
+        params: None,
+        output: None,
+    })
+}
 
 /// The oracle/tree pair of the frozen-table lookup messages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -665,6 +817,20 @@ mod tests {
         let mask = plan.mask.as_ref().unwrap();
         assert_eq!(mask.pointwise, 2);
         assert_eq!(mask.tail, NORM_OUTPUT_TAIL_RELATIONS);
+    }
+
+    #[test]
+    fn the_core_witness_matches_the_plan_roots() {
+        let profile = real_profile();
+        let space = space();
+        let mut x_rows = vec![vec![0i64; profile.hidden as usize]; profile.positions as usize];
+        x_rows[0][0] = 11;
+        let plan = build_core_plan(&space, &profile, &x_rows).unwrap();
+        let rstd = vec![1i64; profile.positions as usize];
+        let witness = build_core_witness(&plan, &profile, &space, &x_rows, &rstd).unwrap();
+        assert_eq!(witness.x.committed.roots, plan.x_roots);
+        assert!(witness.mask.is_some());
+        assert!(witness.round.is_some());
     }
 
     #[test]
