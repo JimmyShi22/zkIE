@@ -46,8 +46,8 @@ fn run_stage(bin: &Path, args: &[String], run_dir: &Path, case_id: &str) -> Valu
 }
 
 /// The single-case policy: the template's trusted fields with the anchor and
-/// model identity of this commit. The gpt2 case also gets the committed table
-/// identity derived from the same public bundle.
+/// model identity of this commit. A case with a committed encoded table also
+/// gets the table identity derived from the same public bundle.
 fn write_policy(
     template: &Path,
     case_id: &str,
@@ -105,8 +105,8 @@ fn write_policy(
             out.push('\n');
         }
     }
-    if model == "gpt2" {
-        let meta = metas.first().expect("the gpt2 commit publishes one table");
+    if !metas.is_empty() {
+        let meta = metas.first().expect("the commit publishes one table");
         out.push_str(&format!(
             "\n[case.limited_table_identity]\nversion = 1\nmodel = \"{model}\"\nmodel_version = {model_version}\ncase_id = \"{case_id}\"\nanchor_id = \"{anchor_id}\"\nmodel_id = \"{model_id}\"\nasset_id = {}\nasset_table_identity = \"{}\"\ntable_root = \"{}\"\ntable_record_digest = \"{}\"\ntable_configuration = \"{}\"\ncode_log_n = {}\ncode_ell = {}\ncode_r = {}\ntable_v = {}\nanswers = {}\nsalt_bytes = {}\ndistance_radius = {}\ndistance_later_radius = {}\ndistance_m_once = {}\ndistance_m_later = {}\nmatrix_rows_log = {}\nk_lo = 0\nk_col = {}\nprotocol_identity = \"{}\"\n",
             meta.asset_id,
