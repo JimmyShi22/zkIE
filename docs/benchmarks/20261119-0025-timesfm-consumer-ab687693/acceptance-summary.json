@@ -1,0 +1,61 @@
+{
+  "case_id": "timesfm-16patch",
+  "model": "timesfm",
+  "rounds": [
+    {
+      "anchor_id": "414daed0bd88340e7f45cb22c8456eb334382e3dc019d83cc1be0c0b402335d6",
+      "commit": {
+        "authenticated_output_digest": null,
+        "authenticated_output_elements": null,
+        "command": "commit",
+        "error_code": null,
+        "last_completed_stage": "commit",
+        "last_event_seq": 33,
+        "outcome": "PASS",
+        "output_binding": null,
+        "progress_path": "/data/zkie-a01-ev/accept-timesfm-ab687693/round-1/commit-run/progress.jsonl",
+        "proof_bytes": null,
+        "protocol_wall_ms": 153400,
+        "run_id": "commit",
+        "stage_wall_ms": 153400,
+        "vmhwm_kib": 13821444
+      },
+      "model_id": "c87a951844e832fcfc8022688ab86f6c7f634c86874a6b6758c1c88104460742",
+      "proof_bin_deleted_bytes": 3613502964,
+      "proof_bytes": 3615796947,
+      "prove": {
+        "authenticated_output_digest": null,
+        "authenticated_output_elements": null,
+        "command": "prove",
+        "error_code": null,
+        "last_completed_stage": "prove",
+        "last_event_seq": 124,
+        "outcome": "PASS",
+        "output_binding": null,
+        "progress_path": "/data/zkie-a01-ev/accept-timesfm-ab687693/round-1/prove-run/progress.jsonl",
+        "proof_bytes": 3615796947,
+        "protocol_wall_ms": 81701,
+        "run_id": "prove",
+        "stage_wall_ms": 81701,
+        "vmhwm_kib": 9045896
+      },
+      "round": 1,
+      "verify": {
+        "authenticated_output_digest": "cc72805b7a845cb2b8505d6092dbb79477d083394a03c99cdac7f5665de56ba3",
+        "authenticated_output_elements": 32768,
+        "command": "verify",
+        "error_code": null,
+        "last_completed_stage": "verify",
+        "last_event_seq": 15,
+        "outcome": "PASS",
+        "output_binding": "expected",
+        "progress_path": "/data/zkie-a01-ev/accept-timesfm-ab687693/round-1/verify-run/progress.jsonl",
+        "proof_bytes": null,
+        "protocol_wall_ms": 64746,
+        "run_id": "verify",
+        "stage_wall_ms": 64746,
+        "vmhwm_kib": 6442368
+      }
+    }
+  ]
+}

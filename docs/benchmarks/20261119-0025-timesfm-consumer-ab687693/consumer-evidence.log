@@ -1,0 +1,11 @@
+case timesfm-16patch
+commit 160857 ms
+commit hwm 18090264 KiB
+prove 79990 ms
+verify 62578 ms
+trace bytes 3613502964 (237 assets; 33604088 bytes of the consumer opening removed; with opening 3647107052)
+statement bytes 133214
+consumer proof bytes 2028208
+key prove 115879 ms, commit verify 35527 ms, request verify 35615 ms, file 3206184 bytes
+pro_out_w extrema [-5320, 5304] within declared [-131072, 131071]
+accepted; twelve consumer-matrix negatives and one version negative refused
