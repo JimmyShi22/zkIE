@@ -367,3 +367,56 @@ pub fn segment_work_dir(output_dir: &Path) -> Result<PathBuf> {
     let parent = output_dir.parent().ok_or(Error::IncompleteArtifact)?;
     Ok(parent.join("norm-segment-work"))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zkie_engine::pcs::request::code::build_code_plan;
+    use zkie_engine::pcs::request::field::Fp3;
+    use zkie_engine::pcs::request::table::{IndexRecord, TableDistances};
+
+    fn reader() -> IndexReader {
+        let shape = IndexShape {
+            code: build_code_plan(12, 2049, 4).unwrap(),
+            v: 0,
+            answers: 1,
+            salt_bytes: 40,
+            distances: TableDistances {
+                radius: 0,
+                later_radius: 0,
+                m_once: 0,
+                m_later: 0,
+            },
+        };
+        IndexReader {
+            shape,
+            configuration: Digest([0x61; 32]),
+            root: Digest([0x62; 32]),
+            record: IndexRecord {
+                y: vec![Fp3::ONE; shape.rows() as usize],
+            },
+        }
+    }
+
+    #[test]
+    fn the_carrier_round_trips_and_rejects_edits() {
+        let carrier = NormSegmentCarrier {
+            version: NORM_SEGMENT_CARRIER_VERSION,
+            reader: reader(),
+            messages: vec![1, 2, 3, 4],
+        };
+        let bytes = carrier.encode().unwrap();
+        let decoded = NormSegmentCarrier::decode(&bytes).unwrap();
+        assert_eq!(decoded.version, carrier.version);
+        assert_eq!(decoded.reader.root, carrier.reader.root);
+        assert_eq!(decoded.reader.record, carrier.reader.record);
+        assert_eq!(decoded.messages, carrier.messages);
+        let mut wrong_version = carrier.clone();
+        wrong_version.version += 1;
+        assert!(wrong_version.encode().is_err());
+        let mut empty = carrier.clone();
+        empty.messages.clear();
+        assert!(empty.encode().is_err());
+        assert!(NormSegmentCarrier::decode(&bytes[..bytes.len() - 1]).is_err());
+    }
+}
