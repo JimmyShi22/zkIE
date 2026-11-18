@@ -499,6 +499,33 @@ pub fn build_core_witness(
 }
 
 
+
+/// Re-commits the final output rows with the plan-fixed public coins and
+/// returns the out group roots. The verifier uses this on the trace's
+/// materialized MatMul activation rows; equality with the chain's committed
+/// out message roots is the materialized identity binding.
+pub fn out_group_roots(
+    plan: &NormPlan,
+    profile: &NormSegmentProfile,
+    rows: &[Vec<i64>],
+) -> Result<Vec<Digest>> {
+    let output = plan.output.as_ref().ok_or(Error::InvalidConfig)?;
+    if rows.len() != profile.positions as usize
+        || rows.iter().any(|row| row.len() != profile.columns as usize)
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let values = rows
+        .iter()
+        .map(|row| {
+            signed_column(&row.iter().map(|value| *value as i128).collect::<Vec<_>>())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(commit_group(&output.out, &values, group_seed(b"out"))?
+        .committed
+        .roots)
+}
+
 /// Fills the private gain and bias vectors of the parameter tables.
 pub fn attach_params_witness(
     witness: &mut NormWitness,
@@ -1155,6 +1182,19 @@ mod tests {
         assert!(witness.params.is_some());
         assert!(witness.lookup.is_some());
         assert!(witness.rstd.is_some());
+        let out_rows = witness
+            .output
+            .as_ref()
+            .unwrap()
+            .rows
+            .iter()
+            .map(|row| row.out.clone())
+            .collect::<Vec<_>>();
+        let roots = out_group_roots(&plan, &profile, &out_rows).unwrap();
+        assert_eq!(
+            roots,
+            witness.output.as_ref().unwrap().out.committed.roots
+        );
     }
 
     #[test]
