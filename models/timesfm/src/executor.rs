@@ -18,9 +18,15 @@ use zkie_ops::profile_norm::ProfileLayerNormOp;
 use zkie_ops::profile_rms::ProfileRmsNormOp;
 use zkie_ops::profile_standardize::ProfileStandardizeOp;
 use zkie_ops::projection::ProjectionOp;
+use zkie_ops::proof::asset_table::AssetTableInput;
+use zkie_ops::proof::consumer_proof::ConsumerProofFile;
+use zkie_ops::proof::consumer_request::ConsumerSharedPlan;
+use zkie_ops::proof::consumer_session::{
+    prove_consumer_request, ConsumerRequestSeed, ConsumerRequestWitness,
+};
 use zkie_ops::proof::model_commitment::{
-    commit_assets, AssetOpening, AssetStore, ModelAssetSpec, ModelCommitment, SharedTrace,
-    SharedTraceStep,
+    commit_assets_with_tables_on_identity, AssetOpening, AssetStore, ModelAssetSpec,
+    ModelCommitment, SharedTrace, SharedTraceStep,
 };
 use zkie_ops::proof::relations::{
     proof_output_values, prove_op_relation_shared, RelationConfig, RelationReceiptMessage,
@@ -137,9 +143,16 @@ impl<'a> Assets<'a> {
     fn load(commitment: &'a ModelCommitment, public_tables: bool) -> Result<Self> {
         let store = AssetStore::open(commitment)?;
         let public_paths = crate::plan::public_table_paths();
+        let consumer_paths = crate::plan::consumer_asset_paths();
         let mut trace_assets = Vec::with_capacity(commitment.assets.len());
         for (index, asset) in commitment.assets.iter().enumerate() {
-            if public_tables && public_paths.contains(&asset.path.as_str()) {
+            // The production trace carries no opening for a public table and
+            // none for a consumer-authenticated asset: both values are supplied
+            // by their own trusted sources.
+            if public_tables
+                && (public_paths.contains(&asset.path.as_str())
+                    || consumer_paths.contains(&asset.path.as_str()))
+            {
                 continue;
             }
             trace_assets.push(store.open_asset(index)?);
@@ -400,7 +413,7 @@ fn silu(
 }
 
 pub fn execute_shared(commitment: &ModelCommitment, input: &[i64]) -> Result<SharedTrace> {
-    execute_shared_inner(commitment, input, None, false)
+    execute_shared_inner(commitment, input, None, false, None).map(|(trace, _)| trace)
 }
 
 pub fn execute_shared_with_progress(
@@ -408,7 +421,7 @@ pub fn execute_shared_with_progress(
     input: &[i64],
     progress: Option<&dyn ProgressSink>,
 ) -> Result<SharedTrace> {
-    execute_shared_inner(commitment, input, progress, false)
+    execute_shared_inner(commitment, input, progress, false, None).map(|(trace, _)| trace)
 }
 
 /// The production trace: the migrated public tables are not carried as trace
@@ -418,7 +431,20 @@ pub fn execute_shared_with_progress_public(
     input: &[i64],
     progress: Option<&dyn ProgressSink>,
 ) -> Result<SharedTrace> {
-    execute_shared_inner(commitment, input, progress, true)
+    execute_shared_inner(commitment, input, progress, true, None).map(|(trace, _)| trace)
+}
+
+/// The production trace together with the request's consumer proof over the
+/// registered encoded table. The consumer-authenticated first projection has
+/// no trace opening; its relation is closed by the request consumer chain.
+pub fn execute_shared_with_progress_public_consumer(
+    commitment: &ModelCommitment,
+    input: &[i64],
+    tables: &[AssetTableInput],
+    progress: Option<&dyn ProgressSink>,
+) -> Result<(SharedTrace, ConsumerProofFile)> {
+    let (trace, consumer) = execute_shared_inner(commitment, input, progress, true, Some(tables))?;
+    Ok((trace, consumer.ok_or(Error::IncompleteArtifact)?))
 }
 
 fn execute_shared_inner(
@@ -426,7 +452,8 @@ fn execute_shared_inner(
     input: &[i64],
     progress: Option<&dyn ProgressSink>,
     public_tables: bool,
-) -> Result<SharedTrace> {
+    consumer_tables: Option<&[AssetTableInput]>,
+) -> Result<(SharedTrace, Option<ConsumerProofFile>)> {
     if input.len() != RAW_POINTS {
         return Err(Error::InvalidConfig);
     }
@@ -480,8 +507,28 @@ fn execute_shared_inner(
     )?;
     let (activation, activation_step) = silu(&mut builder, hid, hid_step, silu_table.clone(), silu_pool)?;
     let pro_out_path = format!("{WEIGHT_DIR}/pro_out_w_i32.bin");
+    let pro_out_weight = weight(&pro_out_path)?;
+    let probe = ProjectionOp {
+        m: SEQ,
+        n: H_PAD,
+        k: H_PAD,
+        shift: 16,
+        bias: None,
+    };
+    let record = probe.forward_values(&[activation.clone(), pro_out_weight.clone()])?;
+    let consumer_activation = activation.clone();
+    let consumer_raw = record
+        .raw_accumulators
+        .first()
+        .ok_or(Error::IncompleteArtifact)?
+        .clone();
+    let consumer_output = record
+        .outputs
+        .first()
+        .ok_or(Error::IncompleteArtifact)?
+        .clone();
     let (out_proj, out_step) = project(
-        &mut builder, activation, activation_step, weight(&pro_out_path)?, Some(pool(&pro_out_path)?),
+        &mut builder, activation, activation_step, pro_out_weight, Some(pool(&pro_out_path)?),
         SEQ, H_PAD, H_PAD, 16,
     )?;
     let (out_proj, out_step) = add_bias(
@@ -683,16 +730,64 @@ fn execute_shared_inner(
         event.unit = Some("relation_steps".into());
         let _ = progress.emit(event);
     }
-    Ok(SharedTrace {
-        tokens: input.iter().map(|value| *value as u32).collect(),
-        assets: assets.trace_assets,
-        steps,
-        argmax: Vec::new(),
-        output,
-    })
+    let consumer = match consumer_tables {
+        Some(tables) => {
+            let plan = crate::plan::trace_plan_public(SEQ)?;
+            let params = crate::plan::projection_table_params(crate::plan::FIRST_PROJECTION)
+                .ok_or(Error::InvalidConfig)?;
+            let meta = commitment
+                .tables
+                .iter()
+                .find(|meta| meta.path == params.path)
+                .ok_or(Error::IncompleteArtifact)?;
+            let derived = crate::plan::derive_table_plan(&crate::plan::TABLE_PLAN_CANDIDATE)?;
+            let shared = ConsumerSharedPlan {
+                m_once: derived.table_shape.distances.m_once,
+                m_later: derived.table_shape.distances.m_later,
+                one_time_columns: derived.one_time_columns,
+                later_columns: derived.later_batch_columns,
+                declared_batches: 1,
+                table_tail: derived.table_shape.code.r,
+            };
+            let raw = vec![consumer_raw];
+            let outputs = vec![consumer_output];
+            let witness = ConsumerRequestWitness {
+                activation: &consumer_activation,
+                raw: &raw,
+                outputs: &outputs,
+            };
+            Some(prove_consumer_request(
+                &plan,
+                commitment,
+                &assets.store,
+                tables,
+                meta,
+                &params,
+                crate::plan::table_model_identity()?,
+                shared,
+                &witness,
+                ConsumerRequestSeed::sample()?,
+            )?)
+        }
+        None => None,
+    };
+    Ok((
+        SharedTrace {
+            tokens: input.iter().map(|value| *value as u32).collect(),
+            assets: assets.trace_assets,
+            steps,
+            argmax: Vec::new(),
+            output,
+        },
+        consumer,
+    ))
 }
 
-pub fn build_commitment(asset_root: &Path, input: &[i64]) -> Result<ModelCommitment> {
+pub fn build_commitment(
+    asset_root: &Path,
+    input: &[i64],
+    tables: &[AssetTableInput],
+) -> Result<ModelCommitment> {
     let parameters = zkie_engine::primitives::transcript::hash_labeled(
         zkie_engine::primitives::transcript::tag_word(
             zkie_engine::primitives::transcript::STATEMENT,
@@ -712,5 +807,12 @@ pub fn build_commitment(asset_root: &Path, input: &[i64]) -> Result<ModelCommitm
         None,
         &bytes,
     )?;
-    commit_assets(asset_root, model, parameters, &asset_specs())
+    commit_assets_with_tables_on_identity(
+        asset_root,
+        model,
+        crate::plan::table_model_identity()?,
+        parameters,
+        &asset_specs(),
+        tables,
+    )
 }

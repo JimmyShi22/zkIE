@@ -28,8 +28,7 @@ use zkie_ops::pipeline::{
 };
 use zkie_ops::proof::model_commitment::{
     verify_model_anchor_with_tables, verify_model_anchor_with_tables_on_identity,
-    verify_shared_trace, verify_shared_trace_output,
-    ModelCommitmentPublic, SharedTrace,
+    verify_shared_trace, ModelCommitmentPublic, SharedTrace,
 };
 use zkie_ops::proof::asset_key::{
     prove_asset_key, verify_asset_key, AssetKeyColumns, ASSET_KEY_BUNDLE,
@@ -370,11 +369,37 @@ fn gpt2_key_columns() -> Result<(
     Ok((params, spec, columns))
 }
 
+/// The registered first projection table of TimesFM: its trusted parameters,
+/// its asset specification and the derived key-stage columns.
+fn timesfm_key_columns() -> Result<(
+    AssetTableParams,
+    zkie_ops::proof::model_commitment::ModelAssetSpec,
+    AssetKeyColumns,
+)> {
+    let path = zkie_models_timesfm::plan::FIRST_PROJECTION;
+    let params = zkie_models_timesfm::plan::projection_table_params(path)
+        .ok_or(Error::UnsupportedPrimitive)?;
+    let spec = zkie_models_timesfm::plan::asset_specs()
+        .into_iter()
+        .find(|spec| spec.path == path)
+        .ok_or(Error::UnsupportedPrimitive)?;
+    let derived = zkie_models_timesfm::plan::derive_table_plan(
+        &zkie_models_timesfm::plan::TABLE_PLAN_CANDIDATE,
+    )?;
+    let columns = AssetKeyColumns {
+        key_columns: derived.one_time_columns,
+        instance_columns: derived.total_columns,
+        k_lo: zkie_models_timesfm::plan::TABLE_PLAN_CANDIDATE.k_lo,
+        lin_check: derived.lin_check,
+    };
+    Ok((params, spec, columns))
+}
+
 fn trusted_table_params(model: &str) -> Result<Vec<AssetTableParams>> {
     match model {
         "gpt2" => zkie_models_gpt2::plan::asset_table_params(),
         "gemma3" => Ok(Vec::new()),
-        "timesfm" => Ok(Vec::new()),
+        "timesfm" => zkie_models_timesfm::plan::asset_table_params(),
         _ => Err(Error::UnsupportedPrimitive),
     }
 }
@@ -391,15 +416,11 @@ fn build_commitment(
             }
             gemma3::build_commitment(Path::new(&config.case_root), &config.tokens)
         }
-        "timesfm" => {
-            if !tables.is_empty() {
-                return Err(Error::InvalidConfig);
-            }
-            timesfm::build_commitment(
-                Path::new(&config.case_root),
-                &config.input.iter().map(|value| *value as i64).collect::<Vec<_>>(),
-            )
-        }
+        "timesfm" => timesfm::build_commitment(
+            Path::new(&config.case_root),
+            &config.input.iter().map(|value| *value as i64).collect::<Vec<_>>(),
+            tables,
+        ),
         _ => Err(Error::UnsupportedPrimitive),
     }
 }
@@ -424,12 +445,13 @@ fn execute_shared(
             Some(progress),
         )
         .map(|trace| (trace, None)),
-        "timesfm" => timesfm::execute_shared_with_progress_public(
+        "timesfm" => timesfm::execute_shared_with_progress_public_consumer(
             commitment,
             &config.input.iter().map(|value| *value as i64).collect::<Vec<_>>(),
+            tables,
             Some(progress),
         )
-        .map(|trace| (trace, None)),
+        .map(|(trace, file)| (trace, Some(file))),
         _ => Err(Error::UnsupportedPrimitive),
     }
 }
@@ -464,10 +486,33 @@ impl PipelineProvider for ProductionProvider {
                 .find(|table| table.params.path == params.path)
                 .ok_or(Error::IncompleteArtifact)?;
             let started = Instant::now();
-            let bytes = prove_asset_key(&commitment, meta, &params, identity, &spec, input, columns)?;
+            let range = zkie_ops::proof::table_range::production_table_range()?;
+            let bytes = prove_asset_key(&commitment, meta, &params, identity, &spec, input, columns, &range)?;
             ctx.metrics.record("key_prove_ms", started.elapsed().as_millis() as u64);
             let started = Instant::now();
-            verify_asset_key(meta, &params, identity, &spec, columns, &bytes)?;
+            verify_asset_key(meta, &params, identity, &spec, columns, &range, &bytes)?;
+            ctx.metrics.record("key_verify_ms", started.elapsed().as_millis() as u64);
+            ctx.metrics.record("key_bytes", bytes.len() as u64);
+            key_bundle = Some(bytes);
+        }
+        if config.model == "timesfm" {
+            let (params, spec, columns) = timesfm_key_columns()?;
+            let identity = zkie_models_timesfm::plan::table_model_identity()?;
+            let meta = commitment
+                .tables
+                .iter()
+                .find(|meta| meta.path == params.path)
+                .ok_or(Error::IncompleteArtifact)?;
+            let input = tables
+                .iter()
+                .find(|table| table.params.path == params.path)
+                .ok_or(Error::IncompleteArtifact)?;
+            let started = Instant::now();
+            let range = zkie_models_timesfm::plan::production_table_range()?;
+            let bytes = prove_asset_key(&commitment, meta, &params, identity, &spec, input, columns, &range)?;
+            ctx.metrics.record("key_prove_ms", started.elapsed().as_millis() as u64);
+            let started = Instant::now();
+            verify_asset_key(meta, &params, identity, &spec, columns, &range, &bytes)?;
             ctx.metrics.record("key_verify_ms", started.elapsed().as_millis() as u64);
             ctx.metrics.record("key_bytes", bytes.len() as u64);
             key_bundle = Some(bytes);
@@ -584,7 +629,24 @@ impl PipelineProvider for ProductionProvider {
             let bytes =
                 checked_artifact_file(&request.commit_dir, &commit_manifest, ASSET_KEY_BUNDLE)?;
             let started = Instant::now();
-            verify_asset_key(meta, &params, identity, &spec, columns, &bytes)?;
+            let range = zkie_ops::proof::table_range::production_table_range()?;
+            verify_asset_key(meta, &params, identity, &spec, columns, &range, &bytes)?;
+            ctx.metrics.record("key_verify_ms", started.elapsed().as_millis() as u64);
+            ctx.metrics.record("key_bytes", bytes.len() as u64);
+        }
+        if config.model == "timesfm" {
+            let (params, spec, columns) = timesfm_key_columns()?;
+            let identity = zkie_models_timesfm::plan::table_model_identity()?;
+            let meta = commitment
+                .tables
+                .iter()
+                .find(|meta| meta.path == params.path)
+                .ok_or(Error::IncompleteArtifact)?;
+            let bytes =
+                checked_artifact_file(&request.commit_dir, &commit_manifest, ASSET_KEY_BUNDLE)?;
+            let started = Instant::now();
+            let range = zkie_models_timesfm::plan::production_table_range()?;
+            verify_asset_key(meta, &params, identity, &spec, columns, &range, &bytes)?;
             ctx.metrics.record("key_verify_ms", started.elapsed().as_millis() as u64);
             ctx.metrics.record("key_bytes", bytes.len() as u64);
         }
@@ -770,12 +832,14 @@ impl PipelineProvider for ProductionProvider {
                     .find(|meta| meta.path == key_params.path)
                     .ok_or(Error::IncompleteArtifact)?;
                 let started = Instant::now();
+                let key_range = zkie_ops::proof::table_range::production_table_range()?;
                 verify_asset_key(
                     key_meta,
                     &key_params,
                     identity,
                     &key_spec,
                     key_columns,
+                    &key_range,
                     &key_bytes,
                 )?;
                 ctx.metrics.record("key_verify_ms", started.elapsed().as_millis() as u64);
@@ -899,21 +963,93 @@ impl PipelineProvider for ProductionProvider {
                 }
                 let parameters = zkie_models_timesfm::plan::parameters_digest()?;
                 let specs = zkie_models_timesfm::plan::asset_specs();
-                verify_model_anchor_with_tables(
+                let identity = zkie_models_timesfm::plan::table_model_identity()?;
+                verify_model_anchor_with_tables_on_identity(
                     &public,
                     trusted.anchor_id,
                     model_id,
+                    identity,
                     parameters,
                     &specs,
                     &table_metas,
                     &table_params,
                 )?;
-                let output = verify_shared_trace_output(
+                let (key_params, key_spec, key_columns) = timesfm_key_columns()?;
+                let key_bytes =
+                    checked_artifact_file(commit_root, &commit_manifest, ASSET_KEY_BUNDLE)?;
+                let key_meta = table_metas
+                    .iter()
+                    .find(|meta| meta.path == key_params.path)
+                    .ok_or(Error::IncompleteArtifact)?;
+                let started = Instant::now();
+                let key_range = zkie_models_timesfm::plan::production_table_range()?;
+                verify_asset_key(
+                    key_meta,
+                    &key_params,
+                    identity,
+                    &key_spec,
+                    key_columns,
+                    &key_range,
+                    &key_bytes,
+                )?;
+                ctx.metrics.record("key_verify_ms", started.elapsed().as_millis() as u64);
+                ctx.metrics.record("key_bytes", key_bytes.len() as u64);
+                let sidecar_entry = proof_manifest
+                    .find_file(zkie_ops::proof::consumer_proof::CONSUMER_PROOF_FILE)
+                    .ok_or(Error::IncompleteArtifact)?;
+                let sidecar_bytes = fs::read(
+                    proof_dir.join(zkie_ops::proof::consumer_proof::CONSUMER_PROOF_FILE),
+                )
+                .map_err(|_| Error::IncompleteArtifact)?;
+                if sidecar_bytes.len() as u64 != sidecar_entry.byte_length
+                    || digest_bytes(&sidecar_bytes) != sidecar_entry.content_digest
+                {
+                    return Err(Error::ArtifactIntegrityMismatch);
+                }
+                let consumer = ConsumerProofFile::decode(&sidecar_bytes)?;
+                let outputs = zkie_ops::proof::model_commitment::verify_shared_trace_outputs(
                     &public,
                     &trace,
                     &statement.tokens,
                     &plan,
                     Some(public_root),
+                )?;
+                let last = outputs.last().ok_or(Error::StatementMismatch)?;
+                let output: Vec<i64> = last.iter().flatten().copied().collect();
+                if output != trace.output {
+                    return Err(Error::StatementMismatch);
+                }
+                let path = key_params.path.as_str();
+                let consumer_params = zkie_models_timesfm::plan::projection_table_params(path)
+                    .ok_or(Error::UnsupportedPrimitive)?;
+                let derived = zkie_models_timesfm::plan::derive_table_plan(
+                    &zkie_models_timesfm::plan::TABLE_PLAN_CANDIDATE,
+                )?;
+                let shared = ConsumerSharedPlan {
+                    m_once: derived.table_shape.distances.m_once,
+                    m_later: derived.table_shape.distances.m_later,
+                    one_time_columns: derived.one_time_columns,
+                    later_columns: derived.later_batch_columns,
+                    declared_batches: 1,
+                    table_tail: derived.table_shape.code.r,
+                };
+                let spec = zkie_models_timesfm::plan::asset_specs()
+                    .into_iter()
+                    .find(|spec| spec.path == path)
+                    .ok_or(Error::UnsupportedPrimitive)?;
+                let meta = table_metas
+                    .iter()
+                    .find(|meta| meta.path == path)
+                    .ok_or(Error::IncompleteArtifact)?;
+                verify_consumer_request(
+                    &plan,
+                    &outputs,
+                    identity,
+                    meta,
+                    &consumer_params,
+                    &spec,
+                    shared,
+                    &consumer,
                 )?;
                 if output.len() != zkie_models_timesfm::plan::output_elements(patches)? {
                     return Err(Error::ShapeMismatch);

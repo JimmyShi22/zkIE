@@ -26,8 +26,7 @@ use crate::proof::hidden_send_session::{
 };
 use crate::proof::model_commitment::{AssetReader, ModelAssetSpec, ModelCommitment};
 use crate::proof::table_range::{
-    production_table_range, range_bit_values, range_multiplicities, EntryRangePlan,
-    IntegerRangeTable,
+    range_bit_values, range_multiplicities, EntryRangePlan, IntegerRangeTable,
 };
 
 /// The public bundle path of the request's one-time key proof.
@@ -54,14 +53,14 @@ pub fn asset_key_plan(
     table_model_identity: Digest,
     spec: &ModelAssetSpec,
     columns: AssetKeyColumns,
-) -> Result<(crate::proof::hidden_send_session::KeyFirstPlan, EntryRangePlan)> {
+    range: &EntryRangePlan,
+) -> Result<crate::proof::hidden_send_session::KeyFirstPlan> {
     verify_asset_table_meta(meta, table_model_identity, spec, params)?;
     let reader = consumer_table_reader(meta, params, table_model_identity, spec)?;
     let matrix_rows = meta.shape.rows();
     let full_columns = matrix_rows
         .checked_shl(columns.k_lo)
         .ok_or(Error::ResourceLimit)?;
-    let range = production_table_range()?;
     let plan = production_key_first_plan(&KeyPlanInputs {
         table_identity: reader_table_identity(&reader)?,
         table_configuration: meta.configuration,
@@ -73,7 +72,7 @@ pub fn asset_key_plan(
         lin_check: columns.lin_check,
         range: range.clone(),
     })?;
-    Ok((plan, range))
+    Ok(plan)
 }
 
 /// Reads the key witness of the committed matrix one stored row at a time and
@@ -145,14 +144,15 @@ pub fn prove_asset_key(
     spec: &ModelAssetSpec,
     input: &AssetTableInput,
     columns: AssetKeyColumns,
+    range: &EntryRangePlan,
 ) -> Result<Vec<u8>> {
     if input.params != *params {
         return Err(Error::StatementMismatch);
     }
     verify_asset_table_meta(meta, table_model_identity, spec, params)?;
-    let (plan, range) = asset_key_plan(meta, params, table_model_identity, spec, columns)?;
-    let (keys, bits) = key_witness(commitment, params, &range)?;
-    let lookup = IntegerRangeTable::new(&range, 1 << 20)?;
+    let plan = asset_key_plan(meta, params, table_model_identity, spec, columns, range)?;
+    let (keys, bits) = key_witness(commitment, params, range)?;
+    let lookup = IntegerRangeTable::new(range, 1 << 20)?;
     let reader = consumer_table_reader(meta, params, table_model_identity, spec)?;
     let mut keeper = open_consumer_table_keeper(
         commitment,
@@ -183,11 +183,12 @@ pub fn verify_asset_key(
     table_model_identity: Digest,
     spec: &ModelAssetSpec,
     columns: AssetKeyColumns,
+    range: &EntryRangePlan,
     bytes: &[u8],
 ) -> Result<AcceptedKey> {
     let reader = consumer_table_reader(meta, params, table_model_identity, spec)?;
-    let (plan, range) = asset_key_plan(meta, params, table_model_identity, spec, columns)?;
-    let lookup = IntegerRangeTable::new(&range, 1 << 20)?;
+    let plan = asset_key_plan(meta, params, table_model_identity, spec, columns, range)?;
+    let lookup = IntegerRangeTable::new(range, 1 << 20)?;
     let accepted = verify_key(&plan, &reader, &lookup, bytes)?;
     let record_digest = {
         let mut writer = zkie_engine::primitives::codec::CanonicalWriter::new();
