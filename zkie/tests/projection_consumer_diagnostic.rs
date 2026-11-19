@@ -848,6 +848,7 @@ fn plan_for(
             column_work_bits: 0,
             shared_base_positions: 2,
             own_base_positions: 2,
+            own_deferred_samples: true,
             shared_stages: Vec::new(),
             own_stages: Vec::new(),
             planner_checked: false,
@@ -1158,6 +1159,7 @@ fn hidden_plan_with_table(
             column_work_bits: 0,
             shared_base_positions: assembled.shared.last().unwrap().positions as usize,
             own_base_positions: assembled.own.last().unwrap().positions as usize,
+            own_deferred_samples: true,
             shared_stages: assembled.shared.iter().map(stage_plan).collect(),
             own_stages: assembled.own.iter().map(stage_plan).collect(),
             // The trusted re-derivation's model does not carry the segment's
@@ -1601,6 +1603,7 @@ fn prefix_plan_from_config(
             column_work_bits: 0,
             shared_base_positions: assembled.shared.last().unwrap().positions as usize,
             own_base_positions: assembled.own.last().unwrap().positions as usize,
+            own_deferred_samples: true,
             shared_stages: assembled.shared.iter().map(stage_plan).collect(),
             own_stages: assembled.own.iter().map(stage_plan).collect(),
             planner_checked: true,

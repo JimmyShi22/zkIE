@@ -760,6 +760,7 @@ fn selected_gpt2_output_head_request_session() {
         column_work_bits: COLUMN_WORK_BITS,
         shared_base_positions: 2,
         own_base_positions: 259,
+        own_deferred_samples: true,
         shared_stages: vec![
             IoppStagePlan {
                 main: code,

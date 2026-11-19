@@ -273,6 +273,9 @@ struct BatOracle {
     shape: BatOracleShape,
     sampled: bool,
     sample_rows: Vec<BatRow>,
+    /// The answer count registered for streaming production, when the sample
+    /// rows are not materialized. Zero means the oracle has no deferred rows.
+    deferred_samples: u64,
     mask_open: bool,
     mask_used: BTreeSet<u64>,
 }
@@ -295,6 +298,9 @@ struct BatGroup {
 pub struct BatRunInput {
     pub layout: BatGroupLayout,
     pub rows: Arc<Vec<BatRow>>,
+    /// Deferred sample answers per oracle in member order: the streaming run
+    /// must emit exactly these rows. Empty when every sample row is in `rows`.
+    pub deferred: Vec<(u64, u64)>,
 }
 
 impl BatRunInput {
@@ -367,6 +373,7 @@ impl BatStatement {
             shape,
             sampled: false,
             sample_rows: Vec::new(),
+            deferred_samples: 0,
             mask_open: shape.mask_rows > 0,
             mask_used: BTreeSet::new(),
         });
@@ -429,6 +436,28 @@ impl BatStatement {
         }
         let entry = self.oracle_mut(oracle)?;
         entry.sample_rows = rows;
+        entry.sampled = true;
+        Ok(())
+    }
+
+    /// Register the sample answer count of one oracle without materializing
+    /// its rows. The streaming run then emits exactly this many SAMPLE rows for
+    /// the oracle, in the frozen class order, and `finish_run_streaming`
+    /// checks the count, the reference oracle and every row entry. The
+    /// materialized `finish_run` refuses a deferred run.
+    pub fn sample_deferred(&mut self, oracle: u64, rows: u64) -> Result<()> {
+        let shape = {
+            let entry = self.oracle(oracle)?;
+            if entry.sampled || entry.shape.answers == 0 {
+                return Err(Error::InvalidSessionState);
+            }
+            entry.shape
+        };
+        if rows != shape.answers as u64 {
+            return Err(Error::ShapeMismatch);
+        }
+        let entry = self.oracle_mut(oracle)?;
+        entry.deferred_samples = rows;
         entry.sampled = true;
         Ok(())
     }
@@ -583,8 +612,10 @@ impl BatStatement {
         };
         for oracle in &members {
             let entry = self.oracle(*oracle)?;
+            let answers = entry.shape.answers as usize;
             if entry.shape.answers > 0
-                && entry.sample_rows.len() != entry.shape.answers as usize
+                && entry.sample_rows.len() != answers
+                && entry.deferred_samples != answers as u64
             {
                 return Err(Error::ShapeMismatch);
             }
@@ -600,11 +631,19 @@ impl BatStatement {
         for oracle in &members {
             self.oracle_mut(*oracle)?.mask_open = false;
         }
+        let mut deferred = Vec::new();
+        for oracle in &members {
+            let entry = self.oracle(*oracle)?;
+            if entry.deferred_samples > 0 {
+                deferred.push((*oracle, entry.deferred_samples));
+            }
+        }
         let entry = self.group_mut(group)?;
         entry.in_run = true;
         Ok(BatRunInput {
             layout,
             rows: Arc::new(rows),
+            deferred,
         })
     }
 
@@ -936,6 +975,9 @@ impl BatSession {
         if pending.layout != input.layout || !Arc::ptr_eq(&pending.rows, &input.rows) {
             return Err(Error::StatementMismatch);
         }
+        if !input.deferred.is_empty() {
+            return Err(Error::InvalidSessionState);
+        }
         let prefix = self.chain.message().prefix(KIND_ALGEBRAIC, 0)?;
         if !self.chain.step(&prefix, 0)? {
             return Err(Error::InvalidProof);
@@ -967,6 +1009,18 @@ impl BatSession {
         }
         let x = self.chain.draw_e()?;
         self.last_x = Some(x);
+        // Deferred sample rows are emitted by the streaming closure after the
+        // plain rows, in the registered oracle order. Mixed materialized and
+        // deferred samples in one run are refused: the trailing combine order
+        // would differ from the emitted order.
+        let mut deferred: Vec<(u64, u64)> = input.deferred.clone();
+        let planned_deferred: u64 = deferred.iter().map(|(_, rows)| *rows).sum();
+        if input.rows.len() as u64 + planned_deferred != self.planned_rows {
+            return Err(Error::StatementMismatch);
+        }
+        if !deferred.is_empty() && !input.rows.is_empty() {
+            return Err(Error::InvalidSessionState);
+        }
         let mut out = BatGroupRow {
             group: input.layout.group,
             main: vec![Fp3::ZERO; input.layout.group_len(BatPart::Main)?],
@@ -977,10 +1031,45 @@ impl BatSession {
         let mut scale = Fp3::ONE;
         let mut chunk: Vec<(BatRow, Fp3)> = Vec::new();
         let mut chunk_symbols = 0usize;
+        let mut deferred_at = 0usize;
+        let mut samples_started = false;
         {
             let statement = &self.statement;
             let layout = &input.layout;
             let mut sink = |row: BatRow| -> Result<()> {
+                if row.kind == BatRowKind::Sample {
+                    let Some(entry) = deferred.get_mut(deferred_at) else {
+                        return Err(Error::StatementMismatch);
+                    };
+                    let oracle = entry.0;
+                    let foreign = row
+                        .terms
+                        .iter()
+                        .map(|term| term.oracle)
+                        .chain(row.units.iter().map(|unit| unit.oracle))
+                        .chain(row.runs.iter().map(|run| run.oracle))
+                        .chain(row.forms.iter().map(|form| form.oracle))
+                        .any(|referenced| referenced != oracle);
+                    if foreign {
+                        return Err(Error::StatementMismatch);
+                    }
+                    check_row_entries(&row, |referenced| {
+                        if referenced != oracle {
+                            return Err(Error::StatementMismatch);
+                        }
+                        Ok(statement.oracle(referenced)?.shape)
+                    })?;
+                    samples_started = true;
+                    entry.1 -= 1;
+                    if entry.1 == 0 {
+                        deferred_at += 1;
+                    }
+                } else if samples_started {
+                    // The deferred samples close the stream, matching the
+                    // frozen class order where they precede only the generator
+                    // rows of a materialized run.
+                    return Err(Error::StatementMismatch);
+                }
                 chunk_symbols += row_symbols(&row);
                 chunk.push((row, scale));
                 scale = scale.mul(&x);
@@ -999,6 +1088,9 @@ impl BatSession {
         for row in input.rows.iter() {
             combine_row_into(&self.statement, &input.layout, &mut out, row, scale)?;
             scale = scale.mul(&x);
+        }
+        if deferred_at != deferred.len() {
+            return Err(Error::StatementMismatch);
         }
         Ok(out)
     }
@@ -2478,5 +2570,113 @@ mod tests {
             });
             assert_eq!(serial, parallel, "threads {threads}");
         }
+    }
+
+    fn deferred_fixture() -> (BatStatement, u64, BatRow, BatRow, Vec<BatRow>) {
+        let mut st = BatStatement::new();
+        st.add_oracle(shape(0, 2, 0, 2)).unwrap();
+        st.sample_deferred(0, 2).unwrap();
+        let group = st.new_group(code(), mask_code()).unwrap();
+        st.join(group, 0, false).unwrap();
+        let mut plain = BatRow::new(BatRowKind::Plain);
+        plain.target = Fp3::from_u64(3);
+        plain.add_term(0, BatPart::Main, one_at(16, 0, 5));
+        let mut generator = BatRow::new(BatRowKind::Generator);
+        generator.target = Fp3::from_u64(4);
+        let mut first = BatRow::new(BatRowKind::Sample);
+        first.target = Fp3::from_u64(11);
+        first.add_term(0, BatPart::Main, one_at(16, 1, 7));
+        let mut second = BatRow::new(BatRowKind::Sample);
+        second.target = Fp3::from_u64(12);
+        second.add_term(0, BatPart::Main, one_at(16, 5, 9));
+        (st, group, plain, generator, vec![first, second])
+    }
+
+    #[test]
+    fn sample_deferred_refuses_a_wrong_count() {
+        let mut st = BatStatement::new();
+        st.add_oracle(shape(0, 2, 0, 2)).unwrap();
+        assert!(st.sample_deferred(0, 1).is_err());
+        assert!(st.sample_deferred(0, 2).is_ok());
+        assert!(st.sample_deferred(0, 2).is_err());
+    }
+
+    #[test]
+    fn deferred_samples_combine_in_the_emitted_order() {
+        let (st, group, plain, generator, samples) = deferred_fixture();
+        let mut session = BatSession::new(st, chain(), 2).unwrap();
+        let input = session.begin_run(group).unwrap();
+        assert!(input.rows.is_empty());
+        assert_eq!(input.deferred, vec![(0, 2)]);
+        let layout = input.layout.clone();
+        let mut rows = vec![plain.clone(), generator.clone()];
+        rows.extend(samples.iter().cloned());
+        let streamed = session
+            .finish_run_streaming(input, |sink| {
+                sink(plain)?;
+                sink(generator)?;
+                for row in &samples {
+                    sink(row.clone())?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        let x = session.last_x().unwrap();
+        let expected = combine(session.statement(), &layout, &rows, x).unwrap();
+        assert_eq!(streamed, expected);
+    }
+
+    #[test]
+    fn deferred_samples_refuse_a_short_stream() {
+        let (st, group, plain, generator, samples) = deferred_fixture();
+        let mut session = BatSession::new(st, chain(), 2).unwrap();
+        let input = session.begin_run(group).unwrap();
+        let result = session.finish_run_streaming(input, |sink| {
+            sink(plain)?;
+            sink(generator)?;
+            sink(samples[0].clone())?;
+            Ok(())
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deferred_samples_close_the_stream() {
+        let (st, group, plain, _generator, samples) = deferred_fixture();
+        let mut session = BatSession::new(st, chain(), 2).unwrap();
+        let input = session.begin_run(group).unwrap();
+        let result = session.finish_run_streaming(input, |sink| {
+            sink(samples[0].clone())?;
+            sink(samples[1].clone())?;
+            sink(plain)?;
+            Ok(())
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deferred_samples_refuse_a_foreign_reference() {
+        let (st, group, _plain, _generator, samples) = deferred_fixture();
+        let mut session = BatSession::new(st, chain(), 2).unwrap();
+        let input = session.begin_run(group).unwrap();
+        let mut foreign = samples[0].clone();
+        foreign.add_term(1, BatPart::Main, one_at(16, 0, 1));
+        let result = session.finish_run_streaming(input, |sink| {
+            sink(foreign)?;
+            sink(samples[1].clone())?;
+            Ok(())
+        });
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deferred_samples_require_the_streaming_run() {
+        let (st, group, _plain, _generator, _samples) = deferred_fixture();
+        let mut session = BatSession::new(st, chain(), 2).unwrap();
+        let input = session.begin_run(group).unwrap();
+        assert!(matches!(
+            session.finish_run(input),
+            Err(Error::InvalidSessionState)
+        ));
     }
 }

@@ -295,7 +295,7 @@ use crate::proof::proximity_iopp::{
 /// difference row that replaces the per-position equality rows and, when the
 /// trusted plan selects it, the presence-flagged output-closure block (the
 /// slack, packed-bit, product and mask messages and their samples).
-const HIDDEN_SEND_SCHEMA_VERSION: u64 = 4;
+const HIDDEN_SEND_SCHEMA_VERSION: u64 = 5;
 
 /// The plan tag appended to the send statement when the Dot activation is the
 /// norm hidden-output object. The tag is absent on the independently
@@ -8754,6 +8754,11 @@ pub struct HiddenProximityPlan {
     pub column_work_bits: u8,
     pub shared_base_positions: usize,
     pub own_base_positions: usize,
+    /// Whether the own proximity registers its sample rows deferred and emits
+    /// them during the streamed BAT run instead of materializing them. The
+    /// verifier's own sample claims are empty in this mode: it is the plan
+    /// fact, not a silent discard.
+    pub own_deferred_samples: bool,
     /// The trusted multi-stage IOPP stage lists for the two groups. Empty
     /// keeps the current single-stage path.
     pub shared_stages: Vec<IoppStagePlan>,
@@ -9698,6 +9703,7 @@ impl HiddenLinPlan {
         writer.put_u64(self.proximity.column_work_bits as u64);
         writer.put_u64(self.proximity.shared_base_positions as u64);
         writer.put_u64(self.proximity.own_base_positions as u64);
+        writer.put_u64(self.proximity.own_deferred_samples as u64);
         match &self.output_relation {
             Some(digest) => {
                 writer.put_u64(1);
@@ -9816,6 +9822,10 @@ pub struct HiddenLinOutcome {
     pub group: SendGroup,
     pub eval_rows: Vec<EvalSampleRow>,
     pub shared_claims: Vec<GuRelationRow>,
+    /// The own sample claims of the materialized mode. The own group runs the
+    /// deferred-sample mode whenever the plan sets `own_deferred_samples` (the
+    /// production plans do): the streaming BAT run consumes the rows and this
+    /// vector is empty by plan fact, not by a silent discard.
     pub own_claims: Vec<GuRelationRow>,
     pub psi: Vec<Vec<Fp3>>,
     pub shared_point: Vec<Fp3>,
@@ -10158,6 +10168,39 @@ fn adapt_sample_row(
     }
     out.target = row.target;
     Ok(out)
+}
+
+/// Registers the sample rows of one group from either source. The materialized
+/// path adapts every row against its member; the deferred path registers only
+/// the answer count and lets the streaming run supply the rows.
+fn register_sample_rows(
+    statement: &mut BatStatement,
+    members: &[ProximityMember],
+    samples: &SampleRowsSource<'_>,
+) -> Result<()> {
+    match samples {
+        SampleRowsSource::Materialized(sample_rows) => {
+            if sample_rows.len() != members.len() {
+                return Err(Error::ShapeMismatch);
+            }
+            for (index, member) in members.iter().enumerate() {
+                let rows = sample_rows[index]
+                    .iter()
+                    .map(|row| adapt_sample_row(row, member))
+                    .collect::<Result<Vec<_>>>()?;
+                if rows.len() != member.answers as usize {
+                    return Err(Error::ShapeMismatch);
+                }
+                statement.sample(member.bat_oracle, rows)?;
+            }
+        }
+        SampleRowsSource::Deferred => {
+            for member in members {
+                statement.sample_deferred(member.bat_oracle, member.answers as u64)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Builds the group main table in the FOLD layout order from the committed
@@ -13871,6 +13914,15 @@ pub(crate) enum PlainRows<'a> {
     ),
 }
 
+/// Source of the registered sample rows of one proximity group. Materialized
+/// rows are adapted and checked before the run; deferred rows are registered
+/// by count only and the streaming closure emits them in member order, so at
+/// most one member's rows are alive at a time.
+pub(crate) enum SampleRowsSource<'a> {
+    Materialized(&'a [Vec<GuRelationRow>]),
+    Deferred,
+}
+
 /// Materialized-row entry of the proximity prover.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn proximity_prove(
@@ -13891,7 +13943,7 @@ pub(crate) fn proximity_prove(
         fold,
         members,
         trees,
-        sample_rows,
+        SampleRowsSource::Materialized(sample_rows),
         PlainRows::Materialized(plain_rows),
         fresh_id,
         mask_tree,
@@ -13924,7 +13976,40 @@ pub(crate) fn proximity_prove_streaming(
         fold,
         members,
         trees,
-        sample_rows,
+        SampleRowsSource::Materialized(sample_rows),
+        PlainRows::Streamed(run),
+        fresh_id,
+        mask_tree,
+        seed,
+        base_positions,
+        iopp,
+    )
+}
+
+/// Deferred-sample streaming entry of the proximity prover: the run closure
+/// emits each member's sample rows after the plain rows, in member order.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn proximity_prove_streaming_deferred(
+    chain: Chain,
+    fold: FoldShape,
+    members: Vec<ProximityMember>,
+    trees: ProximityTreeSource<'_>,
+    run: &mut dyn FnMut(
+        &[ProximityMember],
+        &mut dyn FnMut(BatRow) -> Result<()>,
+    ) -> Result<()>,
+    fresh_id: u64,
+    mask_tree: MaskTreePlan,
+    seed: Digest,
+    base_positions: usize,
+    iopp: Option<&ProximityIoppPlan>,
+) -> Result<ProximityProof> {
+    proximity_prove_rows(
+        chain,
+        fold,
+        members,
+        trees,
+        SampleRowsSource::Deferred,
         PlainRows::Streamed(run),
         fresh_id,
         mask_tree,
@@ -13939,7 +14024,7 @@ fn proximity_prove_rows(
     fold: FoldShape,
     members: Vec<ProximityMember>,
     trees: ProximityTreeSource<'_>,
-    sample_rows: &[Vec<GuRelationRow>],
+    samples: SampleRowsSource<'_>,
     plain: PlainRows<'_>,
     fresh_id: u64,
     mask_tree: MaskTreePlan,
@@ -13948,7 +14033,7 @@ fn proximity_prove_rows(
     iopp: Option<&ProximityIoppPlan>,
 ) -> Result<ProximityProof> {
     let _profile_proximity = zkie_engine::profile::Scope::new("prox.proximity_prove");
-    if members.is_empty() || sample_rows.len() != members.len() {
+    if members.is_empty() {
         return Err(Error::ShapeMismatch);
     }
     let omega_opening = trees.omega_opening();
@@ -13958,17 +14043,7 @@ fn proximity_prove_rows(
         statement.add_oracle(member_bat_shape(member))
             ?;
     }
-    for (index, member) in members.iter().enumerate() {
-        let rows = sample_rows[index]
-            .iter()
-            .map(|row| adapt_sample_row(row, member))
-            .collect::<Result<Vec<_>>>()?;
-        if rows.len() != member.answers as usize {
-            return Err(Error::ShapeMismatch);
-        }
-        statement.sample(member.bat_oracle, rows)
-            ?;
-    }
+    register_sample_rows(&mut statement, &members, &samples)?;
     let group = statement.new_group(fold.code, fold.mask_code)
         ?;
     for member in &members {
@@ -14315,7 +14390,7 @@ pub(crate) fn proximity_verify(
         chain,
         fold,
         members,
-        sample_rows,
+        SampleRowsSource::Materialized(sample_rows),
         PlainRows::Materialized(plain_rows),
         messages,
         fresh_id,
@@ -14346,7 +14421,38 @@ pub(crate) fn proximity_verify_streaming(
         chain,
         fold,
         members,
-        sample_rows,
+        SampleRowsSource::Materialized(sample_rows),
+        PlainRows::Streamed(run),
+        messages,
+        fresh_id,
+        mask_tree,
+        base_positions,
+        iopp,
+    )
+}
+
+/// Deferred-sample streaming entry of the proximity verifier; the run closure
+/// emits the sample rows exactly as the prover's does.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn proximity_verify_streaming_deferred(
+    chain: Chain,
+    fold: FoldShape,
+    members: &[ProximityMember],
+    run: &mut dyn FnMut(
+        &[ProximityMember],
+        &mut dyn FnMut(BatRow) -> Result<()>,
+    ) -> Result<()>,
+    messages: &ProximityMessages,
+    fresh_id: u64,
+    mask_tree: MaskTreePlan,
+    base_positions: usize,
+    iopp: Option<&ProximityIoppPlan>,
+) -> Result<ProximityVerification> {
+    proximity_verify_rows(
+        chain,
+        fold,
+        members,
+        SampleRowsSource::Deferred,
         PlainRows::Streamed(run),
         messages,
         fresh_id,
@@ -14360,7 +14466,7 @@ fn proximity_verify_rows(
     chain: Chain,
     fold: FoldShape,
     members: &[ProximityMember],
-    sample_rows: &[Vec<GuRelationRow>],
+    samples: SampleRowsSource<'_>,
     plain: PlainRows<'_>,
     messages: &ProximityMessages,
     fresh_id: u64,
@@ -14369,7 +14475,7 @@ fn proximity_verify_rows(
     iopp: Option<&ProximityIoppPlan>,
 ) -> Result<ProximityVerification> {
     let _profile = zkie_engine::profile::Scope::new("verify.proximity");
-    if members.is_empty() || sample_rows.len() != members.len() {
+    if members.is_empty() {
         return Err(Error::ShapeMismatch);
     }
     let _profile_statement = zkie_engine::profile::Scope::light("verify.proximity.statement");
@@ -14377,16 +14483,7 @@ fn proximity_verify_rows(
     for member in members {
         statement.add_oracle(member_bat_shape(member))?;
     }
-    for (index, member) in members.iter().enumerate() {
-        let rows = sample_rows[index]
-            .iter()
-            .map(|row| adapt_sample_row(row, member))
-            .collect::<Result<Vec<_>>>()?;
-        if rows.len() != member.answers as usize {
-            return Err(Error::ShapeMismatch);
-        }
-        statement.sample(member.bat_oracle, rows)?;
-    }
+    register_sample_rows(&mut statement, members, &samples)?;
     let group = statement.new_group(fold.code, fold.mask_code)?;
     for member in members {
         statement.join(group, member.bat_oracle, false)?;
@@ -18535,84 +18632,111 @@ fn own_members(
     Ok((members, order))
 }
 
-fn own_sample_rows(
-    plan: &HiddenLinPlan,
-    members: &[ProximityMember],
-    first: &HiddenSendMessages,
-    shared: &HiddenSharedMessages,
-) -> Result<Vec<Vec<GuRelationRow>>> {
-    let shape = plan.send.w.oracle_shape();
-    zkie_engine::scheduling::try_map_bounded(
-        members,
-        zkie_engine::scheduling::DEFAULT_UNITS_IN_FLIGHT,
-        |member| -> Result<Vec<GuRelationRow>> {
-        if let (Some(rw), Some(message)) = (&plan.send.request_w, &first.request_w) {
-            if member.source_oracle == rw.oracle {
-                if message.sample.seed.len() != message.sample.answers.len()
-                    || message.sample.seed.len() != member.answers as usize
-                {
-                    return Err(Error::ShapeMismatch);
-                }
-                let mut rows = Vec::with_capacity(message.sample.seed.len());
-                for (seed, answer) in message.sample.seed.iter().zip(&message.sample.answers) {
-                    rows.push(oracle_sample_row(
-                        rw.oracle,
-                        rw.group,
-                        &rw.shape.oracle_shape(),
-                        std::slice::from_ref(seed),
-                        0,
-                        *answer,
+fn member_sample_rows(
+plan: &HiddenLinPlan,
+member: &ProximityMember,
+first: &HiddenSendMessages,
+shared: &HiddenSharedMessages,
+) -> Result<Vec<GuRelationRow>> {
+let shape = plan.send.w.oracle_shape();
+    if let (Some(rw), Some(message)) = (&plan.send.request_w, &first.request_w) {
+        if member.source_oracle == rw.oracle {
+            if message.sample.seed.len() != message.sample.answers.len()
+                || message.sample.seed.len() != member.answers as usize
+            {
+                return Err(Error::ShapeMismatch);
+            }
+            let mut rows = Vec::with_capacity(message.sample.seed.len());
+            for (seed, answer) in message.sample.seed.iter().zip(&message.sample.answers) {
+                rows.push(oracle_sample_row(
+                    rw.oracle,
+                    rw.group,
+                    &rw.shape.oracle_shape(),
+                    std::slice::from_ref(seed),
+                    0,
+                    *answer,
+                )?);
+            }
+            return Ok(rows);
+        }
+    }
+    if let Some(norm_plan) = &plan.norm {
+        if let Some(params_plan) = &norm_plan.params {
+            let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
+            let message_params = norm_first.params.as_ref().ok_or(Error::ShapeMismatch)?;
+            let claims = [
+                (
+                    params_plan.gain_claim.as_ref(),
+                    Some(&message_params.gain),
+                ),
+                (
+                    params_plan.bias_claim.as_ref(),
+                    message_params.bias.as_ref(),
+                ),
+            ];
+            for (claim, message) in claims {
+                let (claim, message) = match (claim, message) {
+                    (Some(claim), Some(message)) => (claim, message),
+                    _ => continue,
+                };
+                if member.source_oracle == claim.gu.oracle {
+                    let registry = norm_param_registry(claim, message)?;
+                    return Ok(sample_rows_of(
+                        &claim.gu,
+                        &registry,
+                        &message.seeds,
+                        &message.answers,
                     )?);
                 }
-                return Ok(rows);
             }
         }
-        if let Some(norm_plan) = &plan.norm {
-            if let Some(params_plan) = &norm_plan.params {
-                let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
-                let message_params = norm_first.params.as_ref().ok_or(Error::ShapeMismatch)?;
-                let claims = [
-                    (
-                        params_plan.gain_claim.as_ref(),
-                        Some(&message_params.gain),
-                    ),
-                    (
-                        params_plan.bias_claim.as_ref(),
-                        message_params.bias.as_ref(),
-                    ),
-                ];
-                for (claim, message) in claims {
-                    let (claim, message) = match (claim, message) {
-                        (Some(claim), Some(message)) => (claim, message),
-                        _ => continue,
-                    };
-                    if member.source_oracle == claim.gu.oracle {
-                        let registry = norm_param_registry(claim, message)?;
-                        return Ok(sample_rows_of(
-                            &claim.gu,
-                            &registry,
-                            &message.seeds,
-                            &message.answers,
-                        )?);
-                    }
-                }
+    }
+    if let Some(norm_plan) = &plan.norm {
+        let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
+        let groups = norm_group_plans(norm_plan);
+        let mut messages = vec![
+            &norm_first.x,
+            &norm_first.sum,
+            &norm_first.squares,
+            &norm_first.mean,
+            &norm_first.variance,
+        ];
+        if let Some(round) = &norm_first.round {
+            messages.push(round);
+        }
+        let positions = plan.send.positions() as u64;
+        for (group_plan, message) in groups.iter().zip(messages.iter()) {
+            let base = group_plan.oracle_base;
+            if member.source_oracle >= base
+                && member.source_oracle < base.saturating_add(positions)
+            {
+                let position = (member.source_oracle - base) as usize;
+                let target = *message
+                    .sample
+                    .answers
+                    .get(position)
+                    .ok_or(Error::ShapeMismatch)?;
+                return Ok(vec![oracle_sample_row(
+                    member.source_oracle,
+                    plan.send.group,
+                    &group_plan.shape.oracle_shape(),
+                    &message.sample.seed,
+                    0,
+                    target,
+                )?]);
             }
         }
-        if let Some(norm_plan) = &plan.norm {
-            let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
-            let groups = norm_group_plans(norm_plan);
-            let mut messages = vec![
-                &norm_first.x,
-                &norm_first.sum,
-                &norm_first.squares,
-                &norm_first.mean,
-                &norm_first.variance,
+        if let (Some(output_message), Some(output_plan)) =
+            (&norm_first.output, &norm_plan.output)
+        {
+            let outputs = [
+                (&output_message.broadcast, &output_plan.broadcast),
+                (&output_message.product, &output_plan.product),
+                (&output_message.image, &output_plan.image),
+                (&output_message.out, &output_plan.out),
             ];
-            if let Some(round) = &norm_first.round {
-                messages.push(round);
-            }
             let positions = plan.send.positions() as u64;
-            for (group_plan, message) in groups.iter().zip(messages.iter()) {
+            for (message, group_plan) in outputs {
                 let base = group_plan.oracle_base;
                 if member.source_oracle >= base
                     && member.source_oracle < base.saturating_add(positions)
@@ -18633,311 +18757,293 @@ fn own_sample_rows(
                     )?]);
                 }
             }
-            if let (Some(output_message), Some(output_plan)) =
-                (&norm_first.output, &norm_plan.output)
-            {
-                let outputs = [
-                    (&output_message.broadcast, &output_plan.broadcast),
-                    (&output_message.product, &output_plan.product),
-                    (&output_message.image, &output_plan.image),
-                    (&output_message.out, &output_plan.out),
-                ];
+        }
+        if let (Some(tail_message), Some(output_plan)) =
+            (&norm_first.tail, &norm_plan.output)
+        {
+            if let Some(tail_plan) = &output_plan.tail {
+                let base = tail_plan.group.oracle_base;
                 let positions = plan.send.positions() as u64;
-                for (message, group_plan) in outputs {
-                    let base = group_plan.oracle_base;
-                    if member.source_oracle >= base
-                        && member.source_oracle < base.saturating_add(positions)
-                    {
-                        let position = (member.source_oracle - base) as usize;
-                        let target = *message
-                            .sample
-                            .answers
-                            .get(position)
-                            .ok_or(Error::ShapeMismatch)?;
-                        return Ok(vec![oracle_sample_row(
-                            member.source_oracle,
-                            plan.send.group,
-                            &group_plan.shape.oracle_shape(),
-                            &message.sample.seed,
-                            0,
-                            target,
-                        )?]);
-                    }
-                }
-            }
-            if let (Some(tail_message), Some(output_plan)) =
-                (&norm_first.tail, &norm_plan.output)
-            {
-                if let Some(tail_plan) = &output_plan.tail {
-                    let base = tail_plan.group.oracle_base;
-                    let positions = plan.send.positions() as u64;
-                    if member.source_oracle >= base
-                        && member.source_oracle < base.saturating_add(positions)
-                    {
-                        let position = (member.source_oracle - base) as usize;
-                        let target = *tail_message
-                            .group
-                            .sample
-                            .answers
-                            .get(position)
-                            .ok_or(Error::ShapeMismatch)?;
-                        return Ok(vec![oracle_sample_row(
-                            member.source_oracle,
-                            plan.send.group,
-                            &tail_plan.group.shape.oracle_shape(),
-                            &tail_message.group.sample.seed,
-                            0,
-                            target,
-                        )?]);
-                    }
-                }
-            }
-            if let Some(mask_plan) = &norm_plan.mask {
-                if member.source_oracle == mask_plan.oracle {
-                    let message = norm_first.mask.as_ref().ok_or(Error::ShapeMismatch)?;
-                    let target = *message
+                if member.source_oracle >= base
+                    && member.source_oracle < base.saturating_add(positions)
+                {
+                    let position = (member.source_oracle - base) as usize;
+                    let target = *tail_message
+                        .group
                         .sample
                         .answers
-                        .first()
-                        .ok_or(Error::ShapeMismatch)?;
-                    let mut row = norm_mask_sample_row(mask_plan, message, target)?;
-                    row.group = plan.send.group;
-                    return Ok(vec![row]);
-                }
-            }
-            if let Some(lookup_plan) = &norm_plan.lookup {
-                let lookup_first = norm_first.lookup.as_ref().ok_or(Error::ShapeMismatch)?;
-                let commit = &lookup_plan.commit;
-                if member.source_oracle == commit.bits_oracle {
-                    let target = *lookup_first
-                        .bits
-                        .sample
-                        .answers
-                        .first()
+                        .get(position)
                         .ok_or(Error::ShapeMismatch)?;
                     return Ok(vec![oracle_sample_row(
                         member.source_oracle,
-                        lookup_first.bits.message.group.group,
-                        &commit.bits_shape.oracle_shape(),
-                        &lookup_first.bits.sample.seed,
+                        plan.send.group,
+                        &tail_plan.group.shape.oracle_shape(),
+                        &tail_message.group.sample.seed,
                         0,
                         target,
                     )?]);
-                }
-                if member.source_oracle == commit.mask_oracle {
-                    let target = *lookup_first
-                        .mask
-                        .sample
-                        .answers
-                        .first()
-                        .ok_or(Error::ShapeMismatch)?;
-                    let row =
-                        lookup_mask_sample_row(commit, &lookup_first.mask, target)?;
-                    return Ok(vec![row]);
-                }
-            }
-            // frozen-table lookup: own sample rows
-            if let Some(lookup_plan) = &norm_plan.rstd {
-                let lookup_first = norm_first.rstd.as_ref().ok_or(Error::ShapeMismatch)?;
-                let commit = &lookup_plan.commit;
-                if member.source_oracle == commit.bits_oracle {
-                    let target = *lookup_first
-                        .bits
-                        .sample
-                        .answers
-                        .first()
-                        .ok_or(Error::ShapeMismatch)?;
-                    return Ok(vec![oracle_sample_row(
-                        member.source_oracle,
-                        lookup_first.bits.message.group.group,
-                        &commit.bits_shape.oracle_shape(),
-                        &lookup_first.bits.sample.seed,
-                        0,
-                        target,
-                    )?]);
-                }
-                if member.source_oracle == commit.mask_oracle {
-                    let target = *lookup_first
-                        .mask
-                        .sample
-                        .answers
-                        .first()
-                        .ok_or(Error::ShapeMismatch)?;
-                    let row =
-                        lookup_mask_sample_row(commit, &lookup_first.mask, target)?;
-                    return Ok(vec![row]);
                 }
             }
         }
-        if let (Some(closure_plan), Some(closure_first)) = (&plan.closure, &first.closure) {
-            let positions = plan.send.positions() as u64;
-            let slack_base = closure_plan.slack_oracle_base;
-            let bits_base = closure_plan.bits_oracle_base;
-            if member.source_oracle >= slack_base
-                && member.source_oracle < slack_base.saturating_add(positions)
-            {
-                let position = (member.source_oracle - slack_base) as usize;
-                let target = *closure_first
-                    .slack_sample
+        if let Some(mask_plan) = &norm_plan.mask {
+            if member.source_oracle == mask_plan.oracle {
+                let message = norm_first.mask.as_ref().ok_or(Error::ShapeMismatch)?;
+                let target = *message
+                    .sample
                     .answers
-                    .get(position)
+                    .first()
+                    .ok_or(Error::ShapeMismatch)?;
+                let mut row = norm_mask_sample_row(mask_plan, message, target)?;
+                row.group = plan.send.group;
+                return Ok(vec![row]);
+            }
+        }
+        if let Some(lookup_plan) = &norm_plan.lookup {
+            let lookup_first = norm_first.lookup.as_ref().ok_or(Error::ShapeMismatch)?;
+            let commit = &lookup_plan.commit;
+            if member.source_oracle == commit.bits_oracle {
+                let target = *lookup_first
+                    .bits
+                    .sample
+                    .answers
+                    .first()
                     .ok_or(Error::ShapeMismatch)?;
                 return Ok(vec![oracle_sample_row(
                     member.source_oracle,
-                    plan.send.group,
-                    &closure_plan.slack.oracle_shape(),
-                    &closure_first.slack_sample.seed,
+                    lookup_first.bits.message.group.group,
+                    &commit.bits_shape.oracle_shape(),
+                    &lookup_first.bits.sample.seed,
                     0,
                     target,
                 )?]);
             }
-            if member.source_oracle >= bits_base
-                && member.source_oracle < bits_base.saturating_add(positions)
-            {
-                let position = (member.source_oracle - bits_base) as usize;
-                let target = *closure_first
-                    .bits_sample
-                    .answers
-                    .get(position)
-                    .ok_or(Error::ShapeMismatch)?;
-                return Ok(vec![oracle_sample_row(
-                    member.source_oracle,
-                    plan.send.group,
-                    &closure_plan.bits.oracle_shape(),
-                    &closure_first.bits_sample.seed,
-                    0,
-                    target,
-                )?]);
-            }
-            let map_base = closure_plan.map_oracle_base;
-            if member.source_oracle >= map_base
-                && member.source_oracle < map_base.saturating_add(positions)
-            {
-                let position = (member.source_oracle - map_base) as usize;
-                let target = *closure_first
-                    .map_sample
-                    .answers
-                    .get(position)
-                    .ok_or(Error::ShapeMismatch)?;
-                return Ok(vec![oracle_sample_row(
-                    member.source_oracle,
-                    plan.send.group,
-                    &closure_plan.map.oracle_shape(),
-                    &closure_first.map_sample.seed,
-                    0,
-                    target,
-                )?]);
-            }
-            if member.source_oracle == closure_plan.mask.oracle {
-                let target = *closure_first
+            if member.source_oracle == commit.mask_oracle {
+                let target = *lookup_first
                     .mask
                     .sample
                     .answers
                     .first()
                     .ok_or(Error::ShapeMismatch)?;
-                return Ok(vec![closure_mask_sample_row(
-                    &closure_plan.mask,
-                    &closure_first.mask,
-                    target,
-                )?]);
+                let row =
+                    lookup_mask_sample_row(commit, &lookup_first.mask, target)?;
+                return Ok(vec![row]);
             }
         }
-        if let (Some(source_plan), Some(message)) = (&plan.send.source_data, &first.source_data) {
-            if member.source_oracle == source_plan.oracle {
-                if message.sample.seed.len() != message.sample.answers.len()
-                    || message.sample.seed.len() != member.answers as usize
-                {
-                    return Err(Error::ShapeMismatch);
-                }
-                let mut rows = Vec::with_capacity(message.sample.seed.len());
-                for (seed, answer) in message.sample.seed.iter().zip(&message.sample.answers) {
-                    rows.push(oracle_sample_row(
-                        source_plan.oracle,
-                        source_plan.group,
-                        &source_plan.shape.oracle_shape(),
-                        std::slice::from_ref(seed),
-                        0,
-                        *answer,
-                    )?);
-                }
-                return Ok(rows);
-            }
-        }
-        if let Some(chain_plan) = &plan.send.chain_mask {
-            if member.source_oracle == chain_plan.oracle {
-                let message = first.chain_mask.as_ref().ok_or(Error::ShapeMismatch)?;
-                let target = *message
-                    .sample
-                    .answers
-                    .first()
-                    .ok_or(Error::ShapeMismatch)?;
-                return Ok(vec![chain_mask_sample_row(chain_plan, message, target)?]);
-            }
-        }
-        if let Some(index) = &plan.send.index_mask {
-            if member.source_oracle == index.oracle {
-                let message = first.index_mask.as_ref().ok_or(Error::ShapeMismatch)?;
-                let target = *message
-                    .sample
-                    .answers
-                    .first()
-                    .ok_or(Error::ShapeMismatch)?;
-                return Ok(vec![index_mask_sample_row(index, message, target)?]);
-            }
-        }
-        if let Some(dot) = plan.send.dot.as_ref().filter(|_| !plan.send.activation_source.is_norm_hd()) {
-            if member.source_oracle == dot.oracle {
-                let message = first.dot.as_ref().ok_or(Error::ShapeMismatch)?;
-                let target = *message
+        // frozen-table lookup: own sample rows
+        if let Some(lookup_plan) = &norm_plan.rstd {
+            let lookup_first = norm_first.rstd.as_ref().ok_or(Error::ShapeMismatch)?;
+            let commit = &lookup_plan.commit;
+            if member.source_oracle == commit.bits_oracle {
+                let target = *lookup_first
+                    .bits
                     .sample
                     .answers
                     .first()
                     .ok_or(Error::ShapeMismatch)?;
                 return Ok(vec![oracle_sample_row(
-                    dot.oracle,
-                    dot.group,
-                    &dot.oracle_shape(),
-                    &message.sample.seed,
+                    member.source_oracle,
+                    lookup_first.bits.message.group.group,
+                    &commit.bits_shape.oracle_shape(),
+                    &lookup_first.bits.sample.seed,
                     0,
                     target,
                 )?]);
             }
+            if member.source_oracle == commit.mask_oracle {
+                let target = *lookup_first
+                    .mask
+                    .sample
+                    .answers
+                    .first()
+                    .ok_or(Error::ShapeMismatch)?;
+                let row =
+                    lookup_mask_sample_row(commit, &lookup_first.mask, target)?;
+                return Ok(vec![row]);
+            }
         }
-        if member.source_oracle == plan.proximity.omega.oracle {
-            let mut list = Vec::with_capacity(shared.omega_answers.len());
-            for (answer, target) in shared.omega_answers.iter().enumerate() {
-                list.push(oracle_sample_row(
-                    plan.proximity.omega.oracle,
-                    plan.proximity.omega.group,
-                    &plan.proximity.omega.u,
-                    &shared.omega_seeds,
-                    answer as u32,
-                    *target,
-                )?);
-            }
-            return Ok(list);
-        } else {
-            let position = (member.source_oracle - plan.send.oracle_base) as usize;
-            if position >= plan.send.positions() as usize {
-                return Err(Error::StatementMismatch);
-            }
-            let index = position * plan.send.w.answers as usize;
-            let target = *first
-                .samples
+    }
+    if let (Some(closure_plan), Some(closure_first)) = (&plan.closure, &first.closure) {
+        let positions = plan.send.positions() as u64;
+        let slack_base = closure_plan.slack_oracle_base;
+        let bits_base = closure_plan.bits_oracle_base;
+        if member.source_oracle >= slack_base
+            && member.source_oracle < slack_base.saturating_add(positions)
+        {
+            let position = (member.source_oracle - slack_base) as usize;
+            let target = *closure_first
+                .slack_sample
                 .answers
-                .get(index)
+                .get(position)
                 .ok_or(Error::ShapeMismatch)?;
             return Ok(vec![oracle_sample_row(
                 member.source_oracle,
                 plan.send.group,
-                &shape,
-                &first.samples.seed,
+                &closure_plan.slack.oracle_shape(),
+                &closure_first.slack_sample.seed,
                 0,
                 target,
             )?]);
         }
-        },
-    )
+        if member.source_oracle >= bits_base
+            && member.source_oracle < bits_base.saturating_add(positions)
+        {
+            let position = (member.source_oracle - bits_base) as usize;
+            let target = *closure_first
+                .bits_sample
+                .answers
+                .get(position)
+                .ok_or(Error::ShapeMismatch)?;
+            return Ok(vec![oracle_sample_row(
+                member.source_oracle,
+                plan.send.group,
+                &closure_plan.bits.oracle_shape(),
+                &closure_first.bits_sample.seed,
+                0,
+                target,
+            )?]);
+        }
+        let map_base = closure_plan.map_oracle_base;
+        if member.source_oracle >= map_base
+            && member.source_oracle < map_base.saturating_add(positions)
+        {
+            let position = (member.source_oracle - map_base) as usize;
+            let target = *closure_first
+                .map_sample
+                .answers
+                .get(position)
+                .ok_or(Error::ShapeMismatch)?;
+            return Ok(vec![oracle_sample_row(
+                member.source_oracle,
+                plan.send.group,
+                &closure_plan.map.oracle_shape(),
+                &closure_first.map_sample.seed,
+                0,
+                target,
+            )?]);
+        }
+        if member.source_oracle == closure_plan.mask.oracle {
+            let target = *closure_first
+                .mask
+                .sample
+                .answers
+                .first()
+                .ok_or(Error::ShapeMismatch)?;
+            return Ok(vec![closure_mask_sample_row(
+                &closure_plan.mask,
+                &closure_first.mask,
+                target,
+            )?]);
+        }
+    }
+    if let (Some(source_plan), Some(message)) = (&plan.send.source_data, &first.source_data) {
+        if member.source_oracle == source_plan.oracle {
+            if message.sample.seed.len() != message.sample.answers.len()
+                || message.sample.seed.len() != member.answers as usize
+            {
+                return Err(Error::ShapeMismatch);
+            }
+            let mut rows = Vec::with_capacity(message.sample.seed.len());
+            for (seed, answer) in message.sample.seed.iter().zip(&message.sample.answers) {
+                rows.push(oracle_sample_row(
+                    source_plan.oracle,
+                    source_plan.group,
+                    &source_plan.shape.oracle_shape(),
+                    std::slice::from_ref(seed),
+                    0,
+                    *answer,
+                )?);
+            }
+            return Ok(rows);
+        }
+    }
+    if let Some(chain_plan) = &plan.send.chain_mask {
+        if member.source_oracle == chain_plan.oracle {
+            let message = first.chain_mask.as_ref().ok_or(Error::ShapeMismatch)?;
+            let target = *message
+                .sample
+                .answers
+                .first()
+                .ok_or(Error::ShapeMismatch)?;
+            return Ok(vec![chain_mask_sample_row(chain_plan, message, target)?]);
+        }
+    }
+    if let Some(index) = &plan.send.index_mask {
+        if member.source_oracle == index.oracle {
+            let message = first.index_mask.as_ref().ok_or(Error::ShapeMismatch)?;
+            let target = *message
+                .sample
+                .answers
+                .first()
+                .ok_or(Error::ShapeMismatch)?;
+            return Ok(vec![index_mask_sample_row(index, message, target)?]);
+        }
+    }
+    if let Some(dot) = plan.send.dot.as_ref().filter(|_| !plan.send.activation_source.is_norm_hd()) {
+        if member.source_oracle == dot.oracle {
+            let message = first.dot.as_ref().ok_or(Error::ShapeMismatch)?;
+            let target = *message
+                .sample
+                .answers
+                .first()
+                .ok_or(Error::ShapeMismatch)?;
+            return Ok(vec![oracle_sample_row(
+                dot.oracle,
+                dot.group,
+                &dot.oracle_shape(),
+                &message.sample.seed,
+                0,
+                target,
+            )?]);
+        }
+    }
+    if member.source_oracle == plan.proximity.omega.oracle {
+        let mut list = Vec::with_capacity(shared.omega_answers.len());
+        for (answer, target) in shared.omega_answers.iter().enumerate() {
+            list.push(oracle_sample_row(
+                plan.proximity.omega.oracle,
+                plan.proximity.omega.group,
+                &plan.proximity.omega.u,
+                &shared.omega_seeds,
+                answer as u32,
+                *target,
+            )?);
+        }
+        return Ok(list);
+    } else {
+        let position = (member.source_oracle - plan.send.oracle_base) as usize;
+        if position >= plan.send.positions() as usize {
+            return Err(Error::StatementMismatch);
+        }
+        let index = position * plan.send.w.answers as usize;
+        let target = *first
+            .samples
+            .answers
+            .get(index)
+            .ok_or(Error::ShapeMismatch)?;
+        return Ok(vec![oracle_sample_row(
+            member.source_oracle,
+            plan.send.group,
+            &shape,
+            &first.samples.seed,
+            0,
+            target,
+        )?]);
+    }
+}
+
+/// The materialized sample rows of every member, in member order. The own
+/// stage defers them into the streamed run and does not call this; the
+/// materialized proximity entries keep using it.
+fn own_sample_rows(
+    plan: &HiddenLinPlan,
+    members: &[ProximityMember],
+    first: &HiddenSendMessages,
+    shared: &HiddenSharedMessages,
+) -> Result<Vec<Vec<GuRelationRow>>> {
+    members
+        .iter()
+        .map(|member| member_sample_rows(plan, member, first, shared))
+        .collect()
 }
 
 
@@ -26129,10 +26235,8 @@ fn prove_second(
         (None, None, None) => (None, None),
         _ => return Err(Error::ShapeMismatch),
     };
-    let _profile_sample_rows = zkie_engine::profile::Scope::new("second.sample_rows");
-    let sample_rows = own_sample_rows(plan, &members, first, shared)?;
-    drop(_profile_sample_rows);
     let request_bundle = request_rows_bundle(plan, &members, shared_point)?;
+    let deferred_samples = plan.proximity.own_deferred_samples;
     let mut streaming_chain_rows = Some(chain_rows);
     let mut plain_stream =
         |members: &[ProximityMember], sink: &mut dyn FnMut(BatRow) -> Result<()>| -> Result<()> {
@@ -26151,7 +26255,18 @@ fn prove_second(
                 request_bundle.as_ref(),
                 ChainRows::Owned(chain_rows),
                 sink,
-            )
+            )?;
+            if deferred_samples {
+                let _profile_sample_rows =
+                    zkie_engine::profile::Scope::new("second.sample_rows");
+                for member in members {
+                    let rows = member_sample_rows(plan, member, first, shared)?;
+                    for row in &rows {
+                        sink(adapt_sample_row(row, member)?)?;
+                    }
+                }
+            }
+            Ok(())
         };
     let fold = member_fold_shape(
         plan.proximity.code,
@@ -26167,26 +26282,51 @@ fn prove_second(
         ProximityGroupRole::Own,
     )?;
     let _profile_proximity = zkie_engine::profile::Scope::new("second.proximity");
-    let proximity = proximity_prove_streaming(
-        chain,
-        fold,
-        members,
-        ProximityTreeSource::Retained {
-            witness,
-            shared_witness,
-            first,
-            plan,
-        },
-        &sample_rows,
-        &mut plain_stream,
-        plan.proximity.own_fresh,
-        plan.proximity.own_mask_tree,
-        derive_run_seed(seed, 5, 0)?,
-        plan.proximity.own_base_positions,
-        iopp.as_ref(),
-    )?;
+    let mut claims = Vec::new();
+    let proximity = if deferred_samples {
+        proximity_prove_streaming_deferred(
+            chain,
+            fold,
+            members,
+            ProximityTreeSource::Retained {
+                witness,
+                shared_witness,
+                first,
+                plan,
+            },
+            &mut plain_stream,
+            plan.proximity.own_fresh,
+            plan.proximity.own_mask_tree,
+            derive_run_seed(seed, 5, 0)?,
+            plan.proximity.own_base_positions,
+            iopp.as_ref(),
+        )?
+    } else {
+        let _profile_sample_rows = zkie_engine::profile::Scope::new("second.sample_rows");
+        let sample_rows = own_sample_rows(plan, &members, first, shared)?;
+        drop(_profile_sample_rows);
+        let proximity = proximity_prove_streaming(
+            chain,
+            fold,
+            members,
+            ProximityTreeSource::Retained {
+                witness,
+                shared_witness,
+                first,
+                plan,
+            },
+            &sample_rows,
+            &mut plain_stream,
+            plan.proximity.own_fresh,
+            plan.proximity.own_mask_tree,
+            derive_run_seed(seed, 5, 0)?,
+            plan.proximity.own_base_positions,
+            iopp.as_ref(),
+        )?;
+        claims = sample_rows.into_iter().flatten().collect::<Vec<_>>();
+        proximity
+    };
     drop(_profile_proximity);
-    let mut claims = sample_rows.into_iter().flatten().collect::<Vec<_>>();
     let _ = order;
     Ok(OwnProveResult {
         messages: HiddenSecondMessages {
@@ -26564,7 +26704,7 @@ fn verify_second(
         _ => return Err(Error::ShapeMismatch),
     };
     let (members, _order) = own_members(plan, first, shared, None, None)?;
-    let sample_rows = own_sample_rows(plan, &members, first, shared)?;
+    let deferred_samples = plan.proximity.own_deferred_samples;
     let request_bundle = request_rows_bundle(plan, &members, shared_point)?;
     let mut streaming_chain_rows = Some(chain_rows);
     let mut plain_stream =
@@ -26584,7 +26724,18 @@ fn verify_second(
                 request_bundle.as_ref(),
                 ChainRows::Owned(chain_rows),
                 sink,
-            )
+            )?;
+            if deferred_samples {
+                let _profile_sample_rows =
+                    zkie_engine::profile::Scope::new("verify.second.sample_rows");
+                for member in members {
+                    let rows = member_sample_rows(plan, member, first, shared)?;
+                    for row in &rows {
+                        sink(adapt_sample_row(row, member)?)?;
+                    }
+                }
+            }
+            Ok(())
         };
     let fold = member_fold_shape(
         plan.proximity.code,
@@ -26600,29 +26751,51 @@ fn verify_second(
         ProximityGroupRole::Own,
     )?;
     let _profile_proximity = zkie_engine::profile::Scope::new("verify.second.proximity");
+    let mut own_claims = Vec::new();
+    let proximity = if deferred_samples {
+        proximity_verify_streaming_deferred(
+            chain,
+            fold,
+            &members,
+            &mut plain_stream,
+            &ProximityMessages {
+                fold_start: messages.fold_start.clone(),
+                fold_rounds: messages.fold_rounds.clone(),
+                tail: messages.tail.clone(),
+            },
+            plan.proximity.own_fresh,
+            plan.proximity.own_mask_tree,
+            plan.proximity.own_base_positions,
+            iopp.as_ref(),
+        )?
+    } else {
+        let sample_rows = own_sample_rows(plan, &members, first, shared)?;
         let proximity = proximity_verify_streaming(
-        chain,
-        fold,
-        &members,
-        &sample_rows,
-        &mut plain_stream,
-        &ProximityMessages {
-            fold_start: messages.fold_start.clone(),
-            fold_rounds: messages.fold_rounds.clone(),
-            tail: messages.tail.clone(),
-        },
-        plan.proximity.own_fresh,
-        plan.proximity.own_mask_tree,
-        plan.proximity.own_base_positions,
-        iopp.as_ref(),
-    )?;
+            chain,
+            fold,
+            &members,
+            &sample_rows,
+            &mut plain_stream,
+            &ProximityMessages {
+                fold_start: messages.fold_start.clone(),
+                fold_rounds: messages.fold_rounds.clone(),
+                tail: messages.tail.clone(),
+            },
+            plan.proximity.own_fresh,
+            plan.proximity.own_mask_tree,
+            plan.proximity.own_base_positions,
+            iopp.as_ref(),
+        )?;
+        own_claims = sample_rows.into_iter().flatten().collect();
+        proximity
+    };
     drop(_profile_proximity);
     if proximity.seal != messages.seal {
         return Err(Error::InvalidProof);
     }
     Ok((
         proximity.seal,
-        sample_rows.into_iter().flatten().collect(),
+        own_claims,
         proximity.base,
         dot_binding,
         closure_binding,
@@ -29954,6 +30127,7 @@ mod merged_tests {
                 column_work_bits: 0,
                 shared_base_positions: 2,
                 own_base_positions: 2,
+                own_deferred_samples: true,
                 shared_stages: Vec::new(),
                 own_stages: Vec::new(),
                 planner_checked: false,
@@ -30877,11 +31051,13 @@ mod merged_tests {
         let activation = activation();
         let mut table = table();
         let (plan, witness, mut params) = norm_params_fixture(&activation);
+        // The two column draws must land on distinct table columns for the
+        // swap check below; the seed is the fixture's choice, not a plan value.
         let (messages, _) = prove_hidden_lin_hidden_with_norm_and_params(
             &plan,
             &activation,
             &mut table,
-            Digest([0x71; 32]),
+            Digest([0x72; 32]),
             &witness,
             &mut params,
         )
