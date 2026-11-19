@@ -318,7 +318,7 @@ pub fn build_core_plan(
         (0..26).collect()
     };
     let round_layout =
-        NormRoundLayout::new(profile.round_widths, profile.valid, profile.sum_offset, profile.mean_offset)?;
+        NormRoundLayout::new(profile.round_widths, profile.valid, profile.sum_offset, profile.mean_offset)?.with_mode(profile.mode);
     let round_columns = profile.round_widths.columns()?;
     let x_roots = x_roots(space, profile, x_rows)?;
     let mask = base_mask_plan(space, profile, variables, relations.len())?;

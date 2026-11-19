@@ -1435,8 +1435,8 @@ impl NormRstdPlan {
                 .checked_add(position as u64)
                 .ok_or(Error::ResourceLimit)?;
             for (column, slot) in [
-                (0u8, round.layout.slots.index_value),
-                (1u8, round.layout.slots.rstd),
+                (0u8, round.layout.index_value_slot()),
+                (1u8, round.layout.rstd_slot()),
             ] {
                 let row = slot % round_rows;
                 let place = slot / round_rows;
@@ -2147,6 +2147,9 @@ impl NormPlan {
             }
         }
         if let Some(round) = &self.round {
+            if round.layout.mode != self.mode {
+                return Err(Error::InvalidConfig);
+            }
             if round.input_bound == 0
                 || round.table_real_len == 0
                 || round.table_real_len > (1u64 << 32)
@@ -2363,12 +2366,13 @@ impl NormPlan {
         let sh_cap = capacity(widths.shifted)?;
         let pre_cap = capacity(widths.pre_clamp)?;
         let pre_half = half_range(widths.pre_clamp)?;
-        let round_bounds = norm_no_wrap(
+        let round_bounds = norm_no_wrap_mode(
             round.input_bound,
             self.shape.valid,
             &round.layout.widths,
             round.layout.sum_offset,
             round.layout.mean_offset,
+            self.mode,
         )?;
         let gain = params
             .gain
@@ -5249,11 +5253,30 @@ pub struct NormRoundLayout {
     pub widths: NormRoundWidths,
     pub sum_offset: u64,
     pub mean_offset: u64,
+    /// The normalization mode this layout was built for. The witness writer
+    /// and every lookup constructor consume the same field.
+    pub mode: NormMode,
     pub slots: NormRoundSlots,
 }
 
 impl NormRoundLayout {
     pub const FIXED_SLOTS: usize = 6;
+
+    /// Binds the layout to a normalization mode. Existing LayerNorm callers
+    /// keep the default; RMS callers must set this before any witness or
+    /// lookup construction.
+    pub fn with_mode(mut self, mode: NormMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    pub fn index_value_slot(&self) -> usize {
+        self.slots.index_value
+    }
+
+    pub fn rstd_slot(&self) -> usize {
+        self.slots.rstd
+    }
 
     pub fn new(
         widths: NormRoundWidths,
@@ -5371,6 +5394,7 @@ impl NormRoundLayout {
             widths,
             sum_offset,
             mean_offset,
+            mode: NormMode::LayerNorm,
             slots: NormRoundSlots {
                 mean_remainder,
                 mean_offset: mean_offset_slot,
@@ -5548,7 +5572,7 @@ impl NormRoundLayout {
         values[self.slots.coarse_r] = Fp3::from_u64((rsqrt.coarse_r & 0xff) as u64);
         values[self.slots.coarse_r + 1] =
             Fp3::from_u64(((rsqrt.coarse_r >> 8) & 0xffff) as u64);
-        values[self.slots.index_value] = fp3_signed(rsqrt.index as i128)?;
+        values[self.index_value_slot()] = fp3_signed(rsqrt.index as i128)?;
         write_digits(
             &mut values[self.slots.index_digits
                 ..self.slots.index_digits + RSQRT_INDEX_WIDTH],
@@ -5559,7 +5583,7 @@ impl NormRoundLayout {
                 ..self.slots.index_slack + RSQRT_INDEX_SLACK_WIDTH],
             &rsqrt.index_slack_digits,
         )?;
-        values[self.slots.rstd] = fp3_signed(rsqrt.rstd as i128)?;
+        values[self.rstd_slot()] = fp3_signed(rsqrt.rstd as i128)?;
         Ok(values)
     }
 }
@@ -6916,6 +6940,28 @@ mod tests {
             },
             column_draws: 2,
         }
+    }
+
+    #[test]
+    fn round_layout_mode_mismatch_is_rejected() {
+        let (mut plan, _, _) = integrated_fixture();
+        plan.validate().unwrap();
+        let layout = NormRoundLayout::new(
+            NormRoundWidths { sum: 2, squares: 2, variance: 2, mean: 2, offset: 1 },
+            plan.shape.valid,
+            0,
+            0,
+        )
+        .unwrap()
+        .with_mode(crate::proof::hidden_norm::NormMode::LayerNorm);
+        plan.mode = crate::proof::hidden_norm::NormMode::RmsNorm;
+        plan.round = Some(NormRoundPlan {
+            group: plan.x.clone(),
+            layout,
+            input_bound: 1,
+            table_real_len: 1,
+        });
+        assert!(plan.validate().is_err(), "a round layout with another mode must be rejected");
     }
 
     #[test]
