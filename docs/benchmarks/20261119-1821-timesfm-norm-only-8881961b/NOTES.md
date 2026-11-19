@@ -100,3 +100,16 @@ construction and branch changes.
   round-1 artifact, and the other rounds differ within a few thousand bytes.
 - No performance sign-off beyond the recorded stage numbers; the peak figure
   covers the whole acceptance process tree.
+
+## Acceptance record
+
+The timesfm L0 attention RMS pre-norm norm-only segment was approved and
+closed on 2026-11-19. The review covered the segment shape (norm-only entry,
+the two-stage switch repair, the materialized identity binding with the
+source-row negative), the four-round evidence (one cold and three warm, all
+passing), the seven-case negative matrix with the control, the hard gate, the
+byte account and the stated boundaries. Code commits: `8881961b` (segment
+wiring and tests), `111ae1c0` (shared mode-aware norm output rows), `1b1d1f06`
+(sparse tail units); evidence commit `220deb06`.
+
+Closed.
