@@ -7,6 +7,7 @@ pub mod commit;
 pub mod output;
 pub mod norm_parent;
 pub mod timesfm_norm_parent;
+pub mod timesfm_norm_segment_provider;
 pub mod norm_segment_provider;
 pub mod provider;
 pub mod progress;

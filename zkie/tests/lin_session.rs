@@ -568,6 +568,7 @@ fn selected_gpt2_output_head_request_session() {
         expected_argmax: Vec::new(),
         expected_output: Vec::new(),
         segment_identity: None,
+        norm_only: false,
     };
     let work_dir = env::temp_dir().join(format!(
         "zkie-output-head-session-{}",

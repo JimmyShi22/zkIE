@@ -9522,6 +9522,7 @@ impl HiddenLinPlan {
         match (&self.send.index_mask, self.weights.is_empty()) {
             (Some(_), true) => {}
             (None, false) => {}
+            (None, true) if self.send.activation_source.is_norm_only() => {}
             (Some(_), false) => return Err(Error::InvalidConfig),
             (None, true) => return Err(Error::InvalidConfig),
         }
@@ -10508,6 +10509,10 @@ pub(crate) enum ProximityTreeSource<'a> {
         shared_witness: &'a SharedWitness,
         first: &'a HiddenSendMessages,
         plan: &'a HiddenLinPlan,
+        /// The norm witness, when the caller holds it outside the send
+        /// witness. The norm-only second stage borrows the single owned copy
+        /// instead of cloning it into `HiddenSendWitness`.
+        norm: Option<&'a NormWitness>,
     },
 }
 
@@ -10524,7 +10529,8 @@ impl ProximityTreeSource<'_> {
                 shared_witness,
                 first,
                 plan,
-            } => witness_tree_for(member, witness, shared_witness, first, plan),
+                norm,
+            } => witness_tree_for(member, witness, shared_witness, first, plan, *norm),
         }
     }
 
@@ -13895,7 +13901,7 @@ pub(crate) fn table_key_group_verify(
 pub(crate) fn proximity_prove(
     chain: Chain,
     fold: FoldShape,
-    members: Vec<ProximityMember>,
+    mut members: Vec<ProximityMember>,
     trees: ProximityTreeSource<'_>,
     sample_rows: &[Vec<GuRelationRow>],
     plain_rows: Vec<BatRow>,
@@ -14092,6 +14098,16 @@ pub(crate) fn proximity_prove(
         drop(prover);
         let private = loop_private_material(&seed, &iopp.chain)?;
         drop(_profile_fold_output);
+        // A retained opening count belongs to the Omega tree of the shared
+        // stage. In the norm-only own chain there is no Omega member, so a
+        // count that names no opened member must not be handed to the switch
+        // (the switch refuses a count that matches no tree it opens).
+        let member_opening = omega_opening.clone().filter(|count| {
+            basis
+                .members
+                .iter()
+                .any(|member| count.tree() == member.tree.tree_number && count.root() == member.root)
+        });
         let (proof, seal, chain) = prove_multi_stage_iopp(
             chain,
             &iopp.chain,
@@ -14102,7 +14118,7 @@ pub(crate) fn proximity_prove(
                 member_trees,
                 old_mask_tree: None,
                 fresh_tree: stage_zero_tree,
-                member_opening: omega_opening.clone(),
+                member_opening,
             },
             &private.switches,
             &private.stage_folds,
@@ -17576,13 +17592,12 @@ struct OwnProveResult {
 fn norm_members_core(
     plan: &HiddenLinPlan,
     norm_first: &NormFirstMessages,
-    witness: Option<&HiddenSendWitness>,
+    norm_witness: Option<&NormWitness>,
 ) -> Result<Vec<ProximityMember>> {
     let mut members = Vec::new();
     let Some(norm_plan) = plan.norm.as_ref() else {
         return Ok(members);
     };
-    let norm_witness = witness.and_then(|witness| witness.norm.as_ref());
     let positions = plan.send.positions();
     let mut groups = vec![
         (&norm_first.x, &norm_plan.x, norm_witness.map(|w| &w.x)),
@@ -17898,7 +17913,7 @@ fn norm_members_core(
             mask_tails: lookup_mask_tails,
         });
     }
-    for input in norm_param_claim_inputs_from_norm(plan, norm_first, witness.and_then(|w| w.norm.as_ref()))? {
+    for input in norm_param_claim_inputs_from_norm(plan, norm_first, norm_witness)? {
     let gu = &input.claim.gu;
     let (message, tails) = match &input.material {
         Some(material) => (material.message.clone(), material.tails.clone()),
@@ -17931,14 +17946,14 @@ fn norm_members(
     let Some(norm_first) = first.norm.as_ref() else {
         return Ok(Vec::new());
     };
-    norm_members_core(plan, norm_first, witness)
+    norm_members_core(plan, norm_first, witness.and_then(|witness| witness.norm.as_ref()))
 }
 
 /// The ordered norm-only members and their source-oracle order.
 pub fn norm_only_members(
     plan: &HiddenLinPlan,
     norm_first: &NormFirstMessages,
-    witness: Option<&HiddenSendWitness>,
+    witness: Option<&NormWitness>,
 ) -> Result<(Vec<ProximityMember>, Vec<u64>)> {
     let mut members = norm_members_core(plan, norm_first, witness)?;
     members.sort_by_key(|member| {
@@ -18003,8 +18018,11 @@ pub fn norm_only_own_stages(plan: &HiddenLinPlan) -> Result<NormOnlyOwnPlan> {
         });
         source_oracle += 1;
     };
+    let positions = usize::try_from(norm.shape.positions).map_err(|_| Error::ResourceLimit)?;
     for group in norm_group_plans(norm) {
-        push(group.shape.main_rows, 0, &mut members);
+        for _ in 0..positions {
+            push(group.shape.main_rows, 0, &mut members);
+        }
     }
     let mut total_mask_rows = 0u64;
     if let Some(mask) = &norm.mask {
@@ -18039,10 +18057,14 @@ pub fn norm_only_own_stages(plan: &HiddenLinPlan) -> Result<NormOnlyOwnPlan> {
     }
     if let Some(output) = &norm.output {
         for group in [&output.broadcast, &output.product, &output.image, &output.out] {
-            push(group.shape.main_rows, 0, &mut members);
+            for _ in 0..positions {
+                push(group.shape.main_rows, 0, &mut members);
+            }
         }
         if let Some(tail) = &output.tail {
-            push(tail.group.shape.main_rows, 0, &mut members);
+            for _ in 0..positions {
+                push(tail.group.shape.main_rows, 0, &mut members);
+            }
         }
     }
     if members.is_empty() {
@@ -18062,12 +18084,10 @@ pub fn norm_only_own_stages(plan: &HiddenLinPlan) -> Result<NormOnlyOwnPlan> {
     )?;
     let last_main = build_code_plan(code.log_n, code.ell, 1)?;
     let last_mask = build_code_plan(mask_code.log_n, 16_384, 1)?;
-    let positions = usize::try_from(norm.shape.positions).map_err(|_| Error::ResourceLimit)?;
-    let fold_k = code.r.trailing_zeros() + 1;
-    let max_stage_zero_positions = 1usize
-        .checked_shl(fold_k)
-        .ok_or(Error::ResourceLimit)?
-        .max(positions);
+    // The stage-0 fold is the real member fold derived above; a code-tail
+    // formula is not the fold round count of this member set.
+    let fold_k = fold.k;
+    let max_stage_zero_positions = 252usize.max(positions.max(1));
     let two = crate::proof::proximity_planner::plan_own_two_stage(
         code,
         mask_code,
@@ -25879,6 +25899,7 @@ fn prove_second(
             shared_witness,
             first,
             plan,
+            norm: None,
         },
         &sample_rows,
         plain_rows,
@@ -25916,6 +25937,7 @@ fn witness_tree_for(
     shared_witness: &SharedWitness,
     first: &HiddenSendMessages,
     plan: &HiddenLinPlan,
+    norm_override: Option<&NormWitness>,
 ) -> Result<Arc<RuntimeTree>> {
     if let Some(chain_plan) = &plan.send.chain_mask {
         if member.source_oracle == chain_plan.oracle {
@@ -25948,7 +25970,10 @@ fn witness_tree_for(
         }
     }
     if let Some(norm_plan) = &plan.norm {
-        let norm_witness = witness.norm.as_ref().ok_or(Error::ShapeMismatch)?;
+        let norm_witness = match norm_override {
+            Some(norm) => norm,
+            None => witness.norm.as_ref().ok_or(Error::ShapeMismatch)?,
+        };
         let groups = norm_group_plans(norm_plan);
         let group_witnesses = norm_group_witnesses(norm_witness);
         let positions = plan.send.positions() as u64;
@@ -26942,6 +26967,17 @@ pub fn prove_norm_only_first(
     norm: &NormWitness,
     param_tables: Option<&mut dyn NormParamTableProver>,
 ) -> Result<(NormOnlyFirstMessages, NormWitness)> {
+    prove_norm_only_first_owned(plan, seed, norm.clone(), param_tables)
+}
+
+/// The owning form of the norm-only first stage. The witness is moved into
+/// the returned owned copy, so the prover does not hold two full witnesses.
+pub fn prove_norm_only_first_owned(
+    plan: &HiddenLinPlan,
+    seed: Digest,
+    norm: NormWitness,
+    param_tables: Option<&mut dyn NormParamTableProver>,
+) -> Result<(NormOnlyFirstMessages, NormWitness)> {
     plan.validate()?;
     if !plan.send.activation_source.is_norm_only() || plan.norm.is_none() {
         return Err(Error::InvalidConfig);
@@ -26955,8 +26991,8 @@ pub fn prove_norm_only_first(
     )?;
     absorb_claim(&mut chain, plan)?;
     let (message, lookup_messages, rstd_messages, param_claims) =
-        prove_norm_first(plan, &mut chain, norm, &seed, param_tables)?;
-    let mut owned = norm.clone();
+        prove_norm_first(plan, &mut chain, &norm, &seed, param_tables)?;
+    let mut owned = norm;
     if let Some(lookup) = owned.lookup.as_mut() {
         lookup.messages = lookup_messages;
     }
@@ -27113,28 +27149,7 @@ pub fn prove_norm_only_second(
     )?;
     let (norm_proof, norm_binding) =
         prove_norm_second(&mut chain, norm_plan, &first.norm, witness, rstd_table)?;
-    let (members, _order) =
-        norm_only_members(plan, &first.norm, Some(&HiddenSendWitness {
-            group: plan.send.group,
-            w: plan.send.w,
-            positions: plan.send.positions(),
-            oracle_base: plan.send.oracle_base,
-            columns: plan.send.columns,
-            messages: Vec::new(),
-            tails: Vec::new(),
-            salts: Vec::new(),
-            pads: Vec::new(),
-            roots: Vec::new(),
-            trees: RetainedTrees::default(),
-            index_mask: None,
-            dot: None,
-            closure: None,
-            norm: Some(witness.clone()),
-            request_w: None,
-            source_data: None,
-            chain_mask: None,
-            fold_charge: None,
-        }))?;
+    let (members, _order) = norm_only_members(plan, &first.norm, Some(witness))?;
     let first_send = norm_only_send_message(plan, first);
     let sample_rows = own_sample_rows(plan, &members, &first_send, None)?;
     let plain_rows = own_plain_rows(
@@ -27190,7 +27205,7 @@ pub fn prove_norm_only_second(
         index_mask: None,
         dot: None,
         closure: None,
-        norm: Some(witness.clone()),
+        norm: None,
         request_w: None,
         source_data: None,
         chain_mask: None,
@@ -27205,6 +27220,7 @@ pub fn prove_norm_only_second(
             shared_witness: &shared_witness,
             first: &first_send,
             plan,
+            norm: Some(witness),
         },
         &sample_rows,
         plain_rows,

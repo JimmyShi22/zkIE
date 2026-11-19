@@ -22,7 +22,13 @@ use zkie_ops::proof::norm_segment::{
 const GAIN_PATH: &str = "models/timesfm/weights/L0_lnw_i32.bin";
 const SALT: usize = 40;
 
-fn param_claim(kind: NormParamKind, width: u64) -> Result<NormParamClaimPlan> {
+/// The patch count the norm-only segment is defined for. The segment proves
+/// the L0 attention pre-norm of the sixteen patch tokens; the model input is
+/// the 512 raw points, so the segment positions come from the case patch
+/// count, never from the raw token list.
+pub const SEGMENT_POSITIONS: usize = 16;
+
+fn param_claim(kind: NormParamKind, shape: zkie_engine::pcs::request::table::IndexShape) -> Result<NormParamClaimPlan> {
     use zkie_engine::pcs::request::gu::{GuOracleShape, GuShape};
     let code = build_code_plan(17, 65_536, 8_192)?;
     Ok(NormParamClaimPlan {
@@ -53,18 +59,7 @@ fn param_claim(kind: NormParamKind, width: u64) -> Result<NormParamClaimPlan> {
                 mask_code: None,
                 answers: 1,
             },
-            index: zkie_engine::pcs::request::table::IndexShape {
-                code,
-                v: width.trailing_zeros(),
-                answers: 1,
-                salt_bytes: SALT,
-                distances: zkie_engine::pcs::request::table::TableDistances {
-                    radius: 0,
-                    later_radius: 0,
-                    m_once: 0,
-                    m_later: 0,
-                },
-            },
+            index: shape,
         },
         column_draws: 2,
     })
@@ -98,7 +93,7 @@ pub fn param_identities(metas: &[AssetTableMeta]) -> Result<NormParamTablesPlan>
         valid_max: i64::from(zkie_models_timesfm::norm_profile::GAIN_MAX),
         trusted_i32_mapping: true,
     };
-    let gain_claim = param_claim(NormParamKind::Gain, identity.width)?;
+    let gain_claim = param_claim(NormParamKind::Gain, identity.reader.shape)?;
     Ok(NormParamTablesPlan {
         gain: identity,
         bias: None,
@@ -293,7 +288,7 @@ fn segment_gu_shape(code: zkie_engine::pcs::request::code::CodeParams, index: In
         log_n: code.log_n,
         log_n_zk: code.log_n,
         parts: vec![RuntimeTreePart {
-            main_symbols: E_DEGREE as u64,
+            main_symbols: 2 * E_DEGREE as u64,
             mask_symbols: 0,
         }],
         salt_bytes: 40,
@@ -308,7 +303,7 @@ fn segment_gu_shape(code: zkie_engine::pcs::request::code::CodeParams, index: In
         rows_high: true,
         u: GuOracleShape {
             code,
-            main_rows: 1,
+            main_rows: 2,
             main_deg: E_DEGREE as u32,
             mask_rows: 0,
             mask_code: None,
@@ -365,7 +360,7 @@ pub fn build_norm_only_plan(
     let mask_code = build_code_plan(17, 512, 256)?;
     let table_shape = IndexShape {
         code,
-        v: 1,
+        v: 11,
         answers: 1,
         salt_bytes: 40,
         distances: TableDistances {
@@ -403,13 +398,18 @@ pub fn build_norm_only_plan(
         mask_code,
         shared_mask_tree: mask_tree(0),
         own_mask_tree: mask_tree(1),
+        // The fresh-mask oracle ids stay below the norm group oracle bases
+        // (9000+) and above every member's BAT registration id. The norm-only
+        // member set registers more than ninety BAT oracles, so the earlier
+        // small ids collided with a member; these values follow the accepted
+        // final-norm configuration.
         shared_fresh: 50,
-        own_fresh: 51,
+        own_fresh: 1_000,
         column_draws: 1,
         column_budget: 1,
         ledger: ReadLedgerCell::new(1),
         column_work_bits: 0,
-        shared_base_positions: 0,
+        shared_base_positions: 1,
         own_base_positions: 0,
         shared_stages: Vec::new(),
         own_stages: Vec::new(),
@@ -470,4 +470,70 @@ pub fn build_norm_only_plan(
         .map_err(|_| Error::ResourceLimit)?;
     plan.validate()?;
     Ok(plan)
+}
+
+/// Reads the frozen rstd value of every position by index from the shared
+/// GPT-2 rsqrt table under the timesfm asset root.
+pub fn read_rstd_values(
+    asset_root: &std::path::Path,
+    profile: &NormSegmentProfile,
+    x_rows: &[Vec<i64>],
+) -> Result<Vec<i64>> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = asset_root.join("models/gpt2/weights/rsqrt_table_i32.bin");
+    let mut file = std::fs::File::open(path).map_err(|_| Error::AssetMismatch)?;
+    let mut values = Vec::with_capacity(x_rows.len());
+    for row in x_rows {
+        let core = zkie_ops::proof::hidden_norm::NormCoreRow::from_values_mode(row, profile.valid as usize, profile.mode)?;
+        let index = zkie_ops::registry::profile_rsqrt_index(core.variance)?;
+        if index >= profile.table_real_len {
+            return Err(Error::BoundViolation);
+        }
+        file.seek(SeekFrom::Start(index * 4)).map_err(|_| Error::Io)?;
+        let mut entry = [0u8; 4];
+        file.read_exact(&mut entry).map_err(|_| Error::Io)?;
+        values.push(i32::from_le_bytes(entry) as i64);
+    }
+    Ok(values)
+}
+
+/// The authenticated bounds checks behind the segment's trusted values.
+pub fn check_authenticated_bounds(
+    plan: &zkie_ops::proof::hidden_norm_psc::NormPlan,
+    profile: &NormSegmentProfile,
+    x_rows: &[Vec<i64>],
+    gain: &[i64],
+    table: &zkie_ops::proof::lookup_table::RangeTable<
+        zkie_ops::proof::lookup_table::PublicFileTable,
+    >,
+) -> Result<()> {
+    let round = plan.round.as_ref().ok_or(Error::InvalidConfig)?;
+    let params = plan.params.as_ref().ok_or(Error::InvalidConfig)?;
+    let rstd = plan.rstd.as_ref().ok_or(Error::InvalidConfig)?;
+    zkie_ops::proof::lookup::LookupTable::check_content(table)?;
+    if gain.len() != profile.columns as usize || x_rows.len() != profile.positions as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    for value in gain {
+        if *value < params.gain.valid_min || *value > params.gain.valid_max {
+            return Err(Error::BoundViolation);
+        }
+    }
+    let bound = i64::try_from(round.input_bound).map_err(|_| Error::ResourceLimit)?;
+    for row in x_rows {
+        if row.len() != profile.hidden as usize {
+            return Err(Error::ShapeMismatch);
+        }
+        if row.iter().any(|value| *value < -bound || *value > bound) {
+            return Err(Error::BoundViolation);
+        }
+        let core = zkie_ops::proof::hidden_norm::NormCoreRow::from_values_mode(row, profile.valid as usize, profile.mode)?;
+        let index = zkie_ops::registry::profile_rsqrt_index(core.variance)?;
+        let value = table
+            .row_value(usize::try_from(index).map_err(|_| Error::ResourceLimit)?)?;
+        if value < 0 || value as u64 > rstd.value_bound {
+            return Err(Error::BoundViolation);
+        }
+    }
+    Ok(())
 }

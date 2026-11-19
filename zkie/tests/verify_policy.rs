@@ -55,6 +55,7 @@ fn setup(
         expected_argmax: vec![0; tokens.len()],
         expected_output: Vec::new(),
         segment_identity: None,
+        norm_only: false,
     };
     write(&root.join("statement.bin"), &statement);
     let trace = SharedTrace {

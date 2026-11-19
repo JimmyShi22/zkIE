@@ -799,7 +799,7 @@ pub fn norm_param_table_params() -> Result<Vec<AssetTableParams>> {
         .into_iter()
         .find(|spec| spec.path == path)
         .ok_or(Error::InvalidConfig)?;
-    let code = build_code_plan(12, 2049, 4)?;
+    let code = build_code_plan(12, 2051, 4)?;
     let shape = IndexShape {
         code,
         v: 0,

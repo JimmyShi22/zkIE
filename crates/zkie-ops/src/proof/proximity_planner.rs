@@ -16,7 +16,7 @@ use std::cmp::Ordering;
 use zkie_core::error::{Error, Result};
 use zkie_engine::pcs::request::code::CodeParams;
 
-use super::interval::{surely_le, surely_lt, Big, Bound, Real};
+use super::interval::{bits_of, surely_le, surely_lt, Big, Bound, Real};
 
 const TARGET_BITS: u32 = 128;
 const FIELD_DEGREE: u32 = 3;
@@ -2997,6 +2997,86 @@ pub fn plan_own_two_stage(
     })
 }
 
+/// One candidate's recomputed own-chain accounting. The values are the
+/// planner's outward-rounded upper bounds; they are reported to the acceptance
+/// note and never feed a planner decision.
+#[derive(Clone, Copy, Debug)]
+pub struct TwoStageReport {
+    pub plan: TwoStagePlan,
+    /// `agree^t` of the stage-0 query round, in bits.
+    pub stage_zero_query_bits: f64,
+    /// The last stage's carried term `list * powers_error(2 + 3t)`, in bits.
+    pub stage_zero_carried_bits: f64,
+    /// The stage-0 target `2^-(128 - work)`, in bits.
+    pub stage_zero_target_bits: f64,
+    /// `query + carried` in bits plus the stage-0 work bits.
+    pub stage_zero_joint_bits: f64,
+    /// The last stage's BASE error, in bits.
+    pub last_base_bits: f64,
+    /// The last stage's target `2^-128`, in bits.
+    pub last_target_bits: f64,
+}
+
+/// Recomputes the candidate's error components from the trusted codes. The
+/// returned plan is exactly the plan `plan_own_two_stage` returns; the bits
+/// only expose the bounds that the planner already checked.
+pub fn plan_own_two_stage_report(
+    main: CodeParams,
+    mask: CodeParams,
+    last_main: CodeParams,
+    last_mask: CodeParams,
+    k: u32,
+    h: u32,
+    max_stage_zero_positions: usize,
+) -> Result<TwoStageReport> {
+    let plan = plan_own_two_stage(main, mask, last_main, last_mask, k, h, max_stage_zero_positions)?;
+    let stage_zero = group_shape(main, mask, k, h)?;
+    let zero_load = group_load(&stage_zero, main.r);
+    let zero_m = largest_m(&stage_zero, zero_load);
+    let zero_analysis = analysis_of_m(&stage_zero, zero_m)?;
+    if zero_analysis.bad || zero_m != plan.stage_zero_m {
+        return Err(Error::InvalidConfig);
+    }
+    let (last_r, last_m, last_analysis) = plan_last(last_main, last_mask, main.r)?;
+    if last_m != plan.last_m || last_r as usize != plan.last_positions {
+        return Err(Error::InvalidConfig);
+    }
+    let t = u64::try_from(plan.stage_zero_positions).map_err(|_| Error::ResourceLimit)?;
+    let rows = 1u64
+        .checked_add(1)
+        .and_then(|value| value.checked_add(3u64.checked_mul(t)?))
+        .ok_or(Error::ResourceLimit)?;
+    let carried = Bound::from_big(last_analysis.list.clone()).mul(&powers_error(rows));
+    let query = zero_analysis.at.agree.pow(t);
+    let sum = query.add(&carried);
+    let last_main_code = CodeParams {
+        log_n: last_main.log_n,
+        ell: last_main.ell,
+        r: last_r,
+    };
+    let last_mask_code = CodeParams {
+        log_n: last_mask.log_n,
+        ell: last_mask.ell,
+        r: last_r,
+    };
+    let last_group = group_shape(last_main_code, last_mask_code, 0, 0)?;
+    let last_again = analysis_of_m(&last_group, last_m)?;
+    if last_again.bad {
+        return Err(Error::InvalidConfig);
+    }
+    let last_base = base_error(&last_group, &last_again);
+    let work = u32::from(plan.stage_zero_work_bits);
+    Ok(TwoStageReport {
+        plan,
+        stage_zero_query_bits: bits_of(&query.error()),
+        stage_zero_carried_bits: bits_of(&carried.error()),
+        stage_zero_target_bits: bits_of(&goal(work).error()),
+        stage_zero_joint_bits: bits_of(&sum.error()) + f64::from(work),
+        last_base_bits: bits_of(&last_base.error()),
+        last_target_bits: bits_of(&goal(0).error()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3233,6 +3313,26 @@ mod tests {
         println!("worst_round_bits={:.6}", bits_of(&worst.error()));
         assert!(!union.bad && !worst.bad);
         assert!(bits_of(&union.error()) < 128.0);
+    }
+
+    /// The candidate report recomputes the same plan and the stage bounds the
+    /// planner checked; the joint accounting never falls below 128 bits.
+    #[test]
+    fn the_candidate_report_recomputes_the_stage_bounds() {
+        let main = build_code_plan(17, 65_536, 8_192).unwrap();
+        let mask = build_code_plan(17, 512, 256).unwrap();
+        let last_main = build_code_plan(17, 65_536, 1).unwrap();
+        let last_mask = build_code_plan(17, 16_384, 1).unwrap();
+        let report =
+            plan_own_two_stage_report(main, mask, last_main, last_mask, 14, 2, 252).unwrap();
+        assert_eq!(
+            report.plan,
+            plan_own_two_stage(main, mask, last_main, last_mask, 14, 2, 252).unwrap()
+        );
+        assert!(report.stage_zero_target_bits <= 128.0);
+        assert!(report.stage_zero_joint_bits >= 127.999);
+        assert!(report.last_target_bits <= 128.0);
+        assert!(report.last_base_bits >= 127.999);
     }
 
     #[test]

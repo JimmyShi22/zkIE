@@ -62,10 +62,10 @@ const RSTD_CONTENT_ROOT: &str =
 /// The rounding digit widths of the L0 norm profile.
 pub fn round_widths() -> NormRoundWidths {
     NormRoundWidths {
-        sum: 5,
+        sum: 6,
         squares: 6,
         variance: 6,
-        mean: 3,
+        mean: 5,
         offset: 2,
     }
 }
