@@ -2034,6 +2034,20 @@ pub fn lookup_mask_rows(
     Err(Error::ResourceLimit)
 }
 
+/// The trusted plan of the multi-limb RMS statistic. The two limb groups are
+/// committed column rows bound pointwise to the trusted x group; the widths
+/// are derived from the input bound and the valid count.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RmsLimbPlan {
+    pub low: NormGroupPlan,
+    pub high: NormGroupPlan,
+    pub widths: RmsLimbWidths,
+    /// The trusted bound of the rounded mean square.
+    pub mean_bound: u64,
+    /// The correlated bound of the pre-clamp value.
+    pub pre_bound: u64,
+}
+
 /// The trusted plan of the integrated norm relation.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormPlan {
@@ -2050,6 +2064,9 @@ pub struct NormPlan {
     /// The trusted product-form x group. Its roots are plan values.
     pub x: NormGroupPlan,
     pub x_roots: Vec<Digest>,
+    /// The multi-limb RMS limb groups and bounds; present only for the RMS
+    /// form.
+    pub rms: Option<RmsLimbPlan>,
     /// The proof-fixed sum/squares/mean/variance witness groups.
     pub sum: NormGroupPlan,
     pub squares: NormGroupPlan,
@@ -2104,18 +2121,15 @@ impl NormPlan {
             return Err(Error::UnsupportedPrimitive);
         }
         if self.mode.is_rms() {
-            // The RMS form proves the sum of squares and the two rounding
-            // equations; the centering relations of the layer form must not
-            // be listed because their equations are false for this relation.
-            if self.relations.contains(&0)
-                || self.relations.contains(&1)
-                || !self.relations.contains(&2)
-                || !self.relations.contains(&3)
-                || !self.relations.contains(&26)
+            // The RMS form proves the multi-limb statistic and the rsqrt
+            // rows; the layer relations 0..15 are not part of its plan.
+            if self.relations.iter().any(|relation| *relation < 16)
+                || !(16..=25).all(|relation| self.relations.contains(&relation))
+                || !(26..=63).all(|relation| self.relations.contains(&relation))
             {
                 return Err(Error::InvalidConfig);
             }
-        } else if self.relations.contains(&26) {
+        } else if self.relations.iter().any(|relation| *relation >= 26) {
             return Err(Error::InvalidConfig);
         }
         if self.x.columns != self.columns
@@ -2139,7 +2153,11 @@ impl NormPlan {
         {
             return Err(Error::InvalidConfig);
         }
-        let groups = [&self.x, &self.sum, &self.squares, &self.mean, &self.variance];
+        let mut groups = vec![&self.x, &self.sum, &self.squares, &self.mean, &self.variance];
+        if let Some(rms) = &self.rms {
+            groups.push(&rms.low);
+            groups.push(&rms.high);
+        }
         for left in 0..groups.len() {
             for right in left + 1..groups.len() {
                 if groups[left].oracle_base == groups[right].oracle_base {
@@ -2161,15 +2179,16 @@ impl NormPlan {
             {
                 return Err(Error::InvalidConfig);
             }
-            if norm_no_wrap_mode(
-                round.input_bound,
-                self.shape.valid,
-                &round.layout.widths,
-                round.layout.sum_offset,
-                round.layout.mean_offset,
-                self.mode,
-            )
-            .is_err()
+            if !self.mode.is_rms()
+                && norm_no_wrap_mode(
+                    round.input_bound,
+                    self.shape.valid,
+                    &round.layout.widths,
+                    round.layout.sum_offset,
+                    round.layout.mean_offset,
+                    self.mode,
+                )
+                .is_err()
             {
                 return Err(Error::InvalidConfig);
             }
@@ -2287,6 +2306,45 @@ impl NormPlan {
             if self.mode.is_rms() && params.bias.is_some() {
                 return Err(Error::InvalidConfig);
             }
+        }
+        match (&self.rms, self.mode.is_rms()) {
+            (Some(rms), true) => {
+                if rms.low.columns != self.columns
+                    || rms.high.columns != self.columns
+                    || rms.low.fault(self.shape.positions).is_some()
+                    || rms.high.fault(self.shape.positions).is_some()
+                    || rms.mean_bound == 0
+                    || rms.mean_bound >= (1u64 << 62)
+                    || rms.pre_bound == 0
+                {
+                    return Err(Error::InvalidConfig);
+                }
+                rms.widths.validate()?;
+                let round = self.round.as_ref().ok_or(Error::InvalidConfig)?;
+                if round.layout.rms.is_none() || rms.widths != crate::proof::rms_limbs::RmsLimbWidths::derive(
+                    round.input_bound,
+                    self.shape.valid,
+                )? {
+                    return Err(Error::InvalidConfig);
+                }
+                if round.group.columns < round.layout.total_slots() as u64 {
+                    return Err(Error::InvalidConfig);
+                }
+                // The 752 window cover with the correlated pre bound.
+                let reconstruction = ((1u128 << 31) - 1)
+                    .checked_mul(1u128 << 32)
+                    .and_then(|value| value.checked_add((1u128 << 32) - 1))
+                    .ok_or(Error::ResourceLimit)?;
+                if (rms.pre_bound as u128)
+                    .checked_add(reconstruction)
+                    .filter(|value| *value < MODULUS as u128)
+                    .is_none()
+                {
+                    return Err(Error::InvalidConfig);
+                }
+            }
+            (None, false) => {}
+            _ => return Err(Error::InvalidConfig),
         }
         if let Some(output) = &self.output {
             if self.params.is_none() {
@@ -2530,6 +2588,21 @@ impl NormPlan {
         writer.put_u64(self.x_roots.len() as u64);
         for root in &self.x_roots {
             writer.put_digest(root);
+        }
+        match &self.rms {
+            Some(rms) => {
+                writer.put_u64(1);
+                put_norm_group(writer, &rms.low);
+                put_norm_group(writer, &rms.high);
+                writer.put_u64(rms.widths.s_ll as u64);
+                writer.put_u64(rms.widths.s_lh as u64);
+                writer.put_u64(rms.widths.s_hh as u64);
+                writer.put_u64(rms.widths.v as u64);
+                writer.put_u64(rms.widths.mean as u64);
+                writer.put_u64(rms.mean_bound);
+                writer.put_u64(rms.pre_bound);
+            }
+            None => writer.put_u64(0),
         }
         put_norm_group(writer, &self.sum);
         put_norm_group(writer, &self.squares);
@@ -6845,6 +6918,7 @@ mod tests {
             relations: vec![0, 1, 2, 3],
             x: integrated_group(&psc.groups.x),
             x_roots: psc.groups.x.roots.clone(),
+            rms: None,
             sum: integrated_group(&psc.groups.sum),
             squares: integrated_group(&psc.groups.squares),
             mean: integrated_group(&psc.groups.mean),

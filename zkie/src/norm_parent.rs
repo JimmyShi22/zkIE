@@ -627,6 +627,8 @@ mod tests {
             squares: GroupIds { oracle: 9200, tree: 60200 },
             mean: GroupIds { oracle: 9300, tree: 60300 },
             variance: GroupIds { oracle: 9400, tree: 60400 },
+            low: GroupIds { oracle: 9700, tree: 60700 },
+            high: GroupIds { oracle: 9710, tree: 60710 },
             round: GroupIds { oracle: 9600, tree: 60600 },
             mask: GroupIds { oracle: 9500, tree: 60500 },
         }
@@ -878,6 +880,8 @@ pub fn norm_segment_space(configuration: Digest) -> NormSegmentSpace {
         squares: GroupIds { oracle: 9200, tree: 60200 },
         mean: GroupIds { oracle: 9300, tree: 60300 },
         variance: GroupIds { oracle: 9400, tree: 60400 },
+        low: GroupIds { oracle: 9700, tree: 60700 },
+        high: GroupIds { oracle: 9710, tree: 60710 },
         round: GroupIds { oracle: 9600, tree: 60600 },
         mask: GroupIds { oracle: 9500, tree: 60500 },
     }

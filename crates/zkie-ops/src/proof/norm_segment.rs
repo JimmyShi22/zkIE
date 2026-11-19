@@ -61,6 +61,8 @@ pub struct NormSegmentSpace {
     pub squares: GroupIds,
     pub mean: GroupIds,
     pub variance: GroupIds,
+    pub low: GroupIds,
+    pub high: GroupIds,
     pub round: GroupIds,
     pub mask: GroupIds,
 }
@@ -83,6 +85,10 @@ pub struct NormSegmentProfile {
     pub round_widths: NormRoundWidths,
     pub tail_widths: NormOutputTailWidths,
     pub table_real_len: u64,
+    /// The trusted bound of the rounded mean square (RMS form).
+    pub mean_bound: u64,
+    /// The correlated pre-clamp bound (RMS form).
+    pub pre_bound: u64,
     /// The fixed public coin seed of the trusted x group derivation.
     pub x_seed: Digest,
 }
@@ -313,12 +319,17 @@ pub fn build_core_plan(
     let columns = profile.columns;
     let variables = columns.trailing_zeros() as usize + 1;
     let relations: Vec<usize> = if profile.mode.is_rms() {
-        (2..=26).collect()
+        (16..=25).chain(26..=63).collect()
     } else {
         (0..26).collect()
     };
     let round_layout =
         NormRoundLayout::new(profile.round_widths, profile.valid, profile.sum_offset, profile.mean_offset)?;
+    let round_layout = if profile.mode.is_rms() {
+        round_layout.with_rms()?
+    } else {
+        round_layout
+    };
     let round_columns = profile.round_widths.columns()?;
     let x_roots = x_roots(space, profile, x_rows)?;
     let mask = base_mask_plan(space, profile, variables, relations.len())?;
@@ -330,6 +341,20 @@ pub fn build_core_plan(
         relations,
         x: group_plan(space, profile, columns, space.x)?,
         x_roots,
+        rms: if profile.mode.is_rms() {
+            Some(crate::proof::hidden_norm_psc::RmsLimbPlan {
+                low: group_plan(space, profile, columns, space.low)?,
+                high: group_plan(space, profile, columns, space.high)?,
+                widths: crate::proof::rms_limbs::RmsLimbWidths::derive(
+                    profile.input_bound,
+                    profile.valid,
+                )?,
+                mean_bound: profile.mean_bound,
+                pre_bound: profile.pre_bound,
+            })
+        } else {
+            None
+        },
         sum: group_plan(space, profile, 1, space.sum)?,
         squares: group_plan(space, profile, 1, space.squares)?,
         mean: group_plan(space, profile, 1, space.mean)?,
@@ -924,6 +949,8 @@ mod tests {
             squares: GroupIds { oracle: 9200, tree: 60200 },
             mean: GroupIds { oracle: 9300, tree: 60300 },
             variance: GroupIds { oracle: 9400, tree: 60400 },
+            low: GroupIds { oracle: 9700, tree: 60700 },
+            high: GroupIds { oracle: 9710, tree: 60710 },
             round: GroupIds { oracle: 9600, tree: 60600 },
             mask: GroupIds { oracle: 9500, tree: 60500 },
         }
@@ -966,6 +993,8 @@ mod tests {
                 pre_clamp: 4,
             },
             table_real_len: 7_340_032,
+            mean_bound: 0,
+            pre_bound: 0,
             x_seed: Digest([0x91; 32]),
         }
     }

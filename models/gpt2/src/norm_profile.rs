@@ -160,6 +160,8 @@ pub fn segment_profile(
         round_widths: round_widths(),
         tail_widths: tail_widths(),
         table_real_len: RSTD_TABLE_REAL_LEN,
+        mean_bound: 0,
+        pre_bound: 0,
         x_seed,
     })
 }
