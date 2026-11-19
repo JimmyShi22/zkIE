@@ -1109,11 +1109,12 @@ pub fn segment_x_seed(model: Digest, positions: usize) -> Digest {
 }
 
 /// The plan-fixed public session seed of the output-head hidden session.
-pub fn segment_session_seed(model: Digest, positions: usize) -> Digest {
+pub fn segment_session_seed(model: Digest, positions: usize, identity_binding: Digest) -> Digest {
     let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"zkie/norm-segment/session/v1");
+    bytes.extend_from_slice(b"zkie/norm-segment/session/v2");
     bytes.extend_from_slice(&model.0);
     bytes.extend_from_slice(&(positions as u64).to_le_bytes());
+    bytes.extend_from_slice(&identity_binding.0);
     zkie_core::artifact::digest_bytes(&bytes)
 }
 

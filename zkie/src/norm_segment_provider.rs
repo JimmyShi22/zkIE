@@ -15,9 +15,10 @@ use zkie_engine::pcs::request::field::Fp;
 use zkie_engine::pcs::request::plan::RequestPlan;
 use zkie_engine::pcs::request::read::HidingState;
 use zkie_engine::pcs::request::table::{
-    commit_table_streaming, ColumnOpening, EncodedRowStore, IndexReader, IndexShape,
-    StreamingTable, TableRowSource,
+    commit_table_streaming, validate_index_shape, ColumnOpening, EncodedRowStore, IndexReader,
+    IndexShape, StreamingTable, TableDistances, TableRowSource,
 };
+use zkie_engine::primitives::codec::CanonicalWriter;
 use zkie_engine::storage::encoded_store::FileRowStore;
 use zkie_ops::proof::asset_table::{
     asset_row_source, asset_table_configuration, AssetRowSource, AssetTableInput,
@@ -77,6 +78,116 @@ impl NormSegmentCarrier {
         }
         Ok(value)
     }
+}
+
+
+/// The complete table identity the segment's own plan fixes for its output
+/// head table. The consumer policy block names a different table; this
+/// identity rides the statement and its digest is absorbed into the segment's
+/// session derivation, so a changed identity breaks the proof.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SegmentTableIdentity {
+    pub asset_id: u64,
+    pub asset_table_identity: Digest,
+    pub code_log_n: u32,
+    pub code_ell: u64,
+    pub code_r: u64,
+    pub table_v: u32,
+    pub answers: u32,
+    pub salt_bytes: u64,
+    pub distance_radius: u64,
+    pub distance_later_radius: u64,
+    pub distance_m_once: u64,
+    pub distance_m_later: u64,
+    pub matrix_rows_log: u32,
+    pub k_lo: u32,
+    pub k_col: u32,
+    pub table_root: Digest,
+    pub table_record_digest: Digest,
+    pub table_configuration: Digest,
+}
+
+impl SegmentTableIdentity {
+    /// The table shape declared by the identity.
+    pub fn shape(&self) -> Result<IndexShape> {
+        let code = zkie_engine::pcs::request::code::build_code_plan(
+            self.code_log_n,
+            self.code_ell,
+            self.code_r,
+        )?;
+        let shape = IndexShape {
+            code,
+            v: self.table_v,
+            answers: self.answers,
+            salt_bytes: usize::try_from(self.salt_bytes).map_err(|_| Error::InvalidConfig)?,
+            distances: TableDistances {
+                radius: self.distance_radius,
+                later_radius: self.distance_later_radius,
+                m_once: self.distance_m_once,
+                m_later: self.distance_m_later,
+            },
+        };
+        validate_index_shape(&shape)?;
+        Ok(shape)
+    }
+
+    /// The matrix row count declared by the identity.
+    pub fn matrix_rows(&self) -> Result<u64> {
+        if self.table_v != self.matrix_rows_log
+            || self.table_v >= 64
+            || self.k_lo >= self.k_col
+            || self.k_col > 63
+        {
+            return Err(Error::InvalidConfig);
+        }
+        let rows = 1u64.checked_shl(self.table_v).ok_or(Error::InvalidConfig)?;
+        let factor = 1u64.checked_shl(self.k_lo).ok_or(Error::InvalidConfig)?;
+        if factor.checked_mul(rows).ok_or(Error::ResourceLimit)? != 1u64 << self.k_col {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(rows)
+    }
+
+    /// Checks the identity's digests, shape and matrix mapping.
+    pub fn validate(&self) -> Result<()> {
+        if self.asset_id == 0
+            || self.asset_table_identity == Digest::ZERO
+            || self.table_root == Digest::ZERO
+            || self.table_record_digest == Digest::ZERO
+            || self.table_configuration == Digest::ZERO
+        {
+            return Err(Error::InvalidConfig);
+        }
+        self.shape()?;
+        self.matrix_rows()?;
+        Ok(())
+    }
+}
+
+/// The canonical digest of the segment identity. It is fixed in the plan and
+/// absorbed into the session derivation.
+pub fn segment_identity_binding(identity: &SegmentTableIdentity) -> Digest {
+    let mut writer = CanonicalWriter::new();
+    writer.put_u64(1);
+    writer.put_u64(identity.asset_id);
+    writer.put_bytes(&identity.asset_table_identity.0);
+    writer.put_u64(identity.code_log_n as u64);
+    writer.put_u64(identity.code_ell);
+    writer.put_u64(identity.code_r);
+    writer.put_u64(identity.table_v as u64);
+    writer.put_u64(identity.answers as u64);
+    writer.put_u64(identity.salt_bytes);
+    writer.put_u64(identity.distance_radius);
+    writer.put_u64(identity.distance_later_radius);
+    writer.put_u64(identity.distance_m_once);
+    writer.put_u64(identity.distance_m_later);
+    writer.put_u64(identity.matrix_rows_log as u64);
+    writer.put_u64(identity.k_lo as u64);
+    writer.put_u64(identity.k_col as u64);
+    writer.put_bytes(&identity.table_root.0);
+    writer.put_bytes(&identity.table_record_digest.0);
+    writer.put_bytes(&identity.table_configuration.0);
+    zkie_core::artifact::digest_bytes(&writer.into_bytes())
 }
 
 /// The output-head table prover: the committed table and the read-only row

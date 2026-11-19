@@ -47,9 +47,9 @@ use crate::norm_parent::{
 };
 use crate::norm_segment_provider::{
     build_param_tables, build_segment_table, configuration_for, lm_head_asset, plan_identifier,
-    prove_segment_bytes, rstd_table_view, segment_table_key, segment_work_dir,
-    verify_segment_bytes, NormSegmentCarrier, NORM_SEGMENT_CARRIER_FILE,
-    NORM_SEGMENT_CARRIER_VERSION,
+    prove_segment_bytes, rstd_table_view, segment_identity_binding, segment_table_key,
+    segment_work_dir, verify_segment_bytes, NormSegmentCarrier, SegmentTableIdentity,
+    NORM_SEGMENT_CARRIER_FILE, NORM_SEGMENT_CARRIER_VERSION,
 };
 
 const PROTOCOL_ID: Digest = Digest([0xA1; 32]);
@@ -89,6 +89,10 @@ pub struct StatementData {
     pub tokens: Vec<u32>,
     pub expected_argmax: Vec<u32>,
     pub expected_output: Vec<i32>,
+    /// The segment's own output head table identity. The policy block names
+    /// the consumer table; this one rides the statement and its digest is
+    /// absorbed into the segment session derivation.
+    pub segment_identity: Option<SegmentTableIdentity>,
 }
 
 fn read_i32(path: &Path) -> Result<Vec<i32>> {
@@ -485,7 +489,7 @@ fn prove_norm_segment(
     trace: &SharedTrace,
     output_dir: &Path,
     ctx: &mut PipelineContext<'_>,
-) -> Result<Option<Vec<u8>>> {
+) -> Result<Option<(Vec<u8>, SegmentTableIdentity)>> {
     let positions = config.tokens.len();
     if positions != zkie_ops::proof::output_head_lin::OUTPUT_HEAD_POSITIONS {
         return Ok(None);
@@ -541,7 +545,34 @@ fn prove_norm_segment(
         &work_dir,
     )?;
     let reader = table.reader().clone();
-    let session_seed = segment_session_seed(model, positions);
+    let specs = zkie_models_gpt2::plan::asset_specs();
+    let spec = specs
+        .iter()
+        .find(|spec| spec.path == matmul.weight_path)
+        .ok_or(Error::UnsupportedPrimitive)?;
+    let identity = SegmentTableIdentity {
+        asset_id: spec.asset_id,
+        asset_table_identity: zkie_ops::proof::model_commitment::asset_table_identity(spec),
+        code_log_n: reader.shape.code.log_n,
+        code_ell: reader.shape.code.ell,
+        code_r: reader.shape.code.r,
+        table_v: reader.shape.v,
+        answers: reader.shape.answers,
+        salt_bytes: reader.shape.salt_bytes as u64,
+        distance_radius: reader.shape.distances.radius,
+        distance_later_radius: reader.shape.distances.later_radius,
+        distance_m_once: reader.shape.distances.m_once,
+        distance_m_later: reader.shape.distances.m_later,
+        matrix_rows_log: request_plan.lin.matrix_rows_log,
+        k_lo: request_plan.lin.k_lo,
+        k_col: request_plan.lin.k_col,
+        table_root: reader.root,
+        table_record_digest: zkie_core::artifact::digest_bytes(&reader.record.encode()),
+        table_configuration: configuration,
+    };
+    identity.validate()?;
+    let binding = segment_identity_binding(&identity);
+    let session_seed = segment_session_seed(model, positions, binding);
     let plan = build_segment_plan(
         &trace_plan,
         &config.expected_argmax,
@@ -571,7 +602,7 @@ fn prove_norm_segment(
         reader,
         messages,
     };
-    Ok(Some(carrier.encode()?))
+    Ok(Some((carrier.encode()?, identity)))
 }
 
 /// Verifies the final norm segment carrier when the proof publishes one. The
@@ -610,15 +641,16 @@ fn verify_norm_segment(
         return Err(Error::ArtifactIntegrityMismatch);
     }
     let carrier = NormSegmentCarrier::decode(&bytes)?;
-    let identity = trusted.trusted_limited_table_identity()?;
+    let identity = statement
+        .segment_identity
+        .as_ref()
+        .ok_or(Error::IncompleteArtifact)?;
     identity.validate()?;
     let positions = statement.tokens.len();
     if positions != zkie_ops::proof::output_head_lin::OUTPUT_HEAD_POSITIONS
-        || identity.model != trusted.model
-        || identity.model_version != trusted.model_version
-        || identity.case_id != trusted.case_id
-        || identity.anchor_id != trusted.anchor_id
-        || identity.model_id != public.anchor.model_commitment
+        || statement.model != trusted.model
+        || statement.case_id != trusted.case_id
+        || statement.model_commitment != public.anchor.model_commitment
     {
         return Err(Error::StatementMismatch);
     }
@@ -654,7 +686,13 @@ fn verify_norm_segment(
     let identifier = plan_identifier(public, &trace_plan, matmul.index)?;
     let request_plan = zkie_models_gpt2::lm_head_plan::lm_head_plan()?;
     let configuration = configuration_for(&request_plan, identifier)?;
-    if configuration != reader.configuration {
+    if configuration != reader.configuration
+        || identity.table_configuration != configuration
+        || identity.shape()? != request_plan.table_shape()?
+        || identity.matrix_rows_log != request_plan.lin.matrix_rows_log
+        || identity.k_lo != request_plan.lin.k_lo
+        || identity.k_col != request_plan.lin.k_col
+    {
         return Err(Error::StatementMismatch);
     }
     let model = statement.model_commitment;
@@ -669,7 +707,8 @@ fn verify_norm_segment(
     }
     let norm_plan = build_norm_plan(&profile, configuration, table_metas, &x_rows)?;
     let (gain, bias) = read_anchored_params(asset_root, &public.assets)?;
-    let session_seed = segment_session_seed(model, positions);
+    let session_seed =
+        segment_session_seed(model, positions, segment_identity_binding(identity));
     let plan = build_segment_plan(
         &trace_plan,
         &statement.expected_argmax,
@@ -847,6 +886,22 @@ impl PipelineProvider for ProductionProvider {
             ctx.metrics.record("key_verify_ms", started.elapsed().as_millis() as u64);
             ctx.metrics.record("key_bytes", bytes.len() as u64);
         }
+        let (trace, consumer) = execute_shared(&config, &commitment, &tables, ctx.progress)?;
+        let (norm_carrier, segment_identity) = if config.model == "gpt2" {
+            match prove_norm_segment(
+                &config,
+                &commitment,
+                &tables,
+                &trace,
+                &request.output_dir,
+                ctx,
+            )? {
+                Some((bytes, identity)) => (Some(bytes), Some(identity)),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
         let statement = StatementData {
             case_id: config.case_id.clone(),
             model: config.model.clone(),
@@ -854,21 +909,9 @@ impl PipelineProvider for ProductionProvider {
             tokens: config.tokens.clone(),
             expected_argmax: config.expected_argmax.clone(),
             expected_output: config.expected_output.clone(),
+            segment_identity,
         };
         let statement_bytes = bincode::serialize(&statement).map_err(|_| Error::InvalidEncoding)?;
-        let (trace, consumer) = execute_shared(&config, &commitment, &tables, ctx.progress)?;
-        let norm_carrier = if config.model == "gpt2" {
-            prove_norm_segment(
-                &config,
-                &commitment,
-                &tables,
-                &trace,
-                &request.output_dir,
-                ctx,
-            )?
-        } else {
-            None
-        };
         let consumer_bytes = consumer
             .as_ref()
             .map(|file| file.encode())
@@ -1305,6 +1348,7 @@ mod tests {
             tokens: Vec::new(),
             expected_argmax: Vec::new(),
             expected_output: Vec::new(),
+            segment_identity: None,
         }
     }
 

@@ -567,6 +567,7 @@ fn selected_gpt2_output_head_request_session() {
         tokens: trace.tokens.clone(),
         expected_argmax: Vec::new(),
         expected_output: Vec::new(),
+        segment_identity: None,
     };
     let work_dir = env::temp_dir().join(format!(
         "zkie-output-head-session-{}",

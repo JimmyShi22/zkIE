@@ -152,6 +152,30 @@ fn norm_segment_carrier_negatives() {
     wrong_root.reader.root = zkie_core::types::Digest([0xAA; 32]);
     cases.push(("reader_root", wrong_root.encode().unwrap()));
 
+    // The segment identity rides the statement; a changed identity must not
+    // verify against the same carrier.
+    let mut tampered_statement: zkie::provider::StatementData =
+        bincode::deserialize(&fs::read(proof.join("statement.bin")).unwrap()).unwrap();
+    if let Some(identity) = tampered_statement.segment_identity.as_mut() {
+        identity.table_root = zkie_core::types::Digest([0xAB; 32]);
+        let bytes = bincode::serialize(&tampered_statement).unwrap();
+        let dir = out.join("case-statement_identity");
+        publish_tampered(&round, &dir, "statement.bin", &bytes);
+        let (ok, outcome) = run_verify(
+            &bin,
+            &round,
+            &dir,
+            &out.join("run-statement_identity"),
+            &model_id,
+        );
+        assert!(!ok || outcome != "PASS", "the statement identity tamper was accepted");
+        summary.push(serde_json::json!({
+            "case": "statement_identity",
+            "exit_ok": ok,
+            "outcome": outcome,
+        }));
+    }
+
     let mut wrong_record = carrier.clone();
     wrong_record.reader.record.y[0] = Fp3::from_u64(2);
     cases.push(("record_digest", wrong_record.encode().unwrap()));
