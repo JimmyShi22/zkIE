@@ -5704,6 +5704,55 @@ impl NormRoundLayout {
             &rsqrt.index_slack_digits,
         )?;
         values[self.slots.rstd] = fp3_signed(rsqrt.rstd as i128)?;
+        if let Some(slots) = self.rms {
+            if columns < slots.total as u64 {
+                return Err(Error::ShapeMismatch);
+            }
+            let rms = core.rms.as_ref().ok_or(Error::ShapeMismatch)?;
+            write_digits(
+                &mut values[slots.s_ll_digits..slots.s_ll_digits + 5],
+                &rms.s_ll_digits,
+            )?;
+            write_digits(
+                &mut values[slots.s_lh_digits..slots.s_lh_digits + 6],
+                &rms.s_lh_digits,
+            )?;
+            write_digits(
+                &mut values[slots.s_hh_digits..slots.s_hh_digits + 6],
+                &rms.s_hh_digits,
+            )?;
+            write_digits(
+                &mut values[slots.v_digits..slots.v_digits + 10],
+                &rms.v_digits,
+            )?;
+            for (index, carry) in rms.v_carries.iter().enumerate() {
+                let encoded = i64::from(*carry)
+                    .checked_add(RmsRoundSlots::CARRY_OFFSET as i64)
+                    .ok_or(Error::BoundViolation)?;
+                let encoded = u16::try_from(encoded).map_err(|_| Error::BoundViolation)?;
+                values[slots.v_carries + 2 * index] = Fp3::from_u64((encoded & 0xff) as u64);
+                values[slots.v_carries + 2 * index + 1] =
+                    Fp3::from_u64((encoded >> 8) as u64);
+            }
+            write_digits(
+                &mut values[slots.v_plus_digits..slots.v_plus_digits + 10],
+                &rms.v_plus_digits,
+            )?;
+            write_digits(
+                &mut values[slots.v_plus_carries..slots.v_plus_carries + 10],
+                &rms.v_plus_carries,
+            )?;
+            write_digits(
+                &mut values[slots.q_digits..slots.q_digits + 10],
+                &rms.mean_digits,
+            )?;
+            for (index, carry) in rms.division_carries.iter().enumerate() {
+                values[slots.division_carries + 2 * index] =
+                    Fp3::from_u64(u64::from(*carry & 0xff));
+                values[slots.division_carries + 2 * index + 1] =
+                    Fp3::from_u64(u64::from(*carry >> 8));
+            }
+        }
         Ok(values)
     }
 }

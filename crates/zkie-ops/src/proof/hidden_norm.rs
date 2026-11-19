@@ -173,6 +173,8 @@ pub struct NormCoreRow {
     pub variance_complement: i128,
     pub variance_offset_digits: Vec<u8>,
     pub variance_complement_digits: Vec<u8>,
+    /// The exact multi-limb RMS row, present only for the RMS form.
+    pub rms: Option<crate::proof::rms_limbs::RmsLimbRow>,
 }
 
 impl NormCoreRow {
@@ -289,7 +291,83 @@ impl NormCoreRow {
             variance_complement,
             variance_offset_digits,
             variance_complement_digits,
+            rms: None,
         })
+    }
+
+    /// Computes the exact multi-limb RMS core of one position. The shared
+    /// statistic fields carry the three bounded partial sums and the rounded
+    /// mean square; the multi-limb digits and carries ride the row.
+    pub fn from_values_rms(
+        values: &[i64],
+        valid: usize,
+        input_bound: u64,
+        widths: crate::proof::rms_limbs::RmsLimbWidths,
+        mean_bound: u64,
+    ) -> Result<Self> {
+        let limb =
+            crate::proof::rms_limbs::RmsLimbRow::from_values(values, valid, input_bound, widths)?;
+        if limb.mean_square < 0 || limb.mean_square > mean_bound as i128 {
+            return Err(Error::BoundViolation);
+        }
+        let mut row = Self {
+            sum: limb.s_ll,
+            mean: i64::try_from(limb.s_hh).map_err(|_| Error::BoundViolation)?,
+            mean_remainder: 0,
+            squares: limb.s_lh,
+            variance: i64::try_from(limb.mean_square).map_err(|_| Error::BoundViolation)?,
+            variance_remainder: 0,
+            sum_negative: false,
+            sum_digits: Vec::new(),
+            mean_negative: false,
+            mean_digits: Vec::new(),
+            squares_digits: Vec::new(),
+            variance_digits: Vec::new(),
+            mean_offset: 0,
+            mean_complement: 0,
+            mean_offset_digits: Vec::new(),
+            mean_complement_digits: Vec::new(),
+            variance_offset: 0,
+            variance_complement: 0,
+            variance_offset_digits: Vec::new(),
+            variance_complement_digits: Vec::new(),
+            rms: None,
+        };
+        row.sum = limb.s_ll;
+        row.squares = limb.s_lh;
+        row.mean = i64::try_from(limb.s_hh).map_err(|_| Error::BoundViolation)?;
+        row.variance = i64::try_from(limb.mean_square).map_err(|_| Error::BoundViolation)?;
+        row.mean_remainder = 0;
+        row.variance_remainder = 0;
+        row.mean_offset = 0;
+        row.mean_complement = 0;
+        row.variance_offset = 0;
+        row.variance_complement = 0;
+        row.mean_digits.clear();
+        row.squares_digits.clear();
+        row.variance_digits.clear();
+        row.mean_offset_digits.clear();
+        row.mean_complement_digits.clear();
+        row.variance_offset_digits.clear();
+        row.variance_complement_digits.clear();
+        row.rms = Some(limb);
+        Ok(row)
+    }
+
+    /// Rechecks the multi-limb RMS core.
+    pub fn check_rms(
+        &self,
+        values: &[i64],
+        valid: usize,
+        input_bound: u64,
+        widths: crate::proof::rms_limbs::RmsLimbWidths,
+        mean_bound: u64,
+    ) -> Result<()> {
+        let expected = Self::from_values_rms(values, valid, input_bound, widths, mean_bound)?;
+        if *self != expected {
+            return Err(Error::InvalidProof);
+        }
+        Ok(())
     }
 
     /// Rechecks the integer equations and the canonical digit rows. The
