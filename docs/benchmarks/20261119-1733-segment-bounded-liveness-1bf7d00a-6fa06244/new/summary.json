@@ -1,0 +1,61 @@
+{
+  "case_id": "gpt2-seq16",
+  "model": "gpt2",
+  "rounds": [
+    {
+      "anchor_id": "27f2bfd564f4d3e47a01a9a7fd0d9085e5ebf9a36fbbb2ae3f37920ad08c2476",
+      "commit": {
+        "authenticated_output_digest": null,
+        "authenticated_output_elements": null,
+        "command": "commit",
+        "error_code": null,
+        "last_completed_stage": "commit",
+        "last_event_seq": 50,
+        "outcome": "PASS",
+        "output_binding": null,
+        "progress_path": "/data/a04-gpt2/docs/benchmarks/20261119-1733-segment-bounded-liveness-1bf7d00a-6fa06244/new/round-1/commit-run/progress.jsonl",
+        "proof_bytes": null,
+        "protocol_wall_ms": 235045,
+        "run_id": "commit",
+        "stage_wall_ms": 235045,
+        "vmhwm_kib": 27296656
+      },
+      "model_id": "c2971c0179463bf12aecaefc3488417228008c1314e6905c49a55078242c1268",
+      "proof_bin_deleted_bytes": null,
+      "proof_bytes": 3589359289,
+      "prove": {
+        "authenticated_output_digest": null,
+        "authenticated_output_elements": null,
+        "command": "prove",
+        "error_code": null,
+        "last_completed_stage": "prove",
+        "last_event_seq": 226,
+        "outcome": "PASS",
+        "output_binding": null,
+        "progress_path": "/data/a04-gpt2/docs/benchmarks/20261119-1733-segment-bounded-liveness-1bf7d00a-6fa06244/new/round-1/prove-run/progress.jsonl",
+        "proof_bytes": 3589359289,
+        "protocol_wall_ms": 765577,
+        "run_id": "prove",
+        "stage_wall_ms": 765577,
+        "vmhwm_kib": 212605940
+      },
+      "round": 1,
+      "verify": {
+        "authenticated_output_digest": "135c4d1c47aee4fd1985fa862afefbedde9d59beaf112bd2cf0dcfff03339280",
+        "authenticated_output_elements": 16,
+        "command": "verify",
+        "error_code": null,
+        "last_completed_stage": "verify",
+        "last_event_seq": 42,
+        "outcome": "PASS",
+        "output_binding": "expected",
+        "progress_path": "/data/a04-gpt2/docs/benchmarks/20261119-1733-segment-bounded-liveness-1bf7d00a-6fa06244/new/round-1/verify-run/progress.jsonl",
+        "proof_bytes": null,
+        "protocol_wall_ms": 195936,
+        "run_id": "verify",
+        "stage_wall_ms": 195936,
+        "vmhwm_kib": 125866204
+      }
+    }
+  ]
+}
