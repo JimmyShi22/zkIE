@@ -1542,21 +1542,53 @@ mod tests {
                 Some(rsqrt),
             )
             .unwrap_or_else(|error| panic!("relation {relation}: {error:?}"));
-            if *relation <= 32 {
-                let inner = left.iter().zip(&right).fold(
-                    zkie_engine::pcs::request::field::Fp3::ZERO,
-                    |sum, (l, r)| sum.add(&l.mul(r)),
-                );
-                assert_eq!(
-                    inner,
-                    zkie_engine::pcs::request::field::Fp3::ZERO,
-                    "relation {relation}"
-                );
-            } else {
-                let _ = (&left, &right);
-            }
+            let inner = left.iter().zip(&right).fold(
+                zkie_engine::pcs::request::field::Fp3::ZERO,
+                |sum, (l, r)| sum.add(&l.mul(r)),
+            );
+            assert_eq!(
+                inner,
+                zkie_engine::pcs::request::field::Fp3::ZERO,
+                "relation {relation}"
+            );
         }
         let _ = plan.rms.as_mut().unwrap();
+    }
+
+    /// The limb relations bind every term: a changed limb digit or mean byte
+    /// breaks its relation, so the zero on the honest witness is not vacuous.
+    #[test]
+    fn the_rms_limb_relations_bind_a_changed_digit() {
+        use zkie_engine::pcs::request::field::Fp3;
+        let profile = rms_profile();
+        let rows = vec![vec![3i64, -5, 7, 0], vec![-4, 8, -6, 2]];
+        let plan = build_core_plan(&space(), &profile, &rows).unwrap();
+        let round = plan.round.as_ref().unwrap();
+        let columns = plan.columns as usize;
+        let rstd = vec![64i64, 64];
+        let witness = build_core_witness(&plan, &profile, &space(), &rows, &rstd).unwrap();
+        let rsqrt = &witness.rsqrt.as_ref().unwrap()[0];
+        let dot = |core: &NormCoreRow, relation: usize| {
+            let (left, right) = crate::proof::hidden_norm_psc::rel_map(
+                core,
+                &rows[0],
+                profile.valid as usize,
+                columns,
+                relation,
+                Some(round),
+                Some(rsqrt),
+            )
+            .unwrap();
+            left.iter()
+                .zip(&right)
+                .fold(Fp3::ZERO, |sum, (l, r)| sum.add(&l.mul(r)))
+        };
+        let mut changed = witness.core[0].clone();
+        changed.rms.as_mut().unwrap().v_digits[0] += 1;
+        assert!(!dot(&changed, 33).is_zero(), "relation 33 reads the digit");
+        let mut changed = witness.core[0].clone();
+        changed.rms.as_mut().unwrap().mean_digits[4] += 1;
+        assert!(!dot(&changed, 93).is_zero(), "relation 93 reads the mean byte");
     }
 
     /// The coarse rsqrt relation must hold on a witness whose raw value is in

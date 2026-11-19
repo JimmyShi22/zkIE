@@ -23543,10 +23543,13 @@ fn norm_plain_rows(
                 let round_columns = usize::try_from(round_plan.group.columns)
                     .map_err(|_| Error::ResourceLimit)?;
                 let mut dense = vec![Fp3::ZERO; round_columns];
-                let factor = Fp3::from_u64(1u64 << 32);
-                for index in 0..4 {
-                    dense[rms_slots.q_digits + index] = eq[index];
-                    dense[rms_slots.q_digits + 4 + index] = eq[4 + index].mul(&factor);
+                let (terms, _constant) =
+                    crate::proof::hidden_norm_psc::rms_relation_terms(93, &rms_slots)?;
+                for (index, (slot, coefficient)) in terms.iter().enumerate() {
+                    let entry = dense.get_mut(*slot).ok_or(Error::ShapeMismatch)?;
+                    *entry = entry.add(
+                        &crate::proof::output_closure::fp3_signed(*coefficient)?.mul(&eq[index]),
+                    );
                 }
                 let coefficients = scatter_message_coefficients(
                     &round_plan.group.shape,

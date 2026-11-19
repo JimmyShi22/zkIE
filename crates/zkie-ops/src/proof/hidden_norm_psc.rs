@@ -764,7 +764,12 @@ pub fn rms_relation_terms(
                 terms.push((slots.v_carries + 2 * (index - 1) + 1, -256));
             }
             if index < 9 {
-                constant = -(255 * carry_offset) + if index == 7 { 16 } else { 0 };
+                // The carry pair reads 256*(carry + OFFSET); the previous
+                // pair subtracts another OFFSET, so 255 offsets cancel, or
+                // all 256 at the first digit.
+                constant = -(255 * carry_offset)
+                    + if index == 0 { -carry_offset } else { 0 }
+                    + if index == 7 { 16 } else { 0 };
             } else {
                 constant = carry_offset;
             }
@@ -780,7 +785,10 @@ pub fn rms_relation_terms(
                 terms.push((slots.v_plus_carries + index - 1, -1));
             }
             if index == 0 {
-                constant = -320;
+                // The value is shifted by half the valid count before the
+                // two-stage division; the shift is a plan value.
+                let valid = slots.first_divisor as i128 * slots.second_divisor as i128;
+                constant = -(valid / 2);
             }
         }
         53..=62 => {
@@ -789,8 +797,8 @@ pub fn rms_relation_terms(
             terms.push((slots.q1_digits + index, slots.first_divisor as i128));
             terms.push((slots.shift_carries + index, 1));
             terms.push((slots.v_plus_digits + index, -1));
-            if index > 0 {
-                terms.push((slots.shift_carries + index - 1, -256));
+            if index + 1 < 10 {
+                terms.push((slots.shift_carries + index + 1, -256));
             }
         }
         63..=72 => {
@@ -806,8 +814,8 @@ pub fn rms_relation_terms(
             terms.push((slots.q_digits + index, slots.second_divisor as i128));
             terms.push((slots.division_carries + index, 1));
             terms.push((slots.q1_digits + index, -1));
-            if index > 0 {
-                terms.push((slots.division_carries + index - 1, -256));
+            if index + 1 < 10 {
+                terms.push((slots.division_carries + index + 1, -256));
             }
         }
         83..=92 => {
@@ -816,6 +824,14 @@ pub fn rms_relation_terms(
             terms.push((slots.division_carries + index, 1));
             terms.push((slots.division_slack + index, 1));
             constant = -(slots.second_divisor as i128 - 1);
+        }
+        93 => {
+            // The mean digits reconstruct the rounded mean square over the
+            // two 32-bit halves: each byte carries its positional weight, so
+            // the high half's bytes are shifted by 2^32.
+            for index in 0..8 {
+                terms.push((slots.q_digits + index, 1i128 << (8 * index)));
+            }
         }
         94 => {
             terms.push((slots.q_digits + 8, 1));
@@ -843,9 +859,16 @@ pub(crate) fn rms_slot_value(
     let value = if slot >= slots.v_digits && slot < slots.v_digits + 10 {
         row.v_digits[slot - slots.v_digits] as i128
     } else if slot >= slots.v_carries && slot < slots.v_carries + 20 {
+        // The committed pair is the 16-bit `carry + OFFSET` split into its
+        // low and high byte, exactly as the round message writes it.
         let index = (slot - slots.v_carries) / 2;
         let byte = (slot - slots.v_carries) % 2;
-        i128::from(row.v_carries[index]) + offset + (byte as i128) * 256
+        let encoded = i128::from(row.v_carries[index]) + offset;
+        if byte == 0 {
+            encoded & 0xff
+        } else {
+            (encoded >> 8) & 0xff
+        }
     } else if slot >= slots.s_ll_digits && slot < slots.s_ll_digits + 5 {
         row.s_ll_digits[slot - slots.s_ll_digits] as i128
     } else if slot >= slots.s_lh_digits && slot < slots.s_lh_digits + 6 {
@@ -874,6 +897,36 @@ pub(crate) fn rms_slot_value(
         return Err(Error::InvalidIndex);
     };
     Ok(value)
+}
+
+/// One evaluated term of an RMS limb relation: its slot, the plan's
+/// coefficient and the exact witness value at that slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RmsRelationTerm {
+    pub slot: usize,
+    pub coefficient: i128,
+    pub value: i128,
+}
+
+/// The single evaluation path of one RMS limb relation: the plan's terms and
+/// the witness values at their slots, with the constant of
+/// `Σ coefficient · slot + constant = 0`. The PSC relation map and the
+/// second-stage plain rows read the same term list.
+pub(crate) fn rms_relation_values(
+    row: &crate::proof::rms_limbs::RmsLimbRow,
+    slots: &RmsRoundSlots,
+    relation: usize,
+) -> Result<(Vec<RmsRelationTerm>, i128)> {
+    let (terms, constant) = rms_relation_terms(relation, slots)?;
+    let mut values = Vec::with_capacity(terms.len());
+    for (slot, coefficient) in terms {
+        values.push(RmsRelationTerm {
+            slot,
+            coefficient,
+            value: rms_slot_value(row, slots, slot)?,
+        });
+    }
+    Ok((values, constant))
 }
 
 pub(crate) fn rel_map(
@@ -1176,34 +1229,29 @@ pub(crate) fn rel_map(
             left[columns] = fp3_signed(-value)?;
             right[columns] = Fp3::ONE;
         }
-        33..=72 | 73..=92 | 94..=95 => {
+        33..=95 => {
             let round = round.ok_or(Error::InvalidConfig)?;
             let rms_slots = round.layout.rms.ok_or(Error::InvalidConfig)?;
             let limb = row.rms.as_ref().ok_or(Error::InvalidConfig)?;
-            let (terms, constant) = rms_relation_terms(relation, &rms_slots)?;
+            let (terms, constant) = rms_relation_values(limb, &rms_slots, relation)?;
             if terms.len() + 1 >= columns {
                 return Err(Error::ShapeMismatch);
             }
-            for (index, (slot, _)) in terms.iter().enumerate() {
-                left[index] = fp3_signed(rms_slot_value(limb, &rms_slots, *slot)?)?;
+            for (index, term) in terms.iter().enumerate() {
+                let value = term
+                    .coefficient
+                    .checked_mul(term.value)
+                    .ok_or(Error::ResourceLimit)?;
+                left[index] = fp3_signed(value)?;
                 right[index] = Fp3::ONE;
             }
-            left[columns] = fp3_signed(-constant)?;
-            right[columns] = Fp3::ONE;
-        }
-        93 => {
-            let round = round.ok_or(Error::InvalidConfig)?;
-            let rms_slots = round.layout.rms.ok_or(Error::InvalidConfig)?;
-            let limb = row.rms.as_ref().ok_or(Error::InvalidConfig)?;
-            let factor = 1i128 << 32;
-            for index in 0..4 {
-                left[index] = fp3_signed(limb.mean_digits[index] as i128)?;
-                right[index] = Fp3::ONE;
-                left[4 + index] = fp3_signed(factor * limb.mean_digits[4 + index] as i128)?;
-                right[4 + index] = Fp3::ONE;
-            }
-            let _ = rms_slots;
-            left[columns] = fp3_signed(-(row.variance as i128))?;
+            let constant = match relation {
+                93 => constant
+                    .checked_sub(row.variance as i128)
+                    .ok_or(Error::ResourceLimit)?,
+                _ => constant,
+            };
+            left[columns] = fp3_signed(constant)?;
             right[columns] = Fp3::ONE;
         }
         26..=28 => {
