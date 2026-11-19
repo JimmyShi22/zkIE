@@ -1,0 +1,61 @@
+{
+  "case_id": "gpt2-seq16",
+  "model": "gpt2",
+  "rounds": [
+    {
+      "anchor_id": "3a773763e8752fbfe75e0e08247adc9f19b3a344bfef15c6f046b63733e9c51d",
+      "commit": {
+        "authenticated_output_digest": null,
+        "authenticated_output_elements": null,
+        "command": "commit",
+        "error_code": null,
+        "last_completed_stage": "commit",
+        "last_event_seq": 50,
+        "outcome": "PASS",
+        "output_binding": null,
+        "progress_path": "docs/benchmarks/20261119-2018-segment-read-path-streaming-6e049ae7-1c4dc4e7/round-1/commit-run/progress.jsonl",
+        "proof_bytes": null,
+        "protocol_wall_ms": 236732,
+        "run_id": "commit",
+        "stage_wall_ms": 236732,
+        "vmhwm_kib": 27296464
+      },
+      "model_id": "c2971c0179463bf12aecaefc3488417228008c1314e6905c49a55078242c1268",
+      "proof_bin_deleted_bytes": null,
+      "proof_bytes": 3589344213,
+      "prove": {
+        "authenticated_output_digest": null,
+        "authenticated_output_elements": null,
+        "command": "prove",
+        "error_code": null,
+        "last_completed_stage": "prove",
+        "last_event_seq": 224,
+        "outcome": "PASS",
+        "output_binding": null,
+        "progress_path": "docs/benchmarks/20261119-2018-segment-read-path-streaming-6e049ae7-1c4dc4e7/round-1/prove-run/progress.jsonl",
+        "proof_bytes": 3589344213,
+        "protocol_wall_ms": 755339,
+        "run_id": "prove",
+        "stage_wall_ms": 755339,
+        "vmhwm_kib": 212621908
+      },
+      "round": 1,
+      "verify": {
+        "authenticated_output_digest": "135c4d1c47aee4fd1985fa862afefbedde9d59beaf112bd2cf0dcfff03339280",
+        "authenticated_output_elements": 16,
+        "command": "verify",
+        "error_code": null,
+        "last_completed_stage": "verify",
+        "last_event_seq": 41,
+        "outcome": "PASS",
+        "output_binding": "expected",
+        "progress_path": "docs/benchmarks/20261119-2018-segment-read-path-streaming-6e049ae7-1c4dc4e7/round-1/verify-run/progress.jsonl",
+        "proof_bytes": null,
+        "protocol_wall_ms": 191993,
+        "run_id": "verify",
+        "stage_wall_ms": 191993,
+        "vmhwm_kib": 125784612
+      }
+    }
+  ]
+}
