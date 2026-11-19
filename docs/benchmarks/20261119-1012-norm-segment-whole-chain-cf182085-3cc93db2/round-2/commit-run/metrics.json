@@ -1,0 +1,9 @@
+{
+  "counters": {
+    "commit_bytes": 42493,
+    "key_bytes": 4547472,
+    "key_prove_ms": 180981,
+    "key_verify_ms": 52574
+  },
+  "schema": 1
+}

@@ -5,6 +5,8 @@ mod bounded_trace;
 pub mod commitment_ledger;
 pub mod commit;
 pub mod output;
+pub mod norm_parent;
+pub mod norm_segment_provider;
 pub mod provider;
 pub mod progress;
 pub mod policy;

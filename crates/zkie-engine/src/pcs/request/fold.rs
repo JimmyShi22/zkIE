@@ -3121,6 +3121,69 @@ mod tests {
     }
 
     #[test]
+    fn mask_table_and_weights_match_for_a04_shape() {
+        for &(k, h) in &[
+            (2u32, 0u32),
+            (2, 1),
+            (3, 1),
+            (14, 0),
+            (14, 2),
+            (14, 3),
+            (14, 7),
+        ] {
+            let len = 512usize.max(fold_mask_columns(k, h));
+            let w = values(k);
+            let g: Vec<Fp3> = (0..k as u64)
+                .map(|index| Fp3::from_u64(index * 2 + 3))
+                .collect();
+            let table =
+                MaskTable::new(1usize << h, len, fold_mask_table(k, h, len, &w).unwrap()).unwrap();
+            let u = fold_mask_weights(k, h, len, &g).unwrap();
+            let mut folded = vec![Fp3::ZERO; len];
+            for b in 0..(1usize << h) {
+                let mut weight = Fp3::ONE;
+                for l in 0..h as usize {
+                    let bit = (b >> l) & 1;
+                    let factor = if bit == 1 {
+                        g[l]
+                    } else {
+                        Fp3::ONE.sub(&g[l])
+                    };
+                    weight = weight.mul(&factor);
+                }
+                for c in 0..len {
+                    folded[c] = folded[c].add(&weight.mul(&table.at(b, c).unwrap()));
+                }
+            }
+            let mut inner = Fp3::ZERO;
+            for c in 0..len {
+                inner = inner.add(&folded[c].mul(&u[c]));
+            }
+            let mut expected = Fp3::ZERO;
+            for l in 0..k as usize {
+                let mut weight = Fp3::ZERO;
+                for degree in 0..E_DEGREE {
+                    if l + 1 < k as usize && degree == 0 {
+                        continue;
+                    }
+                    let place = hp_place(k, l as u32, degree as u32).unwrap();
+                    let mut power = Fp3::ONE;
+                    for _ in 0..degree {
+                        power = power.mul(&g[l]);
+                    }
+                    weight = weight.add(&w[place].mul(&power));
+                }
+                let mut tail = Fp3::ONE;
+                for j in (l + 1)..k as usize {
+                    tail = tail.mul(&g[j]);
+                }
+                expected = expected.add(&weight.mul(&tail));
+            }
+            assert_eq!(inner, expected, "k={k} h={h}");
+        }
+    }
+
+    #[test]
     fn gather_mask_rows() {
         let first = MaskTable::new(
             1,

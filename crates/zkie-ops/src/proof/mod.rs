@@ -28,6 +28,7 @@ pub mod lin_rows;
 pub mod hidden_send_session;
 pub mod hidden_norm;
 pub mod hidden_norm_psc;
+pub mod norm_segment;
 pub mod send_session;
 pub mod lin_session;
 pub mod output_head_lin;

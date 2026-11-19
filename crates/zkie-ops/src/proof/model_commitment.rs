@@ -531,6 +531,46 @@ pub fn open_asset(
     open_asset_from_reader(commitment, &reader, asset_id, row_start, row_count)
 }
 
+/// Reads one small asset file and returns its signed values together with
+/// the recomputed row-leaf root. The file is decoded through the same
+/// encoding the commitment builder uses, so an unchanged asset reproduces its
+/// anchored leaf record. It is meant for the small parameter assets, never for
+/// the weight matrices.
+pub fn read_asset_values_with_root(
+    root: &Path,
+    spec: &ModelAssetSpec,
+) -> Result<(Vec<i64>, Digest)> {
+    let encoding = AssetEncoding::parse(&spec.encoding)?;
+    let bytes = std::fs::read(root.join(&spec.path)).map_err(|_| Error::AssetMismatch)?;
+    let expected = spec
+        .element_count
+        .checked_mul(encoding.element_size())
+        .ok_or(Error::ResourceLimit)?;
+    if bytes.len() as u64 != expected {
+        return Err(Error::AssetMismatch);
+    }
+    let values = encoding.decode(&bytes);
+    let actual_rows = spec.element_count.div_ceil(spec.row_width as u64);
+    let padded_rows = actual_rows.max(1).next_power_of_two();
+    let mut digests = Vec::with_capacity(padded_rows as usize);
+    for row in 0..padded_rows {
+        let start = row
+            .checked_mul(spec.row_width as u64)
+            .ok_or(Error::ResourceLimit)?;
+        let mut values_row = vec![0u64; spec.row_width];
+        if start < spec.element_count {
+            let available = (spec.element_count - start).min(spec.row_width as u64) as usize;
+            let first = usize::try_from(start).map_err(|_| Error::ResourceLimit)?;
+            values_row[..available].copy_from_slice(&values[first..first + available]);
+        }
+        digests.push(oracle_leaf(row, &values_row));
+    }
+    let start = oracle_start(&table_identity(spec));
+    let tree = merkle_build(&start, &digests)?;
+    let signed = values.into_iter().map(|value| value as i64).collect();
+    Ok((signed, tree.root))
+}
+
 pub fn open_asset_reader(
     commitment: &ModelCommitment,
     asset_id: u64,

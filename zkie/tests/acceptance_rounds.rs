@@ -55,6 +55,7 @@ fn write_policy(
     anchor_id: &str,
     model_id: &str,
     metas: &[AssetTableMeta],
+    keep_output_head: bool,
 ) -> String {
     let text = fs::read_to_string(template).unwrap();
     let mut header = String::new();
@@ -85,7 +86,23 @@ fn write_policy(
         .into_iter()
         .find(|block| block.contains(&format!("case_id = \"{case_id}\"")))
         .expect("the template lists the case");
+    let mut kept_output_head: Option<String> = None;
     if let Some(cut) = block.find("[case.limited_table_identity]") {
+        if keep_output_head && model == "gpt2" {
+            let mut fixed = String::new();
+            for line in block[cut..].lines() {
+                let trimmed = line.trim_start();
+                if trimmed.starts_with("anchor_id = ") {
+                    fixed.push_str(&format!("anchor_id = \"{anchor_id}\"\n"));
+                } else if trimmed.starts_with("model_id = ") {
+                    fixed.push_str(&format!("model_id = \"{model_id}\"\n"));
+                } else {
+                    fixed.push_str(line);
+                    fixed.push('\n');
+                }
+            }
+            kept_output_head = Some(fixed);
+        }
         block.truncate(cut);
     }
     let model_version = header
@@ -105,8 +122,19 @@ fn write_policy(
             out.push('\n');
         }
     }
-    if !metas.is_empty() {
-        let meta = metas.first().expect("the commit publishes one table");
+    let identity_meta = if model == "gpt2" {
+        if let Some(kept) = kept_output_head {
+            out.push_str(&kept);
+            None
+        } else {
+            metas.first()
+        }
+    } else if !metas.is_empty() {
+        metas.first()
+    } else {
+        None
+    };
+    if let Some(meta) = identity_meta {
         out.push_str(&format!(
             "\n[case.limited_table_identity]\nversion = 1\nmodel = \"{model}\"\nmodel_version = {model_version}\ncase_id = \"{case_id}\"\nanchor_id = \"{anchor_id}\"\nmodel_id = \"{model_id}\"\nasset_id = {}\nasset_table_identity = \"{}\"\ntable_root = \"{}\"\ntable_record_digest = \"{}\"\ntable_configuration = \"{}\"\ncode_log_n = {}\ncode_ell = {}\ncode_r = {}\ntable_v = {}\nanswers = {}\nsalt_bytes = {}\ndistance_radius = {}\ndistance_later_radius = {}\ndistance_m_once = {}\ndistance_m_later = {}\nmatrix_rows_log = {}\nk_lo = 0\nk_col = {}\nprotocol_identity = \"{}\"\n",
             meta.asset_id,
@@ -200,6 +228,9 @@ fn acceptance_rounds() {
             &anchor_id,
             &model_id,
             &metas,
+            std::env::var("ZKIE_ACCEPT_OUTPUT_HEAD_IDENTITY")
+                .map(|value| value == "template")
+                .unwrap_or(false),
         );
         let policy = dir.join("policy.toml");
         fs::write(&policy, policy_text).unwrap();

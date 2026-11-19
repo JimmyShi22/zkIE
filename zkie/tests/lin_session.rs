@@ -500,30 +500,7 @@ fn selected_gpt2_output_head_request_session() {
     }
 
     fn fixed_key_randomness(shape: zkie_engine::pcs::request::table::IndexShape) -> LmHeadKeyRandomness {
-        let rows = shape.rows() as usize;
-        let n = shape.code.n() as usize;
-        let tail_len = shape.code.r as usize;
-        let pads_len = E_DEGREE * shape.answers as usize;
-        let word = |seed: u64| Fp::from_u64(seed % 1021 + 1);
-        LmHeadKeyRandomness {
-            tails: (0..rows)
-                .map(|row| {
-                    (0..tail_len)
-                        .map(|entry| word(row as u64 * 31 + entry as u64))
-                        .collect()
-                })
-                .collect(),
-            salts: (0..n)
-                .map(|position| vec![(position as u8) ^ 0x5A; SALT])
-                .collect(),
-            pads: (0..rows)
-                .map(|row| {
-                    (0..pads_len)
-                        .map(|entry| word(row as u64 * 7 + entry as u64))
-                        .collect()
-                })
-                .collect(),
-        }
+        zkie::lm_head_key::fixed_lm_head_key_randomness(shape)
     }
 
     /// The committed encoded table and the read-only row source that produced
@@ -590,6 +567,7 @@ fn selected_gpt2_output_head_request_session() {
         tokens: trace.tokens.clone(),
         expected_argmax: Vec::new(),
         expected_output: Vec::new(),
+        segment_identity: None,
     };
     let work_dir = env::temp_dir().join(format!(
         "zkie-output-head-session-{}",

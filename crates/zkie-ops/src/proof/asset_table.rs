@@ -376,6 +376,50 @@ fn check_asset_table_randomness(
     Ok(())
 }
 
+
+/// Samples the private table material from a plan-fixed public seed. The same
+/// seed and parameters give the same salts and tails, so the table root is a
+/// reproducible function of the trusted asset and the public derivation. The
+/// material never enters the public bundle.
+pub fn sample_asset_table_randomness_public(
+    params: &AssetTableParams,
+    seed: zkie_core::types::Digest,
+) -> Result<AssetTableRandomness> {
+    use zkie_core::common::field::PrimeField64;
+    use zkie_engine::pcs::request::field::Fp3;
+    use zkie_engine::pcs::request::fold::{ByteMaskCoins, MaskCoins};
+    if seed == zkie_core::types::Digest::ZERO {
+        return Err(ZkieError::InvalidConfig);
+    }
+    let columns = usize::try_from(params.shape.code.n()).map_err(|_| ZkieError::ResourceLimit)?;
+    let rows = usize::try_from(params.shape.rows()).map_err(|_| ZkieError::ResourceLimit)?;
+    let salt_bytes = params.shape.salt_bytes;
+    let tail_len = usize::try_from(params.shape.code.r).map_err(|_| ZkieError::ResourceLimit)?;
+    let mut coins = ByteMaskCoins::new(seed)?;
+    let mut salts = Vec::with_capacity(columns);
+    for _ in 0..columns {
+        let mut salt = Vec::with_capacity(salt_bytes);
+        while salt.len() < salt_bytes {
+            let (value, _) = coins.draw()?;
+            for coefficient in value.c {
+                salt.extend_from_slice(&coefficient.as_canonical_u64().to_le_bytes());
+            }
+        }
+        salt.truncate(salt_bytes);
+        salts.push(salt);
+    }
+    let mut tails = Vec::with_capacity(rows);
+    for _ in 0..rows {
+        let mut tail = Vec::with_capacity(tail_len);
+        for _ in 0..tail_len {
+            let (value, _) = coins.draw()?;
+            tail.push(value.c[0]);
+        }
+        tails.push(tail);
+    }
+    Ok(AssetTableRandomness { salts, tails })
+}
+
 /// Samples the private randomness of every trusted table. The result is
 /// aligned with `params` and is the input of the table commit.
 pub fn sample_asset_table_inputs(params: &[AssetTableParams]) -> Result<Vec<AssetTableInput>> {

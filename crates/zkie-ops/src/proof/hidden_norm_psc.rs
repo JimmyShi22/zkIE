@@ -1291,6 +1291,10 @@ pub struct NormRstdPlan {
     pub commit: LookupCommitPlan,
     pub key: crate::proof::lookup::LookupKeyPlan,
     pub table: TableConfig,
+    /// The trusted maximum magnitude of the table entries used by this
+    /// segment. It is a plan value derived from the pinned table content and
+    /// the segment index domain, recorded with its derivation evidence.
+    pub value_bound: u64,
 }
 
 impl NormRstdPlan {
@@ -1313,6 +1317,7 @@ impl NormRstdPlan {
             || self.table.real_len > rows
             || self.key.table_identity != self.table.identity
             || self.key.padding_values.len() != 2
+            || self.value_bound == 0
         {
             return Err(Error::InvalidConfig);
         }
@@ -1354,6 +1359,7 @@ impl NormRstdPlan {
         writer.put_digest(&self.table.content_root);
         writer.put_u64(self.table.real_len as u64);
         writer.put_u64(self.table.version);
+        writer.put_u64(self.value_bound);
         writer.put_u64(match self.table.encoding {
             crate::proof::lookup_table::TableEncoding::I32Le => 4,
             crate::proof::lookup_table::TableEncoding::I64Le => 8,
@@ -1369,10 +1375,12 @@ impl NormRstdPlan {
         positions: u32,
         table: TableConfig,
         first_value: Fp3,
+        value_bound: u64,
         params: &NormRstdParams,
     ) -> Result<Self> {
         if positions == 0
             || table.real_len == 0
+            || value_bound == 0
             || table.version != TABLE_ENCODING_VERSION
             || table.identity == Digest::ZERO
             || table.content_root == Digest::ZERO
@@ -1488,6 +1496,7 @@ impl NormRstdPlan {
             commit,
             key,
             table,
+            value_bound,
         };
         plan.validate()?;
         Ok(plan)
@@ -2274,11 +2283,14 @@ impl NormPlan {
         Ok(())
     }
 
-    /// The plan-level no-wrap derivation of the output tail. Every integer
-    /// magnitude is bounded from the trusted widths, the shift, the input
-    /// bound and the published parameter ranges; each reconstruction and
-    /// relation term must stay below half the base modulus. The witness-level
-    /// bound is not a substitute for this plan check.
+    /// The plan-level no-wrap derivation of the output tail. It works over
+    /// the full byte ranges the lookups enforce and the trusted value bounds:
+    /// every relation's integer residual interval must contain no nonzero
+    /// multiple of the base modulus. Relation 0 is checked as a window cover
+    /// (image bound plus the quotient/remainder reconstruction window below
+    /// the modulus), which makes a modular zero an integer zero and fixes the
+    /// quotient and remainder; the other relations keep their term bounds.
+    /// The witness-level bound is not a substitute for this plan check.
     fn tail_no_wrap(&self) -> Result<()> {
         let output = self.output.as_ref().ok_or(Error::InvalidConfig)?;
         let tail = output.tail.as_ref().ok_or(Error::InvalidConfig)?;
@@ -2333,14 +2345,19 @@ impl NormPlan {
         let centered = (round.input_bound as u128)
             .checked_mul(2)
             .ok_or(Error::ResourceLimit)?;
-        // The normalized image: the centered input times the reciprocal
-        // standard deviation and the gain, at the committed fixed-point
-        // scale. The scale division only shrinks the true value, so the
-        // product of the three published magnitudes plus the rounding term
-        // is a safe integer bound over the tile.
-        let image = (self.shape.valid as u128)
-            .checked_mul(centered)
-            .and_then(|value| value.checked_mul(round_bounds.rsqrt))
+        // The image is the pointwise product pinned by the product-sumcheck;
+        // the prover has no free choice over it. The per-column bound uses the
+        // trusted input contract and the pinned table magnitudes: the centered
+        // amplitude (twice the input bound), the rstd value bound of the
+        // frozen-table plan when present, and the gain bound. The valid-column
+        // count is not a factor: the claim target is field arithmetic and the
+        // image carries no per-row sum.
+        let rstd_bound = match &self.rstd {
+            Some(rstd) => u128::from(rstd.value_bound),
+            None => round_bounds.rsqrt,
+        };
+        let image = centered
+            .checked_mul(rstd_bound)
             .and_then(|value| value.checked_mul(gain))
             .and_then(|value| value.checked_add(1))
             .ok_or(Error::ResourceLimit)?;
@@ -2353,14 +2370,23 @@ impl NormPlan {
         if shifted >= half || bias_sum >= half || image >= half {
             return Err(Error::InvalidConfig);
         }
-        // Relation 0: image plus the quotient and remainder reconstruction.
-        let reconstruction = (q_cap - 1)
+        // Relation 0: the image minus the quotient/remainder reconstruction.
+        // The byte lookups force the encoded quotient into
+        // [-q_half, q_half) and the remainder into [0, r_cap); the
+        // reconstruction window has width (q_half - 1) * divisor + (r_cap - 1).
+        // When the image bound plus this window stays below the modulus, a
+        // modular zero is an integer zero and the quotient and remainder are
+        // unique inside the window. This is a window-cover check, not a sum
+        // of independent absolute values.
+        let reconstruction = (q_half - 1)
             .checked_mul(divisor)
             .and_then(|value| value.checked_add(r_cap - 1))
-            .and_then(|value| value.checked_add(divisor.checked_mul(q_half)?))
-            .and_then(|value| value.checked_add(image))
             .ok_or(Error::ResourceLimit)?;
-        if reconstruction >= half {
+        if image
+            .checked_add(reconstruction)
+            .filter(|value| *value < MODULUS as u128)
+            .is_none()
+        {
             return Err(Error::InvalidConfig);
         }
         // Relation 1: shifted value from the quotient and the half selector.
@@ -3377,9 +3403,12 @@ impl NormOutputTailPlan {
                         return Err(Error::InvalidConfig);
                     }
                 }
-                let pre_capacity = 1u128 << (8 * self.widths.pre_clamp as u32);
+                // The pre-clamp distance is bounded by the pre-clamp half
+                // range plus the clamp bound (the pre value is half-offset
+                // encoded), not by the full pre-clamp capacity.
+                let pre_half = 1u128 << (8 * self.widths.pre_clamp as u32 - 1);
                 let bound = (low.unsigned_abs() as u128).max(high.unsigned_abs() as u128);
-                let span = pre_capacity
+                let span = pre_half
                     .checked_add(bound)
                     .ok_or(Error::InvalidConfig)?;
                 if digit_bound(clamp.low).map_err(|_| Error::InvalidConfig)? + 1 < span
@@ -4035,6 +4064,11 @@ pub struct NormOutputPlan {
     pub shift: u32,
     /// The optional clamp interval of the runtime op.
     pub clamp: Option<(i64, i64)>,
+    /// Marks the trusted no-op clamp contract form: the registered model has
+    /// no clamp, the plan fixes a symmetric interval `[-B, B]` that covers the
+    /// honest pre-clamp range, and the equivalence is carried by the trusted
+    /// input contract, not by a model clamp.
+    pub no_op_clamp: bool,
     /// The committed witness rows of the rounding, bias and clamp tail.
     pub tail: Option<NormOutputTailPlan>,
 }
@@ -4063,6 +4097,20 @@ impl NormOutputPlan {
         if let Some((low, high)) = self.clamp {
             if low > high {
                 return Err(Error::InvalidConfig);
+            }
+        }
+        if self.no_op_clamp {
+            // The no-op form is the signed-offset domain of the pre-clamp
+            // cell: every reachable pre-clamp value lies inside it, so the
+            // comparison selectors are forced to zero by the chain's own sign
+            // relations and the output equals the pre-clamp value in-chain.
+            let tail = self.tail.as_ref().ok_or(Error::InvalidConfig)?;
+            let half = 1i64
+                .checked_shl(8 * tail.widths.pre_clamp as u32 - 1)
+                .ok_or(Error::InvalidConfig)?;
+            match self.clamp {
+                Some((low, high)) if low == -half && high == half - 1 => {}
+                _ => return Err(Error::InvalidConfig),
             }
         }
         let mut bases = [
@@ -4105,6 +4153,7 @@ impl NormOutputPlan {
             }
             None => writer.put_u64(0),
         }
+        writer.put_u64(u64::from(self.no_op_clamp));
         match &self.tail {
             Some(tail) => {
                 writer.put_u64(1);
@@ -6183,7 +6232,7 @@ mod tests {
             run: Digest([0x73; 32]),
             configuration: Digest([0x74; 32]),
         };
-        let plan = NormRstdPlan::from_round(&round, 2, table, Fp3::from_u64(100), &params)
+        let plan = NormRstdPlan::from_round(&round, 2, table, Fp3::from_u64(100), 1000, &params)
             .unwrap();
         assert_eq!(plan.lookup.columns, 2);
         assert_eq!(plan.lookup.table_log, 3);
@@ -6201,7 +6250,7 @@ mod tests {
 
         let mut bad = table;
         bad.identity = Digest::ZERO;
-        assert!(NormRstdPlan::from_round(&round, 2, bad, Fp3::ZERO, &params).is_err());
+        assert!(NormRstdPlan::from_round(&round, 2, bad, Fp3::ZERO, 1000, &params).is_err());
         let mut bad = plan.clone();
         bad.lookup.columns = 1;
         assert!(bad.validate().is_err());
@@ -6871,6 +6920,7 @@ mod tests {
             out: group(703, 7300),
             shift: 4,
             clamp: Some((-5, 5)),
+            no_op_clamp: false,
             tail: None,
         };
         let digest = plan.digest();
@@ -7011,6 +7061,30 @@ mod tests {
             .unwrap()
             .widths
             .quotient = 8;
+        assert!(changed.validate().is_err());
+
+        let mut changed = with_tail.clone();
+        changed
+            .output
+            .as_mut()
+            .unwrap()
+            .tail
+            .as_mut()
+            .unwrap()
+            .widths
+            .remainder = 0;
+        assert!(changed.validate().is_err());
+
+        let mut changed = with_tail.clone();
+        changed
+            .output
+            .as_mut()
+            .unwrap()
+            .tail
+            .as_mut()
+            .unwrap()
+            .widths
+            .tie_slack = 0;
         assert!(changed.validate().is_err());
 
         assert_eq!(widths.slots().unwrap(), 16);

@@ -35,11 +35,21 @@ use zkie_ops::proof::asset_key::{
 };
 use zkie_ops::proof::asset_table::{
     decode_asset_table_randomness_set, encode_asset_table_randomness_set,
-    sample_asset_table_inputs, AssetTableInput, AssetTableMeta, AssetTableParams,
+    sample_asset_table_randomness, sample_asset_table_randomness_public, AssetTableInput, AssetTableMeta, AssetTableParams,
 };
 use zkie_ops::proof::consumer_proof::ConsumerProofFile;
 use zkie_ops::proof::consumer_request::ConsumerSharedPlan;
 use zkie_ops::proof::consumer_session::verify_consumer_request;
+use crate::norm_parent::{
+    build_norm_plan, build_norm_segment, build_segment_plan, check_authenticated_bounds,
+    final_norm_rows, read_anchored_params, read_rstd_values, segment_session_seed, segment_x_seed,
+};
+use crate::norm_segment_provider::{
+    build_param_tables, build_segment_table, configuration_for, lm_head_asset, plan_identifier,
+    prove_segment_bytes, rstd_table_view, segment_identity_binding, segment_table_key,
+    segment_work_dir, verify_segment_bytes, NormSegmentCarrier, SegmentTableIdentity,
+    NORM_SEGMENT_CARRIER_FILE, NORM_SEGMENT_CARRIER_VERSION,
+};
 
 const PROTOCOL_ID: Digest = Digest([0xA1; 32]);
 const PARAMETERS_DIGEST: Digest = Digest([0xA2; 32]);
@@ -78,6 +88,10 @@ pub struct StatementData {
     pub tokens: Vec<u32>,
     pub expected_argmax: Vec<u32>,
     pub expected_output: Vec<i32>,
+    /// The segment's own output head table identity. The policy block names
+    /// the consumer table; this one rides the statement and its digest is
+    /// absorbed into the segment session derivation.
+    pub segment_identity: Option<SegmentTableIdentity>,
 }
 
 fn read_i32(path: &Path) -> Result<Vec<i32>> {
@@ -395,6 +409,36 @@ fn timesfm_key_columns() -> Result<(
     Ok((params, spec, columns))
 }
 
+/// Samples the commit table material. The final-norm parameter tables use a
+/// plan-fixed public seed, so their roots are a reproducible function of the
+/// trusted asset and the public derivation; the projection table keeps fresh
+/// material.
+fn sample_production_tables(params: &[AssetTableParams]) -> Result<Vec<AssetTableInput>> {
+    let mut tables = Vec::with_capacity(params.len());
+    for params in params {
+        let randomness = if params.path.ends_with("ln_f_w_i32.bin")
+            || params.path.ends_with("ln_f_b_i32.bin")
+        {
+            sample_asset_table_randomness_public(params, norm_param_seed(params))?
+        } else {
+            sample_asset_table_randomness(params)?
+        };
+        tables.push(AssetTableInput {
+            params: params.clone(),
+            randomness,
+        });
+    }
+    Ok(tables)
+}
+
+fn norm_param_seed(params: &AssetTableParams) -> zkie_core::types::Digest {
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(b"zkie/norm-param-table/v1");
+    bytes.extend_from_slice(&params.asset_id.to_le_bytes());
+    bytes.extend_from_slice(params.path.as_bytes());
+    zkie_core::artifact::digest_bytes(&bytes)
+}
+
 fn trusted_table_params(model: &str) -> Result<Vec<AssetTableParams>> {
     match model {
         "gpt2" => zkie_models_gpt2::plan::asset_table_params(),
@@ -456,6 +500,259 @@ fn execute_shared(
     }
 }
 
+
+/// Proves the final norm segment and returns its public carrier. The segment
+/// is assembled only at the accepted hidden session's position count.
+fn prove_norm_segment(
+    config: &ProviderConfig,
+    commitment: &zkie_ops::proof::model_commitment::ModelCommitment,
+    tables: &[AssetTableInput],
+    trace: &SharedTrace,
+    output_dir: &Path,
+    ctx: &mut PipelineContext<'_>,
+) -> Result<Option<(Vec<u8>, SegmentTableIdentity)>> {
+    let positions = config.tokens.len();
+    if positions != zkie_ops::proof::output_head_lin::OUTPUT_HEAD_POSITIONS {
+        return Ok(None);
+    }
+    let model = commitment.anchor.record.model_commitment;
+    let public = ModelCommitmentPublic::from_commitment(commitment);
+    let trace_plan = zkie_models_gpt2::plan::trace_plan(positions)?;
+    let matmul = crate::s7_context::find_lm_head_matmul(&trace_plan)?;
+    let identifier = plan_identifier(&public, &trace_plan, matmul.index)?;
+    let request_plan = zkie_models_gpt2::lm_head_plan::lm_head_plan()?;
+    let configuration = configuration_for(&request_plan, identifier)?;
+    let plan_positions = u32::try_from(positions).map_err(|_| Error::ResourceLimit)?;
+    let profile = zkie_models_gpt2::norm_profile::segment_profile(
+        plan_positions,
+        segment_x_seed(model, positions),
+    )?;
+    let (norm_index, x_rows, hd_rows) = final_norm_rows(trace)?;
+    if matmul.activation_step != norm_index {
+        return Err(Error::StatementMismatch);
+    }
+    let asset_root = Path::new(&config.asset_root);
+    let (gain, bias) = read_anchored_params(asset_root, &public.assets)?;
+    let rstd = read_rstd_values(asset_root, &profile, &x_rows)?;
+    let (norm_plan, witness) = build_norm_segment(
+        &profile,
+        configuration,
+        &commitment.tables,
+        &x_rows,
+        &gain,
+        &bias,
+        &rstd,
+    )?;
+    let rstd_table = rstd_table_view(asset_root)?;
+    check_authenticated_bounds(
+        &norm_plan,
+        &profile,
+        &x_rows,
+        &gain,
+        &bias,
+        &rstd_table,
+    )?;
+    let key = segment_table_key(request_plan.table_shape()?);
+    let asset = lm_head_asset(commitment, &matmul.weight_path)?;
+    let work_dir = segment_work_dir(output_dir)?;
+    std::fs::create_dir_all(&work_dir).map_err(|_| Error::Io)?;
+    let started = Instant::now();
+    let mut table = build_segment_table(
+        asset_root,
+        &asset,
+        &request_plan,
+        configuration,
+        &key,
+        &work_dir,
+    )?;
+    let reader = table.reader().clone();
+    let specs = zkie_models_gpt2::plan::asset_specs();
+    let spec = specs
+        .iter()
+        .find(|spec| spec.path == matmul.weight_path)
+        .ok_or(Error::UnsupportedPrimitive)?;
+    let identity = SegmentTableIdentity {
+        asset_id: spec.asset_id,
+        asset_table_identity: zkie_ops::proof::model_commitment::asset_table_identity(spec),
+        code_log_n: reader.shape.code.log_n,
+        code_ell: reader.shape.code.ell,
+        code_r: reader.shape.code.r,
+        table_v: reader.shape.v,
+        answers: reader.shape.answers,
+        salt_bytes: reader.shape.salt_bytes as u64,
+        distance_radius: reader.shape.distances.radius,
+        distance_later_radius: reader.shape.distances.later_radius,
+        distance_m_once: reader.shape.distances.m_once,
+        distance_m_later: reader.shape.distances.m_later,
+        matrix_rows_log: request_plan.lin.matrix_rows_log,
+        k_lo: request_plan.lin.k_lo,
+        k_col: request_plan.lin.k_col,
+        table_root: reader.root,
+        table_record_digest: zkie_core::artifact::digest_bytes(&reader.record.encode()),
+        table_configuration: configuration,
+    };
+    identity.validate()?;
+    let binding = segment_identity_binding(&identity);
+    let session_seed = segment_session_seed(model, positions, binding);
+    let plan = build_segment_plan(
+        &trace_plan,
+        &config.expected_argmax,
+        &reader,
+        reader.shape,
+        configuration,
+        &norm_plan,
+        &profile,
+        &hd_rows,
+        session_seed,
+    )?;
+    let mut params = build_param_tables(commitment, tables)?;
+    let messages = prove_segment_bytes(
+        &plan,
+        &mut table,
+        session_seed,
+        &witness,
+        &mut params,
+        &rstd_table,
+    )?;
+    let _ = std::fs::remove_dir_all(&work_dir);
+    ctx.metrics
+        .record("norm_segment_prove_ms", started.elapsed().as_millis() as u64);
+    ctx.metrics.record("norm_segment_bytes", messages.len() as u64);
+    let carrier = NormSegmentCarrier {
+        version: NORM_SEGMENT_CARRIER_VERSION,
+        reader,
+        messages,
+    };
+    Ok(Some((carrier.encode()?, identity)))
+}
+
+/// Verifies the final norm segment carrier when the proof publishes one. The
+/// published reader is pinned to the operator policy, the plan is rebuilt from
+/// the authenticated trace and the chain verifies against the frozen table.
+fn verify_norm_segment(
+    trusted: &crate::policy::TrustedRequest,
+    public: &ModelCommitmentPublic,
+    statement: &StatementData,
+    trace: &SharedTrace,
+    proof_dir: &Path,
+    proof_manifest: &ArtifactManifest,
+    asset_root: &Path,
+    table_metas: &[AssetTableMeta],
+    ctx: &mut PipelineContext<'_>,
+) -> Result<()> {
+    let applies =
+        statement.tokens.len() == zkie_ops::proof::output_head_lin::OUTPUT_HEAD_POSITIONS;
+    let entry = match proof_manifest.find_file(NORM_SEGMENT_CARRIER_FILE) {
+        Some(entry) => entry,
+        None => {
+            if applies {
+                return Err(Error::IncompleteArtifact);
+            }
+            return Ok(());
+        }
+    };
+    if !applies {
+        return Err(Error::StatementMismatch);
+    }
+    let bytes = fs::read(proof_dir.join(NORM_SEGMENT_CARRIER_FILE))
+        .map_err(|_| Error::IncompleteArtifact)?;
+    if bytes.len() as u64 != entry.byte_length
+        || digest_bytes(&bytes) != entry.content_digest
+    {
+        return Err(Error::ArtifactIntegrityMismatch);
+    }
+    let carrier = NormSegmentCarrier::decode(&bytes)?;
+    let identity = statement
+        .segment_identity
+        .as_ref()
+        .ok_or(Error::IncompleteArtifact)?;
+    identity.validate()?;
+    let positions = statement.tokens.len();
+    if positions != zkie_ops::proof::output_head_lin::OUTPUT_HEAD_POSITIONS
+        || statement.model != trusted.model
+        || statement.case_id != trusted.case_id
+        || statement.model_commitment != public.anchor.model_commitment
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let reader = &carrier.reader;
+    if reader.fault().is_some()
+        || reader.root != identity.table_root
+        || reader.configuration != identity.table_configuration
+        || reader.shape != identity.shape()?
+        || digest_bytes(&reader.record.encode()) != identity.table_record_digest
+        || identity.matrix_rows()? != reader.shape.rows()
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let trace_plan = zkie_models_gpt2::plan::trace_plan(positions)?;
+    let matmul = crate::s7_context::find_lm_head_matmul(&trace_plan)?;
+    let specs = zkie_models_gpt2::plan::asset_specs();
+    let spec = specs
+        .iter()
+        .find(|spec| spec.path == matmul.weight_path)
+        .ok_or(Error::UnsupportedPrimitive)?;
+    let asset_meta = public
+        .assets
+        .iter()
+        .find(|asset| asset.path == spec.path)
+        .ok_or(Error::AssetMismatch)?;
+    if identity.asset_id != asset_meta.asset_id
+        || identity.asset_table_identity
+            != zkie_ops::proof::model_commitment::asset_table_identity(spec)
+        || asset_meta.leaf_record.table_identity != identity.asset_table_identity
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let identifier = plan_identifier(public, &trace_plan, matmul.index)?;
+    let request_plan = zkie_models_gpt2::lm_head_plan::lm_head_plan()?;
+    let configuration = configuration_for(&request_plan, identifier)?;
+    if configuration != reader.configuration
+        || identity.table_configuration != configuration
+        || identity.shape()? != request_plan.table_shape()?
+        || identity.matrix_rows_log != request_plan.lin.matrix_rows_log
+        || identity.k_lo != request_plan.lin.k_lo
+        || identity.k_col != request_plan.lin.k_col
+    {
+        return Err(Error::StatementMismatch);
+    }
+    let model = statement.model_commitment;
+    let plan_positions = u32::try_from(positions).map_err(|_| Error::ResourceLimit)?;
+    let profile = zkie_models_gpt2::norm_profile::segment_profile(
+        plan_positions,
+        segment_x_seed(model, positions),
+    )?;
+    let (norm_index, x_rows, hd_rows) = final_norm_rows(trace)?;
+    if matmul.activation_step != norm_index {
+        return Err(Error::StatementMismatch);
+    }
+    let norm_plan = build_norm_plan(&profile, configuration, table_metas, &x_rows)?;
+    let (gain, bias) = read_anchored_params(asset_root, &public.assets)?;
+    let session_seed =
+        segment_session_seed(model, positions, segment_identity_binding(identity));
+    let plan = build_segment_plan(
+        &trace_plan,
+        &statement.expected_argmax,
+        reader,
+        reader.shape,
+        configuration,
+        &norm_plan,
+        &profile,
+        &hd_rows,
+        session_seed,
+    )?;
+    let rstd = rstd_table_view(asset_root)?;
+    check_authenticated_bounds(&norm_plan, &profile, &x_rows, &gain, &bias, &rstd)?;
+    let started = Instant::now();
+    let outcome = verify_segment_bytes(&plan, reader, &carrier.messages, &rstd)?;
+    ctx.metrics
+        .record("norm_segment_verify_ms", started.elapsed().as_millis() as u64);
+    if outcome.activation.root != plan.send.activation_root {
+        return Err(Error::InvalidProof);
+    }
+    Ok(())
+}
+
 pub struct ProductionProvider;
 
 impl PipelineProvider for ProductionProvider {
@@ -466,7 +763,7 @@ impl PipelineProvider for ProductionProvider {
     ) -> Result<CommitReceipt> {
         let config = parse_case(&request.case_config)?;
         let table_params = trusted_table_params(&config.model)?;
-        let tables = sample_asset_table_inputs(&table_params)?;
+        let tables = sample_production_tables(&table_params)?;
         let commitment = build_commitment(&config, &tables)?;
         // The one-time key qualification is proved once over this committed
         // instance and published in the commit's public bundle. Every request
@@ -650,6 +947,22 @@ impl PipelineProvider for ProductionProvider {
             ctx.metrics.record("key_verify_ms", started.elapsed().as_millis() as u64);
             ctx.metrics.record("key_bytes", bytes.len() as u64);
         }
+        let (trace, consumer) = execute_shared(&config, &commitment, &tables, ctx.progress)?;
+        let (norm_carrier, segment_identity) = if config.model == "gpt2" {
+            match prove_norm_segment(
+                &config,
+                &commitment,
+                &tables,
+                &trace,
+                &request.output_dir,
+                ctx,
+            )? {
+                Some((bytes, identity)) => (Some(bytes), Some(identity)),
+                None => (None, None),
+            }
+        } else {
+            (None, None)
+        };
         let statement = StatementData {
             case_id: config.case_id.clone(),
             model: config.model.clone(),
@@ -657,9 +970,9 @@ impl PipelineProvider for ProductionProvider {
             tokens: config.tokens.clone(),
             expected_argmax: config.expected_argmax.clone(),
             expected_output: config.expected_output.clone(),
+            segment_identity,
         };
         let statement_bytes = bincode::serialize(&statement).map_err(|_| Error::InvalidEncoding)?;
-        let (trace, consumer) = execute_shared(&config, &commitment, &tables, ctx.progress)?;
         let consumer_bytes = consumer
             .as_ref()
             .map(|file| file.encode())
@@ -698,6 +1011,16 @@ impl PipelineProvider for ProductionProvider {
                 digest,
             ));
             ctx.metrics.record("consumer_proof_bytes", bytes.len() as u64);
+        }
+        if let Some(bytes) = &norm_carrier {
+            let digest = digest_bytes(bytes);
+            files.push((NORM_SEGMENT_CARRIER_FILE, bytes.as_slice()));
+            digests.push((NORM_SEGMENT_CARRIER_FILE, digest));
+            manifest_files.push(ArtifactFile::new(
+                NORM_SEGMENT_CARRIER_FILE,
+                bytes.len() as u64,
+                digest,
+            ));
         }
         let manifest = proof_manifest(model, manifest_files);
         ArtifactPublisher::publish_with_digests(&request.output_dir, &manifest, &files, &digests)?;
@@ -899,6 +1222,17 @@ impl PipelineProvider for ProductionProvider {
                     &spec,
                     shared,
                     &consumer,
+                )?;
+                verify_norm_segment(
+                    &trusted,
+                    &public,
+                    &statement,
+                    &trace,
+                    proof_dir,
+                    &proof_manifest,
+                    public_root,
+                    &table_metas,
+                    ctx,
                 )?;
                 let argmax = trace.argmax.clone();
                 let computed: Vec<i64> = argmax.iter().map(|value| *value as i64).collect();
@@ -1149,6 +1483,7 @@ mod tests {
             tokens: Vec::new(),
             expected_argmax: Vec::new(),
             expected_output: Vec::new(),
+            segment_identity: None,
         }
     }
 

@@ -5226,17 +5226,32 @@ fn hd_activation_identity(
             return Err(Error::StatementMismatch);
         }
     }
+    let roots: Vec<Digest> = entries.iter().map(|entry| entry.root).collect();
+    hd_activation_root(plan, &roots)
+}
+
+/// The activation identity of the norm hidden-output object derived from the
+/// committed out group roots. The verifier re-commits the materialized output
+/// rows with the plan-fixed public coins and compares this identity with the
+/// chain statement.
+pub fn hd_activation_root(plan: &HiddenLinPlan, roots: &[Digest]) -> Result<Digest> {
+    let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
+    let output = norm.output.as_ref().ok_or(Error::InvalidConfig)?;
+    let group = &output.out;
+    if roots.len() != plan.send.positions() as usize || roots.iter().any(|root| *root == Digest::ZERO) {
+        return Err(Error::ShapeMismatch);
+    }
     let mut writer = CanonicalWriter::new();
     writer.put_u64(HD_ACTIVATION_IDENTITY_VERSION);
     writer.put_u64(group.oracle_base);
     writer.put_u64(group.group);
     writer.put_u64(group.columns);
     group.shape.encode_into(&mut writer);
-    writer.put_u64(entries.len() as u64);
-    for entry in entries {
-        writer.put_u64(entry.position as u64);
-        writer.put_u64(entry.oracle);
-        writer.put_digest(&entry.root);
+    writer.put_u64(roots.len() as u64);
+    for (position, root) in roots.iter().enumerate() {
+        writer.put_u64(position as u64);
+        writer.put_u64(group.oracle_base + position as u64);
+        writer.put_digest(root);
     }
     hash_labeled(tag_word(PARAMETERS, 7), 0, None, &writer.into_bytes())
 }
@@ -9441,7 +9456,10 @@ impl HiddenLinPlan {
             let norm = self.norm.as_ref().ok_or(Error::InvalidConfig)?;
             let output = norm.output.as_ref().ok_or(Error::InvalidConfig)?;
             let out = &output.out;
-            if u64::from(norm.shape.valid) != self.send.matrix_rows
+            // The norm may carry zero padding columns: the valid statistical
+            // columns are at most the matrix rows, and the padded columns are
+            // bound column by column through the output tail padding rows.
+            if u64::from(norm.shape.valid) > self.send.matrix_rows
                 || norm.columns < self.send.matrix_rows
                 || out.columns != norm.columns
                 || out.oracle_base == 0
@@ -21153,7 +21171,7 @@ fn norm_pointwise_maps(
 /// Resolves the key cells of the norm digit lookup across the committed
 /// rounding and tail messages. The key groups name the message each source
 /// addresses; the caller supplies the unencoded message rows of both groups.
-fn norm_lookup_key_values(
+pub(crate) fn norm_lookup_key_values(
     plan: &NormPlan,
     lookup: &crate::proof::hidden_norm_psc::NormLookupPlan,
     round_rows: &[Vec<Vec<Fp3>>],
@@ -23185,7 +23203,7 @@ fn norm_plain_rows(
                 for index in 0..width {
                     let entry = dense.get_mut(start + index).ok_or(Error::ShapeMismatch)?;
                     *entry = power.mul(&eq[index]);
-                    power = power.add(&power);
+                    power = power.mul(&Fp3::from_u64(256));
                 }
                 if let Some(slot) = value_slot {
                     let entry = dense.get_mut(slot).ok_or(Error::ShapeMismatch)?;
@@ -26399,6 +26417,37 @@ pub fn prove_hidden_lin_hidden_with_norm_and_rstd_table(
         Some(norm),
         Some(rstd_table),
         None,
+        None,
+    )
+}
+
+/// Proves the norm hidden-output chain with the frozen-table rstd view and
+/// the parameter tables. This is the NormHd form of the rstd-table prover:
+/// the prover reads the same frozen table the verifier checks.
+pub fn prove_hidden_lin_hidden_with_norm_hd_rstd_table(
+    plan: &HiddenLinPlan,
+    table: &mut dyn HiddenTableProver,
+    seed: Digest,
+    norm: &NormWitness,
+    rstd_table: &dyn crate::proof::lookup::LookupTable,
+    param_tables: Option<&mut dyn NormParamTableProver>,
+) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
+    if !plan.weights.is_empty()
+        || plan.norm.is_none()
+        || !plan.send.activation_source.is_norm_hd()
+    {
+        return Err(Error::InvalidConfig);
+    }
+    prove_hidden_lin_inner(
+        plan,
+        None,
+        table,
+        None,
+        seed,
+        true,
+        Some(norm),
+        Some(rstd_table),
+        param_tables,
         None,
     )
 }
@@ -30215,6 +30264,7 @@ mod merged_tests {
             POSITIONS,
             config,
             Fp3::from_u64(values[0] as u64),
+            1000,
             &params,
         )
         .unwrap();
@@ -36023,6 +36073,7 @@ mod merged_tests {
             out: group(93, 20_300, 61_300),
             shift: 3,
             clamp: Some((-1_000, 1_000)),
+            no_op_clamp: false,
             tail: Some(crate::proof::hidden_norm_psc::NormOutputTailPlan {
                 group: NormGroupPlan {
                     shape: WShape::new(
