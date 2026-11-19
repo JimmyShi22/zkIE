@@ -26,10 +26,11 @@ use zkie_ops::proof::hidden_send_session::{
 use zkie_ops::proof::norm_segment::{out_group_roots, NormSegmentProfile};
 use zkie_ops::proof::output_closure::ClosureMaskPlan;
 use zkie_ops::proof::output_head_lin::{
-    build_output_head_hidden_plan, build_output_head_output_plan, output_head_shape,
-    OutputClosureSetup, OutputHeadLinSetup, OutputHeadTrustedInputs, OUTPUT_HEAD_ASSET_PATH,
-    OUTPUT_HEAD_COLUMNS, OUTPUT_HEAD_HIDDEN, OUTPUT_HEAD_K_LO, OUTPUT_HEAD_POSITIONS,
-    OUTPUT_HEAD_SLACK_BITS, OUTPUT_HEAD_RANGE_BITS,
+    build_output_head_hidden_plan, build_output_head_output_plan,
+    build_output_head_output_plan_for, build_output_head_output_plan_unmasked_for,
+    output_head_shape_for, OutputClosureSetup, OutputHeadLinSetup, OutputHeadTrustedInputs,
+    OUTPUT_HEAD_ASSET_PATH, OUTPUT_HEAD_COLUMNS, OUTPUT_HEAD_HIDDEN, OUTPUT_HEAD_K_LO,
+    OUTPUT_HEAD_POSITIONS, OUTPUT_HEAD_RANGE_BITS, OUTPUT_HEAD_SLACK_BITS,
 };
 use zkie_ops::proof::plan::TracePlan;
 use zkie_ops::proof::psc::{hp_entries, psc_variables};
@@ -72,6 +73,33 @@ const CLOSURE_MASK_RUN: Digest = Digest([0x6A; 32]);
 const COLUMN_DRAWS: usize = 603;
 const COLUMN_WORK_BITS: u8 = 12;
 
+/// The explicit output-head geometry of one segment. The accepted gpt2
+/// segment is the masked form with the 2^16-column table; a model whose
+/// logits are argmaxed directly supplies the unmasked form.
+#[derive(Clone, Copy, Debug)]
+pub struct SegmentHeadGeometry {
+    pub positions: usize,
+    pub hidden: usize,
+    pub columns: usize,
+    pub k_lo: u32,
+    pub range_bits: u32,
+    pub slack_bits: u32,
+    pub masked: bool,
+    pub asset_path: &'static str,
+}
+
+/// The accepted gpt2 segment geometry.
+pub const GPT2_SEGMENT_HEAD: SegmentHeadGeometry = SegmentHeadGeometry {
+    positions: OUTPUT_HEAD_POSITIONS,
+    hidden: OUTPUT_HEAD_HIDDEN,
+    columns: OUTPUT_HEAD_COLUMNS,
+    k_lo: OUTPUT_HEAD_K_LO,
+    range_bits: OUTPUT_HEAD_RANGE_BITS,
+    slack_bits: OUTPUT_HEAD_SLACK_BITS,
+    masked: true,
+    asset_path: OUTPUT_HEAD_ASSET_PATH,
+};
+
 fn mask_tree(tree_number: u64, configuration: Digest, code: zkie_engine::pcs::request::code::CodeParams) -> MaskTreePlan {
     MaskTreePlan {
         tree_number,
@@ -100,14 +128,67 @@ pub fn build_segment_plan(
     hd_rows: &[Vec<i64>],
     seed: Digest,
 ) -> Result<HiddenLinPlan> {
-    if profile.positions as usize != OUTPUT_HEAD_POSITIONS
-        || profile.hidden as usize != OUTPUT_HEAD_HIDDEN
-        || profile.columns != OUTPUT_HEAD_HIDDEN as u64
+    build_segment_plan_for(
+        &GPT2_SEGMENT_HEAD,
+        trace_plan,
+        expected_argmax,
+        table_reader,
+        table_shape,
+        table_configuration,
+        norm_plan,
+        profile,
+        hd_rows,
+        seed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn build_segment_plan_for(
+    geometry: &SegmentHeadGeometry,
+    trace_plan: &TracePlan,
+    expected_argmax: &[u32],
+    table_reader: &IndexReader,
+    table_shape: IndexShape,
+    table_configuration: Digest,
+    norm_plan: &NormPlan,
+    profile: &NormSegmentProfile,
+    hd_rows: &[Vec<i64>],
+    seed: Digest,
+) -> Result<HiddenLinPlan> {
+    if profile.positions as usize != geometry.positions
+        || profile.hidden as usize != geometry.hidden
+        || profile.columns != geometry.hidden as u64
     {
         return Err(Error::UnsupportedPrimitive);
     }
-    let output_plan = build_output_head_output_plan(trace_plan, expected_argmax)?;
-    let code = build_code_plan(17, OUTPUT_HEAD_COLUMNS as u64, 8192)?;
+    let output_plan = if geometry.masked {
+        build_output_head_output_plan_for(
+            trace_plan,
+            geometry.positions,
+            geometry.hidden,
+            geometry.columns,
+            geometry.asset_path,
+            geometry.range_bits,
+            geometry.slack_bits,
+            expected_argmax,
+        )?
+    } else {
+        build_output_head_output_plan_unmasked_for(
+            trace_plan,
+            geometry.positions,
+            geometry.hidden,
+            geometry.columns,
+            geometry.asset_path,
+            geometry.range_bits,
+            geometry.slack_bits,
+            expected_argmax,
+        )?
+    };
+    let code_log = (geometry.columns as u64 + 8192)
+        .checked_next_power_of_two()
+        .ok_or(Error::ResourceLimit)?
+        .trailing_zeros();
+    let code = build_code_plan(code_log, geometry.columns as u64, 8192)?;
     let mask_code = build_code_plan(17, 512, 256)?;
     let tree = |tree_number: u64, run: Digest, main_rows: u64| -> Result<RuntimeTreePlan> {
         Ok(RuntimeTreePlan {
@@ -127,10 +208,10 @@ pub fn build_segment_plan(
         })
     };
     let w = WShape::new(
-        OUTPUT_HEAD_COLUMNS as u64,
+        geometry.columns as u64,
         code,
         1,
-        OUTPUT_HEAD_POSITIONS as u32,
+        geometry.positions as u32,
         SALT,
         W_TREE_NUMBER,
         1,
@@ -193,8 +274,8 @@ pub fn build_segment_plan(
                 answers: 1,
             },
             rows_high: true,
-            matrix_rows: OUTPUT_HEAD_HIDDEN as u64,
-            k_lo: OUTPUT_HEAD_K_LO,
+            matrix_rows: geometry.hidden as u64,
+            k_lo: geometry.k_lo,
         },
         code,
         mask_code,
@@ -222,7 +303,7 @@ pub fn build_segment_plan(
                 work_bits: 0,
             },
             IoppStagePlan {
-                main: build_code_plan(17, OUTPUT_HEAD_COLUMNS as u64, 256)?,
+                main: build_code_plan(code_log, geometry.columns as u64, 256)?,
                 mask: build_code_plan(17, 16_384, 256)?,
                 k: 0,
                 h: 0,
@@ -274,7 +355,7 @@ pub fn build_segment_plan(
             run: INDEX_MASK_RUN,
             configuration: table_configuration,
         },
-        entries: MaskEntryAllocation::new(OUTPUT_HEAD_POSITIONS as u32)?,
+        entries: MaskEntryAllocation::new(geometry.positions as u32)?,
     };
     let index_rows = index_mask.tree_rows()?;
     let norm_mask_rows = norm_plan
@@ -308,23 +389,23 @@ pub fn build_segment_plan(
     let own_two_stage = zkie_ops::proof::proximity_planner::plan_own_two_stage(
         code,
         mask_code,
-        build_code_plan(17, OUTPUT_HEAD_COLUMNS as u64, 1)?,
+        build_code_plan(code_log, geometry.columns as u64, 1)?,
         build_code_plan(17, 16_384, 1)?,
         14,
         own_h,
         252,
     )?;
-    let closure_width = 2 * (OUTPUT_HEAD_RANGE_BITS + 1) + OUTPUT_HEAD_SLACK_BITS;
-    let bits_columns = (OUTPUT_HEAD_COLUMNS as u64)
+    let closure_width = 2 * (geometry.range_bits + 1) + geometry.slack_bits;
+    let bits_columns = (geometry.columns as u64)
         .checked_mul(closure_width as u64)
         .ok_or(Error::ResourceLimit)?
         .next_power_of_two();
     let boolean_variables = bits_columns.trailing_zeros() as usize;
     let closure_slack = WShape::new(
-        OUTPUT_HEAD_COLUMNS as u64,
+        geometry.columns as u64,
         code,
         1,
-        OUTPUT_HEAD_POSITIONS as u32,
+        geometry.positions as u32,
         SALT,
         SLACK_TREE_NUMBER,
         2,
@@ -335,7 +416,7 @@ pub fn build_segment_plan(
         bits_columns,
         code,
         1,
-        OUTPUT_HEAD_POSITIONS as u32,
+        geometry.positions as u32,
         SALT,
         BITS_TREE_NUMBER,
         2,
@@ -363,7 +444,7 @@ pub fn build_segment_plan(
             run: CLOSURE_MASK_RUN,
             configuration: table_configuration,
         },
-        positions: OUTPUT_HEAD_POSITIONS as u32,
+        positions: geometry.positions as u32,
         hiding: hp_entries(&closure_variables)?,
         shown: 5,
     };
@@ -378,7 +459,7 @@ pub fn build_segment_plan(
             bits_columns,
             code,
             1,
-            OUTPUT_HEAD_POSITIONS as u32,
+            geometry.positions as u32,
             SALT,
             MAP_TREE_NUMBER,
             2,
@@ -389,15 +470,15 @@ pub fn build_segment_plan(
         map_openings: 2,
         mask: closure_mask,
     };
-    let activation_salts: Vec<Vec<u8>> = (0..OUTPUT_HEAD_POSITIONS)
+    let activation_salts: Vec<Vec<u8>> = (0..geometry.positions)
         .map(|position| vec![(position as u8).wrapping_mul(11) ^ 0x3C; SALT])
         .collect();
     let setup = OutputHeadLinSetup {
-        asset_path: OUTPUT_HEAD_ASSET_PATH.to_string(),
+        asset_path: geometry.asset_path.to_string(),
         send: HiddenSendPlan {
             activation: ActivationShape::new(
-                OUTPUT_HEAD_POSITIONS as u32,
-                OUTPUT_HEAD_HIDDEN as u32,
+                geometry.positions as u32,
+                geometry.hidden as u32,
                 SALT,
             )?,
             activation_configuration: table_configuration,
@@ -405,9 +486,9 @@ pub fn build_segment_plan(
             activation_source: ActivationSource::Commitment,
             table_shape,
             table_identity: reader_table_identity(table_reader)?,
-            matrix_rows: OUTPUT_HEAD_HIDDEN as u64,
-            k_lo: OUTPUT_HEAD_K_LO,
-            columns: OUTPUT_HEAD_COLUMNS as u64,
+            matrix_rows: geometry.hidden as u64,
+            k_lo: geometry.k_lo,
+            columns: geometry.columns as u64,
             group: GROUP,
             oracle_base: ORACLE_BASE,
             openings_per_oracle: 2,
@@ -417,17 +498,17 @@ pub fn build_segment_plan(
                 oracle: DOT_ORACLE,
                 group: GROUP,
                 shape: WShape::new(
-                    (OUTPUT_HEAD_POSITIONS * OUTPUT_HEAD_HIDDEN) as u64,
+                    (geometry.positions * geometry.hidden) as u64,
                     code,
                     1,
-                    OUTPUT_HEAD_POSITIONS as u32,
+                    geometry.positions as u32,
                     SALT,
                     DOT_TREE_NUMBER,
                     2,
                     DOT_RUN,
                     table_configuration,
                 )?,
-                hidden: OUTPUT_HEAD_HIDDEN as u32,
+                hidden: geometry.hidden as u32,
             }),
             expected_dot_root: None,
             expected_roots: None,
@@ -454,8 +535,8 @@ pub fn build_segment_plan(
     let placeholder = ActivationCommitment {
         root: Digest([0x70; 32]),
         shape: ActivationShape::new(
-            OUTPUT_HEAD_POSITIONS as u32,
-            OUTPUT_HEAD_HIDDEN as u32,
+            geometry.positions as u32,
+            geometry.hidden as u32,
             SALT,
         )?,
         configuration: table_configuration,
@@ -465,7 +546,7 @@ pub fn build_segment_plan(
         output: output_plan,
     };
     let mut plan = build_output_head_hidden_plan(
-        output_head_shape()?,
+        output_head_shape_for(geometry.hidden as u64, geometry.k_lo, table_reader.shape.rows(), geometry.columns as u64)?,
         &setup,
         table_reader,
         &trusted,
@@ -475,8 +556,8 @@ pub fn build_segment_plan(
     let roots = out_group_roots(norm_plan, profile, hd_rows)?;
     let root = hd_activation_root(&plan, &roots)?;
     plan.send.activation = ActivationShape::new(
-        OUTPUT_HEAD_POSITIONS as u32,
-        OUTPUT_HEAD_HIDDEN as u32,
+        geometry.positions as u32,
+        geometry.hidden as u32,
         SALT,
     )?;
     plan.send.activation_configuration = table_configuration;

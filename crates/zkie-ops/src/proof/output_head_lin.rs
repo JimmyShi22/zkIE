@@ -95,12 +95,22 @@ pub const OUTPUT_HEAD_ASSET_PATH: &str = "gpt2/weights/lm_head_w_i32.bin";
 /// The table has 1024 rows and 65536 entries per row, and every one of its
 /// entries is read by the matrix mapping.
 pub fn output_head_shape() -> Result<LinShape> {
-    LinShape::new(
+    output_head_shape_for(
         OUTPUT_HEAD_HIDDEN as u64,
         OUTPUT_HEAD_K_LO,
         OUTPUT_HEAD_TABLE_ROWS,
         OUTPUT_HEAD_COLUMNS as u64,
     )
+}
+
+/// The output-head matrix shape of an explicit model geometry.
+pub fn output_head_shape_for(
+    hidden: u64,
+    k_lo: u32,
+    table_rows: u64,
+    columns: u64,
+) -> Result<LinShape> {
+    LinShape::new(hidden, k_lo, table_rows, columns)
 }
 
 /// The trusted plan items of one output-head step.
