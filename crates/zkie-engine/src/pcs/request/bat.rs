@@ -948,6 +948,50 @@ impl BatSession {
         combine(&self.statement, &input.layout, input.rows.as_slice(), x)
     }
 
+    /// Close the BAT round over rows produced during the combine. The chain
+    /// step and the x draw happen in the same order as `finish_run`; each
+    /// emitted row is scattered with its position's power of x, so the group
+    /// row is the same as the materialized path. The caller emits the rows in
+    /// the same order the frozen statement would have held them.
+    pub fn finish_run_streaming<F>(&mut self, input: BatRunInput, run: F) -> Result<BatGroupRow>
+    where
+        F: FnOnce(&mut dyn FnMut(BatRow) -> Result<()>) -> Result<()>,
+    {
+        let pending = self.pending.take().ok_or(Error::InvalidSessionState)?;
+        if pending.layout != input.layout || !Arc::ptr_eq(&pending.rows, &input.rows) {
+            return Err(Error::StatementMismatch);
+        }
+        let prefix = self.chain.message().prefix(KIND_ALGEBRAIC, 0)?;
+        if !self.chain.step(&prefix, 0)? {
+            return Err(Error::InvalidProof);
+        }
+        let x = self.chain.draw_e()?;
+        self.last_x = Some(x);
+        let mut out = BatGroupRow {
+            group: input.layout.group,
+            main: vec![Fp3::ZERO; input.layout.group_len(BatPart::Main)?],
+            mask: vec![Fp3::ZERO; input.layout.group_len(BatPart::Mask)?],
+            kept: Vec::new(),
+            target: Fp3::ZERO,
+        };
+        let statement = &self.statement;
+        let layout = &input.layout;
+        let mut scale = Fp3::ONE;
+        {
+            let mut sink = |row: BatRow| -> Result<()> {
+                combine_row_into(statement, layout, &mut out, &row, scale)?;
+                scale = scale.mul(&x);
+                Ok(())
+            };
+            run(&mut sink)?;
+        }
+        for row in input.rows.iter() {
+            combine_row_into(statement, layout, &mut out, row, scale)?;
+            scale = scale.mul(&x);
+        }
+        Ok(out)
+    }
+
     pub fn run(&mut self, group: u64) -> Result<BatGroupRow> {
         let input = self.begin_run(group)?;
         self.finish_run(input)
@@ -1194,6 +1238,189 @@ fn combine_with_min(
         }
     }
     Ok(out)
+}
+
+/// Adds one plain row to the group row with the given power of x. The terms
+/// are the same scatters the materialized combine applies; field addition is
+/// exact and order independent, so applying them row by row yields the same
+/// group row as the batched pass.
+fn combine_row_into(
+    statement: &BatStatement,
+    layout: &BatGroupLayout,
+    out: &mut BatGroupRow,
+    row: &BatRow,
+    scale: Fp3,
+) -> Result<()> {
+    let group_bits = layout.group_row_bits(BatPart::Main);
+    let chunk_len = 1usize
+        .checked_shl(group_bits)
+        .ok_or(Error::ResourceLimit)?;
+    if chunk_len == 0 || out.main.len() % chunk_len != 0 {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut row_scatter: Vec<MainScatter<'_>> = Vec::new();
+    let mut row_units: Vec<MainUnitScatter> = Vec::new();
+    for term in &row.terms {
+        let shape = statement.oracle(term.oracle)?.shape;
+        let member = layout
+            .members
+            .iter()
+            .find(|member| member.oracle == term.oracle)
+            .ok_or(Error::StatementMismatch)?;
+        if term.part == BatPart::Main && !member.kept {
+            if !shape.has(term.part) || term.values.len() != shape.table_len(term.part)? {
+                return Err(Error::ShapeMismatch);
+            }
+            row_scatter.push(main_scatter(
+                &term.values,
+                member.main_first.ok_or(Error::StatementMismatch)?,
+                shape.row_bits(term.part),
+                scale,
+            )?);
+        } else {
+            carry_table(
+                statement,
+                layout,
+                term.oracle,
+                term.part,
+                &term.values,
+                scale,
+                out,
+            )?;
+        }
+    }
+    for unit in &row.units {
+        let shape = statement.oracle(unit.oracle)?.shape;
+        let member = layout
+            .members
+            .iter()
+            .find(|member| member.oracle == unit.oracle)
+            .ok_or(Error::StatementMismatch)?;
+        let len = shape.table_len(unit.part)?;
+        if !shape.has(unit.part) || unit.index >= len as u64 {
+            return Err(Error::InvalidIndex);
+        }
+        if unit.part == BatPart::Main && !member.kept {
+            row_units.push(main_unit_scatter(
+                member.main_first.ok_or(Error::StatementMismatch)?,
+                shape.row_bits(unit.part),
+                unit.index,
+                scale.mul(&unit.coefficient),
+            )?);
+        } else {
+            carry_entry(
+                statement,
+                layout,
+                unit.oracle,
+                unit.part,
+                unit.index,
+                unit.coefficient,
+                scale,
+                out,
+            )?;
+        }
+    }
+    for run in &row.runs {
+        if run.step == 0 {
+            return Err(Error::ShapeMismatch);
+        }
+        let shape = statement.oracle(run.oracle)?.shape;
+        let member = layout
+            .members
+            .iter()
+            .find(|member| member.oracle == run.oracle)
+            .ok_or(Error::StatementMismatch)?;
+        let len = shape.table_len(run.part)?;
+        for (offset, value) in run.values.iter().enumerate() {
+            let index = run
+                .first
+                .checked_add(
+                    run.step
+                        .checked_mul(offset as u64)
+                        .ok_or(Error::ResourceLimit)?,
+                )
+                .ok_or(Error::ResourceLimit)?;
+            if !shape.has(run.part) || index >= len as u64 {
+                return Err(Error::InvalidIndex);
+            }
+            if run.part == BatPart::Main && !member.kept {
+                row_units.push(main_unit_scatter(
+                    member.main_first.ok_or(Error::StatementMismatch)?,
+                    shape.row_bits(run.part),
+                    index,
+                    scale.mul(value),
+                )?);
+            } else {
+                carry_entry(
+                    statement,
+                    layout,
+                    run.oracle,
+                    run.part,
+                    index,
+                    *value,
+                    scale,
+                    out,
+                )?;
+            }
+        }
+    }
+    for form in &row.forms {
+        let shape = statement.oracle(form.oracle)?.shape;
+        let member = layout
+            .members
+            .iter()
+            .find(|member| member.oracle == form.oracle)
+            .ok_or(Error::StatementMismatch)?;
+        if !member.kept {
+            if !shape.has(BatPart::Main)
+                || form.values.len() != shape.table_len(BatPart::Main)?
+            {
+                return Err(Error::ShapeMismatch);
+            }
+            row_scatter.push(main_scatter(
+                &form.values,
+                member.main_first.ok_or(Error::StatementMismatch)?,
+                shape.row_bits(BatPart::Main),
+                scale,
+            )?);
+        } else {
+            carry_table(
+                statement,
+                layout,
+                form.oracle,
+                BatPart::Main,
+                &form.values,
+                scale,
+                out,
+            )?;
+        }
+    }
+    out.target = out.target.add(&scale.mul(&row.target));
+    for (place, chunk) in out.main.chunks_mut(chunk_len).enumerate() {
+        for term in &row_scatter {
+            if place >= term.places {
+                continue;
+            }
+            let lo = place * term.rows_per_place;
+            let hi = lo + term.rows_per_place;
+            let target = chunk
+                .get_mut(term.first..term.first + term.rows_per_place)
+                .ok_or(Error::InvalidIndex)?;
+            for (slot, value) in target.iter_mut().zip(&term.values[lo..hi]) {
+                *slot = slot.add(&term.scale.mul(value));
+            }
+        }
+        for unit in &row_units {
+            if unit.place != place {
+                continue;
+            }
+            let slot = chunk
+                .get_mut(unit.first + unit.row)
+                .ok_or(Error::InvalidIndex)?;
+            *slot = slot.add(&unit.scaled);
+        }
+    }
+    Ok(())
 }
 
 /// Folded-main terms use the parallel block scatter from this group-row
@@ -2019,6 +2246,45 @@ mod tests {
             session.finish_run(independent),
             Err(Error::StatementMismatch)
         ));
+    }
+
+    #[test]
+    fn streaming_combine_matches_materialized_combine() {
+        let (mut st, group) = group_fixture();
+        let mut first = BatRow::new(BatRowKind::Plain);
+        first.target = Fp3::from_u64(5);
+        first.add_term(0, BatPart::Main, one_at(16, 5, 3));
+        first.add_unit(1, BatPart::Mask, 3, Fp3::from_u64(2));
+        first.add_run(2, BatPart::Main, 1, 2, vec![Fp3::from_u64(7), Fp3::from_u64(9)]);
+        first.add_form(0, one_at(16, 0, 1));
+        let mut second = BatRow::new(BatRowKind::Plain);
+        second.target = Fp3::from_u64(6);
+        second.add_term(1, BatPart::Main, one_at(32, 0, 5));
+        second.add_term(2, BatPart::Main, one_at(32, 9, 11));
+        st.add_row(group, first).unwrap();
+        st.add_row(group, second).unwrap();
+        let input = st.begin_run(group).unwrap();
+        let x = Fp3::from_u64(7);
+        let materialized = combine_with_min(&st, &input.layout, &input.rows, x, 0).unwrap();
+        let mut streamed = BatGroupRow {
+            group,
+            main: vec![
+                Fp3::ZERO;
+                input.layout.group_len(BatPart::Main).unwrap()
+            ],
+            mask: vec![
+                Fp3::ZERO;
+                input.layout.group_len(BatPart::Mask).unwrap()
+            ],
+            kept: Vec::new(),
+            target: Fp3::ZERO,
+        };
+        let mut scale = Fp3::ONE;
+        for row in input.rows.iter() {
+            combine_row_into(&st, &input.layout, &mut streamed, row, scale).unwrap();
+            scale = scale.mul(&x);
+        }
+        assert_eq!(materialized, streamed);
     }
 
     #[test]

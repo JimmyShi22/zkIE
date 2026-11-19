@@ -13858,6 +13858,21 @@ pub(crate) fn table_key_group_verify(
 /// verifier needs is in the returned messages; the member rows never leave the
 /// prover.
 #[allow(clippy::too_many_arguments)]
+/// Ownership of the own-stage plain rows. The prover and verifier can hand
+/// their rows over as a materialized vector or emit them during the BAT
+/// combine; the combine consumes either form in the same row order.
+pub(crate) enum PlainRows<'a> {
+    Materialized(Vec<BatRow>),
+    Streamed(
+        &'a mut dyn FnMut(
+            &[ProximityMember],
+            &mut dyn FnMut(BatRow) -> Result<()>,
+        ) -> Result<()>,
+    ),
+}
+
+/// Materialized-row entry of the proximity prover.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn proximity_prove(
     chain: Chain,
     fold: FoldShape,
@@ -13865,6 +13880,67 @@ pub(crate) fn proximity_prove(
     trees: ProximityTreeSource<'_>,
     sample_rows: &[Vec<GuRelationRow>],
     plain_rows: Vec<BatRow>,
+    fresh_id: u64,
+    mask_tree: MaskTreePlan,
+    seed: Digest,
+    base_positions: usize,
+    iopp: Option<&ProximityIoppPlan>,
+) -> Result<ProximityProof> {
+    proximity_prove_rows(
+        chain,
+        fold,
+        members,
+        trees,
+        sample_rows,
+        PlainRows::Materialized(plain_rows),
+        fresh_id,
+        mask_tree,
+        seed,
+        base_positions,
+        iopp,
+    )
+}
+
+/// Streaming-row entry of the proximity prover.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn proximity_prove_streaming(
+    chain: Chain,
+    fold: FoldShape,
+    members: Vec<ProximityMember>,
+    trees: ProximityTreeSource<'_>,
+    sample_rows: &[Vec<GuRelationRow>],
+    run: &mut dyn FnMut(
+        &[ProximityMember],
+        &mut dyn FnMut(BatRow) -> Result<()>,
+    ) -> Result<()>,
+    fresh_id: u64,
+    mask_tree: MaskTreePlan,
+    seed: Digest,
+    base_positions: usize,
+    iopp: Option<&ProximityIoppPlan>,
+) -> Result<ProximityProof> {
+    proximity_prove_rows(
+        chain,
+        fold,
+        members,
+        trees,
+        sample_rows,
+        PlainRows::Streamed(run),
+        fresh_id,
+        mask_tree,
+        seed,
+        base_positions,
+        iopp,
+    )
+}
+
+fn proximity_prove_rows(
+    chain: Chain,
+    fold: FoldShape,
+    members: Vec<ProximityMember>,
+    trees: ProximityTreeSource<'_>,
+    sample_rows: &[Vec<GuRelationRow>],
+    plain: PlainRows<'_>,
     fresh_id: u64,
     mask_tree: MaskTreePlan,
     seed: Digest,
@@ -13899,19 +13975,35 @@ pub(crate) fn proximity_prove(
         statement.join(group, member.bat_oracle, false)
             ?;
     }
-    let planned = plain_rows.len() as u64
+    let (planned_plain, mut stream) = match plain {
+        PlainRows::Materialized(rows) => {
+            let count = rows.len() as u64;
+            for row in rows {
+                statement.add_row(group, row)?;
+            }
+            (count, None)
+        }
+        PlainRows::Streamed(run) => (0u64, Some(run)),
+    };
+    let planned = planned_plain
         + members.iter().map(|member| member.answers as u64).sum::<u64>();
-    for row in plain_rows {
-        statement.add_row(group, row)
-            ?;
-    }
     let layout = statement.layout(group)
         ?;
     let fold_layout = statement.to_fold_layout_checked(group, &fold)
         ?;
     let mut bat = BatSession::new(statement, chain, planned)?;
     let input = bat.begin_run(group)?;
-    let combined = bat.finish_run(input)?;
+    let combined = match stream.as_mut() {
+        Some(run) => {
+            let run: &mut dyn FnMut(
+                &[ProximityMember],
+                &mut dyn FnMut(BatRow) -> Result<()>,
+            ) -> Result<()> = &mut **run;
+            let members_ref: &[ProximityMember] = &members[..];
+            bat.finish_run_streaming(input, |sink| run(members_ref, sink))?
+        }
+        None => bat.finish_run(input)?,
+    };
     let fold_row = bat.statement().to_fold_input_row(combined, &layout)?;
     let chain = bat.into_chain()
         ?;
@@ -14205,12 +14297,71 @@ pub(crate) fn proximity_prove(
 /// FOLD start and rounds, and runs BASE against its own member roots. It never
 /// reads a member message row.
 #[allow(clippy::too_many_arguments)]
+/// Materialized-row entry of the proximity verifier.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn proximity_verify(
     chain: Chain,
     fold: FoldShape,
     members: &[ProximityMember],
     sample_rows: &[Vec<GuRelationRow>],
     plain_rows: Vec<BatRow>,
+    messages: &ProximityMessages,
+    fresh_id: u64,
+    mask_tree: MaskTreePlan,
+    base_positions: usize,
+    iopp: Option<&ProximityIoppPlan>,
+) -> Result<ProximityVerification> {
+    proximity_verify_rows(
+        chain,
+        fold,
+        members,
+        sample_rows,
+        PlainRows::Materialized(plain_rows),
+        messages,
+        fresh_id,
+        mask_tree,
+        base_positions,
+        iopp,
+    )
+}
+
+/// Streaming-row entry of the proximity verifier.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn proximity_verify_streaming(
+    chain: Chain,
+    fold: FoldShape,
+    members: &[ProximityMember],
+    sample_rows: &[Vec<GuRelationRow>],
+    run: &mut dyn FnMut(
+        &[ProximityMember],
+        &mut dyn FnMut(BatRow) -> Result<()>,
+    ) -> Result<()>,
+    messages: &ProximityMessages,
+    fresh_id: u64,
+    mask_tree: MaskTreePlan,
+    base_positions: usize,
+    iopp: Option<&ProximityIoppPlan>,
+) -> Result<ProximityVerification> {
+    proximity_verify_rows(
+        chain,
+        fold,
+        members,
+        sample_rows,
+        PlainRows::Streamed(run),
+        messages,
+        fresh_id,
+        mask_tree,
+        base_positions,
+        iopp,
+    )
+}
+
+fn proximity_verify_rows(
+    chain: Chain,
+    fold: FoldShape,
+    members: &[ProximityMember],
+    sample_rows: &[Vec<GuRelationRow>],
+    plain: PlainRows<'_>,
     messages: &ProximityMessages,
     fresh_id: u64,
     mask_tree: MaskTreePlan,
@@ -14240,18 +14391,35 @@ pub(crate) fn proximity_verify(
     for member in members {
         statement.join(group, member.bat_oracle, false)?;
     }
-    let planned = plain_rows.len() as u64
+    let (planned_plain, mut stream) = match plain {
+        PlainRows::Materialized(rows) => {
+            let count = rows.len() as u64;
+            for row in rows {
+                statement.add_row(group, row)?;
+            }
+            (count, None)
+        }
+        PlainRows::Streamed(run) => (0u64, Some(run)),
+    };
+    let planned = planned_plain
         + members.iter().map(|member| member.answers as u64).sum::<u64>();
-    for row in plain_rows {
-        statement.add_row(group, row)?;
-    }
     let layout = statement.layout(group)?;
     let fold_layout = statement.to_fold_layout_checked(group, &fold)?;
     drop(_profile_statement);
     let _profile_bat = zkie_engine::profile::Scope::new("verify.proximity.bat");
     let mut bat = BatSession::new(statement, chain, planned)?;
     let input = bat.begin_run(group)?;
-    let combined = bat.finish_run(input)?;
+    let combined = match stream.as_mut() {
+        Some(run) => {
+            let run: &mut dyn FnMut(
+                &[ProximityMember],
+                &mut dyn FnMut(BatRow) -> Result<()>,
+            ) -> Result<()> = &mut **run;
+            let members_ref: &[ProximityMember] = &members[..];
+            bat.finish_run_streaming(input, |sink| run(members_ref, sink))?
+        }
+        None => bat.finish_run(input)?,
+    };
     let fold_row = bat.statement().to_fold_input_row(combined, &layout)?;
     let chain = bat.into_chain()?;
     drop(_profile_bat);
@@ -24535,6 +24703,21 @@ fn output_tail_plain_rows(
     first: &HiddenSendMessages,
     binding: &[crate::proof::hidden_norm_psc::NormTailBinding],
 ) -> Result<Vec<BatRow>> {
+    let mut rows = Vec::new();
+    output_tail_plain_rows_each(plan, members, first, binding, &mut |row| {
+        rows.push(row);
+        Ok(())
+    })?;
+    Ok(rows)
+}
+
+fn output_tail_plain_rows_each(
+    plan: &HiddenLinPlan,
+    members: &[ProximityMember],
+    first: &HiddenSendMessages,
+    binding: &[crate::proof::hidden_norm_psc::NormTailBinding],
+    emit: &mut dyn FnMut(BatRow) -> Result<()>,
+) -> Result<()> {
     use crate::proof::hidden_norm_psc::{
         output_rel_terms, output_tail_variables, NORM_OUTPUT_TAIL_PAIRS,
     };
@@ -24588,7 +24771,6 @@ fn output_tail_plain_rows(
             .copied()
             .ok_or(Error::StatementMismatch)
     };
-    let mut rows = Vec::with_capacity(binding.len() * 3);
     for word in binding {
         let position = word.position as usize;
         if position >= positions || word.relation >= crate::proof::hidden_norm_psc::NORM_OUTPUT_TAIL_RELATIONS {
@@ -24663,7 +24845,7 @@ fn output_tail_plain_rows(
             end0.mask_scale,
         );
         row.target = end0.value.sub(&left_constant);
-        rows.push(row);
+        emit(row)?;
         let mut row = BatRow::new(BatRowKind::Plain);
         row.add_term(tail_member.bat_oracle, BatPart::Main, tail_right);
         row.add_term(image_member.bat_oracle, BatPart::Main, image_right);
@@ -24675,7 +24857,7 @@ fn output_tail_plain_rows(
             end1.mask_scale,
         );
         row.target = end1.value.sub(&right_constant);
-        rows.push(row);
+        emit(row)?;
         let mut row = BatRow::new(BatRowKind::Plain);
         for (index, coefficient) in output.hiding_form.iter().enumerate() {
             let slot = mask_plan.tail_hiding_slot(instances, instance, index)?;
@@ -24687,7 +24869,7 @@ fn output_tail_plain_rows(
             );
         }
         row.target = output.row_target;
-        rows.push(row);
+        emit(row)?;
     }
     // The clamp distance rows: one per position and column binds each
     // committed distance row to pre_clamp minus low (and the high side) over
@@ -24733,12 +24915,12 @@ fn output_tail_plain_rows(
                     row.target = crate::proof::output_closure::fp3_signed(
                         bound_half as i128 - pre_half as i128 - bound,
                     )?;
-                    rows.push(row);
+                    emit(row)?;
                 }
             }
         }
     }
-    Ok(rows)
+    Ok(())
 }
 
 /// The BAT rows of the bias addition: `pre_clamp = shifted + bias` at one
@@ -24951,6 +25133,39 @@ fn own_plain_rows(
     request: Option<&RequestRows>,
     chain_rows: ChainRows<'_>,
 ) -> Result<Vec<BatRow>> {
+    let mut rows = Vec::new();
+    own_plain_rows_each(
+        plan,
+        members,
+        first,
+        shared_point,
+        tilde,
+        dot,
+        closure,
+        norm,
+        request,
+        chain_rows,
+        &mut |row| {
+            rows.push(row);
+            Ok(())
+        },
+    )?;
+    Ok(rows)
+}
+
+fn own_plain_rows_each(
+    plan: &HiddenLinPlan,
+    members: &[ProximityMember],
+    first: &HiddenSendMessages,
+    shared_point: &[Fp3],
+    tilde: &[Fp3],
+    dot: Option<&DotRowBinding>,
+    closure: Option<&ClosureRowBinding>,
+    norm: Option<&NormRowBinding>,
+    request: Option<&RequestRows>,
+    chain_rows: ChainRows<'_>,
+    emit: &mut dyn FnMut(BatRow) -> Result<()>,
+) -> Result<()> {
     let mut bat_of = std::collections::HashMap::new();
     for member in members {
         bat_of.insert(member.source_oracle, member);
@@ -24961,7 +25176,6 @@ fn own_plain_rows(
         usize::try_from(plan.proximity.omega.u.main_rows).map_err(|_| Error::ResourceLimit)?;
     let omega_ell =
         usize::try_from(plan.proximity.omega.u.code.ell).map_err(|_| Error::ResourceLimit)?;
-    let mut rows = Vec::with_capacity(2 * plan.send.positions() as usize);
     let eq_bits = plan.send.columns.trailing_zeros() as usize;
     let _profile_eval_rows = zkie_engine::profile::Scope::new("second.plain.eval");
     for position in 0..plan.send.positions() {
@@ -24993,7 +25207,7 @@ fn own_plain_rows(
             );
         }
         row.target = first.eval_targets[position as usize];
-        rows.push(row);
+        emit(row)?;
     }
     if let Some(index) = &plan.send.index_mask {
         if tilde.len() != plan.send.positions() as usize {
@@ -25023,7 +25237,7 @@ fn own_plain_rows(
                 Fp3::ONE,
             );
             row.target = tilde[position as usize];
-            rows.push(row);
+            emit(row)?;
         }
     }
     // The diagnostic Dot row is linear in the reduced row with the public
@@ -25062,56 +25276,74 @@ fn own_plain_rows(
             let mut row = BatRow::new(BatRowKind::Plain);
             row.add_term(omega.bat_oracle, BatPart::Main, omega_coefficients);
             row.add_term(w_member.bat_oracle, BatPart::Main, w_coefficients);
-            rows.push(row);
+            emit(row)?;
         }
     }
     drop(_profile_eval_rows);
     if let Some(binding) = dot {
         let _scope = zkie_engine::profile::Scope::new("second.plain.dot");
-        rows.extend(dot_plain_rows(plan, members, binding)?);
+        for row in dot_plain_rows(plan, members, binding)? {
+            emit(row)?;
+        }
     }
     if let Some(request) = request {
         let _scope = zkie_engine::profile::Scope::new("second.plain.request");
-        rows.extend(request_rows(request)?);
+        for row in request_rows(request)? {
+            emit(row)?;
+        }
     }
     if let Some(binding) = closure {
         let _scope = zkie_engine::profile::Scope::new("second.plain.closure");
-        rows.extend(closure_plain_rows(plan, members, first, binding)?);
+        for row in closure_plain_rows(plan, members, first, binding)? {
+            emit(row)?;
+        }
     }
     if let Some(binding) = norm {
         let _scope = zkie_engine::profile::Scope::new("second.plain.norm");
-        rows.extend(norm_plain_rows(plan, members, first, binding)?);
+        for row in norm_plain_rows(plan, members, first, binding)? {
+            emit(row)?;
+        }
         if let Some(output) = &binding.output {
             let _scope = zkie_engine::profile::Scope::new("second.plain.output");
-            rows.extend(output_plain_rows(plan, members, first, output)?);
+            for row in output_plain_rows(plan, members, first, output)? {
+                emit(row)?;
+            }
         }
         if let Some(tail) = &binding.tail {
             let _scope = zkie_engine::profile::Scope::new("second.plain.tail");
-            rows.extend(output_tail_plain_rows(plan, members, first, tail)?);
+            output_tail_plain_rows_each(plan, members, first, tail, emit)?;
         }
         if let Some(point) = &binding.bias_point {
             let _scope = zkie_engine::profile::Scope::new("second.plain.bias");
-            rows.extend(output_tail_bias_rows(plan, members, point)?);
-            rows.extend(output_tail_padding_rows(plan, members)?);
+            for row in output_tail_bias_rows(plan, members, point)? {
+                emit(row)?;
+            }
+            for row in output_tail_padding_rows(plan, members)? {
+                emit(row)?;
+            }
         }
         let norm_plan = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
         if let Some(lookup) = &binding.lookup {
             let _scope = zkie_engine::profile::Scope::new("second.plain.lookup");
-            rows.extend(lookup_plain_rows(
+            for row in lookup_plain_rows(
                 plan,
                 norm_plan.lookup.as_ref().ok_or(Error::InvalidConfig)?,
                 members,
                 lookup,
-            )?);
+            )? {
+                emit(row)?;
+            }
         }
         if let Some(rstd) = &binding.rstd {
             let _scope = zkie_engine::profile::Scope::new("second.plain.rstd");
-            rows.extend(lookup_plain_rows(
+            for row in lookup_plain_rows(
                 plan,
                 norm_plan.rstd.as_ref().ok_or(Error::InvalidConfig)?,
                 members,
                 rstd,
-            )?);
+            )? {
+                emit(row)?;
+            }
         }
     }
     // The request chain segment's remaining relations ride the same own group,
@@ -25130,8 +25362,10 @@ fn own_plain_rows(
             unit.oracle = member.bat_oracle;
         }
     }
-    rows.append(&mut chain_rows);
-    Ok(rows)
+    for row in chain_rows {
+        emit(row)?;
+    }
+    Ok(())
 }
 
 /// The masked Dot right-hand side: `W_t(psi*) + g_t` from the committed `W`
@@ -25883,21 +26117,27 @@ fn prove_second(
     let _profile_sample_rows = zkie_engine::profile::Scope::new("second.sample_rows");
     let sample_rows = own_sample_rows(plan, &members, first, shared)?;
     drop(_profile_sample_rows);
-    let _profile_plain_rows = zkie_engine::profile::Scope::new("second.plain_rows");
     let request_bundle = request_rows_bundle(plan, &members, shared_point)?;
-    let plain_rows = own_plain_rows(
-        plan,
-        &members,
-        first,
-        shared_point,
-        &tilde,
-        dot_binding.as_ref(),
-        closure_binding.as_ref(),
-        norm_binding.as_ref(),
-        request_bundle.as_ref(),
-        ChainRows::Owned(chain_rows),
-    )?;
-    drop(_profile_plain_rows);
+    let mut streaming_chain_rows = Some(chain_rows);
+    let mut plain_stream =
+        |members: &[ProximityMember], sink: &mut dyn FnMut(BatRow) -> Result<()>| -> Result<()> {
+            let chain_rows = streaming_chain_rows
+                .take()
+                .ok_or(Error::InvalidSessionState)?;
+            own_plain_rows_each(
+                plan,
+                members,
+                first,
+                shared_point,
+                &tilde,
+                dot_binding.as_ref(),
+                closure_binding.as_ref(),
+                norm_binding.as_ref(),
+                request_bundle.as_ref(),
+                ChainRows::Owned(chain_rows),
+                sink,
+            )
+        };
     let fold = member_fold_shape(
         plan.proximity.code,
         plan.proximity.mask_code,
@@ -25912,7 +26152,7 @@ fn prove_second(
         ProximityGroupRole::Own,
     )?;
     let _profile_proximity = zkie_engine::profile::Scope::new("second.proximity");
-    let proximity = proximity_prove(
+    let proximity = proximity_prove_streaming(
         chain,
         fold,
         members,
@@ -25923,7 +26163,7 @@ fn prove_second(
             plan,
         },
         &sample_rows,
-        plain_rows,
+        &mut plain_stream,
         plan.proximity.own_fresh,
         plan.proximity.own_mask_tree,
         derive_run_seed(seed, 5, 0)?,
@@ -26310,21 +26550,27 @@ fn verify_second(
     };
     let (members, _order) = own_members(plan, first, shared, None, None)?;
     let sample_rows = own_sample_rows(plan, &members, first, shared)?;
-    let _profile_plain_rows = zkie_engine::profile::Scope::new("verify.second.plain_rows");
     let request_bundle = request_rows_bundle(plan, &members, shared_point)?;
-    let plain_rows = own_plain_rows(
-        plan,
-        &members,
-        first,
-        shared_point,
-        &messages.tilde,
-        dot_binding.as_ref(),
-        closure_binding.as_ref(),
-        norm_binding.as_ref(),
-        request_bundle.as_ref(),
-        ChainRows::Owned(chain_rows),
-    )?;
-    drop(_profile_plain_rows);
+    let mut streaming_chain_rows = Some(chain_rows);
+    let mut plain_stream =
+        |members: &[ProximityMember], sink: &mut dyn FnMut(BatRow) -> Result<()>| -> Result<()> {
+            let chain_rows = streaming_chain_rows
+                .take()
+                .ok_or(Error::InvalidSessionState)?;
+            own_plain_rows_each(
+                plan,
+                members,
+                first,
+                shared_point,
+                &messages.tilde,
+                dot_binding.as_ref(),
+                closure_binding.as_ref(),
+                norm_binding.as_ref(),
+                request_bundle.as_ref(),
+                ChainRows::Owned(chain_rows),
+                sink,
+            )
+        };
     let fold = member_fold_shape(
         plan.proximity.code,
         plan.proximity.mask_code,
@@ -26339,12 +26585,12 @@ fn verify_second(
         ProximityGroupRole::Own,
     )?;
     let _profile_proximity = zkie_engine::profile::Scope::new("verify.second.proximity");
-        let proximity = proximity_verify(
+        let proximity = proximity_verify_streaming(
         chain,
         fold,
         &members,
         &sample_rows,
-        plain_rows,
+        &mut plain_stream,
         &ProximityMessages {
             fold_start: messages.fold_start.clone(),
             fold_rounds: messages.fold_rounds.clone(),
