@@ -1295,6 +1295,25 @@ pub struct ClosureWitness {
 }
 
 impl ClosureWitness {
+    /// Drops the encoded value-group messages and their private randomness
+    /// once the first-stage answers and openings have consumed them. The
+    /// retained trees and the PSC inputs stay: the own stage still opens the
+    /// members and checks the bit and map values.
+    pub fn release_committed_messages(&mut self) {
+        for group in [&mut self.slack, &mut self.bits, &mut self.map] {
+            group.messages = Vec::new();
+        }
+        self.slack_tails.clear();
+        self.slack_salts.clear();
+        self.slack_pads.clear();
+        self.bits_tails.clear();
+        self.bits_salts.clear();
+        self.bits_pads.clear();
+        self.map_tails.clear();
+        self.map_salts.clear();
+        self.map_pads.clear();
+    }
+
     pub fn check(&self, plan: &ClosurePlan, send: &HiddenSendPlan) -> Result<()> {
         if plan.fault(send).is_some() {
             return Err(Error::InvalidConfig);

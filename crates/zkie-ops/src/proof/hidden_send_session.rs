@@ -15561,6 +15561,9 @@ fn prove_first(
     witness.request_w = request_w_commit;
     witness.chain_mask = chain_mask_witness;
     witness.source_data = source_data_witness;
+    // The first-stage answers and openings consumed the encoded closure
+    // value-group messages; only their retained trees and the PSC inputs
+    // survive into the own stage.
     Ok((messages, first_seal, witness, chain_rows, section_outputs))
 }
 
@@ -24928,6 +24931,14 @@ fn output_tail_padding_rows(
     Ok(rows)
 }
 
+/// Ownership of the request-chain rows the own stage rebinds and appends.
+/// The prover hands its rows over so the rebind reuses the same allocation;
+/// a verifier that still reads its rows keeps a borrowed copy.
+enum ChainRows<'a> {
+    Borrowed(&'a [BatRow]),
+    Owned(Vec<BatRow>),
+}
+
 fn own_plain_rows(
     plan: &HiddenLinPlan,
     members: &[ProximityMember],
@@ -24938,7 +24949,7 @@ fn own_plain_rows(
     closure: Option<&ClosureRowBinding>,
     norm: Option<&NormRowBinding>,
     request: Option<&RequestRows>,
-    chain_rows: &[BatRow],
+    chain_rows: ChainRows<'_>,
 ) -> Result<Vec<BatRow>> {
     let mut bat_of = std::collections::HashMap::new();
     for member in members {
@@ -24952,6 +24963,7 @@ fn own_plain_rows(
         usize::try_from(plan.proximity.omega.u.code.ell).map_err(|_| Error::ResourceLimit)?;
     let mut rows = Vec::with_capacity(2 * plan.send.positions() as usize);
     let eq_bits = plan.send.columns.trailing_zeros() as usize;
+    let _profile_eval_rows = zkie_engine::profile::Scope::new("second.plain.eval");
     for position in 0..plan.send.positions() {
         let member = bat_of
             .get(&plan.send.oracle(position)?)
@@ -25053,29 +25065,38 @@ fn own_plain_rows(
             rows.push(row);
         }
     }
+    drop(_profile_eval_rows);
     if let Some(binding) = dot {
+        let _scope = zkie_engine::profile::Scope::new("second.plain.dot");
         rows.extend(dot_plain_rows(plan, members, binding)?);
     }
     if let Some(request) = request {
+        let _scope = zkie_engine::profile::Scope::new("second.plain.request");
         rows.extend(request_rows(request)?);
     }
     if let Some(binding) = closure {
+        let _scope = zkie_engine::profile::Scope::new("second.plain.closure");
         rows.extend(closure_plain_rows(plan, members, first, binding)?);
     }
     if let Some(binding) = norm {
+        let _scope = zkie_engine::profile::Scope::new("second.plain.norm");
         rows.extend(norm_plain_rows(plan, members, first, binding)?);
         if let Some(output) = &binding.output {
+            let _scope = zkie_engine::profile::Scope::new("second.plain.output");
             rows.extend(output_plain_rows(plan, members, first, output)?);
         }
         if let Some(tail) = &binding.tail {
+            let _scope = zkie_engine::profile::Scope::new("second.plain.tail");
             rows.extend(output_tail_plain_rows(plan, members, first, tail)?);
         }
         if let Some(point) = &binding.bias_point {
+            let _scope = zkie_engine::profile::Scope::new("second.plain.bias");
             rows.extend(output_tail_bias_rows(plan, members, point)?);
             rows.extend(output_tail_padding_rows(plan, members)?);
         }
         let norm_plan = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
         if let Some(lookup) = &binding.lookup {
+            let _scope = zkie_engine::profile::Scope::new("second.plain.lookup");
             rows.extend(lookup_plain_rows(
                 plan,
                 norm_plan.lookup.as_ref().ok_or(Error::InvalidConfig)?,
@@ -25084,6 +25105,7 @@ fn own_plain_rows(
             )?);
         }
         if let Some(rstd) = &binding.rstd {
+            let _scope = zkie_engine::profile::Scope::new("second.plain.rstd");
             rows.extend(lookup_plain_rows(
                 plan,
                 norm_plan.rstd.as_ref().ok_or(Error::InvalidConfig)?,
@@ -25095,8 +25117,12 @@ fn own_plain_rows(
     // The request chain segment's remaining relations ride the same own group,
     // on the segment's committed mask table. Their units name the plan's
     // source oracle; the group's BAT registration id is the member's.
-    let mut rebound = chain_rows.to_vec();
-    for row in &mut rebound {
+    let _profile_chain_rows = zkie_engine::profile::Scope::new("second.plain.chain");
+    let mut chain_rows = match chain_rows {
+        ChainRows::Borrowed(rows) => rows.to_vec(),
+        ChainRows::Owned(rows) => rows,
+    };
+    for row in &mut chain_rows {
         for unit in &mut row.units {
             let member = bat_of
                 .get(&unit.oracle)
@@ -25104,7 +25130,7 @@ fn own_plain_rows(
             unit.oracle = member.bat_oracle;
         }
     }
-    rows.extend_from_slice(&rebound);
+    rows.append(&mut chain_rows);
     Ok(rows)
 }
 
@@ -25770,12 +25796,12 @@ fn prove_second(
     first_query: &Digest,
     shared: &HiddenSharedMessages,
     shared_witness: &SharedWitness,
-    witness: &HiddenSendWitness,
+    witness: &mut HiddenSendWitness,
     shared_point: &[Fp3],
     seed: &Digest,
     bind_residual: bool,
     rstd_table: Option<&dyn crate::proof::lookup::LookupTable>,
-    chain_rows: &[BatRow],
+    chain_rows: Vec<BatRow>,
 ) -> Result<OwnProveResult> {
     let _profile_second = zkie_engine::profile::Scope::new("second.prove_second");
     let _profile_own_members = zkie_engine::profile::Scope::new("second.own_members");
@@ -25786,6 +25812,11 @@ fn prove_second(
         Some(witness),
         Some((&shared_witness.omega_message, &shared_witness.omega_tails)),
     )?;
+    // The own members own their message rows now; the encoded closure
+    // value-group messages and their private randomness are not read again.
+    if let Some(closure) = witness.closure.as_mut() {
+        closure.release_committed_messages();
+    }
     drop(_profile_own_members);
     let _profile_tilde = zkie_engine::profile::Scope::light("second.tilde");
     let tilde = match &plan.send.index_mask {
@@ -25864,7 +25895,7 @@ fn prove_second(
         closure_binding.as_ref(),
         norm_binding.as_ref(),
         request_bundle.as_ref(),
-        chain_rows,
+        ChainRows::Owned(chain_rows),
     )?;
     drop(_profile_plain_rows);
     let fold = member_fold_shape(
@@ -26186,7 +26217,7 @@ fn verify_second(
     messages: &HiddenSecondMessages,
     closure_r: Option<&[Fp3]>,
     rstd_table: Option<&dyn crate::proof::lookup::LookupTable>,
-    chain_rows: &[BatRow],
+    chain_rows: Vec<BatRow>,
 ) -> Result<(
     Digest,
     Vec<GuRelationRow>,
@@ -26291,7 +26322,7 @@ fn verify_second(
         closure_binding.as_ref(),
         norm_binding.as_ref(),
         request_bundle.as_ref(),
-        chain_rows,
+        ChainRows::Owned(chain_rows),
     )?;
     drop(_profile_plain_rows);
     let fold = member_fold_shape(
@@ -26392,7 +26423,7 @@ fn prove_hidden_lin_inner(
     )?;
     drop(_profile_randomness);
     mem_trace("after_randomness");
-    let (first, first_seal, send_witness, chain_rows, _section_outputs) =
+    let (first, first_seal, mut send_witness, chain_rows, _section_outputs) =
         prove_first(
             plan,
             activation,
@@ -26427,12 +26458,12 @@ fn prove_hidden_lin_inner(
         &first_query,
         &shared.messages,
         &shared.witness,
-        &send_witness,
+        &mut send_witness,
         &shared.points.psi,
         &seed,
         bind_residual,
         rstd_table,
-        &chain_rows,
+        chain_rows,
     )
     ?;
     mem_trace("after_second");
@@ -26695,7 +26726,7 @@ fn verify_hidden_lin_inner(
         &messages.second,
         closure_r.as_deref(),
         rstd_table,
-        &chain_rows,
+        chain_rows,
     )?;
     drop(_profile_second);
     Ok(HiddenLinOutcome {
@@ -35345,7 +35376,7 @@ mod merged_tests {
             None,
             None,
             None,
-            &[],
+            ChainRows::Borrowed(&[]),
         )
         .unwrap();
         let index = plan.send.index_mask.as_ref().unwrap();
@@ -35632,7 +35663,7 @@ mod merged_tests {
             None,
             None,
             None,
-            &[],
+            ChainRows::Borrowed(&[]),
         )
         .unwrap();
         assert_eq!(rows.len(), 2 * positions + 4);
