@@ -21427,11 +21427,19 @@ fn norm_pointwise_maps(
             }
         }
         1 => {
+            // The centered image is mode-aware: RMS uses the uncentered value,
+            // LayerNorm subtracts the row mean. This must match the committed
+            // image row built by `NormOutputRow::from_core`.
             for index in 0..columns {
                 let centered = if index < valid {
-                    (row[index] as i128)
-                        .checked_sub(core.mean as i128)
-                        .ok_or(Error::BoundViolation)?
+                    let value = row[index] as i128;
+                    if plan.mode.is_rms() {
+                        value
+                    } else {
+                        value
+                            .checked_sub(core.mean as i128)
+                            .ok_or(Error::BoundViolation)?
+                    }
                 } else {
                     0
                 };
@@ -24344,15 +24352,19 @@ fn output_plain_rows(
                     coefficients[index] = value;
                 }
                 row.add_term(x_member.bat_oracle, BatPart::Main, coefficients);
-                let mean_oracle = norm.mean.oracle_base + position as u64;
-                let mean_member = member_for(mean_oracle)?;
-                let mean_rows = usize::try_from(norm.mean.shape.main_rows)
-                    .map_err(|_| Error::ResourceLimit)?;
-                let mean_ell = usize::try_from(norm.mean.shape.code.ell)
-                    .map_err(|_| Error::ResourceLimit)?;
-                let mut coefficients = vec![Fp3::ZERO; mean_rows * mean_ell];
-                coefficients[0] = Fp3::ZERO.sub(&eq_sum);
-                row.add_term(mean_member.bat_oracle, BatPart::Main, coefficients);
+                // The centered image subtracts the row mean only in LayerNorm;
+                // RMS uses the uncentered value and has no mean term here.
+                if !norm.mode.is_rms() {
+                    let mean_oracle = norm.mean.oracle_base + position as u64;
+                    let mean_member = member_for(mean_oracle)?;
+                    let mean_rows = usize::try_from(norm.mean.shape.main_rows)
+                        .map_err(|_| Error::ResourceLimit)?;
+                    let mean_ell = usize::try_from(norm.mean.shape.code.ell)
+                        .map_err(|_| Error::ResourceLimit)?;
+                    let mut coefficients = vec![Fp3::ZERO; mean_rows * mean_ell];
+                    coefficients[0] = Fp3::ZERO.sub(&eq_sum);
+                    row.add_term(mean_member.bat_oracle, BatPart::Main, coefficients);
+                }
             }
         }
         row.target = end0.value;
