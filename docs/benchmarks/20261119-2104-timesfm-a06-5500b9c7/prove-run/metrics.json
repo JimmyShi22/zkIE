@@ -1,0 +1,11 @@
+{
+  "counters": {
+    "consumer_proof_bytes": 2028416,
+    "key_bytes": 3207224,
+    "key_verify_ms": 35567,
+    "proof_bytes": 3613502964,
+    "timesfm_norm_bytes": 1644035480,
+    "timesfm_norm_prove_ms": 251104
+  },
+  "schema": 1
+}
