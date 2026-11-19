@@ -88,6 +88,20 @@ pub struct SegmentHeadGeometry {
     pub asset_path: &'static str,
 }
 
+/// The gemma3 segment geometry: the 2^18-column output head argmaxed
+/// directly over the full vocabulary, with the logit bound derived from the
+/// measured 2^35.1 maximum.
+pub const GEMMA3_SEGMENT_HEAD: SegmentHeadGeometry = SegmentHeadGeometry {
+    positions: 16,
+    hidden: 1024,
+    columns: 262_144,
+    k_lo: 8,
+    range_bits: 36,
+    slack_bits: 42,
+    masked: false,
+    asset_path: "models/gemma3/weights/lm_head_i32.bin",
+};
+
 /// The accepted gpt2 segment geometry.
 pub const GPT2_SEGMENT_HEAD: SegmentHeadGeometry = SegmentHeadGeometry {
     positions: OUTPUT_HEAD_POSITIONS,
@@ -1053,7 +1067,14 @@ pub fn param_identities_gemma3(metas: &[AssetTableMeta]) -> Result<NormParamTabl
 pub fn final_norm_rows(
     trace: &SharedTrace,
 ) -> Result<(usize, Vec<Vec<i64>>, Vec<Vec<i64>>)> {
-    let target = zkie_ops::op::OpCode::ProfileLayerNorm as u16;
+    final_norm_rows_for(trace, zkie_ops::op::OpCode::ProfileLayerNorm as u16)
+}
+
+/// The materialized rows of the last step with the given opcode.
+pub fn final_norm_rows_for(
+    trace: &SharedTrace,
+    target: u16,
+) -> Result<(usize, Vec<Vec<i64>>, Vec<Vec<i64>>)> {
     let (index, step) = trace
         .steps
         .iter()
@@ -1207,7 +1228,7 @@ pub fn check_authenticated_bounds(
     // expected path.
     zkie_ops::proof::lookup::LookupTable::check_content(table)?;
     if gain.len() != profile.columns as usize
-        || bias.len() != profile.columns as usize
+        || (!bias.is_empty() && bias.len() != profile.columns as usize)
         || x_rows.len() != profile.positions as usize
     {
         return Err(Error::ShapeMismatch);
@@ -1382,6 +1403,48 @@ pub fn build_norm_plan(
     attach_output(&mut plan, profile, &space, &norm_output_groups())?;
     attach_lookup(&mut plan, &space, &norm_lookup_space())?;
     Ok(plan)
+}
+
+/// Builds the gemma3 norm plan at the production shape: the gain-only RMS
+/// form, the combined rstd table and the accepted output/lookup attachments.
+pub fn build_norm_plan_gemma3(
+    profile: &NormSegmentProfile,
+    configuration: Digest,
+    metas: &[AssetTableMeta],
+    x_rows: &[Vec<i64>],
+) -> Result<NormPlan> {
+    let space = norm_segment_space(configuration);
+    let mut plan = build_core_plan(&space, profile, x_rows)?;
+    attach_params(&mut plan, param_identities_gemma3(metas)?)?;
+    attach_rstd(
+        &mut plan,
+        &space,
+        &norm_rstd_space(),
+        zkie_models_gemma3::norm_profile::rstd_table_config(),
+        Fp3::from_u64(65_536_000),
+        zkie_models_gemma3::norm_profile::RSTD_VALUE_BOUND,
+    )?;
+    attach_output(&mut plan, profile, &space, &norm_output_groups())?;
+    attach_lookup(&mut plan, &space, &norm_lookup_space())?;
+    Ok(plan)
+}
+
+/// Builds the gain-only gemma3 witness. The bias vector is absent.
+pub fn build_norm_witness_gemma3(
+    plan: &NormPlan,
+    profile: &NormSegmentProfile,
+    configuration: Digest,
+    x_rows: &[Vec<i64>],
+    gain: &[i64],
+    rstd: &[i64],
+) -> Result<zkie_ops::proof::hidden_norm_psc::NormWitness> {
+    let space = norm_segment_space(configuration);
+    let mut witness = build_core_witness(plan, profile, &space, x_rows, rstd)?;
+    attach_params_witness(&mut witness, gain, None)?;
+    attach_output_witness(&mut witness, plan, profile, gain, None, rstd)?;
+    attach_lookup_witness(&mut witness, plan)?;
+    attach_rstd_witness(&mut witness, plan)?;
+    Ok(witness)
 }
 
 /// Builds the private witness of the plan. Prover side only.
