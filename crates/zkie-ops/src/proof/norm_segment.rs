@@ -1559,4 +1559,54 @@ mod tests {
         let _ = plan.rms.as_mut().unwrap();
     }
 
+    /// The coarse rsqrt relation must hold on a witness whose raw value is in
+    /// the coarse segment. The small fixture rows never reach that branch
+    /// (raw lands in the fine segment, so the coarse remainder is zero), so
+    /// this pins the coarse digit weights directly.
+    #[test]
+    fn the_coarse_rsqrt_relation_holds_on_a_coarse_witness() {
+        use zkie_engine::pcs::request::field::Fp3;
+        let profile = rms_profile();
+        let rows = vec![vec![3i64, -5, 7, 0], vec![-4, 8, -6, 2]];
+        let plan = build_core_plan(&space(), &profile, &rows).unwrap();
+        let round = plan.round.as_ref().unwrap();
+        let columns = plan.columns as usize;
+        let raw = crate::registry::RSQRT_COARSE_END + 0x1234;
+        let variance = raw * crate::registry::RSQRT_SHIFT;
+        let rsqrt = crate::proof::hidden_norm::RsqrtRow::from_variance(
+            variance,
+            profile.table_real_len,
+            64,
+        )
+        .unwrap();
+        assert!(rsqrt.coarse);
+        let low = (rsqrt.coarse_r & 0xff) as u64;
+        let high = ((rsqrt.coarse_r >> 8) & 0xffff) as u64;
+        assert_ne!(low, high, "the witness must distinguish the coarse digits");
+        let rms = plan.rms.as_ref().unwrap();
+        let core = NormCoreRow::from_values_rms(
+            &rows[0],
+            profile.valid as usize,
+            profile.input_bound,
+            rms.widths,
+            rms.mean_bound,
+        )
+        .unwrap();
+        let (left, right) = crate::proof::hidden_norm_psc::rel_map(
+            &core,
+            &rows[0],
+            profile.valid as usize,
+            columns,
+            23,
+            Some(round),
+            Some(&rsqrt),
+        )
+        .unwrap();
+        let inner = left
+            .iter()
+            .zip(&right)
+            .fold(Fp3::ZERO, |sum, (l, r)| sum.add(&l.mul(r)));
+        assert_eq!(inner, Fp3::ZERO, "the coarse relation");
+    }
+
 }

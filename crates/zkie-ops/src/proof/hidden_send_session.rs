@@ -24004,8 +24004,8 @@ fn norm_plain_rows(
                             eq[2],
                             &mut left_slots,
                         );
-                        left_slots.push((layout.slots.coarse_r + 1, eq[3]));
-                        left_slots.push((layout.slots.coarse_r, eq[4]));
+                        left_slots.push((layout.slots.coarse_r, eq[3]));
+                        left_slots.push((layout.slots.coarse_r + 1, eq[4]));
                         push_digit_coefficients(
                             layout.slots.raw_digits,
                             widths.raw(),
@@ -24015,8 +24015,8 @@ fn norm_plain_rows(
                         right_constant = right_constant
                             .add(&eq[1].mul(&signed(-(RSQRT_COARSE_END as i128))?))
                             .add(&eq[2].mul(&signed(-65_536)?))
-                            .add(&eq[3].mul(&signed(-256)?))
-                            .sub(&eq[4]);
+                            .sub(&eq[3])
+                            .add(&eq[4].mul(&signed(-256)?));
                     }
                     24 => {
                         left_slots.push((layout.slots.index_value, eq[0]));

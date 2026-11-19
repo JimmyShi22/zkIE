@@ -1113,9 +1113,9 @@ pub(crate) fn rel_map(
                     left[2] = signed(rsqrt.coarse_q as i128)?;
                     right[2] = signed(-65_536)?;
                     left[3] = Fp3::from_u64((rsqrt.coarse_r & 0xff) as u64);
-                    right[3] = signed(-256)?;
+                    right[3] = signed(-1)?;
                     left[4] = Fp3::from_u64(((rsqrt.coarse_r >> 8) & 0xffff) as u64);
-                    right[4] = signed(-1)?;
+                    right[4] = signed(-256)?;
                 }
                 24 => {
                     // index = fine*raw + middle*(FINE+q) + coarse*(END+q)
