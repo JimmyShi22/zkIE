@@ -1150,7 +1150,13 @@ pub fn check_authenticated_bounds(
         if row.iter().any(|value| *value < -bound || *value > bound) {
             return Err(Error::BoundViolation);
         }
-        let core = NormCoreRow::from_values(row, profile.valid as usize)?;
+        let core = authenticated_core(
+            profile,
+            plan.rms
+                .as_ref()
+                .map(|rms| (rms.widths, rms.mean_bound)),
+            row,
+        )?;
         let index = zkie_ops::registry::profile_rsqrt_index(core.variance)?;
         let value = table
             .row_value(usize::try_from(index).map_err(|_| Error::ResourceLimit)?)?;
@@ -1159,6 +1165,37 @@ pub fn check_authenticated_bounds(
         }
     }
     Ok(())
+}
+
+/// The exact core of one authenticated row under the profile's relation. The
+/// RMS form uses the multi-limb row with the same mean bound the plan checks;
+/// the layer form keeps the default centering core.
+fn authenticated_core(
+    profile: &NormSegmentProfile,
+    rms: Option<(zkie_ops::proof::rms_limbs::RmsLimbWidths, u64)>,
+    row: &[i64],
+) -> Result<NormCoreRow> {
+    if profile.mode.is_rms() {
+        let (widths, mean_bound) = match rms {
+            Some(value) => value,
+            None => (
+                zkie_ops::proof::rms_limbs::RmsLimbWidths::derive(
+                    profile.input_bound,
+                    profile.valid,
+                )?,
+                profile.mean_bound,
+            ),
+        };
+        NormCoreRow::from_values_rms(
+            row,
+            profile.valid as usize,
+            profile.input_bound,
+            widths,
+            mean_bound,
+        )
+    } else {
+        NormCoreRow::from_values(row, profile.valid as usize)
+    }
 }
 
 /// Reads the frozen-table rstd value of every position by index.
@@ -1171,7 +1208,7 @@ pub fn read_rstd_values(
     let mut file = File::open(path).map_err(|_| Error::AssetMismatch)?;
     let mut values = Vec::with_capacity(x_rows.len());
     for row in x_rows {
-        let core = NormCoreRow::from_values(row, profile.valid as usize)?;
+        let core = authenticated_core(profile, None, row)?;
         let index = zkie_ops::registry::profile_rsqrt_index(core.variance)?;
         if index >= profile.table_real_len {
             return Err(Error::BoundViolation);
