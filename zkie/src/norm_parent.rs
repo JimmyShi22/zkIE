@@ -96,7 +96,10 @@ pub const GEMMA3_SEGMENT_HEAD: SegmentHeadGeometry = SegmentHeadGeometry {
     hidden: 1024,
     columns: 262_144,
     k_lo: 8,
-    range_bits: 36,
+    // The trusted closure offset must cover the executor's MatMul outputs:
+    // the measured per-position absmax is 118_720_934_707 (2^36.79), so
+    // 2^38 - 1 keeps a ~2.3x margin while 2^36 - 1 does not cover it.
+    range_bits: 38,
     slack_bits: 42,
     masked: false,
     asset_path: "models/gemma3/weights/lm_head_i32.bin",
@@ -614,6 +617,20 @@ pub fn build_segment_plan_for(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_gemma3_output_range_covers_the_executor_logits() {
+        // The executor's published MatMul outputs for the real seq16 case
+        // reach 118_720_934_707 per position (2^36.79). The trusted closure
+        // offset must cover that with margin. The earlier 2^35.09 figure was
+        // a different representation, not the MatMul output.
+        const MEASURED_ABSMAX: u64 = 118_720_934_707;
+        let offset = (1u64 << super::GEMMA3_SEGMENT_HEAD.range_bits) - 1;
+        assert_eq!(super::GEMMA3_SEGMENT_HEAD.range_bits, 38);
+        assert!(offset > MEASURED_ABSMAX);
+        assert!(offset / MEASURED_ABSMAX >= 2);
+        assert!((1u64 << 36) - 1 < MEASURED_ABSMAX);
+    }
+
     use super::*;
     use zkie_engine::pcs::request::code::build_code_plan;
     use zkie_engine::pcs::request::field::Fp3;
