@@ -5929,6 +5929,25 @@ impl NormRoundLayout {
             (self.slots.index_digits, RSQRT_INDEX_WIDTH),
             (self.slots.index_slack, RSQRT_INDEX_SLACK_WIDTH),
         ];
+        let mut ranges = ranges.to_vec();
+        if let Some(rms) = self.rms {
+            ranges.extend([
+                (rms.s_ll_digits, 5),
+                (rms.s_lh_digits, 6),
+                (rms.s_hh_digits, 6),
+                (rms.v_digits, 10),
+                (rms.v_carries, 20),
+                (rms.v_plus_digits, 10),
+                (rms.v_plus_carries, 10),
+                (rms.q1_digits, 10),
+                (rms.shift_carries, 10),
+                (rms.shift_slack, 10),
+                (rms.q_digits, 10),
+                (rms.division_carries, 10),
+                (rms.division_slack, 10),
+                (rms.mean_top_slack, 1),
+            ]);
+        }
         let mut slots = Vec::new();
         for (start, width) in ranges {
             for index in 0..width {

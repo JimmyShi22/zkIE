@@ -1487,6 +1487,18 @@ mod tests {
         assert!(plan.relations.contains(&26));
         assert!(plan.relations.contains(&95));
         assert!(plan.round.as_ref().unwrap().layout.rms.is_some());
+        let round = plan.round.as_ref().unwrap();
+        let digit_count = round.layout.digit_slots().unwrap().len();
+        assert!(digit_count > 128, "the limb slots join the byte lookup");
+        let key = crate::proof::hidden_norm_psc::round_digit_lookup_key(
+            round,
+            profile.positions,
+            16,
+            0,
+            crate::proof::lookup::BYTE_TABLE_IDENTITY,
+        )
+        .unwrap();
+        assert_eq!(key.sources.len(), digit_count * profile.positions as usize);
         let rstd = vec![64i64, 64];
         let rms = plan.rms.as_ref().unwrap();
         let core0 = NormCoreRow::from_values_rms(
