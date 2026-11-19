@@ -117,6 +117,29 @@ pub const GPT2_SEGMENT_HEAD: SegmentHeadGeometry = SegmentHeadGeometry {
     asset_path: OUTPUT_HEAD_ASSET_PATH,
 };
 
+/// The session main and mask codes of one segment geometry.
+///
+/// This is the single derivation point for the hidden session's group code:
+/// the shared stage, the norm, lookup and rstd spaces, the parameter claims
+/// and the segment codes all take their main code from here. A wider output
+/// head therefore keeps its parameter claims in the same BAT group as the
+/// main members instead of a second, hardcoded code family.
+pub fn segment_session_codes(
+    geometry: &SegmentHeadGeometry,
+) -> Result<(
+    zkie_engine::pcs::request::code::CodeParams,
+    zkie_engine::pcs::request::code::CodeParams,
+)> {
+    let code_log = (geometry.columns as u64 + 8192)
+        .checked_next_power_of_two()
+        .ok_or(Error::ResourceLimit)?
+        .trailing_zeros();
+    Ok((
+        build_code_plan(code_log, geometry.columns as u64, 8192)?,
+        build_code_plan(code_log, 512, 256)?,
+    ))
+}
+
 fn mask_tree(tree_number: u64, configuration: Digest, code: zkie_engine::pcs::request::code::CodeParams) -> MaskTreePlan {
     MaskTreePlan {
         tree_number,
@@ -201,12 +224,10 @@ pub fn build_segment_plan_for(
             expected_argmax,
         )?
     };
-    let code_log = (geometry.columns as u64 + 8192)
-        .checked_next_power_of_two()
-        .ok_or(Error::ResourceLimit)?
-        .trailing_zeros();
-    let code = build_code_plan(code_log, geometry.columns as u64, 8192)?;
-    let mask_code = build_code_plan(code_log, 512, 256)?;
+    let (code, mask_code) = segment_session_codes(geometry)?;
+    // The later stage codes share the session log; it comes from the one
+    // derivation above instead of a second formula.
+    let code_log = code.log_n;
     let tree = |tree_number: u64, run: Digest, main_rows: u64| -> Result<RuntimeTreePlan> {
         Ok(RuntimeTreePlan {
             tree_number,
@@ -877,6 +898,24 @@ mod tests {
         plan.validate().unwrap();
     }
 
+    /// The session main and mask codes have one derivation point: both
+    /// accepted geometries come from the same function and the gemma3 helper
+    /// is that derivation, not a second constant.
+    #[test]
+    fn the_session_codes_come_from_one_derivation() {
+        use zkie_engine::pcs::request::code::build_code_plan;
+        let (main, mask) = super::segment_session_codes(&super::GPT2_SEGMENT_HEAD).unwrap();
+        assert_eq!(main, build_code_plan(17, 65536, 8192).unwrap());
+        assert_eq!(mask, build_code_plan(17, 512, 256).unwrap());
+        let (gemma_main, gemma_mask) =
+            super::segment_session_codes(&super::GEMMA3_SEGMENT_HEAD).unwrap();
+        assert_eq!(gemma_main, build_code_plan(19, 262_144, 8192).unwrap());
+        assert_eq!(gemma_mask, build_code_plan(19, 512, 256).unwrap());
+        assert_eq!(
+            super::gemma3_segment_codes().unwrap(),
+            (gemma_main, gemma_mask)
+        );
+    }
 }
 
 use std::fs::File;
@@ -898,11 +937,9 @@ use zkie_ops::proof::norm_segment::{
 
 /// The trusted constants of the production norm segment.
 pub fn norm_segment_space(configuration: Digest) -> NormSegmentSpace {
-    norm_segment_space_coded(
-        configuration,
-        build_code_plan(17, 65536, 8192).expect("the session main code"),
-        build_code_plan(17, 512, 256).expect("the session mask code"),
-    )
+    let (code, mask_code) =
+        segment_session_codes(&GPT2_SEGMENT_HEAD).expect("the session codes");
+    norm_segment_space_coded(configuration, code, mask_code)
 }
 
 /// The segment space with explicit session codes. A wider output head uses
@@ -934,10 +971,9 @@ pub fn norm_segment_space_coded(
 }
 
 pub fn norm_lookup_space() -> LookupSpace {
-    norm_lookup_space_coded(
-        build_code_plan(17, 65536, 8192).expect("the session main code"),
-        build_code_plan(17, 512, 256).expect("the session mask code"),
-    )
+    let (code, mask_code) =
+        segment_session_codes(&GPT2_SEGMENT_HEAD).expect("the session codes");
+    norm_lookup_space_coded(code, mask_code)
 }
 
 pub fn norm_lookup_space_coded(
@@ -955,10 +991,9 @@ pub fn norm_lookup_space_coded(
 }
 
 pub fn norm_rstd_space() -> RstdSpace {
-    norm_rstd_space_coded(
-        build_code_plan(17, 65536, 8192).expect("the session main code"),
-        build_code_plan(17, 512, 256).expect("the session mask code"),
-    )
+    let (code, mask_code) =
+        segment_session_codes(&GPT2_SEGMENT_HEAD).expect("the session codes");
+    norm_rstd_space_coded(code, mask_code)
 }
 
 pub fn norm_rstd_space_coded(
@@ -985,9 +1020,12 @@ pub fn norm_output_groups() -> OutputGroups {
     }
 }
 
-fn param_claim(kind: NormParamKind, shape: IndexShape) -> NormParamClaimPlan {
+fn param_claim(
+    kind: NormParamKind,
+    shape: IndexShape,
+    code: zkie_engine::pcs::request::code::CodeParams,
+) -> NormParamClaimPlan {
     use zkie_engine::pcs::request::gu::{GuOracleShape, GuShape};
-    let code = build_code_plan(17, 65536, 8192).expect("the session main code");
     NormParamClaimPlan {
         kind,
         gu: GuShape {
@@ -1029,6 +1067,7 @@ pub fn param_identities_for(
     metas: &[AssetTableMeta],
     specs: &[zkie_ops::proof::model_commitment::ModelAssetSpec],
     model_identity: Digest,
+    code: zkie_engine::pcs::request::code::CodeParams,
     width: u64,
     gain: (&str, i64, i64),
     bias: Option<(&str, i64, i64)>,
@@ -1066,11 +1105,11 @@ pub fn param_identities_for(
         })
     };
     let gain_identity = identity(NormParamKind::Gain, gain.0, gain.1, gain.2)?;
-    let gain_claim = param_claim(NormParamKind::Gain, gain_identity.reader.shape);
+    let gain_claim = param_claim(NormParamKind::Gain, gain_identity.reader.shape, code);
     let (bias_identity, bias_claim) = match bias {
         Some((path, valid_min, valid_max)) => {
             let bias_identity = identity(NormParamKind::Bias, path, valid_min, valid_max)?;
-            let bias_claim = param_claim(NormParamKind::Bias, bias_identity.reader.shape);
+            let bias_claim = param_claim(NormParamKind::Bias, bias_identity.reader.shape, code);
             (Some(bias_identity), Some(bias_claim))
         }
         None => (None, None),
@@ -1091,6 +1130,7 @@ pub fn param_identities(metas: &[AssetTableMeta]) -> Result<NormParamTablesPlan>
         metas,
         &zkie_models_gpt2::plan::asset_specs(),
         zkie_models_gpt2::plan::table_model_identity()?,
+        segment_session_codes(&GPT2_SEGMENT_HEAD)?.0,
         1024,
         ("gpt2/weights/ln_f_w_i32.bin", -1_141_592, 1_141_592),
         Some(("gpt2/weights/ln_f_b_i32.bin", -482_890, 482_890)),
@@ -1103,6 +1143,7 @@ pub fn param_identities_gemma3(metas: &[AssetTableMeta]) -> Result<NormParamTabl
         metas,
         &zkie_models_gemma3::plan::asset_specs(),
         zkie_models_gemma3::plan::table_model_identity()?,
+        segment_session_codes(&GEMMA3_SEGMENT_HEAD)?.0,
         1024,
         (
             "models/gemma3/weights/final_norm_i32.bin",
@@ -1472,15 +1513,13 @@ pub fn build_norm_plan(
     Ok(plan)
 }
 
-/// The session codes of the gemma3 segment geometry.
+/// The session codes of the gemma3 segment geometry, from the single
+/// derivation point.
 pub fn gemma3_segment_codes() -> Result<(
     zkie_engine::pcs::request::code::CodeParams,
     zkie_engine::pcs::request::code::CodeParams,
 )> {
-    Ok((
-        build_code_plan(19, 262_144, 8192)?,
-        build_code_plan(19, 512, 256)?,
-    ))
+    segment_session_codes(&GEMMA3_SEGMENT_HEAD)
 }
 
 /// Builds the gemma3 norm plan at the production shape: the gain-only RMS
