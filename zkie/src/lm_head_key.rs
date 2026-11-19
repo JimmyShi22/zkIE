@@ -2488,6 +2488,10 @@ impl LmHeadAssetSource {
         if bytes > cap_bytes {
             return Err(Error::ResourceLimit);
         }
+        let factor_bytes = factor.checked_mul(4).ok_or(Error::ResourceLimit)?;
+        if factor_bytes > cap_bytes {
+            return Err(Error::ResourceLimit);
+        }
         let governor = BudgetedMemoryGovernor::new(cap_bytes);
         let permit = governor.acquire(&MemoryRequest {
             mapped_window_bytes: bytes,
