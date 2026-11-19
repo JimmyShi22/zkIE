@@ -113,3 +113,23 @@ wiring and tests), `111ae1c0` (shared mode-aware norm output rows), `1b1d1f06`
 (sparse tail units); evidence commit `220deb06`.
 
 Closed.
+
+## Peak composition and the no-streaming justification
+
+The acceptance peak is the prove stage high-water mark, 58,571,468 KiB; the
+verify stage peaks at 37,946,416 KiB, and the whole run (including the test
+and stage processes) stays at 58,581,632 kB. The composition is the norm-only
+own chain itself: the single owned norm witness (it is never cloned into the
+send witness; the second stage borrows it), the member group tables and their
+BAT/FOLD/CS rows, and the two canonical message stages. The tail clamp and
+padding rows already use the sparse unit representation - each row carries
+only its bound-width or pre-clamp digits instead of a dense per-row
+coefficient vector - which is what removed the earlier 416.9 GB peak, and no
+dense per-row vectors remain on this path.
+
+No streaming rework applies to this segment: it has no output-head table and
+no 2^18-level read surface. The largest structures are the 2^17 code domains
+and the 2^16-row member groups of this single L0 norm; the gain table has
+2,048 columns and the frozen rstd table is read by point lookups. The measured
+peak is therefore well below the 150 GiB reporting line, and the streaming
+design used by the larger slices has nothing to stream here.
