@@ -180,7 +180,9 @@ impl NormParamClaimPlan {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormParamTablesPlan {
     pub gain: NormParamTableIdentity,
-    pub bias: NormParamTableIdentity,
+    /// The bias row, when the normalization adds one. A gain-only relation
+    /// (RMS) carries no bias identity, no bias claim and no bias row.
+    pub bias: Option<NormParamTableIdentity>,
     pub column_draws: usize,
     pub seed_budget: usize,
     /// The folded-message claims, when the plan carries them.
@@ -191,33 +193,46 @@ pub struct NormParamTablesPlan {
 impl NormParamTablesPlan {
     pub fn validate(&self) -> Result<()> {
         self.gain.validate()?;
-        self.bias.validate()?;
-        if self.gain.kind != NormParamKind::Gain || self.bias.kind != NormParamKind::Bias {
+        if self.gain.kind != NormParamKind::Gain {
             return Err(Error::InvalidConfig);
         }
-        if self.gain.reader == self.bias.reader && self.gain.row == self.bias.row {
-            return Err(Error::InvalidConfig);
+        if let Some(bias) = &self.bias {
+            bias.validate()?;
+            if bias.kind != NormParamKind::Bias {
+                return Err(Error::InvalidConfig);
+            }
+            if self.gain.reader == bias.reader && self.gain.row == bias.row {
+                return Err(Error::InvalidConfig);
+            }
         }
         if self.column_draws == 0 || self.seed_budget == 0 {
             return Err(Error::InvalidConfig);
         }
-        for identity in [&self.gain, &self.bias] {
+        for identity in std::iter::once(&self.gain).chain(self.bias.iter()) {
             if self.column_draws as u64 > identity.reader.shape.code.n() {
                 return Err(Error::InvalidConfig);
             }
         }
         match (&self.gain_claim, &self.bias_claim) {
             (None, None) => {}
-            (Some(gain), Some(bias)) => {
+            (Some(gain), None) if self.bias.is_none() => {
+                // A gain-only relation carries the gain claim alone.
                 gain.validate(&self.gain)?;
-                bias.validate(&self.bias)?;
+                if gain.column_draws != self.column_draws {
+                    return Err(Error::InvalidConfig);
+                }
+            }
+            (Some(gain), Some(bias)) => {
+                let bias_identity = self.bias.as_ref().ok_or(Error::InvalidConfig)?;
+                gain.validate(&self.gain)?;
+                bias.validate(bias_identity)?;
                 if gain.column_draws != self.column_draws
                     || bias.column_draws != self.column_draws
                 {
                     return Err(Error::InvalidConfig);
                 }
             }
-            _ => return Err(Error::InvalidConfig),
+            (Some(_), None) | (None, Some(_)) => return Err(Error::InvalidConfig),
         }
         Ok(())
     }
@@ -225,7 +240,13 @@ impl NormParamTablesPlan {
     pub fn digest(&self) -> Digest {
         let mut writer = CanonicalWriter::new();
         writer.put_digest(&self.gain.digest());
-        writer.put_digest(&self.bias.digest());
+        match &self.bias {
+            Some(bias) => {
+                writer.put_u64(1);
+                writer.put_digest(&bias.digest());
+            }
+            None => writer.put_u64(0),
+        }
         writer.put_u64(self.column_draws as u64);
         writer.put_u64(self.seed_budget as u64);
         for claim in [&self.gain_claim, &self.bias_claim] {
@@ -295,7 +316,7 @@ mod tests {
     fn packed_plan() -> NormParamTablesPlan {
         NormParamTablesPlan {
             gain: identity(NormParamKind::Gain, 0, reader(9, 7)),
-            bias: identity(NormParamKind::Bias, 1, reader(9, 7)),
+            bias: Some(identity(NormParamKind::Bias, 1, reader(9, 7))),
             column_draws: 2,
             seed_budget: 1,
             gain_claim: None,
@@ -460,7 +481,7 @@ mod tests {
         let bias = identity(NormParamKind::Bias, reader(8, 6));
         let base = NormParamTablesPlan {
             gain: gain.clone(),
-            bias: bias.clone(),
+            bias: Some(bias.clone()),
             column_draws: 2,
             seed_budget: 1,
             gain_claim: None,
@@ -513,17 +534,18 @@ mod tests {
         assert_ne!(plan.digest(), Digest::ZERO);
 
         let mut changed = plan.clone();
-        changed.bias.row = 0;
+        changed.bias.as_mut().unwrap().row = 0;
         assert!(changed.validate().is_err());
 
         let mut separate = plan.clone();
-        separate.bias.reader = reader(8, 7);
-        separate.bias.row = 0;
+        separate.bias.as_mut().unwrap().reader = reader(8, 7);
+        separate.bias.as_mut().unwrap().row = 0;
         separate.validate().unwrap();
         assert_ne!(separate.digest(), plan.digest());
 
         let mut swapped = plan.clone();
-        std::mem::swap(&mut swapped.gain, &mut swapped.bias);
+        let bias = swapped.bias.as_mut().unwrap();
+        std::mem::swap(&mut swapped.gain, bias);
         assert!(swapped.validate().is_err());
 
         let mut changed = plan.clone();

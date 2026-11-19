@@ -664,7 +664,7 @@ mod tests {
                 valid_max: 1_141_592,
                 trusted_i32_mapping: true,
             },
-            bias: NormParamTableIdentity {
+            bias: Some(NormParamTableIdentity {
                 version: NORM_PARAM_TABLE_VERSION,
                 kind: NormParamKind::Bias,
                 model_identity: Digest([0x63; 32]),
@@ -675,7 +675,7 @@ mod tests {
                 valid_min: -482_890,
                 valid_max: 482_890,
                 trusted_i32_mapping: true,
-            },
+            }),
             column_draws: 2,
             seed_budget: 1,
         };
@@ -913,7 +913,7 @@ pub fn param_identities(metas: &[AssetTableMeta]) -> Result<NormParamTablesPlan>
     let bias_claim = param_claim(NormParamKind::Bias, bias.reader.shape);
     Ok(NormParamTablesPlan {
         gain,
-        bias,
+        bias: Some(bias),
         column_draws: 2,
         seed_budget: 1,
         gain_claim: Some(gain_claim),
@@ -1050,9 +1050,11 @@ pub fn check_authenticated_bounds(
             return Err(Error::BoundViolation);
         }
     }
-    for value in bias {
-        if *value < params.bias.valid_min || *value > params.bias.valid_max {
-            return Err(Error::BoundViolation);
+    if let Some(bias_identity) = &params.bias {
+        for value in bias {
+            if *value < bias_identity.valid_min || *value > bias_identity.valid_max {
+                return Err(Error::BoundViolation);
+            }
         }
     }
     let bound = i64::try_from(round.input_bound).map_err(|_| Error::ResourceLimit)?;
@@ -1154,8 +1156,8 @@ pub fn build_norm_witness(
 ) -> Result<zkie_ops::proof::hidden_norm_psc::NormWitness> {
     let space = norm_segment_space(configuration);
     let mut witness = build_core_witness(plan, profile, &space, x_rows, rstd)?;
-    attach_params_witness(&mut witness, gain, bias)?;
-    attach_output_witness(&mut witness, plan, profile, gain, bias, rstd)?;
+    attach_params_witness(&mut witness, gain, Some(bias))?;
+    attach_output_witness(&mut witness, plan, profile, gain, Some(bias), rstd)?;
     attach_lookup_witness(&mut witness, plan)?;
     attach_rstd_witness(&mut witness, plan)?;
     Ok(witness)
