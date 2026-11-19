@@ -23222,6 +23222,190 @@ fn norm_plain_rows(
                 right.target = word.output.ends[1].value.sub(&eq_sum);
                 rows.push(right);
             }
+            30..=32 => {
+                let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
+                let round_member = round_member.ok_or(Error::StatementMismatch)?;
+                let rms_slots = round_plan.layout.rms.ok_or(Error::StatementMismatch)?;
+                let rms = norm.rms.as_ref().ok_or(Error::StatementMismatch)?;
+                let (start, width, value_group, offset) = match word.relation {
+                    30 => (rms_slots.s_ll_digits, 5usize, &norm.sum, 0i128),
+                    31 => (
+                        rms_slots.s_lh_digits,
+                        6,
+                        &norm.squares,
+                        crate::proof::rms_limbs::CROSS_OFFSET,
+                    ),
+                    _ => (rms_slots.s_hh_digits, 6, &norm.mean, 0),
+                };
+                let value_member = bat_of
+                    .get(
+                        &value_group
+                            .oracle_base
+                            .checked_add(position as u64)
+                            .ok_or(Error::ResourceLimit)?,
+                    )
+                    .ok_or(Error::StatementMismatch)?;
+                if width >= columns {
+                    return Err(Error::ShapeMismatch);
+                }
+                let round_columns = usize::try_from(round_plan.group.columns)
+                    .map_err(|_| Error::ResourceLimit)?;
+                let mut dense = vec![Fp3::ZERO; round_columns];
+                let mut power = Fp3::ONE;
+                for index in 0..width {
+                    let entry = dense.get_mut(start + index).ok_or(Error::ShapeMismatch)?;
+                    *entry = power.mul(&eq[index]);
+                    power = power.mul(&Fp3::from_u64(256));
+                }
+                let coefficients = scatter_message_coefficients(
+                    &round_plan.group.shape,
+                    round_plan.group.columns,
+                    &dense,
+                )?;
+                let mut constant = eq[..width]
+                    .iter()
+                    .fold(Fp3::ZERO, |sum, value| sum.add(value))
+                    .add(&eq[columns]);
+                let mut left = BatRow::new(BatRowKind::Plain);
+                left.add_term(round_member.bat_oracle, BatPart::Main, coefficients);
+                left.add_term(
+                    value_member.bat_oracle,
+                    BatPart::Main,
+                    scalar_message_coefficients(
+                        &value_group.shape,
+                        Fp3::ZERO.sub(&eq[columns]),
+                    )?,
+                );
+                if offset != 0 {
+                    left.target = word.output.ends[0].value.add(
+                        &crate::proof::output_closure::fp3_signed(offset)?
+                            .mul(&eq[width]),
+                    );
+                    constant = constant.add(&eq[width]);
+                } else {
+                    left.target = word.output.ends[0].value;
+                }
+                left.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown0)?,
+                    word.output.ends[0].mask_scale,
+                );
+                rows.push(left);
+
+                let mut right = BatRow::new(BatRowKind::Plain);
+                right.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown1)?,
+                    word.output.ends[1].mask_scale,
+                );
+                right.target = word.output.ends[1].value.sub(&constant);
+                rows.push(right);
+            }
+            33..=72 | 73..=92 | 94 => {
+                let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
+                let round_member = round_member.ok_or(Error::StatementMismatch)?;
+                let rms_slots = round_plan.layout.rms.ok_or(Error::StatementMismatch)?;
+                let (terms, constant) =
+                    crate::proof::hidden_norm_psc::rms_relation_terms(word.relation, &rms_slots)?;
+                let round_columns = usize::try_from(round_plan.group.columns)
+                    .map_err(|_| Error::ResourceLimit)?;
+                let mut dense = vec![Fp3::ZERO; round_columns];
+                let mut constant_sum = Fp3::ZERO;
+                for (index, (slot, coefficient)) in terms.iter().enumerate() {
+                    let entry = dense.get_mut(*slot).ok_or(Error::ShapeMismatch)?;
+                    *entry = entry.add(&crate::proof::output_closure::fp3_signed(*coefficient)?
+                        .mul(&eq[index]));
+                    constant_sum = constant_sum.add(&eq[index]);
+                }
+                let coefficients = scatter_message_coefficients(
+                    &round_plan.group.shape,
+                    round_plan.group.columns,
+                    &dense,
+                )?;
+                let mut left = BatRow::new(BatRowKind::Plain);
+                left.add_term(round_member.bat_oracle, BatPart::Main, coefficients);
+                left.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown0)?,
+                    word.output.ends[0].mask_scale,
+                );
+                left.target = word.output.ends[0]
+                    .value
+                    .add(&crate::proof::output_closure::fp3_signed(constant)?.mul(&eq[columns]));
+                rows.push(left);
+
+                let constant = constant_sum.add(&eq[columns]);
+                let mut right = BatRow::new(BatRowKind::Plain);
+                right.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown1)?,
+                    word.output.ends[1].mask_scale,
+                );
+                right.target = word.output.ends[1].value.sub(&constant);
+                rows.push(right);
+            }
+            93 => {
+                let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
+                let round_member = round_member.ok_or(Error::StatementMismatch)?;
+                let rms_slots = round_plan.layout.rms.ok_or(Error::StatementMismatch)?;
+                let variance_member = bat_of
+                    .get(
+                        &norm
+                            .variance
+                            .oracle_base
+                            .checked_add(position as u64)
+                            .ok_or(Error::ResourceLimit)?,
+                    )
+                    .ok_or(Error::StatementMismatch)?;
+                let round_columns = usize::try_from(round_plan.group.columns)
+                    .map_err(|_| Error::ResourceLimit)?;
+                let mut dense = vec![Fp3::ZERO; round_columns];
+                let factor = Fp3::from_u64(1u64 << 32);
+                for index in 0..4 {
+                    dense[rms_slots.q_digits + index] = eq[index];
+                    dense[rms_slots.q_digits + 4 + index] = eq[4 + index].mul(&factor);
+                }
+                let coefficients = scatter_message_coefficients(
+                    &round_plan.group.shape,
+                    round_plan.group.columns,
+                    &dense,
+                )?;
+                let mut left = BatRow::new(BatRowKind::Plain);
+                left.add_term(round_member.bat_oracle, BatPart::Main, coefficients);
+                left.add_term(
+                    variance_member.bat_oracle,
+                    BatPart::Main,
+                    scalar_message_coefficients(
+                        &norm.variance.shape,
+                        Fp3::ZERO.sub(&eq[columns]),
+                    )?,
+                );
+                left.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown0)?,
+                    word.output.ends[0].mask_scale,
+                );
+                left.target = word.output.ends[0].value;
+                rows.push(left);
+                let constant = eq[..8]
+                    .iter()
+                    .fold(Fp3::ZERO, |sum, value| sum.add(value))
+                    .add(&eq[columns]);
+                let mut right = BatRow::new(BatRowKind::Plain);
+                right.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown1)?,
+                    word.output.ends[1].mask_scale,
+                );
+                right.target = word.output.ends[1].value.sub(&constant);
+                rows.push(right);
+            }
             4 | 5 => {
                 let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
                 let round_member = round_member.ok_or(Error::StatementMismatch)?;

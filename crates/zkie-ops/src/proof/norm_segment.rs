@@ -319,18 +319,28 @@ pub fn build_core_plan(
     let columns = profile.columns;
     let variables = columns.trailing_zeros() as usize + 1;
     let relations: Vec<usize> = if profile.mode.is_rms() {
-        (16..=25).chain(26..=63).collect()
+        (16..=25).chain(26..=94).collect()
     } else {
         (0..26).collect()
     };
     let round_layout =
         NormRoundLayout::new(profile.round_widths, profile.valid, profile.sum_offset, profile.mean_offset)?;
-    let round_layout = if profile.mode.is_rms() {
-        round_layout.with_rms()?
+    let rms_widths = if profile.mode.is_rms() {
+        Some(crate::proof::rms_limbs::RmsLimbWidths::derive(
+            profile.input_bound,
+            profile.valid,
+        )?)
     } else {
-        round_layout
+        None
     };
-    let round_columns = profile.round_widths.columns()?;
+    let round_layout = match &rms_widths {
+        Some(widths) => round_layout.with_rms(widths.first_divisor, widths.second_divisor)?,
+        None => round_layout,
+    };
+    let round_columns = u64::try_from(round_layout.total_slots())
+        .ok()
+        .and_then(|slots| slots.checked_next_power_of_two())
+        .ok_or(Error::ResourceLimit)?;
     let x_roots = x_roots(space, profile, x_rows)?;
     let mask = base_mask_plan(space, profile, variables, relations.len())?;
     let mut plan = NormPlan {
@@ -345,10 +355,7 @@ pub fn build_core_plan(
             Some(crate::proof::hidden_norm_psc::RmsLimbPlan {
                 low: group_plan(space, profile, columns, space.low)?,
                 high: group_plan(space, profile, columns, space.high)?,
-                widths: crate::proof::rms_limbs::RmsLimbWidths::derive(
-                    profile.input_bound,
-                    profile.valid,
-                )?,
+                widths: rms_widths.clone().ok_or(Error::InvalidConfig)?,
                 mean_bound: profile.mean_bound,
                 pre_bound: profile.pre_bound,
             })
@@ -1428,4 +1435,116 @@ mod tests {
         let third = x_roots(&space, &profile, &changed).unwrap();
         assert_ne!(first, third);
     }
+    fn rms_profile() -> NormSegmentProfile {
+        NormSegmentProfile {
+            positions: 2,
+            hidden: 4,
+            valid: 4,
+            columns: 16,
+            mode: crate::proof::hidden_norm::NormMode::RmsNorm,
+            shift: 32,
+            clamp: Some((-(1 << 31), (1 << 31) - 1)),
+            clamp_widths: Some(NormClampWidths {
+                low: 5,
+                high: 5,
+                low_strict: 4,
+                low_nonstrict: 4,
+                high_strict: 4,
+                high_nonstrict: 4,
+            }),
+            no_op_clamp: true,
+            input_bound: 1 << 10,
+            sum_offset: 0,
+            mean_offset: 0,
+            round_widths: NormRoundWidths {
+                sum: 7,
+                squares: 7,
+                variance: 7,
+                mean: 7,
+                offset: 3,
+            },
+            tail_widths: NormOutputTailWidths {
+                quotient: 4,
+                remainder: 4,
+                doubled_remainder: 5,
+                tie_slack: 4,
+                shifted: 4,
+                pre_clamp: 4,
+            },
+            table_real_len: 1 << 30,
+            mean_bound: 1 << 40,
+            pre_bound: 1 << 40,
+            x_seed: Digest([0x91; 32]),
+        }
+    }
+
+    #[test]
+    fn the_rms_plan_and_witness_bind_the_limb_groups() {
+        let profile = rms_profile();
+        let rows = vec![vec![3i64, -5, 7, 0], vec![-4, 8, -6, 2]];
+        let mut plan = build_core_plan(&space(), &profile, &rows).unwrap();
+        assert!(plan.rms.is_some());
+        assert!(plan.relations.contains(&26));
+        assert!(plan.relations.contains(&94));
+        assert!(plan.round.as_ref().unwrap().layout.rms.is_some());
+        let rstd = vec![64i64, 64];
+        let rms = plan.rms.as_ref().unwrap();
+        let core0 = NormCoreRow::from_values_rms(
+            &rows[0],
+            profile.valid as usize,
+            profile.input_bound,
+            rms.widths,
+            rms.mean_bound,
+        )
+        .unwrap();
+        let _rsqrt0 = crate::proof::hidden_norm::RsqrtRow::from_variance(
+            core0.variance,
+            profile.table_real_len,
+            rstd[0],
+        )
+        .unwrap();
+        let witness = build_core_witness(&plan, &profile, &space(), &rows, &rstd).unwrap();
+        let low = witness.low.as_ref().expect("the low limb group");
+        let high = witness.high.as_ref().expect("the high limb group");
+        assert_eq!(low.committed.roots.len(), profile.positions as usize);
+        assert_eq!(high.committed.roots.len(), profile.positions as usize);
+        for position in 0..profile.positions as usize {
+            let core = &witness.core[position];
+            let limb = core.rms.as_ref().unwrap();
+            assert_eq!(core.sum, limb.s_ll);
+            assert_eq!(core.squares, limb.s_lh);
+            assert_eq!(core.mean, limb.s_hh as i64);
+            assert_eq!(core.variance, limb.mean_square as i64);
+        }
+        let round = plan.round.as_ref().unwrap();
+        let rsqrt = &witness.rsqrt.as_ref().unwrap()[0];
+        let columns = plan.columns as usize;
+        for relation in &plan.relations {
+            let (left, right) = crate::proof::hidden_norm_psc::rel_map(
+                &witness.core[0],
+                &rows[0],
+                profile.valid as usize,
+                columns,
+                *relation,
+                Some(round),
+                Some(rsqrt),
+            )
+            .unwrap_or_else(|error| panic!("relation {relation}: {error:?}"));
+            if *relation <= 32 {
+                let inner = left.iter().zip(&right).fold(
+                    zkie_engine::pcs::request::field::Fp3::ZERO,
+                    |sum, (l, r)| sum.add(&l.mul(r)),
+                );
+                assert_eq!(
+                    inner,
+                    zkie_engine::pcs::request::field::Fp3::ZERO,
+                    "relation {relation}"
+                );
+            } else {
+                let _ = (&left, &right);
+            }
+        }
+        let _ = plan.rms.as_mut().unwrap();
+    }
+
 }

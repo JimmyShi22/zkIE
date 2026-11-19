@@ -42,6 +42,9 @@ pub const MIN_INPUT_BITS: u32 = 1;
 /// The digit widths of the multi-limb RMS row.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RmsLimbWidths {
+    /// The first divisor of the two-stage division; `first * second = valid`.
+    pub first_divisor: u32,
+    pub second_divisor: u32,
     /// Base-256 digits of `S_ll`.
     pub s_ll: usize,
     /// Base-256 digits of `S_lh`.
@@ -92,18 +95,46 @@ impl RmsLimbWidths {
             let bits = 128 - value.leading_zeros();
             Ok(((bits + 7) / 8).max(1) as usize)
         };
+        // The cross-sum offset cancels at byte seven, so the combined row
+        // must cover at least eight bytes even for a tiny input bound.
+        let v_width = width(v)?.max(10);
+        let first_divisor = if valid == 0 {
+            return Err(Error::InvalidConfig);
+        } else {
+            let mut divisor: u32 = 1;
+            while divisor < 256 && valid % (divisor * 2) == 0 {
+                divisor *= 2;
+            }
+            divisor
+        };
+        let second_divisor = valid / first_divisor;
+        if first_divisor == 0 || first_divisor > 255 || second_divisor == 0 || second_divisor > 255 {
+            return Err(Error::InvalidConfig);
+        }
         let widths = Self {
-            s_ll: width(s_ll)?,
-            s_lh: width(s_lh)?,
-            s_hh: width(s_hh)?,
-            v: width(v)?,
-            mean: width(v)?,
+            first_divisor,
+            second_divisor,
+            s_ll: width(s_ll)?.max(5),
+            // The cross sum is stored with its fixed offset, so its digit
+            // row must cover `S_lh + CROSS_OFFSET` even when the bound is
+            // small.
+            s_lh: width(s_lh)?.max(width(CROSS_OFFSET as u128)?),
+            s_hh: width(s_hh)?.max(6),
+            v: v_width,
+            mean: v_width,
         };
         widths.validate()?;
         Ok(widths)
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.first_divisor == 0
+            || self.first_divisor > 255
+            || self.second_divisor == 0
+            || self.second_divisor > 255
+        {
+            return Err(Error::InvalidConfig);
+        }
         // The three partial sums are field elements and stay within seven
         // bytes. The sum of squares and the quotient exist only as digits;
         // their rows may use up to ten bytes.
@@ -146,9 +177,15 @@ pub struct RmsLimbRow {
     /// The digits of `V + valid/2` and its carry chain.
     pub v_plus_digits: Vec<u8>,
     pub v_plus_carries: Vec<u8>,
-    /// The mean-square digits and the division carries.
+    /// The quotient of `V + valid/2` by 128 and its byte carries.
+    pub q1_digits: Vec<u8>,
+    pub shift_carries: Vec<u8>,
+    pub shift_slack: Vec<u8>,
+    /// The mean-square digits (the quotient by five of the shifted value) and
+    /// the stage-two carries.
     pub mean_digits: Vec<u8>,
-    pub division_carries: Vec<u16>,
+    pub division_carries: Vec<u8>,
+    pub division_slack: Vec<u8>,
     /// The rounded mean square and the division remainder.
     pub mean_square: i128,
     pub remainder: u16,
@@ -179,6 +216,9 @@ impl RmsLimbRow {
         widths: RmsLimbWidths,
     ) -> Result<Self> {
         if valid == 0 || valid > values.len() || input_bound == 0 {
+            return Err(Error::InvalidConfig);
+        }
+        if widths.first_divisor as usize * widths.second_divisor as usize != valid {
             return Err(Error::InvalidConfig);
         }
         let bound = i64::try_from(input_bound).map_err(|_| Error::ResourceLimit)?;
@@ -243,7 +283,29 @@ impl RmsLimbRow {
         let divisor = valid as u128;
         let mean = v_plus / divisor;
         let remainder = u16::try_from(v_plus % divisor).map_err(|_| Error::BoundViolation)?;
-        let (mean_digits, division_carries) = divide(&v_plus_digits, valid as u16, widths.mean)?;
+        // The valid count factors into two byte-sized divisors; dividing in
+        // two stages keeps every carry in a byte and makes the canonical
+        // remainder bound a byte slack relation.
+        let first = widths.first_divisor;
+        let second = widths.second_divisor;
+        let (q1_digits, shift_carries) = divide(&v_plus_digits, first, widths.mean)?;
+        let shift_slack = shift_carries
+            .iter()
+            .map(|carry| {
+                (first as u8 - 1)
+                    .checked_sub(*carry)
+                    .ok_or(Error::BoundViolation)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let (mean_digits, division_carries) = divide(&q1_digits, second, widths.mean)?;
+        let division_slack = division_carries
+            .iter()
+            .map(|carry| {
+                (second as u8 - 1)
+                    .checked_sub(*carry)
+                    .ok_or(Error::BoundViolation)
+            })
+            .collect::<Result<Vec<_>>>()?;
         if digits_value(&mean_digits)? != mean {
             return Err(Error::InvalidProof);
         }
@@ -265,8 +327,12 @@ impl RmsLimbRow {
             v_carries,
             v_plus_digits,
             v_plus_carries,
+            q1_digits,
+            shift_carries,
+            shift_slack,
             mean_digits,
             division_carries,
+            division_slack,
             mean_square,
             remainder,
         })
@@ -386,26 +452,26 @@ fn add_small(digits: &[u8], addend: u16, width: usize) -> Result<(Vec<u8>, Vec<u
 /// first. In little-endian indices the bytes and carries satisfy
 /// `up_{i+1} * 256 + digit_i = divisor * q_i + down_i`, with `up_width = 0`;
 /// `down_0` is the division remainder.
-fn divide(digits: &[u8], divisor: u16, width: usize) -> Result<(Vec<u8>, Vec<u16>)> {
-    if divisor == 0 {
+fn divide(digits: &[u8], divisor: u32, width: usize) -> Result<(Vec<u8>, Vec<u8>)> {
+    if divisor == 0 || divisor > 256 {
         return Err(Error::InvalidConfig);
     }
     let mut out = vec![0u8; width];
-    let mut carries = vec![0u16; width];
+    let mut carries = vec![0u8; width];
     let mut up: u32 = 0;
     for index in (0..width).rev() {
         let current = up
             .checked_mul(256)
             .and_then(|value| value.checked_add(u32::from(digits.get(index).copied().unwrap_or(0))))
             .ok_or(Error::ResourceLimit)?;
-        let quotient = current / u32::from(divisor);
-        let down = current % u32::from(divisor);
+        let quotient = current / divisor;
+        let down = current % divisor;
         if quotient > u32::from(u8::MAX) {
             return Err(Error::BoundViolation);
         }
         out[index] = quotient as u8;
         up = down;
-        carries[index] = u16::try_from(down).map_err(|_| Error::BoundViolation)?;
+        carries[index] = u8::try_from(down).map_err(|_| Error::BoundViolation)?;
     }
     Ok((out, carries))
 }
@@ -437,6 +503,7 @@ mod tests {
         assert_eq!(digits_value(&row.v_digits).unwrap(), v as u128);
         assert_eq!(row.v_carries.len(), 10);
         assert_eq!(row.division_carries.len(), 10);
+        assert_eq!(row.shift_carries.len(), 10);
         row.check(&values, 640, 1 << 33, widths()).unwrap();
     }
 
