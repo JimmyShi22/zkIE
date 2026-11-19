@@ -35,6 +35,7 @@ use crate::proof::committed_psc::{
     PositionPscChallenges, PscTranscriptTags,
 };
 use crate::proof::hidden_norm::{NormCoreRow, NormMode, NormShape};
+use crate::proof::rms_limbs::RmsLimbWidths;
 use crate::proof::hidden_send_session::{
     get_column_opening, put_column_opening, SendSamples, WShape,
 };
@@ -5196,6 +5197,58 @@ fn digit_capacity(width: usize) -> Result<u128> {
         .ok_or(Error::ResourceLimit)
 }
 
+/// The digit and carry slots of the multi-limb RMS rows inside the rounding
+/// message. Every digit is one byte cell; every carry is one two-byte signed
+/// cell (offset by `2^15`), so the byte lookup covers every cell. The slots
+/// are absolute positions in the rounding message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RmsRoundSlots {
+    pub s_ll_digits: usize,
+    pub s_lh_digits: usize,
+    pub s_hh_digits: usize,
+    pub v_digits: usize,
+    pub v_carries: usize,
+    pub v_plus_digits: usize,
+    pub v_plus_carries: usize,
+    pub q_digits: usize,
+    pub division_carries: usize,
+    pub total: usize,
+}
+
+impl RmsRoundSlots {
+    pub const CARRY_OFFSET: u64 = 1 << 15;
+
+    pub fn new(base: usize) -> Self {
+        let mut next = base;
+        let mut take = |count: usize| {
+            let at = next;
+            next += count;
+            at
+        };
+        let s_ll_digits = take(5);
+        let s_lh_digits = take(6);
+        let s_hh_digits = take(6);
+        let v_digits = take(10);
+        let v_carries = take(20);
+        let v_plus_digits = take(10);
+        let v_plus_carries = take(10);
+        let q_digits = take(10);
+        let division_carries = take(20);
+        Self {
+            s_ll_digits,
+            s_lh_digits,
+            s_hh_digits,
+            v_digits,
+            v_carries,
+            v_plus_digits,
+            v_plus_carries,
+            q_digits,
+            division_carries,
+            total: next,
+        }
+    }
+}
+
 /// The slot positions of the rounding witness message.
 ///
 /// The six fixed slots hold the mean and variance remainders, offsets and
@@ -5250,6 +5303,8 @@ pub struct NormRoundLayout {
     pub sum_offset: u64,
     pub mean_offset: u64,
     pub slots: NormRoundSlots,
+    /// The multi-limb RMS slots, present only for the RMS form.
+    pub rms: Option<RmsRoundSlots>,
 }
 
 impl NormRoundLayout {
@@ -5404,7 +5459,23 @@ impl NormRoundLayout {
                 rstd,
                 total: next,
             },
+            rms: None,
         })
+    }
+
+    /// Attaches the multi-limb RMS slots after the shared slots.
+    pub fn with_rms(mut self) -> Result<Self> {
+        let base = self.slots.total;
+        self.rms = Some(RmsRoundSlots::new(base));
+        Ok(self)
+    }
+
+    /// The total slot count including the multi-limb slots.
+    pub fn total_slots(&self) -> usize {
+        match self.rms {
+            Some(slots) => slots.total,
+            None => self.slots.total,
+        }
     }
 
     /// The committed digit slots the byte lookup covers, in plan order: the
