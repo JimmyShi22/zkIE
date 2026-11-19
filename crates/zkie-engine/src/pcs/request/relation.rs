@@ -874,6 +874,44 @@ pub fn oracle_sample_row(
     })
 }
 
+/// Fills one sample row's dense coefficient vector in blocks: the equality
+/// weight of a virtual index is the product of a block factor and a block
+/// vector, so the whole `2^bits` weight vector is never materialized.
+#[allow(clippy::too_many_arguments)]
+fn fill_sample_weights(
+    coefficients: &mut [Fp3],
+    seed: &SampleSeed,
+    rows: u64,
+    row_bits: u32,
+    len: u64,
+    bits: u32,
+    front: Fp3,
+) -> Result<()> {
+    const BLOCK_BITS: u32 = 20;
+    let low_bits = bits.min(BLOCK_BITS);
+    let high_bits = bits - low_bits;
+    let low = eq_vector(&seed.z[..low_bits as usize], low_bits)?;
+    let high = if high_bits > 0 {
+        eq_vector(&seed.z[low_bits as usize..], high_bits)?
+    } else {
+        vec![Fp3::ONE]
+    };
+    if high.len() as u64 != 1u64 << high_bits {
+        return Err(Error::ShapeMismatch);
+    }
+    let count = 1u64 << bits;
+    for virtual_index in 0..count {
+        if let Some(offset) = physical_offset(rows, row_bits, len, virtual_index)? {
+            let block = (virtual_index >> low_bits) as usize;
+            let local = (virtual_index & ((1u64 << low_bits) - 1)) as usize;
+            let high = *high.get(block).ok_or(Error::ShapeMismatch)?;
+            let weight = front.mul(&high).mul(&low[local]);
+            coefficients[offset] = weight;
+        }
+    }
+    Ok(())
+}
+
 fn sample_coefficients(
     u: &GuOracleShape,
     seeds: &[SampleSeed],
@@ -892,23 +930,15 @@ fn sample_coefficients(
     let mut mask = empty_mask(u)?;
     if cube.has_main {
         let front = sample_front(seed, &cube, cube.main_bits, false)?;
-        let count = 1u64
-            .checked_shl(cube.main_bits)
-            .ok_or(Error::ResourceLimit)?;
-        let eq = eq_vector(&seed.z, cube.main_bits)?;
-        if eq.len() as u64 != count {
-            return Err(Error::ShapeMismatch);
-        }
-        for virtual_index in 0..count {
-            if let Some(offset) = physical_offset(
-                u.main_rows,
-                cube.main_row_bits,
-                u.code.ell,
-                virtual_index,
-            )? {
-                main[offset] = front.mul(&eq[virtual_index as usize]);
-            }
-        }
+        fill_sample_weights(
+            &mut main,
+            seed,
+            u.main_rows,
+            cube.main_row_bits,
+            u.code.ell,
+            cube.main_bits,
+            front,
+        )?;
         if !cube.has_mask {
             sample_pad(
                 &mut main,
@@ -926,23 +956,15 @@ fn sample_coefficients(
     if cube.has_mask {
         let code = u.mask_code.ok_or(Error::ShapeMismatch)?;
         let front = sample_front(seed, &cube, cube.mask_bits, true)?;
-        let count = 1u64
-            .checked_shl(cube.mask_bits)
-            .ok_or(Error::ResourceLimit)?;
-        let eq = eq_vector(&seed.z, cube.mask_bits)?;
-        if eq.len() as u64 != count {
-            return Err(Error::ShapeMismatch);
-        }
-        for virtual_index in 0..count {
-            if let Some(offset) = physical_offset(
-                u.mask_rows,
-                cube.mask_row_bits,
-                code.ell,
-                virtual_index,
-            )? {
-                mask[offset] = front.mul(&eq[virtual_index as usize]);
-            }
-        }
+        fill_sample_weights(
+            &mut mask,
+            seed,
+            u.mask_rows,
+            cube.mask_row_bits,
+            code.ell,
+            cube.mask_bits,
+            front,
+        )?;
         sample_pad(
             &mut mask,
             seed,
