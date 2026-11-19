@@ -26,6 +26,11 @@ use crate::proof::lookup::{eq_weights, fold_adjacent, LookupTable};
 /// Version of the frozen table row encoding.
 pub const TABLE_ENCODING_VERSION: u64 = 1;
 
+/// The bounded row chunk of one frozen table read. Every range read of a
+/// table view is limited to this many rows, so the transient buffer stays
+/// fixed as the table grows; whole-column results are filled chunk by chunk.
+pub const TABLE_READ_CHUNK_ROWS: usize = 4096;
+
 /// Row encoding of a frozen public table.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TableEncoding {
@@ -318,7 +323,7 @@ impl<S: TableRowSource> RangeTable<S> {
             if error.is_some() || cursor >= real {
                 return None;
             }
-            let count = (real - cursor).min(4096);
+            let count = (real - cursor).min(TABLE_READ_CHUNK_ROWS);
             match self.read_rows_raw(cursor, count) {
                 Ok(rows) => {
                     cursor += count;
@@ -398,9 +403,20 @@ impl<S: TableRowSource> LookupTable for RangeTable<S> {
         Ok(value)
     }
 
+    /// Reads one column's padded row values in row order. The result is
+    /// inherent to the caller, but the reads that produce it stay bounded:
+    /// the column is filled in `TABLE_READ_CHUNK_ROWS` chunks, so the
+    /// transient range buffer does not grow with the table.
     fn column_rows(&self, column: usize) -> Result<Vec<Fp3>> {
         let rows = self.table_rows()?;
-        self.column_chunk(column, 0, rows)
+        let mut values = Vec::with_capacity(rows);
+        let mut start = 0usize;
+        while start < rows {
+            let count = (rows - start).min(TABLE_READ_CHUNK_ROWS);
+            values.extend(self.column_chunk(column, start, count)?);
+            start += count;
+        }
+        Ok(values)
     }
 }
 
@@ -678,5 +694,62 @@ mod tests {
         let direct = fold_adjacent(&table.column_rows(1).unwrap(), &point).unwrap();
         assert_eq!(streamed, direct);
         assert_eq!(table.verify_content().unwrap(), config.content_root);
+    }
+
+    #[test]
+    fn chunked_column_reads_match_a_single_read_and_stay_bounded() {
+        // A table longer than one read chunk: the padded column result equals
+        // a direct read of the same rows, and every range read stays within
+        // the chunk bound.
+        let real = TABLE_READ_CHUNK_ROWS * 3 + 17;
+        let rows = (0..real)
+            .map(|index| ((index as i64 * 11) % 251) - 125)
+            .collect::<Vec<_>>();
+        let source = SplitRows::new(0x88, rows[..1_000].to_vec(), rows[1_000..].to_vec());
+        let config = source.config();
+        let table = RangeTable::open(source, 14, &config).unwrap();
+        let padded = 1usize << 14;
+        let mut expected = rows.iter().map(|value| signed(*value)).collect::<Vec<_>>();
+        expected.resize(padded, signed(rows[0]));
+        assert_eq!(table.column_rows(1).unwrap(), expected);
+        assert!(table.stats().peak_rows <= TABLE_READ_CHUNK_ROWS as u64);
+        let index = table.column_rows(0).unwrap();
+        assert_eq!(
+            index,
+            (0..padded)
+                .map(|row| {
+                    if row < real {
+                        Fp3::from_u64(row as u64)
+                    } else {
+                        Fp3::ZERO
+                    }
+                })
+                .collect::<Vec<_>>()
+        );
+        // The content check streams the same rows and stays bounded as well.
+        let source = SplitRows::new(0x88, rows[..1_000].to_vec(), rows[1_000..].to_vec());
+        let table = RangeTable::open(source, 14, &config).unwrap();
+        assert_eq!(table.verify_content().unwrap(), config.content_root);
+        assert!(table.stats().peak_rows <= TABLE_READ_CHUNK_ROWS as u64);
+    }
+
+    #[test]
+    fn reads_beyond_the_real_length_and_the_table_domain_are_rejected() {
+        let real = TABLE_READ_CHUNK_ROWS + 3;
+        let rows = (0..real).map(|index| index as i64).collect::<Vec<_>>();
+        let source = SplitRows::new(0x89, rows[..10].to_vec(), rows[10..].to_vec());
+        let config = source.config();
+        let source = SplitRows::new(0x89, rows[..10].to_vec(), rows[10..].to_vec());
+        assert!(source.read_rows(real - 1, 2).is_err());
+        assert!(source.read_rows(0, real + 1).is_err());
+        let table = RangeTable::open(source_of(&rows), 13, &config).unwrap();
+        assert!(table.row_value(1 << 13).is_err());
+        assert!(RangeTable::open(source_of(&rows), 12, &config).is_err());
+        assert!(RangeTable::open(source_of(&rows), 31, &config).is_err());
+    }
+
+    fn source_of(rows: &[i64]) -> SplitRows {
+        let split = rows.len().saturating_sub(10);
+        SplitRows::new(0x89, rows[..split].to_vec(), rows[split..].to_vec())
     }
 }
