@@ -301,6 +301,7 @@ const HIDDEN_SEND_SCHEMA_VERSION: u64 = 4;
 /// norm hidden-output object. The tag is absent on the independently
 /// committed activation path, whose statement bytes stay unchanged.
 const HD_ACTIVATION_MODE_TAG: u64 = 0x4E4F_524D_4844;
+const NORM_ONLY_MODE_TAG: u64 = 0x4E4F_524D_4E44;
 
 /// The plan statement root of the norm hidden-output mode. The committed
 /// object itself is bound by the ordered roots in the first-stage norm
@@ -421,19 +422,30 @@ pub enum ActivationSource {
     /// committed norm output messages; the plan carries no separate
     /// activation commitment.
     NormHd,
+    /// The activation is the norm hidden-output object and the session runs
+    /// the norm chain without the Dot/W row stage. The plan carries no table
+    /// reader, no index mask and no closure; the norm out messages are bound
+    /// to the materialized trace rows.
+    NormHdNoDot,
 }
 
 impl ActivationSource {
     /// Appends the mode tag to a statement or parameter digest. The default
     /// path appends nothing so its statement bytes are unchanged.
     fn append(self, writer: &mut CanonicalWriter) {
-        if self == Self::NormHd {
-            writer.put_u64(HD_ACTIVATION_MODE_TAG);
+        match self {
+            Self::Commitment => {}
+            Self::NormHd => writer.put_u64(HD_ACTIVATION_MODE_TAG),
+            Self::NormHdNoDot => writer.put_u64(NORM_ONLY_MODE_TAG),
         }
     }
 
     pub fn is_norm_hd(self) -> bool {
-        self == Self::NormHd
+        matches!(self, Self::NormHd | Self::NormHdNoDot)
+    }
+
+    pub fn is_norm_only(self) -> bool {
+        self == Self::NormHdNoDot
     }
 }
 
@@ -14632,6 +14644,7 @@ impl WCommitRandomness {
                 Some(DotMapRandomness { tail, salts, pad })
             }
             (Some(_), ActivationSource::NormHd) => None,
+            (Some(_), ActivationSource::NormHdNoDot) => None,
             (None, _) => None,
         };
         let closure = match closure {
@@ -14934,7 +14947,7 @@ fn prove_first(
             }
             weights
         }
-        ActivationSource::NormHd => {
+        ActivationSource::NormHd | ActivationSource::NormHdNoDot => {
             if activation.is_some() {
                 return Err(Error::InvalidConfig);
             }
@@ -14958,6 +14971,7 @@ fn prove_first(
             Some(root)
         }
         (Some(_), ActivationSource::NormHd) => None,
+        (Some(_), ActivationSource::NormHdNoDot) => None,
         (None, _) => None,
     };
     let closure_commit = match (&plan.closure, &randomness.closure) {
@@ -15509,7 +15523,7 @@ fn prove_first(
         ActivationSource::Commitment => {
             *activation.ok_or(Error::InvalidConfig)?.commitment()
         }
-        ActivationSource::NormHd => {
+        ActivationSource::NormHd | ActivationSource::NormHdNoDot => {
             let first_norm = norm_first.as_ref().ok_or(Error::InvalidConfig)?;
             let output = first_norm.output.as_ref().ok_or(Error::InvalidConfig)?;
             ActivationCommitment {
@@ -25245,7 +25259,7 @@ fn dot_plain_rows(
         ActivationSource::Commitment => {
             Some(bat_of.get(&dot.oracle).ok_or(Error::StatementMismatch)?)
         }
-        ActivationSource::NormHd => None,
+        ActivationSource::NormHd | ActivationSource::NormHdNoDot => None,
     };
     let omega_member = bat_of
         .get(&plan.proximity.omega.oracle)
@@ -25329,6 +25343,7 @@ fn dot_plain_rows(
     let end_start = index.entries.end_range()?.start;
     let mut row = BatRow::new(BatRowKind::Plain);
     match plan.send.activation_source {
+        ActivationSource::NormHdNoDot => return Err(Error::UnsupportedPrimitive),
         ActivationSource::Commitment => {
             let dot_member = dot_member.ok_or(Error::InvalidConfig)?;
             let dot_rows =
