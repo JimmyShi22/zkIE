@@ -140,12 +140,17 @@ fn literal_config(config: &[PlanConfigValue]) -> Result<Vec<i64>> {
 /// the activation source and output. The plan is compiled into the verifier;
 /// this function reads it, it does not accept a caller-supplied step list.
 pub fn find_lm_head_matmul(plan: &TracePlan) -> Result<LmHeadStep> {
+    find_lm_head_matmul_for(plan, LM_HEAD_SUFFIX)
+}
+
+/// The output-head MatMul of the given weight-path suffix.
+pub fn find_lm_head_matmul_for(plan: &TracePlan, suffix: &str) -> Result<LmHeadStep> {
     for (index, step) in plan.steps.iter().enumerate() {
         if step.opcode != OpCode::MatMul {
             continue;
         }
         let weight = step.inputs.iter().enumerate().find_map(|(port, input)| match input {
-            PlanSource::Asset { path, .. } if path.ends_with(LM_HEAD_SUFFIX) => {
+            PlanSource::Asset { path, .. } if path.ends_with(suffix) => {
                 Some((port, path.clone()))
             }
             _ => None,
