@@ -72,6 +72,7 @@ pub struct NormSegmentProfile {
     pub hidden: u32,
     pub valid: u32,
     pub columns: u64,
+    pub mode: crate::proof::hidden_norm::NormMode,
     pub shift: u32,
     pub clamp: Option<(i64, i64)>,
     pub clamp_widths: Option<NormClampWidths>,
@@ -311,7 +312,11 @@ pub fn build_core_plan(
     let shape = NormShape::new(profile.positions, profile.hidden, profile.valid)?;
     let columns = profile.columns;
     let variables = columns.trailing_zeros() as usize + 1;
-    let relations: Vec<usize> = (0..26).collect();
+    let relations: Vec<usize> = if profile.mode.is_rms() {
+        (2..=26).collect()
+    } else {
+        (0..26).collect()
+    };
     let round_layout =
         NormRoundLayout::new(profile.round_widths, profile.valid, profile.sum_offset, profile.mean_offset)?;
     let round_columns = profile.round_widths.columns()?;
@@ -321,6 +326,7 @@ pub fn build_core_plan(
         shape,
         columns,
         variables,
+        mode: profile.mode,
         relations,
         x: group_plan(space, profile, columns, space.x)?,
         x_roots,
@@ -438,7 +444,11 @@ pub fn build_core_witness(
             return Err(Error::ShapeMismatch);
         }
         rows.push(row.clone());
-        core.push(NormCoreRow::from_values(row, profile.valid as usize)?);
+        core.push(NormCoreRow::from_values_mode(
+            row,
+            profile.valid as usize,
+            plan.mode,
+        )?);
     }
     let rsqrt = core
         .iter()
@@ -588,6 +598,7 @@ pub fn attach_output_witness(
             profile.valid as usize,
             output.shift,
             output.clamp,
+            plan.mode,
         )?);
     }
     let tail = NormOutputTailWitness {
@@ -924,6 +935,7 @@ mod tests {
             hidden: 1024,
             valid: 768,
             columns: 1024,
+            mode: crate::proof::hidden_norm::NormMode::LayerNorm,
             shift: 32,
             clamp: Some((-(1 << 31), (1 << 31) - 1)),
             clamp_widths: Some(NormClampWidths {

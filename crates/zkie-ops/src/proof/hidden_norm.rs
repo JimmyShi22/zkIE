@@ -90,6 +90,29 @@ impl NormCommitments {
     }
 }
 
+/// The normalization relation of the core. The layer form subtracts the
+/// rounded mean before squaring; the RMS form squares the raw valid cells and
+/// uses the rounded mean square as its single statistic. The two forms share
+/// the digit, offset and range machinery but not the centering equation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum NormMode {
+    LayerNorm,
+    RmsNorm,
+}
+
+impl NormMode {
+    pub fn encode(self) -> u64 {
+        match self {
+            Self::LayerNorm => 0,
+            Self::RmsNorm => 1,
+        }
+    }
+
+    pub fn is_rms(self) -> bool {
+        matches!(self, Self::RmsNorm)
+    }
+}
+
 /// The trusted plan of the norm core.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct NormCorePlan {
@@ -154,36 +177,69 @@ pub struct NormCoreRow {
 
 impl NormCoreRow {
     pub fn from_values(values: &[i64], valid: usize) -> Result<Self> {
+        Self::from_values_mode(values, valid, NormMode::LayerNorm)
+    }
+
+    /// Computes the exact core of one position under the selected relation.
+    ///
+    /// The layer form sums the valid cells, rounds their mean, squares the
+    /// centered cells and rounds the variance. The RMS form sums the squares
+    /// of the valid cells and rounds that mean square; it does not subtract a
+    /// mean anywhere, and its `squares` and `variance` fields carry the same
+    /// sum and mean square so the shared digit/offset rows stay exact.
+    pub fn from_values_mode(values: &[i64], valid: usize, mode: NormMode) -> Result<Self> {
         if valid == 0 || valid > values.len() {
             return Err(Error::InvalidConfig);
         }
-        let mut sum: i128 = 0;
-        for value in &values[..valid] {
-            sum = sum
-                .checked_add(*value as i128)
-                .ok_or(Error::BoundViolation)?;
-        }
         let divisor = valid as i128;
-        let mean = round_div_half_up(sum, divisor)?;
-        let mean = i64::try_from(mean).map_err(|_| Error::BoundViolation)?;
-        let mean_remainder = sum
-            .checked_sub((mean as i128) * divisor)
-            .ok_or(Error::BoundViolation)?;
-        let mut squares: i128 = 0;
-        for value in &values[..valid] {
-            let centered = (*value as i128) - mean as i128;
-            let square = centered
-                .checked_mul(centered)
+        let (sum, mean, mean_remainder) = if mode.is_rms() {
+            let mut sum: i128 = 0;
+            for value in &values[..valid] {
+                let value = *value as i128;
+                sum = sum
+                    .checked_add(value.checked_mul(value).ok_or(Error::BoundViolation)?)
+                    .ok_or(Error::BoundViolation)?;
+            }
+            let mean = round_div_half_up(sum, divisor)?;
+            let mean = i64::try_from(mean).map_err(|_| Error::BoundViolation)?;
+            let mean_remainder = sum
+                .checked_sub((mean as i128) * divisor)
                 .ok_or(Error::BoundViolation)?;
-            squares = squares
-                .checked_add(square)
+            (sum, mean, mean_remainder)
+        } else {
+            let mut sum: i128 = 0;
+            for value in &values[..valid] {
+                sum = sum
+                    .checked_add(*value as i128)
+                    .ok_or(Error::BoundViolation)?;
+            }
+            let mean = round_div_half_up(sum, divisor)?;
+            let mean = i64::try_from(mean).map_err(|_| Error::BoundViolation)?;
+            let mean_remainder = sum
+                .checked_sub((mean as i128) * divisor)
                 .ok_or(Error::BoundViolation)?;
-        }
-        let variance = round_div_half_up(squares, divisor)?;
-        let variance = i64::try_from(variance).map_err(|_| Error::BoundViolation)?;
-        let variance_remainder = squares
-            .checked_sub((variance as i128) * divisor)
-            .ok_or(Error::BoundViolation)?;
+            (sum, mean, mean_remainder)
+        };
+        let (squares, variance, variance_remainder) = if mode.is_rms() {
+            (sum, mean, mean_remainder)
+        } else {
+            let mut squares: i128 = 0;
+            for value in &values[..valid] {
+                let centered = (*value as i128) - mean as i128;
+                let square = centered
+                    .checked_mul(centered)
+                    .ok_or(Error::BoundViolation)?;
+                squares = squares
+                    .checked_add(square)
+                    .ok_or(Error::BoundViolation)?;
+            }
+            let variance = round_div_half_up(squares, divisor)?;
+            let variance = i64::try_from(variance).map_err(|_| Error::BoundViolation)?;
+            let variance_remainder = squares
+                .checked_sub((variance as i128) * divisor)
+                .ok_or(Error::BoundViolation)?;
+            (squares, variance, variance_remainder)
+        };
         let sum_digits = unsigned_digits(sum.unsigned_abs())?;
         let mean_digits = unsigned_digits(mean.unsigned_abs() as u128)?;
         let squares_digits = unsigned_digits(squares.unsigned_abs() as u128)?;
@@ -240,7 +296,11 @@ impl NormCoreRow {
     /// relation is exact: the remaining values are the Euclidean remainder
     /// bounds of the round-half-up division and every digit is a byte.
     pub fn check(&self, values: &[i64], valid: usize) -> Result<()> {
-        let expected = Self::from_values(values, valid)?;
+        self.check_mode(values, valid, NormMode::LayerNorm)
+    }
+
+    pub fn check_mode(&self, values: &[i64], valid: usize, mode: NormMode) -> Result<()> {
+        let expected = Self::from_values_mode(values, valid, mode)?;
         if *self != expected {
             return Err(Error::InvalidProof);
         }
@@ -676,6 +736,7 @@ pub struct NormOutputRow {
 }
 
 impl NormOutputRow {
+    #[allow(clippy::too_many_arguments)]
     pub fn from_core(
         core: &NormCoreRow,
         values: &[i64],
@@ -685,6 +746,7 @@ impl NormOutputRow {
         valid: usize,
         shift: u32,
         clamp: Option<(i64, i64)>,
+        mode: NormMode,
     ) -> Result<Self> {
         if valid == 0
             || valid > values.len()
@@ -719,9 +781,13 @@ impl NormOutputRow {
                 .checked_mul(weight[column] as i128)
                 .ok_or(Error::BoundViolation)?;
             let image = if column < valid {
-                let centered = (values[column] as i128)
-                    .checked_sub(core.mean as i128)
-                    .ok_or(Error::BoundViolation)?;
+                let centered = if mode.is_rms() {
+                    values[column] as i128
+                } else {
+                    (values[column] as i128)
+                        .checked_sub(core.mean as i128)
+                        .ok_or(Error::BoundViolation)?
+                };
                 centered
                     .checked_mul(product)
                     .ok_or(Error::BoundViolation)?
@@ -757,6 +823,7 @@ impl NormOutputRow {
         weight: &[i64],
         bias: &[i64],
         valid: usize,
+        mode: NormMode,
     ) -> Result<()> {
         let expected = Self::from_core(
             core,
@@ -767,6 +834,7 @@ impl NormOutputRow {
             valid,
             self.shift,
             self.clamp,
+            mode,
         )?;
         if *self != expected {
             return Err(Error::InvalidProof);
@@ -774,8 +842,7 @@ impl NormOutputRow {
         for column in 0..self.out.len() {
             if self.broadcast[column] != self.rstd
                 || self.shifted[column] != self.quotient[column] + self.selector[column] as i128
-                || self.pre_clamp[column]
-                    != self.shifted[column] + bias[column] as i128
+                || self.pre_clamp[column] != self.shifted[column] + bias[column] as i128
             {
                 return Err(Error::InvalidProof);
             }
@@ -1110,10 +1177,26 @@ mod tests {
             assert_eq!(rstd, rstds[position]);
             let padded_row = &padded[position];
             let tail = NormOutputRow::from_core(
-                &core, padded_row, rstd, &weight, &bias, valid, shift, clamp,
+                &core,
+                padded_row,
+                rstd,
+                &weight,
+                &bias,
+                valid,
+                shift,
+                clamp,
+                NormMode::LayerNorm,
             )
             .unwrap();
-            tail.check(&core, padded_row, &weight, &bias, valid).unwrap();
+            tail.check(
+                &core,
+                padded_row,
+                &weight,
+                &bias,
+                valid,
+                NormMode::LayerNorm,
+            )
+            .unwrap();
             let start = position * columns;
             assert_eq!(&tail.image[..], &images[start..start + columns]);
             assert_eq!(&tail.out[..], &outputs[start..start + columns]);
@@ -1139,6 +1222,7 @@ mod tests {
             valid,
             shift,
             Some((5, 4)),
+            NormMode::LayerNorm,
         )
         .is_err());
     }
@@ -1149,25 +1233,53 @@ mod tests {
         let weight = vec![2i64, -1, 3, 1];
         let bias = vec![1i64, 2, -1, 2];
         let core = NormCoreRow::from_values(&values, 2).unwrap();
-        let tail =
-            NormOutputRow::from_core(&core, &values, 100, &weight, &bias, 2, 3, None).unwrap();
-        tail.check(&core, &values, &weight, &bias, 2).unwrap();
+        let tail = NormOutputRow::from_core(
+            &core,
+            &values,
+            100,
+            &weight,
+            &bias,
+            2,
+            3,
+            None,
+            NormMode::LayerNorm,
+        )
+        .unwrap();
+        tail.check(
+            &core,
+            &values,
+            &weight,
+            &bias,
+            2,
+            NormMode::LayerNorm,
+        )
+        .unwrap();
         let mut changed = tail.clone();
         changed.image[0] += 1;
-        assert!(changed.check(&core, &values, &weight, &bias, 2).is_err());
+        assert!(changed.check(&core, &values, &weight, &bias, 2, NormMode::LayerNorm).is_err());
         let mut changed = tail.clone();
         changed.quotient[0] += 1;
-        assert!(changed.check(&core, &values, &weight, &bias, 2).is_err());
+        assert!(changed.check(&core, &values, &weight, &bias, 2, NormMode::LayerNorm).is_err());
         let mut changed = tail.clone();
         changed.selector[1] = !changed.selector[1];
-        assert!(changed.check(&core, &values, &weight, &bias, 2).is_err());
+        assert!(changed.check(&core, &values, &weight, &bias, 2, NormMode::LayerNorm).is_err());
         let mut changed = tail.clone();
         changed.out[3] -= 1;
-        assert!(changed.check(&core, &values, &weight, &bias, 2).is_err());
+        assert!(changed.check(&core, &values, &weight, &bias, 2, NormMode::LayerNorm).is_err());
         let mut changed = tail.clone();
         changed.broadcast[0] = -100;
-        assert!(changed.check(&core, &values, &weight, &bias, 2).is_err());
-        assert!(NormOutputRow::from_core(&core, &values, 100, &weight, &bias[..3], 2, 3, None)
-            .is_err());
+        assert!(changed.check(&core, &values, &weight, &bias, 2, NormMode::LayerNorm).is_err());
+        assert!(NormOutputRow::from_core(
+            &core,
+            &values,
+            100,
+            &weight,
+            &bias[..3],
+            2,
+            3,
+            None,
+            NormMode::LayerNorm,
+        )
+        .is_err());
     }
 }
