@@ -4,4 +4,5 @@
 pub mod config;
 pub mod executor;
 pub mod lm_head_plan;
+pub mod norm_profile;
 pub mod plan;
