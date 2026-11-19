@@ -24641,21 +24641,29 @@ fn output_tail_plain_rows(
                     (low_at, clamp.low, low_half, low as i128),
                     (high_at, clamp.high, high_half, high as i128),
                 ] {
-                    let mut coefficients = vec![Fp3::ZERO; tail_rows * tail_ell];
+                    let mut row = BatRow::new(BatRowKind::Plain);
                     let mut power = Fp3::ONE;
                     for digit in 0..bound_width {
                         let at = base + bound_at + digit;
-                        coefficients[at] = coefficients[at].add(&power);
+                        row.add_unit(
+                            tail_member.bat_oracle,
+                            BatPart::Main,
+                            u64::try_from(at).map_err(|_| Error::ResourceLimit)?,
+                            power,
+                        );
                         power = power.mul(&Fp3::from_u64(256));
                     }
                     let mut power = Fp3::ONE;
                     for digit in 0..widths.pre_clamp {
                         let at = base + pre_at + digit;
-                        coefficients[at] = coefficients[at].sub(&power);
+                        row.add_unit(
+                            tail_member.bat_oracle,
+                            BatPart::Main,
+                            u64::try_from(at).map_err(|_| Error::ResourceLimit)?,
+                            Fp3::ZERO.sub(&power),
+                        );
                         power = power.mul(&Fp3::from_u64(256));
                     }
-                    let mut row = BatRow::new(BatRowKind::Plain);
-                    row.add_term(tail_member.bat_oracle, BatPart::Main, coefficients);
                     row.target = crate::proof::output_closure::fp3_signed(
                         bound_half as i128 - pre_half as i128 - bound,
                     )?;
@@ -24826,15 +24834,19 @@ fn output_tail_padding_rows(
             if column * slots + pre_at + tail_plan.widths.pre_clamp > tail_rows * tail_ell {
                 return Err(Error::ShapeMismatch);
             }
-            let mut coefficients = vec![Fp3::ZERO; tail_rows * tail_ell];
             let base = column * slots + pre_at;
+            let mut row = BatRow::new(BatRowKind::Plain);
             let mut power = Fp3::ONE;
             for digit in 0..tail_plan.widths.pre_clamp {
-                coefficients[base + digit] = power;
+                let at = base + digit;
+                row.add_unit(
+                    tail_member.bat_oracle,
+                    BatPart::Main,
+                    u64::try_from(at).map_err(|_| Error::ResourceLimit)?,
+                    power,
+                );
                 power = power.mul(&Fp3::from_u64(256));
             }
-            let mut row = BatRow::new(BatRowKind::Plain);
-            row.add_term(tail_member.bat_oracle, BatPart::Main, coefficients);
             if let (Some(claim), Some(bias_member)) = (bias_claim, bias_member) {
                 let mut unit = vec![Fp3::ZERO; bits];
                 for bit in 0..bits {
@@ -24842,13 +24854,15 @@ fn output_tail_padding_rows(
                         unit[bit] = Fp3::ONE;
                     }
                 }
-                let bias_coefficients =
-                    norm_param_eval_coefficients(&claim.gu, norm.columns, &unit)?;
-                let negated: Vec<Fp3> = bias_coefficients
-                    .iter()
-                    .map(|value| Fp3::ZERO.sub(value))
-                    .collect();
-                row.add_term(bias_member.bat_oracle, BatPart::Main, negated);
+                let index = gu_vector_bat_index(&claim.gu, column as u64)?;
+                let eq = crate::proof::output_closure::eq_vector(&unit)?;
+                let coefficient = eq.get(column).copied().ok_or(Error::ShapeMismatch)?;
+                row.add_unit(
+                    bias_member.bat_oracle,
+                    BatPart::Main,
+                    u64::try_from(index).map_err(|_| Error::ResourceLimit)?,
+                    Fp3::ZERO.sub(&coefficient),
+                );
             }
             row.target = target;
             rows.push(row);
