@@ -39,8 +39,11 @@ use crate::proof::psc_general::{
     TableAt, WeightedBitsInner, WeightedProductInner,
 };
 
-/// Version of the lookup plan and messages.
-pub const LOOKUP_VERSION: u64 = 2;
+/// Version of the lookup plan and messages. Version 3 carries the outcome
+/// without the derivable multiplicity payload: the coefficients on the
+/// multiplicity bits and the key total follow from the plan, so the message
+/// no longer transports them and both sides derive them with one rule.
+pub const LOOKUP_VERSION: u64 = 3;
 
 /// The trusted identity of the public byte table `0, 1, .., 255`.
 pub const BYTE_TABLE_IDENTITY: Digest = Digest([0x63; 32]);
@@ -973,6 +976,25 @@ fn equality_variables(point: &[Fp3], plane_count: usize) -> Result<Vec<Weight>> 
         .collect()
 }
 
+/// The multiplicity coefficients and the key total of one lookup, derived
+/// from the plan alone: the coefficient of bit `plane` of table row `row` is
+/// `2^plane`, and the total is the key count. The prover, the verifier and
+/// the message decoder all use this one rule, so the message never carries
+/// the derivable payload.
+pub fn multiplicity_from_plan(plan: &LookupPlan) -> Result<(Vec<Fp3>, Fp3)> {
+    plan.validate()?;
+    let planes = plan.planes()?;
+    let rows = plan.table_rows()?;
+    let mut coefficients = vec![Fp3::ZERO; planes * rows];
+    for plane in 0..planes {
+        let weight = Fp3::from_u64(1u64 << plane);
+        for row in 0..rows {
+            coefficients[plane + planes * row] = weight;
+        }
+    }
+    Ok((coefficients, Fp3::from_u64(plan.key_count()? as u64)))
+}
+
 /// Commits the lookup messages and proves the lookup for one key vector over
 /// the given public table.
 pub fn prove_lookup(
@@ -1391,14 +1413,7 @@ fn prove_lookup_inner(
     slots_out.push(bits_step.shown.clone());
     hiding_out.push(bits_step.hiding.clone());
 
-    let mut coefficients = vec![Fp3::ZERO; planes * rows];
-    for plane in 0..planes {
-        let weight = Fp3::from_u64(1u64 << plane);
-        for row in 0..rows {
-            coefficients[plane + planes * row] = weight;
-        }
-    }
-    let multiplicity = (coefficients, Fp3::from_u64(keys as u64));
+    let multiplicity = multiplicity_from_plan(plan)?;
 
     Ok((
         LookupProof {
@@ -1644,17 +1659,7 @@ fn verify_lookup_inner(
     slots_out.push(shown);
     hiding_out.push(hiding);
 
-    let mut coefficients = vec![Fp3::ZERO; planes * table_rows];
-    for plane in 0..planes {
-        let weight = Fp3::from_u64(1u64 << plane);
-        for row in 0..table_rows {
-            coefficients[plane + planes * row] = weight;
-        }
-    }
-    let multiplicity = (
-        coefficients,
-        Fp3::from_u64(plan.key_count()? as u64),
-    );
+    let multiplicity = multiplicity_from_plan(plan)?;
 
     Ok(LookupOutcome {
         key,
@@ -2115,16 +2120,13 @@ impl LookupOutcome {
 
     /// Writes the outcome without re-checking it against a plan. The enclosing
     /// message checks it on decode; the prover path checks it before calling.
+    /// The derivable multiplicity payload is not written: both sides derive
+    /// it from the plan with one rule.
     pub(crate) fn encode_unchecked(&self) -> Vec<u8> {
         let mut writer = CanonicalWriter::new();
         writer.put_u64(LOOKUP_VERSION);
         put_claim(&mut writer, &self.key);
         writer.put_fp3(&self.theta);
-        writer.put_u64(self.multiplicity.0.len() as u64);
-        for coefficient in &self.multiplicity.0 {
-            writer.put_fp3(coefficient);
-        }
-        writer.put_fp3(&self.multiplicity.1);
         writer.put_u64(self.rows.len() as u64);
         for output in &self.rows {
             put_general_output(&mut writer, output);
@@ -2154,18 +2156,9 @@ impl LookupOutcome {
         let count = mask_count(plan)?;
         let key = get_claim(&mut reader, plan.key_bits as usize, count)?;
         let theta = reader.get_fp3()?;
-        let coefficient_count =
-            usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
-        let planes = plan.planes()?;
-        let rows = plan.table_rows()?;
-        if coefficient_count != planes * rows {
-            return Err(Error::ShapeMismatch);
-        }
-        let mut coefficients = Vec::with_capacity(coefficient_count);
-        for _ in 0..coefficient_count {
-            coefficients.push(reader.get_fp3()?);
-        }
-        let total = reader.get_fp3()?;
+        // The multiplicity payload is not transported; the same plan rule
+        // that the prover used regenerates it here.
+        let multiplicity = multiplicity_from_plan(plan)?;
         let row_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
         if row_count != outcome_rows(plan)? {
             return Err(Error::ShapeMismatch);
@@ -2203,7 +2196,7 @@ impl LookupOutcome {
         let outcome = Self {
             key,
             theta,
-            multiplicity: (coefficients, total),
+            multiplicity,
             rows: outputs,
             end_slots: slot_groups.remove(0),
             hiding_slots: slot_groups.remove(0),
@@ -2949,7 +2942,25 @@ mod tests {
             verify_lookup(&plan, &commit_plan, &key_plan(&keys), &messages.roots(), &proof, &ByteTable, &mut chain()).unwrap();
         assert_eq!(proven, verified);
         let bytes = proven.encode(&plan).unwrap();
-        assert_eq!(LookupOutcome::decode(&plan, &bytes).unwrap(), proven);
+        let decoded = LookupOutcome::decode(&plan, &bytes).unwrap();
+        assert_eq!(decoded, proven);
+        // Both sides derive the multiplicity payload with one plan rule, so
+        // the decoded and the proven vectors are equal instance by instance.
+        let expected = multiplicity_from_plan(&plan).unwrap();
+        assert_eq!(decoded.multiplicity, expected);
+        assert_eq!(proven.multiplicity, expected);
+        assert_eq!(verified.multiplicity, expected);
+        // The old format carried the derivable payload under version 2; the
+        // version tag and the codec reject it, and nothing trails the result.
+        let mut old_version = bytes.clone();
+        old_version[..8].copy_from_slice(&2u64.to_le_bytes());
+        assert!(LookupOutcome::decode(&plan, &old_version).is_err());
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        assert!(LookupOutcome::decode(&plan, &trailing).is_err());
+        let mut truncated = bytes.clone();
+        truncated.pop();
+        assert!(LookupOutcome::decode(&plan, &truncated).is_err());
     }
 
     #[test]
