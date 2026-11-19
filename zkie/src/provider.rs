@@ -663,25 +663,32 @@ fn prove_norm_segment(
     if positions != zkie_ops::proof::output_head_lin::OUTPUT_HEAD_POSITIONS {
         return Ok(None);
     }
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_enter");
     let model = commitment.anchor.record.model_commitment;
     let public = ModelCommitmentPublic::from_commitment(commitment);
     let trace_plan = zkie_models_gpt2::plan::trace_plan(positions)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_trace_plan");
     let matmul = crate::s7_context::find_lm_head_matmul(&trace_plan)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_matmul");
     let identifier = plan_identifier(&public, &trace_plan, matmul.index)?;
     let request_plan = zkie_models_gpt2::lm_head_plan::lm_head_plan()?;
     let configuration = configuration_for(&request_plan, identifier)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_configuration");
     let plan_positions = u32::try_from(positions).map_err(|_| Error::ResourceLimit)?;
     let profile = zkie_models_gpt2::norm_profile::segment_profile(
         plan_positions,
         segment_x_seed(model, positions),
     )?;
     let (norm_index, x_rows, hd_rows) = final_norm_rows(trace)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_final_rows");
     if matmul.activation_step != norm_index {
         return Err(Error::StatementMismatch);
     }
     let asset_root = Path::new(&config.asset_root);
     let (gain, bias) = read_anchored_params(asset_root, &public.assets)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_params");
     let rstd = read_rstd_values(asset_root, &profile, &x_rows)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_rstd");
     let (norm_plan, witness) = build_norm_segment(
         &profile,
         configuration,
@@ -757,7 +764,9 @@ fn prove_norm_segment(
         &hd_rows,
         session_seed,
     )?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_plan");
     let mut params = build_param_tables("gpt2", commitment, tables)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_param_tables");
     zkie_ops::proof::hidden_send_session::mem_trace("gpt2_before_prove");
     let messages = prove_segment_bytes(
         &plan,
@@ -978,7 +987,9 @@ fn verify_norm_segment(
         return Err(Error::StatementMismatch);
     }
     let trace_plan = zkie_models_gpt2::plan::trace_plan(positions)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_trace_plan");
     let matmul = crate::s7_context::find_lm_head_matmul(&trace_plan)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_matmul");
     let specs = zkie_models_gpt2::plan::asset_specs();
     let spec = specs
         .iter()

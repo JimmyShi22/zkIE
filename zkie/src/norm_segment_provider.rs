@@ -312,6 +312,7 @@ pub fn build_segment_table(
         configuration,
         store_max_bytes,
     )?;
+    zkie_ops::proof::hidden_send_session::mem_trace("segment_store_open");
     let holder = build_lm_head_holder_from_asset(
         asset_root,
         asset,
@@ -325,14 +326,18 @@ pub fn build_segment_table(
         WINDOW_BYTES,
         TOTAL_BYTES,
     )?;
+    zkie_ops::proof::hidden_send_session::mem_trace("segment_holder_built");
     let reader = holder.reader().clone();
     let name = holder.table().name.clone();
     let leaves = holder.table().leaves().to_vec();
     let salts = holder.table().salts().to_vec();
     let peak = holder.table().peak_bytes();
     drop(holder);
+    zkie_ops::proof::hidden_send_session::mem_trace("segment_holder_dropped");
     store.cleanup()?;
+    zkie_ops::proof::hidden_send_session::mem_trace("segment_store_cleaned");
     let table = StreamingTable::rebuild(reader.clone(), name, leaves, salts, peak)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("segment_table_rebuilt");
     let source = LmHeadAssetSource::open_with_asset(
         asset_root,
         asset,
@@ -343,6 +348,7 @@ pub fn build_segment_table(
         WINDOW_BYTES,
         total_bytes,
     )?;
+    zkie_ops::proof::hidden_send_session::mem_trace("segment_source_open");
     let hiding = HidingState::new(reader.root, 1, reader.shape.code.r as u64);
     Ok(SegmentTableProver {
         table,
@@ -482,7 +488,7 @@ pub fn prove_segment_bytes(
     params: &mut SegmentParamTables,
     rstd_table: &dyn LookupTable,
 ) -> Result<Vec<u8>> {
-    let (messages, _witness) = prove_hidden_lin_hidden_with_norm_hd_rstd_table(
+    let (messages, private_witness) = prove_hidden_lin_hidden_with_norm_hd_rstd_table(
         plan,
         table,
         seed,
@@ -490,6 +496,9 @@ pub fn prove_segment_bytes(
         rstd_table,
         Some(params),
     )?;
+    // The segment carrier needs only the messages; release the private
+    // witness before the encoded copy exists so the two never share the peak.
+    drop(private_witness);
     messages.encode()
 }
 

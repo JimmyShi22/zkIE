@@ -22,6 +22,12 @@ pub mod verify;
 use provider::production_provider;
 
 pub fn run_cli(args: Vec<String>) -> i32 {
+    let code = run_cli_inner(args);
+    zkie_engine::profile::dump();
+    code
+}
+
+fn run_cli_inner(args: Vec<String>) -> i32 {
     let Some(command) = args.first().map(String::as_str) else {
         print_usage();
         return 0;
