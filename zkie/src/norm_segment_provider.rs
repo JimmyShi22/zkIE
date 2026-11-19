@@ -324,7 +324,7 @@ pub fn build_segment_table(
         table_max_bytes,
         CAP_BYTES,
         WINDOW_BYTES,
-        TOTAL_BYTES,
+        total_bytes,
     )?;
     zkie_ops::proof::hidden_send_session::mem_trace("segment_holder_built");
     let reader = holder.reader().clone();
