@@ -1,6 +1,6 @@
 policy_version = 1
 model = "gemma3"
-model_version = 1
+model_version = 2
 
 [[case]]
 case_id = "gemma3-seq16"

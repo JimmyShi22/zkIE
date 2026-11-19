@@ -7,9 +7,21 @@ use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 use zkie_ops::op::OpCode;
 use zkie_ops::proof::model_commitment::ModelAssetSpec;
+use zkie_engine::pcs::request::code::build_code_plan;
+use zkie_engine::pcs::request::table::{IndexShape, TableDistances};
+use zkie_ops::proof::asset_table::{
+    asset_table_configuration, asset_table_identity, validate_asset_table_params,
+    AssetTableLayout, AssetTableParams,
+};
+use zkie_ops::proof::hidden_send_session::SharedLinCheck;
+use zkie_ops::proof::proximity_planner::{
+    recorded_table_distance, shared_lin_columns, shared_lin_plan_fault, SharedLinPlanFault,
+    SharedLinShape,
+};
 use zkie_ops::proof::plan::{
     config, PlanBuilder, PlanConstant, PlanLayout, PlanSource, TracePlan,
 };
+use zkie_ops::proof::table_range::{PRODUCTION_TABLE_RANGE_HI, PRODUCTION_TABLE_RANGE_LO};
 
 use crate::config;
 
@@ -428,7 +440,7 @@ fn transcript_digest(tag: u64, data: &[u8]) -> Result<Digest> {
     )
 }
 
-pub const MODEL_VERSION: u32 = 1;
+pub const MODEL_VERSION: u32 = 2;
 
 pub fn valid_vocab() -> usize {
     config::VOCAB
@@ -515,13 +527,231 @@ fn public_tables() -> Vec<(String, zkie_ops::proof::plan::PublicTable)> {
     ]
 }
 
+/// The first consumer-authenticated weight: the layer-0 query projection.
+///
+/// The layer-0 key and value projections are rectangular (1024 rows by 256
+/// columns) and do not satisfy the existing key/range chain's square-matrix
+/// geometry. The layer-0 query projection is the first registered square
+/// weight (1024 by 1024) and is consumed by the four per-head projection
+/// steps, the same head-slice form as the accepted chain.
+pub const FIRST_PROJECTION: &str = "models/gemma3/weights/L0_q_w_i32.bin";
+
+/// The consumer-authenticated assets of this model. The first key projection
+/// is proved by the request consumer chain over the committed table, never by
+/// a trace opening.
+pub fn consumer_asset_paths() -> &'static [&'static str] {
+    &[FIRST_PROJECTION]
+}
+
 /// The production plan: the shared tables, the rsqrt extension and the four
-/// RoPE coefficient tables are trusted public files.
+/// RoPE coefficient tables are trusted public files; the layer-0 key
+/// projection is consumer-authenticated.
 pub fn trace_plan_public(m: usize) -> Result<TracePlan> {
     let mut plan = trace_plan(m)?;
     zkie_ops::proof::plan::promote_public_tables(&mut plan, &public_tables());
+    zkie_ops::proof::plan::promote_consumer_assets(&mut plan, consumer_asset_paths())?;
     Ok(plan)
 }
+
+/// The fixed public candidate of the production encoded table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TablePlanCandidate {
+    pub log_n: u32,
+    pub ell: u64,
+    pub r: u64,
+    pub v: u32,
+    pub answers: u32,
+    pub salt_bytes: usize,
+    pub matrix_rows_log: u32,
+    pub k_lo: u32,
+    pub sharing: u64,
+    pub later_batches: u64,
+}
+
+pub const TABLE_PLAN_CANDIDATE: TablePlanCandidate = TablePlanCandidate {
+    log_n: 12,
+    ell: 2048,
+    r: 128,
+    v: 10,
+    answers: 1,
+    salt_bytes: 40,
+    matrix_rows_log: 10,
+    k_lo: 0,
+    sharing: 1,
+    later_batches: 1,
+};
+
+/// The public model-level identity of the encoded tables.
+pub fn table_model_identity() -> Result<Digest> {
+    let parameters = parameters_digest()?;
+    let mut data = Vec::new();
+    data.extend_from_slice(b"gemma3-table-model-v1");
+    data.extend_from_slice(&MODEL_VERSION.to_le_bytes());
+    data.extend_from_slice(&parameters.0);
+    for spec in asset_specs() {
+        data.extend_from_slice(
+            &zkie_ops::proof::model_commitment::asset_identity(&spec).0,
+        );
+    }
+    transcript_digest(20, &data)
+}
+
+#[derive(Clone, Debug)]
+pub struct DerivedTablePlan {
+    pub params: AssetTableParams,
+    pub table_shape: IndexShape,
+    pub table_configuration: Digest,
+    pub table_identity: Digest,
+    pub table_model_identity: Digest,
+    pub one_time_columns: u64,
+    pub later_batch_columns: u64,
+    pub declared_later_batches: u64,
+    pub total_columns: u64,
+    pub lin_check: SharedLinCheck,
+}
+
+/// Derives and checks the table plan of the fixed candidate over the real
+/// layer-0 key projection shape: PAD rows and HEAD_DIM columns.
+pub fn derive_table_plan(candidate: &TablePlanCandidate) -> Result<DerivedTablePlan> {
+    if candidate.later_batches != 1 {
+        return Err(Error::InvalidConfig);
+    }
+    let spec = asset_specs()
+        .into_iter()
+        .find(|spec| spec.path == FIRST_PROJECTION)
+        .ok_or(Error::InvalidConfig)?;
+    if spec.row_width != PAD
+        || spec.element_count != (PAD as u64) * (PAD as u64)
+    {
+        return Err(Error::InvalidConfig);
+    }
+    let code = build_code_plan(candidate.log_n, candidate.ell, candidate.r)?;
+    let rows_log = candidate.matrix_rows_log;
+    let one_time_distance = recorded_table_distance(
+        code,
+        candidate.v,
+        candidate.answers,
+        candidate.v,
+        candidate.sharing,
+        0,
+    )?;
+    let shape = SharedLinShape {
+        v: candidate.v,
+        k_lo: candidate.k_lo,
+        instances: 1,
+        rows_log,
+    };
+    let one_time_columns = shared_lin_columns(shape, code, one_time_distance, 0, 0)?;
+    let later = zkie_ops::proof::proximity_planner::derive_production_later_candidate(
+        code,
+        candidate.v,
+        candidate.answers,
+        candidate.v,
+        rows_log,
+        candidate.k_lo,
+    )?;
+    if later.m_once != one_time_distance || later.one_time_columns != one_time_columns {
+        return Err(Error::InvalidConfig);
+    }
+    if later.capacity_batches < candidate.later_batches || later.later_columns == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let later_batch_columns = later.later_columns;
+    let total_columns = one_time_columns
+        .checked_add(
+            candidate
+                .later_batches
+                .checked_mul(later_batch_columns)
+                .ok_or(Error::ResourceLimit)?,
+        )
+        .ok_or(Error::ResourceLimit)?;
+    if total_columns > code.r {
+        return Err(Error::InvalidConfig);
+    }
+    let fault = SharedLinPlanFault {
+        v: candidate.v,
+        k_lo: candidate.k_lo,
+        rows_log,
+        m: one_time_distance,
+        column_draws: one_time_columns,
+        point_work_bits: 0,
+        column_work_bits: 0,
+        zeta_work_bits: 0,
+    };
+    shared_lin_plan_fault(fault, code)?;
+    let table_shape = IndexShape {
+        code,
+        v: candidate.v,
+        answers: candidate.answers,
+        salt_bytes: candidate.salt_bytes,
+        distances: TableDistances {
+            radius: 0,
+            later_radius: 0,
+            m_once: later.m_once,
+            m_later: later.m_later,
+        },
+    };
+    let pads = 3u64
+        .checked_mul(candidate.answers as u64)
+        .ok_or(Error::ResourceLimit)?;
+    let layout = AssetTableLayout {
+        row_width: spec.row_width as u64,
+        message_len: candidate.ell,
+        tail_len: candidate.r,
+        pads,
+        valid_elements: spec.element_count,
+        padding_zero: true,
+    };
+    let params = AssetTableParams {
+        asset_id: spec.asset_id,
+        path: spec.path.clone(),
+        element_count: spec.element_count,
+        row_width: spec.row_width as u64,
+        encoding: spec.encoding.clone(),
+        shape: table_shape,
+        valid_min: PRODUCTION_TABLE_RANGE_LO,
+        valid_max: PRODUCTION_TABLE_RANGE_HI,
+        layout,
+    };
+    validate_asset_table_params(&spec, &params)?;
+    let table_model_identity = table_model_identity()?;
+    let table_configuration =
+        asset_table_configuration(table_model_identity, &spec, &params)?;
+    let table_identity = asset_table_identity(table_model_identity, &spec, &params)?;
+    let lin_check = SharedLinCheck {
+        point_work_bits: 0,
+        zeta_work_bits: 0,
+    };
+    Ok(DerivedTablePlan {
+        params,
+        table_shape,
+        table_configuration,
+        table_identity,
+        table_model_identity,
+        one_time_columns,
+        later_batch_columns,
+        declared_later_batches: candidate.later_batches,
+        total_columns,
+        lin_check,
+    })
+}
+
+/// The trusted table parameters of the registered first projection.
+pub fn projection_table_params(path: &str) -> Option<AssetTableParams> {
+    if path != FIRST_PROJECTION {
+        return None;
+    }
+    derive_table_plan(&TABLE_PLAN_CANDIDATE)
+        .ok()
+        .map(|plan| plan.params)
+}
+
+/// The trusted encoded-table list of the model plan.
+pub fn asset_table_params() -> Result<Vec<AssetTableParams>> {
+    let plan = derive_table_plan(&TABLE_PLAN_CANDIDATE)?;
+    Ok(vec![plan.params])
+}
+
 
 pub fn asset_specs() -> Vec<ModelAssetSpec> {
     crate::executor::asset_specs()
@@ -650,5 +880,43 @@ mod tests {
     fn plan_step_counts_match_executor() {
         assert_eq!(trace_plan(16).unwrap().steps.len(), 2090);
         assert_eq!(trace_plan(512).unwrap().steps.len(), 1506);
+    }
+
+    #[test]
+    fn projection_table_params_describe_the_first_k_weight() {
+        let path = FIRST_PROJECTION;
+        let params = projection_table_params(path).expect("table params");
+        let spec = asset_specs()
+            .into_iter()
+            .find(|spec| spec.path == path)
+            .expect("asset spec");
+        validate_asset_table_params(&spec, &params).unwrap();
+        assert_eq!(params.shape.rows(), 1024);
+        assert_eq!(params.row_width, PAD as u64);
+        assert_eq!(params.element_count, 1024 * 1024);
+        assert_eq!(params.shape.code.ell, 2048);
+        assert_eq!(params.shape.code.r, 128);
+        assert!(params.shape.distances.m_once >= 3);
+        assert_eq!(params.shape.distances.m_later, 284);
+        assert_eq!(params.layout.tail_len, 128);
+        assert_eq!(
+            projection_table_params("models/gemma3/weights/L1_q_w_i32.bin"),
+            None
+        );
+    }
+
+    #[test]
+    fn the_public_plan_defers_the_first_key_projection() {
+        let plan = trace_plan_public(16).expect("public plan");
+        let deferred = plan
+            .steps
+            .iter()
+            .filter(|step| {
+                step.inputs
+                    .iter()
+                    .any(|source| matches!(source, PlanSource::ConsumerAsset { .. }))
+            })
+            .count();
+        assert_eq!(deferred, 4);
     }
 }

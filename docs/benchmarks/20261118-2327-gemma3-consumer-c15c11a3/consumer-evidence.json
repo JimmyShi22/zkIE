@@ -1,0 +1,22 @@
+{
+  "case": "gemma3-seq16",
+  "commit_ms": 258660,
+  "prove_ms": 105974,
+  "verify_ms": 92516,
+  "trace_bytes": 5716919862,
+  "trace_assets": 236,
+  "removed_opening_bytes": 8413688,
+  "trace_with_opening_bytes": 5725333550,
+  "statement_bytes": 218,
+  "consumer_proof_bytes": 1858632,
+  "key_prove_ms": 189456,
+  "key_commit_verify_ms": 58745,
+  "key_request_verify_ms": 59379,
+  "key_file_bytes": 4543544,
+  "vmhwm_after_prove_kib": 35391092,
+  "vmhwm_after_verify_kib": 35391092,
+  "accepted": true,
+  "negatives": 13,
+  "consumer_matrix_negatives": 12,
+  "version_negatives": 1
+}

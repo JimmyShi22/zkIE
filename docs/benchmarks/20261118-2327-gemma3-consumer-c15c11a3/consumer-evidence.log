@@ -1,0 +1,9 @@
+case gemma3-seq16
+commit 258660 ms
+prove 105974 ms
+verify 92516 ms
+trace bytes 5716919862 (236 assets; 8413688 bytes of the consumer opening removed; with opening 5725333550)
+statement bytes 218
+consumer proof bytes 1858632
+key prove 189456 ms, commit verify 58745 ms, request verify 59379 ms, file 4543544 bytes
+accepted; twelve consumer-matrix negatives and one version negative refused

@@ -18,9 +18,15 @@ use zkie_ops::matmul::MatMulOp;
 use zkie_ops::profile_rms::ProfileRmsNormOp;
 use zkie_ops::profile_rope::ProfileRopeOp;
 use zkie_ops::projection::ProjectionOp;
+use zkie_ops::proof::asset_table::AssetTableInput;
+use zkie_ops::proof::consumer_proof::ConsumerProofFile;
+use zkie_ops::proof::consumer_request::ConsumerSharedPlan;
+use zkie_ops::proof::consumer_session::{
+    prove_consumer_request, ConsumerRequestSeed, ConsumerRequestWitness,
+};
 use zkie_ops::proof::model_commitment::{
-    commit_assets, AssetOpening, AssetStore, ModelAssetSpec, ModelCommitment, SharedTrace,
-    SharedTraceStep,
+    commit_assets_with_tables_on_identity, AssetOpening, AssetStore, ModelAssetSpec,
+    ModelCommitment, SharedTrace, SharedTraceStep,
 };
 use zkie_ops::proof::relations::{
     proof_output_values, prove_op_relation_shared, RelationConfig, RelationReceiptMessage,
@@ -118,9 +124,13 @@ impl<'a> Assets<'a> {
     fn load(commitment: &'a ModelCommitment, public_tables: bool) -> Result<Self> {
         let store = AssetStore::open(commitment)?;
         let public_paths = crate::plan::public_table_paths();
+        let consumer_paths = crate::plan::consumer_asset_paths();
         let mut trace_assets = Vec::with_capacity(commitment.assets.len());
         for (index, asset) in commitment.assets.iter().enumerate() {
-            if public_tables && public_paths.contains(&asset.path.as_str()) {
+            if public_tables
+                && (public_paths.contains(&asset.path.as_str())
+                    || consumer_paths.contains(&asset.path.as_str()))
+            {
                 continue;
             }
             trace_assets.push(store.open_asset(index)?);
@@ -318,7 +328,7 @@ fn rope(
 }
 
 pub fn execute_shared(commitment: &ModelCommitment, tokens: &[i64]) -> Result<SharedTrace> {
-    execute_shared_inner(commitment, tokens, None, false)
+    execute_shared_inner(commitment, tokens, None, false, None).map(|(trace, _)| trace)
 }
 
 pub fn execute_shared_with_progress(
@@ -326,7 +336,7 @@ pub fn execute_shared_with_progress(
     tokens: &[i64],
     progress: Option<&dyn ProgressSink>,
 ) -> Result<SharedTrace> {
-    execute_shared_inner(commitment, tokens, progress, false)
+    execute_shared_inner(commitment, tokens, progress, false, None).map(|(trace, _)| trace)
 }
 
 /// The production trace: the trusted public tables (the shared tables, the
@@ -337,7 +347,20 @@ pub fn execute_shared_with_progress_public(
     tokens: &[i64],
     progress: Option<&dyn ProgressSink>,
 ) -> Result<SharedTrace> {
-    execute_shared_inner(commitment, tokens, progress, true)
+    execute_shared_inner(commitment, tokens, progress, true, None).map(|(trace, _)| trace)
+}
+
+/// The production trace together with the request's consumer proof over the
+/// registered encoded table.
+pub fn execute_shared_with_progress_public_consumer(
+    commitment: &ModelCommitment,
+    tokens: &[i64],
+    tables: &[AssetTableInput],
+    progress: Option<&dyn ProgressSink>,
+) -> Result<(SharedTrace, ConsumerProofFile)> {
+    let (trace, consumer) =
+        execute_shared_inner(commitment, tokens, progress, true, Some(tables))?;
+    Ok((trace, consumer.ok_or(Error::IncompleteArtifact)?))
 }
 
 fn execute_shared_inner(
@@ -345,7 +368,8 @@ fn execute_shared_inner(
     tokens: &[i64],
     progress: Option<&dyn ProgressSink>,
     public_tables: bool,
-) -> Result<SharedTrace> {
+    consumer_tables: Option<&[AssetTableInput]>,
+) -> Result<(SharedTrace, Option<ConsumerProofFile>)> {
     if tokens.is_empty() || tokens.len() > 512 {
         return Err(Error::InvalidConfig);
     }
@@ -388,6 +412,8 @@ fn execute_shared_inner(
     )?;
     let mut current = embedded[0].clone();
     let mut x_step = embed_step;
+    let mut consumer_activation: Option<Vec<i64>> = None;
+    let mut consumer_heads: Vec<(Vec<i128>, Vec<i64>)> = Vec::new();
     let mask = {
         let mut values = vec![0i64; m * m];
         for row in 0..m {
@@ -442,9 +468,33 @@ fn execute_shared_inner(
         )?;
         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
 
+        if layer == 0 && consumer_tables.is_some() {
+            consumer_activation = Some(h.clone());
+        }
         let mut head_acc: Option<(Vec<i64>, usize)> = None;
         for head in 0..HEADS {
             let qw = assets.columns(&path("q_w"), PAD, head * HEAD_DIM, (head + 1) * HEAD_DIM)?;
+            if layer == 0 && consumer_tables.is_some() {
+                let probe = ProjectionOp {
+                    m,
+                    n: HEAD_DIM,
+                    k: PAD,
+                    shift: 16,
+                    bias: None,
+                };
+                let record = probe.forward_values(&[h.clone(), qw.clone()])?;
+                let raw = record
+                    .raw_accumulators
+                    .first()
+                    .ok_or(Error::IncompleteArtifact)?
+                    .clone();
+                let output = record
+                    .outputs
+                    .first()
+                    .ok_or(Error::IncompleteArtifact)?
+                    .clone();
+                consumer_heads.push((raw, output));
+            }
             let (q, q_step) = project(&mut builder, h.clone(), h_step, qw, None, m, HEAD_DIM, PAD, 16)?;
             let (q, q_step) = rms(
                 &mut builder, q, q_step, q_norm.clone(),
@@ -598,16 +648,69 @@ fn execute_shared_inner(
         event.unit = Some("relation_steps".into());
         let _ = progress.emit(event);
     }
-    Ok(SharedTrace {
-        tokens: tokens.iter().map(|value| *value as u32).collect(),
-        assets: assets.trace_assets,
-        steps,
-        argmax,
-        output: Vec::new(),
-    })
+    let consumer = match (consumer_tables, consumer_activation) {
+        (Some(tables), Some(activation)) if !consumer_heads.is_empty() => {
+            let heads = &consumer_heads;
+            let plan = crate::plan::trace_plan_public(m)?;
+            let path = crate::plan::FIRST_PROJECTION;
+            let params = crate::plan::projection_table_params(path)
+                .ok_or(Error::InvalidConfig)?;
+            let meta = commitment
+                .tables
+                .iter()
+                .find(|meta| meta.path == path)
+                .ok_or(Error::IncompleteArtifact)?;
+            let derived =
+                crate::plan::derive_table_plan(&crate::plan::TABLE_PLAN_CANDIDATE)?;
+            let shared = ConsumerSharedPlan {
+                m_once: derived.table_shape.distances.m_once,
+                m_later: derived.table_shape.distances.m_later,
+                one_time_columns: derived.one_time_columns,
+                later_columns: derived.later_batch_columns,
+                declared_batches: 1,
+                table_tail: derived.table_shape.code.r,
+            };
+            let raw: Vec<Vec<i128>> = heads.iter().map(|(raw, _)| raw.clone()).collect();
+            let outputs: Vec<Vec<i64>> =
+                heads.iter().map(|(_, values)| values.clone()).collect();
+            let witness = ConsumerRequestWitness {
+                activation: &activation,
+                raw: &raw,
+                outputs: &outputs,
+            };
+            let proof = prove_consumer_request(
+                &plan,
+                commitment,
+                &assets.store,
+                tables,
+                meta,
+                &params,
+                crate::plan::table_model_identity()?,
+                shared,
+                &witness,
+                ConsumerRequestSeed::sample()?,
+            )?;
+            Some(proof)
+        }
+        _ => None,
+    };
+    Ok((
+        SharedTrace {
+            tokens: tokens.iter().map(|value| *value as u32).collect(),
+            assets: assets.trace_assets,
+            steps,
+            argmax,
+            output: Vec::new(),
+        },
+        consumer,
+    ))
 }
 
-pub fn build_commitment(asset_root: &Path, tokens: &[u32]) -> Result<ModelCommitment> {
+pub fn build_commitment(
+    asset_root: &Path,
+    tokens: &[u32],
+    tables: &[AssetTableInput],
+) -> Result<ModelCommitment> {
     let parameters = zkie_engine::primitives::transcript::hash_labeled(
         zkie_engine::primitives::transcript::tag_word(
             zkie_engine::primitives::transcript::STATEMENT,
@@ -626,5 +729,12 @@ pub fn build_commitment(asset_root: &Path, tokens: &[u32]) -> Result<ModelCommit
         None,
         &tokens.iter().flat_map(|token| token.to_le_bytes()).collect::<Vec<_>>(),
     )?;
-    commit_assets(asset_root, model, parameters, &asset_specs())
+    commit_assets_with_tables_on_identity(
+        asset_root,
+        model,
+        crate::plan::table_model_identity()?,
+        parameters,
+        &asset_specs(),
+        tables,
+    )
 }
