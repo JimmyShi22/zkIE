@@ -276,3 +276,198 @@ pub fn segment_session_seed(model: Digest, positions: usize, norm_only: bool) ->
 pub fn param_table_params(params: &[AssetTableParams]) -> Option<&AssetTableParams> {
     params.iter().find(|params| params.path == GAIN_PATH)
 }
+
+use zkie_engine::pcs::request::foldeq::OmegaShapePlan;
+use zkie_engine::pcs::request::gu::{GuOracleShape, GuShape};
+use zkie_engine::pcs::request::runtime_tree::MaskTreePlan;
+use zkie_engine::pcs::request::table::{IndexShape, TableDistances};
+use zkie_ops::proof::hidden_send_session::{
+    ActivationShape, ActivationSource, HiddenLinPlan, HiddenOutputShape, HiddenProximityPlan,
+    HiddenSendPlan, ReadLedgerCell, WShape,
+};
+
+fn segment_gu_shape(code: zkie_engine::pcs::request::code::CodeParams, index: IndexShape) -> GuShape {
+    let tree = RuntimeTreePlan {
+        tree_number: 10,
+        leaf_class: 0,
+        log_n: code.log_n,
+        log_n_zk: code.log_n,
+        parts: vec![RuntimeTreePart {
+            main_symbols: E_DEGREE as u64,
+            mask_symbols: 0,
+        }],
+        salt_bytes: 40,
+        run: Digest([0x41; 32]),
+        configuration: Digest([0x42; 32]),
+    };
+    GuShape {
+        oracle: 10,
+        group: 7,
+        tree,
+        part: 0,
+        rows_high: true,
+        u: GuOracleShape {
+            code,
+            main_rows: 1,
+            main_deg: E_DEGREE as u32,
+            mask_rows: 0,
+            mask_code: None,
+            answers: 1,
+        },
+        index,
+    }
+}
+
+fn segment_omega_shape(code: zkie_engine::pcs::request::code::CodeParams) -> OmegaShapePlan {
+    let tree = RuntimeTreePlan {
+        tree_number: 11,
+        leaf_class: 1,
+        log_n: code.log_n,
+        log_n_zk: code.log_n,
+        parts: vec![RuntimeTreePart {
+            main_symbols: E_DEGREE as u64,
+            mask_symbols: 0,
+        }],
+        salt_bytes: 40,
+        run: Digest([0x43; 32]),
+        configuration: Digest([0x44; 32]),
+    };
+    OmegaShapePlan {
+        oracle: 11,
+        group: 7,
+        tree,
+        u: GuOracleShape {
+            code,
+            main_rows: 1,
+            main_deg: E_DEGREE as u32,
+            mask_rows: 0,
+            mask_code: None,
+            answers: 1,
+        },
+        rows_high: true,
+        matrix_rows: u64::from(zkie_models_timesfm::norm_profile::HIDDEN_PAD),
+        k_lo: 0,
+    }
+}
+
+/// Builds the complete norm-only plan for the L0 norm. The norm members and
+/// the own-stage derivation come from the shared session; the activation root
+/// is the materialized hd row identity.
+pub fn build_norm_only_plan(
+    profile: &NormSegmentProfile,
+    configuration: Digest,
+    metas: &[AssetTableMeta],
+    x_rows: &[Vec<i64>],
+    hd_rows: &[Vec<i64>],
+) -> Result<HiddenLinPlan> {
+    let norm_plan = build_norm_plan(profile, configuration, metas, x_rows)?;
+    let code = build_code_plan(17, 65_536, 8_192)?;
+    let mask_code = build_code_plan(17, 512, 256)?;
+    let table_shape = IndexShape {
+        code,
+        v: 1,
+        answers: 1,
+        salt_bytes: 40,
+        distances: TableDistances {
+            radius: 0,
+            later_radius: 0,
+            m_once: 0,
+            m_later: 0,
+        },
+    };
+    let positions = profile.positions;
+    let mask_tree = |tree_number: u64| MaskTreePlan {
+        tree_number,
+        leaf_class: 3,
+        log_n: mask_code.log_n,
+        mask_rows: 1,
+        salt_bytes: 40,
+        run: Digest([0x45; 32]),
+        configuration,
+    };
+    let w = WShape::new(
+        1,
+        code,
+        1,
+        positions,
+        40,
+        0,
+        0,
+        Digest([0x46; 32]),
+        configuration,
+    )?;
+    let proximity = HiddenProximityPlan {
+        gu: segment_gu_shape(code, table_shape),
+        omega: segment_omega_shape(code),
+        code,
+        mask_code,
+        shared_mask_tree: mask_tree(0),
+        own_mask_tree: mask_tree(1),
+        shared_fresh: 50,
+        own_fresh: 51,
+        column_draws: 1,
+        column_budget: 1,
+        ledger: ReadLedgerCell::new(1),
+        column_work_bits: 0,
+        shared_base_positions: 0,
+        own_base_positions: 0,
+        shared_stages: Vec::new(),
+        own_stages: Vec::new(),
+        planner_checked: false,
+        lin_check: None,
+    };
+    let send = HiddenSendPlan {
+        activation: ActivationShape::new(positions, zkie_models_timesfm::norm_profile::HIDDEN_PAD, 40)?,
+        activation_configuration: configuration,
+        activation_root: Digest([0x47; 32]),
+        activation_source: ActivationSource::NormHdNoDot,
+        table_shape,
+        table_identity: Digest([0x48; 32]),
+        matrix_rows: u64::from(zkie_models_timesfm::norm_profile::HIDDEN_PAD),
+        k_lo: 0,
+        columns: u64::from(zkie_models_timesfm::norm_profile::HIDDEN_PAD),
+        group: 7,
+        oracle_base: 20,
+        openings_per_oracle: 2,
+        w,
+        index_mask: None,
+        dot: None,
+        expected_dot_root: None,
+        expected_roots: None,
+        member: None,
+        request_chain: None,
+        chain_mask: None,
+        request_reads: None,
+        request_w: None,
+        source_data: None,
+        segment_mask_tree: None,
+        range: None,
+        digit_lookups: Vec::new(),
+    };
+    let mut plan = HiddenLinPlan {
+        send,
+        output: HiddenOutputShape {
+            positions,
+            columns: u64::from(zkie_models_timesfm::norm_profile::HIDDEN_PAD),
+        },
+        weights: Vec::new(),
+        masks: vec![Vec::new(); positions as usize],
+        proximity,
+        output_relation: None,
+        closure: None,
+        norm: Some(norm_plan),
+    };
+    let roots = zkie_ops::proof::norm_segment::out_group_roots(
+        plan.norm.as_ref().ok_or(Error::InvalidConfig)?,
+        profile,
+        hd_rows,
+    )?;
+    plan.send.activation_root = zkie_ops::proof::hidden_send_session::hd_activation_root(&plan, &roots)?;
+    let own = zkie_ops::proof::hidden_send_session::norm_only_own_stages(&plan)?;
+    plan.proximity.own_stages = own.stages;
+    plan.proximity.own_base_positions = own.base_positions;
+    plan.proximity.own_mask_tree.mask_rows = u64::try_from(own.mask_rows)
+        .map_err(|_| Error::ResourceLimit)?;
+    plan.validate()?;
+    Ok(plan)
+}
