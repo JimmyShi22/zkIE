@@ -18779,6 +18779,24 @@ fn own_sample_rows(
 // ---------------------------------------------------------------------------
 
 const NORM_ROOT_TAGS: [u64; 5] = [60, 61, 62, 63, 64];
+const NORM_LOW_ROOT_TAG: u64 = 160;
+const NORM_HIGH_ROOT_TAG: u64 = 161;
+const NORM_LOW_SEED_TAG: u64 = 162;
+const NORM_HIGH_SEED_TAG: u64 = 163;
+const NORM_LOW_ANSWER_TAG: u64 = 164;
+const NORM_HIGH_ANSWER_TAG: u64 = 165;
+const NORM_LOW_POSITION_TAG: u64 = 166;
+const NORM_HIGH_POSITION_TAG: u64 = 167;
+
+/// The group tags in the committed group order: the trusted x row, the two
+/// limb rows when the RMS form carries them, then the four statistic rows.
+fn norm_group_tags(plan: &NormPlan, base: &[u64; 5], low: u64, high: u64) -> Vec<u64> {
+    if plan.rms.is_some() {
+        vec![base[0], low, high, base[1], base[2], base[3], base[4]]
+    } else {
+        base.to_vec()
+    }
+}
 const NORM_MASK_ROOT_TAG: u64 = 65;
 const NORM_SEED_TAGS: [u64; 5] = [66, 67, 68, 69, 70];
 const NORM_MASK_SEED_TAG: u64 = 71;
@@ -18859,13 +18877,17 @@ const NORM_OUTPUT_POSITION_TAGS: [u64; 4] = [
 ];
 
 fn norm_group_plans(plan: &NormPlan) -> Vec<&NormGroupPlan> {
-    let mut groups = vec![
-        &plan.x,
+    let mut groups = vec![&plan.x];
+    if let Some(rms) = &plan.rms {
+        groups.push(&rms.low);
+        groups.push(&rms.high);
+    }
+    groups.extend([
         &plan.sum,
         &plan.squares,
         &plan.mean,
         &plan.variance,
-    ];
+    ]);
     if let Some(round) = &plan.round {
         groups.push(&round.group);
     }
@@ -18873,13 +18895,21 @@ fn norm_group_plans(plan: &NormPlan) -> Vec<&NormGroupPlan> {
 }
 
 fn norm_group_witnesses(witness: &NormWitness) -> Vec<&NormGroupWitness> {
-    let mut groups = vec![
-        &witness.x,
+    let mut groups = vec![&witness.x];
+    match (&witness.low, &witness.high) {
+        (Some(low), Some(high)) => {
+            groups.push(low);
+            groups.push(high);
+        }
+        (None, None) => {}
+        _ => return Vec::new(),
+    }
+    groups.extend([
         &witness.sum,
         &witness.squares,
         &witness.mean,
         &witness.variance,
-    ];
+    ]);
     if let Some(round) = &witness.round {
         groups.push(round);
     }
@@ -19641,7 +19671,8 @@ fn prove_norm_first(
         (None, None) => None,
         _ => return Err(Error::ShapeMismatch),
     };
-    for (tag, group_witness) in NORM_ROOT_TAGS.iter().zip(group_witnesses.iter()) {
+    let root_tags = norm_group_tags(norm, &NORM_ROOT_TAGS, NORM_LOW_ROOT_TAG, NORM_HIGH_ROOT_TAG);
+    for (tag, group_witness) in root_tags.iter().zip(group_witnesses.iter()) {
         absorb_closure_group(chain, *tag, &group_witness.committed.group)?;
     }
     let round_group = match (&norm.round, &witness.round) {
@@ -19723,8 +19754,9 @@ fn prove_norm_first(
     if let (Some(mask_plan), Some(mask_witness)) = (&norm.mask, mask_witness) {
         absorb_norm_mask_root(chain, mask_plan, &mask_witness.committed.root)?;
     }
+    let seed_tags = norm_group_tags(norm, &NORM_SEED_TAGS, NORM_LOW_SEED_TAG, NORM_HIGH_SEED_TAG);
     let mut seeds = Vec::with_capacity(groups.len());
-    for (tag, group_plan) in NORM_SEED_TAGS.iter().zip(groups.iter()) {
+    for (tag, group_plan) in seed_tags.iter().zip(groups.iter()) {
         seeds.push(draw_closure_seed_set(
             chain,
             *tag,
@@ -19765,7 +19797,13 @@ fn prove_norm_first(
             &group_witness.committed.messages,
             seed_set,
         )?;
-        absorb_tagged_answers(chain, NORM_ANSWER_TAGS[index], &values)?;
+        let answer_tags = norm_group_tags(
+            norm,
+            &NORM_ANSWER_TAGS,
+            NORM_LOW_ANSWER_TAG,
+            NORM_HIGH_ANSWER_TAG,
+        );
+        absorb_tagged_answers(chain, answer_tags[index], &values)?;
         answers.push(values);
     }
     let round_answers = match (&norm.round, round_group, round_seed.as_ref()) {
@@ -19804,9 +19842,15 @@ fn prove_norm_first(
         .zip(seeds.iter())
         .enumerate()
     {
+        let position_tags = norm_group_tags(
+            norm,
+            &NORM_POSITION_TAGS,
+            NORM_LOW_POSITION_TAG,
+            NORM_HIGH_POSITION_TAG,
+        );
         let positions = draw_closure_group_positions(
             chain,
-            NORM_POSITION_TAGS[index],
+            position_tags[index],
             positions,
             group_plan.openings,
             group_plan.shape.code.log_n,
@@ -20321,13 +20365,20 @@ fn prove_norm_first(
         _ => return Err(Error::ShapeMismatch),
     };
     let mut iter = group_messages.into_iter();
+    let x = iter.next().ok_or(Error::ShapeMismatch)?;
+    let (low, high) = if norm.rms.is_some() {
+        (
+            Some(iter.next().ok_or(Error::ShapeMismatch)?),
+            Some(iter.next().ok_or(Error::ShapeMismatch)?),
+        )
+    } else {
+        (None, None)
+    };
     Ok((
         NormFirstMessages {
-            x: iter.next().ok_or(Error::ShapeMismatch)?,
-            // The limb groups are committed in the witness; their first
-            // message fields are wired with the RMS relation rows.
-            low: None,
-            high: None,
+            x,
+            low,
+            high,
             sum: iter.next().ok_or(Error::ShapeMismatch)?,
             squares: iter.next().ok_or(Error::ShapeMismatch)?,
             mean: iter.next().ok_or(Error::ShapeMismatch)?,
@@ -20354,13 +20405,21 @@ fn verify_norm_first(
     let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
     let positions = norm.shape.positions;
     let groups = norm_group_plans(norm);
-    let messages = [
-        &message.x,
+    let mut messages = vec![&message.x];
+    match (&message.low, &message.high) {
+        (Some(low), Some(high)) => {
+            messages.push(low);
+            messages.push(high);
+        }
+        (None, None) => {}
+        _ => return Err(Error::ShapeMismatch),
+    }
+    messages.extend([
         &message.sum,
         &message.squares,
         &message.mean,
         &message.variance,
-    ];
+    ]);
     for (group_plan, message) in groups.iter().zip(messages.iter()) {
         if message.message.group.group != group_plan.group
             || message.fault(&group_plan.shape, positions).is_some()
@@ -20431,7 +20490,8 @@ fn verify_norm_first(
         (None, None) => {}
         _ => return Err(Error::ShapeMismatch),
     }
-    for (tag, message) in NORM_ROOT_TAGS.iter().zip(messages.iter()) {
+    let root_tags = norm_group_tags(norm, &NORM_ROOT_TAGS, NORM_LOW_ROOT_TAG, NORM_HIGH_ROOT_TAG);
+    for (tag, message) in root_tags.iter().zip(messages.iter()) {
         absorb_closure_group(chain, *tag, &message.message.group)?;
     }
     if let (Some(round_plan), Some(message)) = (&norm.round, round) {
@@ -20441,7 +20501,8 @@ fn verify_norm_first(
     if let (Some(mask_plan), Some(mask)) = (&norm.mask, &message.mask) {
         absorb_norm_mask_root(chain, mask_plan, &mask.root)?;
     }
-    for (tag, (group_plan, message)) in NORM_SEED_TAGS
+    let seed_tags = norm_group_tags(norm, &NORM_SEED_TAGS, NORM_LOW_SEED_TAG, NORM_HIGH_SEED_TAG);
+    for (tag, (group_plan, message)) in seed_tags
         .iter()
         .zip(groups.iter().zip(messages.iter()))
     {
@@ -20481,7 +20542,13 @@ fn verify_norm_first(
         if message.sample.answers.len() != positions as usize {
             return Err(Error::ShapeMismatch);
         }
-        absorb_tagged_answers(chain, NORM_ANSWER_TAGS[index], &message.sample.answers)?;
+        let answer_tags = norm_group_tags(
+            norm,
+            &NORM_ANSWER_TAGS,
+            NORM_LOW_ANSWER_TAG,
+            NORM_HIGH_ANSWER_TAG,
+        );
+        absorb_tagged_answers(chain, answer_tags[index], &message.sample.answers)?;
     }
     if let Some(round) = round {
         absorb_tagged_answers(chain, NORM_ROUND_ANSWER_TAG, &round.sample.answers)?;
@@ -20490,9 +20557,15 @@ fn verify_norm_first(
         absorb_tagged_answers(chain, NORM_MASK_ANSWER_TAG, &mask.sample.answers)?;
     }
     for (index, (group_plan, message)) in groups.iter().zip(messages.iter()).enumerate() {
+        let position_tags = norm_group_tags(
+            norm,
+            &NORM_POSITION_TAGS,
+            NORM_LOW_POSITION_TAG,
+            NORM_HIGH_POSITION_TAG,
+        );
         let positions = draw_closure_group_positions(
             chain,
-            NORM_POSITION_TAGS[index],
+            position_tags[index],
             positions,
             group_plan.openings,
             group_plan.shape.code.log_n,
