@@ -2021,6 +2021,28 @@ impl HiddenSendPlan {
         {
             return Err(Error::InvalidConfig);
         }
+        if self.activation_source.is_norm_only() {
+            // The norm-only mode carries no table, no Dot/W rows, no index
+            // mask and no closure. The norm groups alone carry the relation.
+            if self.dot.is_some()
+                || self.index_mask.is_some()
+                || self.member.is_some()
+                || self.request_chain.is_some()
+                || self.chain_mask.is_some()
+                || self.request_reads.is_some()
+                || self.request_w.is_some()
+                || self.source_data.is_some()
+                || !self.digit_lookups.is_empty()
+                || self.segment_mask_tree.is_some()
+                || self.range.is_some()
+                || self.group == 0
+                || self.oracle_base == 0
+                || self.openings_per_oracle == 0
+            {
+                return Err(Error::InvalidConfig);
+            }
+            return Ok(());
+        }
         if self.activation_source.is_norm_hd() && self.dot.is_none() {
             return Err(Error::InvalidConfig);
         }
@@ -17541,6 +17563,379 @@ struct OwnProveResult {
 /// The own-group member list, sorted by descending main rows so that BAT's
 /// block order and the FOLD layout agree. `bat_of` maps a source oracle to its
 /// BAT registration id.
+fn norm_members(
+    plan: &HiddenLinPlan,
+    first: &HiddenSendMessages,
+    witness: Option<&HiddenSendWitness>,
+) -> Result<Vec<ProximityMember>> {
+    let mut members = Vec::new();
+    let Some(norm_plan) = plan.norm.as_ref() else {
+        return Ok(members);
+    };
+    let Some(norm_first) = first.norm.as_ref() else {
+        return Ok(members);
+    };
+    let norm_witness = witness.and_then(|witness| witness.norm.as_ref());
+    let positions = plan.send.positions();
+    let mut groups = vec![
+        (&norm_first.x, &norm_plan.x, norm_witness.map(|w| &w.x)),
+        (&norm_first.sum, &norm_plan.sum, norm_witness.map(|w| &w.sum)),
+        (&norm_first.squares, &norm_plan.squares, norm_witness.map(|w| &w.squares)),
+        (&norm_first.mean, &norm_plan.mean, norm_witness.map(|w| &w.mean)),
+        (&norm_first.variance, &norm_plan.variance, norm_witness.map(|w| &w.variance)),
+    ];
+    if let (Some(round_message), Some(round_plan)) =
+        (&norm_first.round, &norm_plan.round)
+    {
+        groups.push((
+            round_message,
+            &round_plan.group,
+            norm_witness.and_then(|witness| witness.round.as_ref()),
+        ));
+    }
+    if let (Some(output_message), Some(output_plan)) =
+        (&norm_first.output, &norm_plan.output)
+    {
+        let output_witness = norm_witness.and_then(|witness| witness.output.as_ref());
+        groups.push((
+            &output_message.broadcast,
+            &output_plan.broadcast,
+            output_witness.map(|witness| &witness.broadcast),
+        ));
+        groups.push((
+            &output_message.product,
+            &output_plan.product,
+            output_witness.map(|witness| &witness.product),
+        ));
+        groups.push((
+            &output_message.image,
+            &output_plan.image,
+            output_witness.map(|witness| &witness.image),
+        ));
+        groups.push((
+            &output_message.out,
+            &output_plan.out,
+            output_witness.map(|witness| &witness.out),
+        ));
+    }
+    if let (Some(tail_message), Some(output_plan)) = (&norm_first.tail, &norm_plan.output) {
+        if let Some(tail_plan) = &output_plan.tail {
+            let tail_witness = norm_witness
+                .and_then(|witness| witness.output.as_ref())
+                .and_then(|witness| witness.tail.as_ref());
+            groups.push((
+                &tail_message.group,
+                &tail_plan.group,
+                tail_witness.map(|witness| &witness.committed),
+            ));
+        }
+    }
+    for (message, group_plan, group_witness) in groups {
+        if message.message.group.group != group_plan.group
+            || message.message.roots.len() != positions as usize
+        {
+            return Err(Error::StatementMismatch);
+        }
+        for position in 0..positions {
+            let root = message
+                .message
+                .group
+                .entries
+                .get(position as usize)
+                .ok_or(Error::ShapeMismatch)?
+                .root;
+            let (message_rows, tails) = match group_witness {
+                Some(group_witness) => {
+                    let rows = group_witness
+                        .messages
+                        .get(position as usize)
+                        .ok_or(Error::ShapeMismatch)?
+                        .clone();
+                    let row_count = usize::try_from(group_plan.shape.main_rows)
+                        .map_err(|_| Error::ResourceLimit)?;
+                    let tail_len = usize::try_from(group_plan.shape.code.r)
+                        .map_err(|_| Error::ResourceLimit)?;
+                    let flat = group_witness
+                        .tails
+                        .get(position as usize)
+                        .ok_or(Error::ShapeMismatch)?;
+                    let mut tails = Vec::with_capacity(row_count);
+                    for row in 0..row_count {
+                        tails.push(
+                            flat.get(row * tail_len..(row + 1) * tail_len)
+                                .ok_or(Error::ShapeMismatch)?
+                                .to_vec(),
+                        );
+                    }
+                    (rows, tails)
+                }
+                None => (Vec::new(), Vec::new()),
+            };
+            members.push(ProximityMember {
+                bat_oracle: 0,
+                source_oracle: group_plan
+                    .oracle_base
+                    .checked_add(position as u64)
+                    .ok_or(Error::ResourceLimit)?,
+                main_code: group_plan.shape.code,
+                mask_code: plan.proximity.mask_code,
+                main_rows: group_plan.shape.main_rows,
+                mask_rows: 0,
+                answers: group_plan.shape.answers,
+                root,
+                tree_plan: group_plan.shape.tree_plan(position)?,
+                message: message_rows,
+                tails,
+                mask_message: Vec::new(),
+                mask_tails: Vec::new(),
+            });
+        }
+    }
+    if let Some(mask_plan) = &norm_plan.mask {
+        let mask_first = norm_first.mask.as_ref().ok_or(Error::ShapeMismatch)?;
+        if mask_first.tree != mask_plan.tree {
+            return Err(Error::StatementMismatch);
+        }
+        let (mask_rows, mask_tails) = match norm_witness {
+            Some(witness) => match &witness.mask {
+                Some(mask) => (mask.committed.rows.clone(), mask.committed.tails.clone()),
+                None => (Vec::new(), Vec::new()),
+            },
+            None => (Vec::new(), Vec::new()),
+        };
+        members.push(ProximityMember {
+            bat_oracle: 0,
+            source_oracle: mask_plan.oracle,
+            main_code: plan.proximity.code,
+            mask_code: mask_plan.mask_code,
+            main_rows: 0,
+            mask_rows: mask_plan.mask_rows,
+            answers: mask_plan.answers,
+            root: mask_first.root,
+            tree_plan: mask_plan.tree.clone(),
+            message: Vec::new(),
+            tails: Vec::new(),
+            mask_message: mask_rows,
+            mask_tails,
+        });
+    }
+    if let Some(lookup_plan) = &norm_plan.lookup {
+        let lookup_first = norm_first.lookup.as_ref().ok_or(Error::ShapeMismatch)?;
+        let commit = &lookup_plan.commit;
+        let bits_entry = lookup_first
+            .bits
+            .message
+            .group
+            .entries
+            .first()
+            .ok_or(Error::ShapeMismatch)?;
+        if bits_entry.tree != commit.bits_shape.tree_plan(0)?
+            || lookup_first.mask.tree != commit.mask_tree
+        {
+            return Err(Error::StatementMismatch);
+        }
+        let lookup_messages = norm_witness
+            .and_then(|witness| witness.lookup.as_ref())
+            .and_then(|lookup| lookup.messages.as_ref());
+        let row_count = usize::try_from(commit.bits_shape.main_rows)
+            .map_err(|_| Error::ResourceLimit)?;
+        let tail_len = usize::try_from(commit.bits_shape.code.r)
+            .map_err(|_| Error::ResourceLimit)?;
+        let (bits_message, bits_tails) = match lookup_messages {
+            Some(messages) => {
+                let message = messages
+                    .bits
+                    .messages
+                    .first()
+                    .ok_or(Error::ShapeMismatch)?
+                    .clone();
+                let mut tails = Vec::with_capacity(row_count);
+                for row in 0..row_count {
+                    tails.push(
+                        messages
+                            .bits_tails
+                            .get(row * tail_len..(row + 1) * tail_len)
+                            .ok_or(Error::ShapeMismatch)?
+                            .to_vec(),
+                    );
+                }
+                (message, tails)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        let (lookup_mask_rows, lookup_mask_tails) = match lookup_messages {
+            Some(messages) => (messages.mask_rows.clone(), messages.mask_tails.clone()),
+            None => (Vec::new(), Vec::new()),
+        };
+        members.push(ProximityMember {
+            bat_oracle: 0,
+            source_oracle: commit.bits_oracle,
+            main_code: commit.bits_shape.code,
+            mask_code: plan.proximity.mask_code,
+            main_rows: commit.bits_shape.main_rows,
+            mask_rows: 0,
+            answers: commit.bits_shape.answers,
+            root: lookup_first
+                .bits
+                .message
+                .roots
+                .first()
+                .copied()
+                .ok_or(Error::ShapeMismatch)?,
+            tree_plan: commit.bits_shape.tree_plan(0)?,
+            message: bits_message,
+            tails: bits_tails,
+            mask_message: Vec::new(),
+            mask_tails: Vec::new(),
+        });
+        members.push(ProximityMember {
+            bat_oracle: 0,
+            source_oracle: commit.mask_oracle,
+            main_code: plan.proximity.code,
+            mask_code: commit.mask_code,
+            main_rows: 0,
+            mask_rows: commit.mask_rows,
+            answers: 1,
+            root: lookup_first.mask.root,
+            tree_plan: commit.mask_tree.clone(),
+            message: Vec::new(),
+            tails: Vec::new(),
+            mask_message: lookup_mask_rows,
+            mask_tails: lookup_mask_tails,
+        });
+    }
+
+    // frozen-table lookup: own members
+    if let Some(lookup_plan) = &norm_plan.rstd {
+        let lookup_first = norm_first.rstd.as_ref().ok_or(Error::ShapeMismatch)?;
+        let commit = &lookup_plan.commit;
+        let bits_entry = lookup_first
+            .bits
+            .message
+            .group
+            .entries
+            .first()
+            .ok_or(Error::ShapeMismatch)?;
+        if bits_entry.tree != commit.bits_shape.tree_plan(0)?
+            || lookup_first.mask.tree != commit.mask_tree
+        {
+            return Err(Error::StatementMismatch);
+        }
+        let lookup_messages = norm_witness
+            .and_then(|witness| witness.rstd.as_ref())
+            .and_then(|lookup| lookup.messages.as_ref());
+        let row_count = usize::try_from(commit.bits_shape.main_rows)
+            .map_err(|_| Error::ResourceLimit)?;
+        let tail_len = usize::try_from(commit.bits_shape.code.r)
+            .map_err(|_| Error::ResourceLimit)?;
+        let (bits_message, bits_tails) = match lookup_messages {
+            Some(messages) => {
+                let message = messages
+                    .bits
+                    .messages
+                    .first()
+                    .ok_or(Error::ShapeMismatch)?
+                    .clone();
+                let mut tails = Vec::with_capacity(row_count);
+                for row in 0..row_count {
+                    tails.push(
+                        messages
+                            .bits_tails
+                            .get(row * tail_len..(row + 1) * tail_len)
+                            .ok_or(Error::ShapeMismatch)?
+                            .to_vec(),
+                    );
+                }
+                (message, tails)
+            }
+            None => (Vec::new(), Vec::new()),
+        };
+        let (lookup_mask_rows, lookup_mask_tails) = match lookup_messages {
+            Some(messages) => (messages.mask_rows.clone(), messages.mask_tails.clone()),
+            None => (Vec::new(), Vec::new()),
+        };
+        members.push(ProximityMember {
+            bat_oracle: 0,
+            source_oracle: commit.bits_oracle,
+            main_code: commit.bits_shape.code,
+            mask_code: plan.proximity.mask_code,
+            main_rows: commit.bits_shape.main_rows,
+            mask_rows: 0,
+            answers: commit.bits_shape.answers,
+            root: lookup_first
+                .bits
+                .message
+                .roots
+                .first()
+                .copied()
+                .ok_or(Error::ShapeMismatch)?,
+            tree_plan: commit.bits_shape.tree_plan(0)?,
+            message: bits_message,
+            tails: bits_tails,
+            mask_message: Vec::new(),
+            mask_tails: Vec::new(),
+        });
+        members.push(ProximityMember {
+            bat_oracle: 0,
+            source_oracle: commit.mask_oracle,
+            main_code: plan.proximity.code,
+            mask_code: commit.mask_code,
+            main_rows: 0,
+            mask_rows: commit.mask_rows,
+            answers: 1,
+            root: lookup_first.mask.root,
+            tree_plan: commit.mask_tree.clone(),
+            message: Vec::new(),
+            tails: Vec::new(),
+            mask_message: lookup_mask_rows,
+            mask_tails: lookup_mask_tails,
+        });
+    }
+    for input in norm_param_claim_inputs(plan, first, witness.and_then(|w| w.norm.as_ref()))? {
+    let gu = &input.claim.gu;
+    let (message, tails) = match &input.material {
+        Some(material) => (material.message.clone(), material.tails.clone()),
+        None => (Vec::new(), Vec::new()),
+    };
+    members.push(ProximityMember {
+        bat_oracle: 0,
+        source_oracle: gu.oracle,
+        main_code: gu.u.code,
+        mask_code: plan.proximity.mask_code,
+        main_rows: gu.u.main_rows,
+        mask_rows: 0,
+        answers: gu.u.answers,
+        root: input.message.root,
+        tree_plan: gu.tree.clone(),
+        message,
+        tails,
+        mask_message: Vec::new(),
+        mask_tails: Vec::new(),
+    });
+}
+    Ok(members)
+}
+
+/// The norm-only member list and its derived fold shape. The Dot/W, Omega,
+/// request and closure members are absent; the fold is derived from the norm
+/// groups and the parameter claims with the shared member-shape rule.
+pub fn norm_only_fold_shape(
+    plan: &HiddenLinPlan,
+    first: &HiddenSendMessages,
+    witness: Option<&HiddenSendWitness>,
+) -> Result<FoldShape> {
+    let mut members = norm_members(plan, first, witness)?;
+    members.sort_by_key(|member| {
+        std::cmp::Reverse((member.main_rows, member.mask_rows, member.source_oracle))
+    });
+    member_fold_shape(
+        plan.proximity.code,
+        plan.proximity.mask_code,
+        &members,
+        plan.proximity.own_mask_tree.leaf_class,
+    )
+}
+
 fn own_members(
     plan: &HiddenLinPlan,
     first: &HiddenSendMessages,
@@ -18023,347 +18418,7 @@ fn own_members(
             mask_tails,
         });
     }
-    if let Some(norm_plan) = &plan.norm {
-        let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
-        let norm_witness = witness.and_then(|witness| witness.norm.as_ref());
-        let positions = plan.send.positions();
-        let mut groups = vec![
-            (&norm_first.x, &norm_plan.x, norm_witness.map(|w| &w.x)),
-            (&norm_first.sum, &norm_plan.sum, norm_witness.map(|w| &w.sum)),
-            (&norm_first.squares, &norm_plan.squares, norm_witness.map(|w| &w.squares)),
-            (&norm_first.mean, &norm_plan.mean, norm_witness.map(|w| &w.mean)),
-            (&norm_first.variance, &norm_plan.variance, norm_witness.map(|w| &w.variance)),
-        ];
-        if let (Some(round_message), Some(round_plan)) =
-            (&norm_first.round, &norm_plan.round)
-        {
-            groups.push((
-                round_message,
-                &round_plan.group,
-                norm_witness.and_then(|witness| witness.round.as_ref()),
-            ));
-        }
-        if let (Some(output_message), Some(output_plan)) =
-            (&norm_first.output, &norm_plan.output)
-        {
-            let output_witness = norm_witness.and_then(|witness| witness.output.as_ref());
-            groups.push((
-                &output_message.broadcast,
-                &output_plan.broadcast,
-                output_witness.map(|witness| &witness.broadcast),
-            ));
-            groups.push((
-                &output_message.product,
-                &output_plan.product,
-                output_witness.map(|witness| &witness.product),
-            ));
-            groups.push((
-                &output_message.image,
-                &output_plan.image,
-                output_witness.map(|witness| &witness.image),
-            ));
-            groups.push((
-                &output_message.out,
-                &output_plan.out,
-                output_witness.map(|witness| &witness.out),
-            ));
-        }
-        if let (Some(tail_message), Some(output_plan)) = (&norm_first.tail, &norm_plan.output) {
-            if let Some(tail_plan) = &output_plan.tail {
-                let tail_witness = norm_witness
-                    .and_then(|witness| witness.output.as_ref())
-                    .and_then(|witness| witness.tail.as_ref());
-                groups.push((
-                    &tail_message.group,
-                    &tail_plan.group,
-                    tail_witness.map(|witness| &witness.committed),
-                ));
-            }
-        }
-        for (message, group_plan, group_witness) in groups {
-            if message.message.group.group != group_plan.group
-                || message.message.roots.len() != positions as usize
-            {
-                return Err(Error::StatementMismatch);
-            }
-            for position in 0..positions {
-                let root = message
-                    .message
-                    .group
-                    .entries
-                    .get(position as usize)
-                    .ok_or(Error::ShapeMismatch)?
-                    .root;
-                let (message_rows, tails) = match group_witness {
-                    Some(group_witness) => {
-                        let rows = group_witness
-                            .messages
-                            .get(position as usize)
-                            .ok_or(Error::ShapeMismatch)?
-                            .clone();
-                        let row_count = usize::try_from(group_plan.shape.main_rows)
-                            .map_err(|_| Error::ResourceLimit)?;
-                        let tail_len = usize::try_from(group_plan.shape.code.r)
-                            .map_err(|_| Error::ResourceLimit)?;
-                        let flat = group_witness
-                            .tails
-                            .get(position as usize)
-                            .ok_or(Error::ShapeMismatch)?;
-                        let mut tails = Vec::with_capacity(row_count);
-                        for row in 0..row_count {
-                            tails.push(
-                                flat.get(row * tail_len..(row + 1) * tail_len)
-                                    .ok_or(Error::ShapeMismatch)?
-                                    .to_vec(),
-                            );
-                        }
-                        (rows, tails)
-                    }
-                    None => (Vec::new(), Vec::new()),
-                };
-                members.push(ProximityMember {
-                    bat_oracle: 0,
-                    source_oracle: group_plan
-                        .oracle_base
-                        .checked_add(position as u64)
-                        .ok_or(Error::ResourceLimit)?,
-                    main_code: group_plan.shape.code,
-                    mask_code: plan.proximity.mask_code,
-                    main_rows: group_plan.shape.main_rows,
-                    mask_rows: 0,
-                    answers: group_plan.shape.answers,
-                    root,
-                    tree_plan: group_plan.shape.tree_plan(position)?,
-                    message: message_rows,
-                    tails,
-                    mask_message: Vec::new(),
-                    mask_tails: Vec::new(),
-                });
-            }
-        }
-        if let Some(mask_plan) = &norm_plan.mask {
-            let mask_first = norm_first.mask.as_ref().ok_or(Error::ShapeMismatch)?;
-            if mask_first.tree != mask_plan.tree {
-                return Err(Error::StatementMismatch);
-            }
-            let (mask_rows, mask_tails) = match norm_witness {
-                Some(witness) => match &witness.mask {
-                    Some(mask) => (mask.committed.rows.clone(), mask.committed.tails.clone()),
-                    None => (Vec::new(), Vec::new()),
-                },
-                None => (Vec::new(), Vec::new()),
-            };
-            members.push(ProximityMember {
-                bat_oracle: 0,
-                source_oracle: mask_plan.oracle,
-                main_code: plan.proximity.code,
-                mask_code: mask_plan.mask_code,
-                main_rows: 0,
-                mask_rows: mask_plan.mask_rows,
-                answers: mask_plan.answers,
-                root: mask_first.root,
-                tree_plan: mask_plan.tree.clone(),
-                message: Vec::new(),
-                tails: Vec::new(),
-                mask_message: mask_rows,
-                mask_tails,
-            });
-        }
-        if let Some(lookup_plan) = &norm_plan.lookup {
-            let lookup_first = norm_first.lookup.as_ref().ok_or(Error::ShapeMismatch)?;
-            let commit = &lookup_plan.commit;
-            let bits_entry = lookup_first
-                .bits
-                .message
-                .group
-                .entries
-                .first()
-                .ok_or(Error::ShapeMismatch)?;
-            if bits_entry.tree != commit.bits_shape.tree_plan(0)?
-                || lookup_first.mask.tree != commit.mask_tree
-            {
-                return Err(Error::StatementMismatch);
-            }
-            let lookup_messages = norm_witness
-                .and_then(|witness| witness.lookup.as_ref())
-                .and_then(|lookup| lookup.messages.as_ref());
-            let row_count = usize::try_from(commit.bits_shape.main_rows)
-                .map_err(|_| Error::ResourceLimit)?;
-            let tail_len = usize::try_from(commit.bits_shape.code.r)
-                .map_err(|_| Error::ResourceLimit)?;
-            let (bits_message, bits_tails) = match lookup_messages {
-                Some(messages) => {
-                    let message = messages
-                        .bits
-                        .messages
-                        .first()
-                        .ok_or(Error::ShapeMismatch)?
-                        .clone();
-                    let mut tails = Vec::with_capacity(row_count);
-                    for row in 0..row_count {
-                        tails.push(
-                            messages
-                                .bits_tails
-                                .get(row * tail_len..(row + 1) * tail_len)
-                                .ok_or(Error::ShapeMismatch)?
-                                .to_vec(),
-                        );
-                    }
-                    (message, tails)
-                }
-                None => (Vec::new(), Vec::new()),
-            };
-            let (lookup_mask_rows, lookup_mask_tails) = match lookup_messages {
-                Some(messages) => (messages.mask_rows.clone(), messages.mask_tails.clone()),
-                None => (Vec::new(), Vec::new()),
-            };
-            members.push(ProximityMember {
-                bat_oracle: 0,
-                source_oracle: commit.bits_oracle,
-                main_code: commit.bits_shape.code,
-                mask_code: plan.proximity.mask_code,
-                main_rows: commit.bits_shape.main_rows,
-                mask_rows: 0,
-                answers: commit.bits_shape.answers,
-                root: lookup_first
-                    .bits
-                    .message
-                    .roots
-                    .first()
-                    .copied()
-                    .ok_or(Error::ShapeMismatch)?,
-                tree_plan: commit.bits_shape.tree_plan(0)?,
-                message: bits_message,
-                tails: bits_tails,
-                mask_message: Vec::new(),
-                mask_tails: Vec::new(),
-            });
-            members.push(ProximityMember {
-                bat_oracle: 0,
-                source_oracle: commit.mask_oracle,
-                main_code: plan.proximity.code,
-                mask_code: commit.mask_code,
-                main_rows: 0,
-                mask_rows: commit.mask_rows,
-                answers: 1,
-                root: lookup_first.mask.root,
-                tree_plan: commit.mask_tree.clone(),
-                message: Vec::new(),
-                tails: Vec::new(),
-                mask_message: lookup_mask_rows,
-                mask_tails: lookup_mask_tails,
-            });
-        }
-
-        // frozen-table lookup: own members
-        if let Some(lookup_plan) = &norm_plan.rstd {
-            let lookup_first = norm_first.rstd.as_ref().ok_or(Error::ShapeMismatch)?;
-            let commit = &lookup_plan.commit;
-            let bits_entry = lookup_first
-                .bits
-                .message
-                .group
-                .entries
-                .first()
-                .ok_or(Error::ShapeMismatch)?;
-            if bits_entry.tree != commit.bits_shape.tree_plan(0)?
-                || lookup_first.mask.tree != commit.mask_tree
-            {
-                return Err(Error::StatementMismatch);
-            }
-            let lookup_messages = norm_witness
-                .and_then(|witness| witness.rstd.as_ref())
-                .and_then(|lookup| lookup.messages.as_ref());
-            let row_count = usize::try_from(commit.bits_shape.main_rows)
-                .map_err(|_| Error::ResourceLimit)?;
-            let tail_len = usize::try_from(commit.bits_shape.code.r)
-                .map_err(|_| Error::ResourceLimit)?;
-            let (bits_message, bits_tails) = match lookup_messages {
-                Some(messages) => {
-                    let message = messages
-                        .bits
-                        .messages
-                        .first()
-                        .ok_or(Error::ShapeMismatch)?
-                        .clone();
-                    let mut tails = Vec::with_capacity(row_count);
-                    for row in 0..row_count {
-                        tails.push(
-                            messages
-                                .bits_tails
-                                .get(row * tail_len..(row + 1) * tail_len)
-                                .ok_or(Error::ShapeMismatch)?
-                                .to_vec(),
-                        );
-                    }
-                    (message, tails)
-                }
-                None => (Vec::new(), Vec::new()),
-            };
-            let (lookup_mask_rows, lookup_mask_tails) = match lookup_messages {
-                Some(messages) => (messages.mask_rows.clone(), messages.mask_tails.clone()),
-                None => (Vec::new(), Vec::new()),
-            };
-            members.push(ProximityMember {
-                bat_oracle: 0,
-                source_oracle: commit.bits_oracle,
-                main_code: commit.bits_shape.code,
-                mask_code: plan.proximity.mask_code,
-                main_rows: commit.bits_shape.main_rows,
-                mask_rows: 0,
-                answers: commit.bits_shape.answers,
-                root: lookup_first
-                    .bits
-                    .message
-                    .roots
-                    .first()
-                    .copied()
-                    .ok_or(Error::ShapeMismatch)?,
-                tree_plan: commit.bits_shape.tree_plan(0)?,
-                message: bits_message,
-                tails: bits_tails,
-                mask_message: Vec::new(),
-                mask_tails: Vec::new(),
-            });
-            members.push(ProximityMember {
-                bat_oracle: 0,
-                source_oracle: commit.mask_oracle,
-                main_code: plan.proximity.code,
-                mask_code: commit.mask_code,
-                main_rows: 0,
-                mask_rows: commit.mask_rows,
-                answers: 1,
-                root: lookup_first.mask.root,
-                tree_plan: commit.mask_tree.clone(),
-                message: Vec::new(),
-                tails: Vec::new(),
-                mask_message: lookup_mask_rows,
-                mask_tails: lookup_mask_tails,
-            });
-        }
-    }
-    for input in norm_param_claim_inputs(plan, first, witness.and_then(|w| w.norm.as_ref()))? {
-        let gu = &input.claim.gu;
-        let (message, tails) = match &input.material {
-            Some(material) => (material.message.clone(), material.tails.clone()),
-            None => (Vec::new(), Vec::new()),
-        };
-        members.push(ProximityMember {
-            bat_oracle: 0,
-            source_oracle: gu.oracle,
-            main_code: gu.u.code,
-            mask_code: plan.proximity.mask_code,
-            main_rows: gu.u.main_rows,
-            mask_rows: 0,
-            answers: gu.u.answers,
-            root: input.message.root,
-            tree_plan: gu.tree.clone(),
-            message,
-            tails,
-            mask_message: Vec::new(),
-            mask_tails: Vec::new(),
-        });
-    }
+    members.extend(norm_members(plan, first, witness)?);
     // The isolated FOLD fixture places blocks in registration order, so the
     // member order must follow the BAT block order: larger main blocks first,
     // and among mask-only members the larger mask block first.
@@ -26522,6 +26577,116 @@ pub fn prove_hidden_lin_hidden_with_norm_and_rstd_table(
 /// Proves the norm hidden-output chain with the frozen-table rstd view and
 /// the parameter tables. This is the NormHd form of the rstd-table prover:
 /// the prover reads the same frozen table the verifier checks.
+/// The first-stage messages of the norm-only mode. The mode carries the norm
+/// first message and the materialized activation commitment; it has no W
+/// group, no Dot map and no table.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormOnlyFirstMessages {
+    pub activation: ActivationCommitment,
+    pub norm: NormFirstMessages,
+    pub chain_value: Digest,
+}
+
+/// The verifier's outcome of the norm-only first stage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormOnlyFirstOutcome {
+    pub activation: ActivationCommitment,
+    pub chain_value: Digest,
+}
+
+/// Proves the norm-only first stage. The norm commitment, transcript, lookup
+/// and PSC instances run exactly as in the accepted norm chain; the Dot/W rows
+/// and the table are absent.
+pub fn prove_norm_only_first(
+    plan: &HiddenLinPlan,
+    seed: Digest,
+    norm: &NormWitness,
+    param_tables: Option<&mut dyn NormParamTableProver>,
+) -> Result<(NormOnlyFirstMessages, NormWitness)> {
+    plan.validate()?;
+    if !plan.send.activation_source.is_norm_only() || plan.norm.is_none() {
+        return Err(Error::InvalidConfig);
+    }
+    let mut chain = Chain::begin(
+        HIDDEN_SEND_CHAIN_LABEL,
+        &plan.parameters_digest(),
+        &plan.first_statement()?,
+        b"zkie/norm-only",
+        None,
+    )?;
+    absorb_claim(&mut chain, plan)?;
+    let (message, lookup_messages, rstd_messages, param_claims) =
+        prove_norm_first(plan, &mut chain, norm, &seed, param_tables)?;
+    let mut owned = norm.clone();
+    if let Some(lookup) = owned.lookup.as_mut() {
+        lookup.messages = lookup_messages;
+    }
+    if let Some(rstd) = owned.rstd.as_mut() {
+        rstd.messages = rstd_messages;
+    }
+    if let Some((gain_claim, bias_claim)) = param_claims {
+        let params = owned.params.as_mut().ok_or(Error::ShapeMismatch)?;
+        params.gain_claim = Some(gain_claim);
+        params.bias_claim = bias_claim;
+    }
+    let output = message.output.as_ref().ok_or(Error::ShapeMismatch)?;
+    let root = hd_activation_identity(plan, &output.out.message.group.entries)?;
+    let activation = ActivationCommitment {
+        shape: plan.send.activation,
+        root,
+        configuration: plan.send.activation_configuration,
+    };
+    Ok((
+        NormOnlyFirstMessages {
+            activation,
+            norm: message,
+            chain_value: *chain.value(),
+        },
+        owned,
+    ))
+}
+
+/// Verifies the norm-only first stage against the plan and the received norm
+/// message.
+pub fn verify_norm_only_first(
+    plan: &HiddenLinPlan,
+    messages: &NormOnlyFirstMessages,
+) -> Result<NormOnlyFirstOutcome> {
+    plan.validate()?;
+    if !plan.send.activation_source.is_norm_only()
+        || plan.norm.is_none()
+        || messages.activation.fault().is_some()
+    {
+        return Err(Error::InvalidConfig);
+    }
+    let mut chain = Chain::begin(
+        HIDDEN_SEND_CHAIN_LABEL,
+        &plan.parameters_digest(),
+        &plan.first_statement()?,
+        b"zkie/norm-only",
+        None,
+    )?;
+    absorb_claim(&mut chain, plan)?;
+    verify_norm_first(&mut chain, plan, &messages.norm)?;
+    let output = messages
+        .norm
+        .output
+        .as_ref()
+        .ok_or(Error::ShapeMismatch)?;
+    let root = hd_activation_identity(plan, &output.out.message.group.entries)?;
+    if root != messages.activation.root
+        || messages.activation.shape != plan.send.activation
+        || messages.activation.configuration != plan.send.activation_configuration
+        || *chain.value() != messages.chain_value
+    {
+        return Err(Error::InvalidProof);
+    }
+    Ok(NormOnlyFirstOutcome {
+        activation: messages.activation,
+        chain_value: messages.chain_value,
+    })
+}
+
 pub fn prove_hidden_lin_hidden_with_norm_hd_rstd_table(
     plan: &HiddenLinPlan,
     table: &mut dyn HiddenTableProver,
@@ -37632,6 +37797,20 @@ mod merged_tests {
             verify_hidden_lin_hidden(&foreign_verifier, &table.reader(), &messages).is_err(),
             "a foreign hidden-output object must not verify"
         );
+    }
+
+    #[test]
+    fn norm_only_activation_tag_is_distinct() {
+        let mut writer = CanonicalWriter::new();
+        ActivationSource::NormHd.append(&mut writer);
+        let hd = writer.into_bytes();
+        let mut writer = CanonicalWriter::new();
+        ActivationSource::NormHdNoDot.append(&mut writer);
+        let no_dot = writer.into_bytes();
+        assert_ne!(hd, no_dot);
+        assert!(ActivationSource::NormHdNoDot.is_norm_only());
+        assert!(ActivationSource::NormHdNoDot.is_norm_hd());
+        assert!(!ActivationSource::NormHd.is_norm_only());
     }
 
     #[test]
