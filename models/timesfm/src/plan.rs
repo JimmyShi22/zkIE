@@ -785,7 +785,54 @@ pub fn projection_table_params(path: &str) -> Option<AssetTableParams> {
 /// The trusted encoded-table list of the model plan.
 pub fn asset_table_params() -> Result<Vec<AssetTableParams>> {
     let plan = derive_table_plan(&TABLE_PLAN_CANDIDATE)?;
-    Ok(vec![plan.params])
+    let mut tables = vec![plan.params];
+    tables.extend(norm_param_table_params()?);
+    Ok(tables)
+}
+
+/// The trusted table parameters of the L0 attention norm gain. The asset is one
+/// 2,048-entry row; the encoded table has one row and the code message carries
+/// the padded row.
+pub fn norm_param_table_params() -> Result<Vec<AssetTableParams>> {
+    let path = "models/timesfm/weights/L0_lnw_i32.bin";
+    let spec = asset_specs()
+        .into_iter()
+        .find(|spec| spec.path == path)
+        .ok_or(Error::InvalidConfig)?;
+    let code = build_code_plan(12, 2049, 4)?;
+    let shape = IndexShape {
+        code,
+        v: 0,
+        answers: 1,
+        salt_bytes: 40,
+        distances: TableDistances {
+            radius: 0,
+            later_radius: 0,
+            m_once: 0,
+            m_later: 0,
+        },
+    };
+    let layout = AssetTableLayout {
+        row_width: spec.row_width as u64,
+        message_len: code.ell,
+        tail_len: code.r,
+        pads: shape.pads() as u64,
+        valid_elements: spec.element_count,
+        padding_zero: true,
+    };
+    let table = AssetTableParams {
+        asset_id: spec.asset_id,
+        path: spec.path.clone(),
+        element_count: spec.element_count,
+        row_width: spec.row_width as u64,
+        encoding: spec.encoding.clone(),
+        shape,
+        valid_min: i32::MIN as i64,
+        valid_max: i32::MAX as i64,
+        layout,
+    };
+    validate_asset_table_params(&spec, &table)?;
+    Ok(vec![table])
 }
 
 fn transcript_digest(tag: u64, data: &[u8]) -> Result<Digest> {    zkie_engine::primitives::transcript::hash_labeled(

@@ -26820,6 +26820,93 @@ pub struct NormOnlyFirstOutcome {
     pub chain_value: Digest,
 }
 
+const NORM_ONLY_MESSAGE_VERSION: u64 = 1;
+
+impl NormOnlyFirstMessages {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = CanonicalWriter::new();
+        writer.put_u64(NORM_ONLY_MESSAGE_VERSION);
+        writer.put_bytes(&self.activation.encode());
+        writer.put_bytes(&self.norm.encode()?);
+        writer.put_digest(&self.chain_value);
+        Ok(writer.into_bytes())
+    }
+
+    pub fn decode(plan: &HiddenLinPlan, bytes: &[u8]) -> Result<Self> {
+        let limits = DecodeLimits {
+            max_bytes: bytes.len(),
+            max_elements: bytes.len(),
+        };
+        let mut reader = CanonicalReader::new(bytes, limits);
+        if reader.get_u64()? != NORM_ONLY_MESSAGE_VERSION {
+            return Err(Error::UnsupportedVersion);
+        }
+        let activation = ActivationCommitment::decode(reader.get_bytes()?)?;
+        let norm_plan = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
+        let norm = NormFirstMessages::decode(norm_plan, reader.get_bytes()?)?;
+        let chain_value = reader.get_digest()?;
+        reader.finish()?;
+        Ok(Self {
+            activation,
+            norm,
+            chain_value,
+        })
+    }
+}
+
+impl NormOnlySecondMessages {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut writer = CanonicalWriter::new();
+        writer.put_u64(NORM_ONLY_MESSAGE_VERSION);
+        writer.put_bytes(&self.norm.encode()?);
+        put_fold_start(&mut writer, &self.fold_start);
+        writer.put_u64(self.fold_rounds.len() as u64);
+        for (left, right) in &self.fold_rounds {
+            writer.put_fp3(left);
+            writer.put_fp3(right);
+        }
+        put_tail(&mut writer, &self.tail);
+        writer.put_digest(&self.seal);
+        Ok(writer.into_bytes())
+    }
+
+    pub fn decode(plan: &HiddenLinPlan, bytes: &[u8]) -> Result<Self> {
+        let limits = DecodeLimits {
+            max_bytes: bytes.len(),
+            max_elements: bytes.len(),
+        };
+        let mut reader = CanonicalReader::new(bytes, limits);
+        if reader.get_u64()? != NORM_ONLY_MESSAGE_VERSION {
+            return Err(Error::UnsupportedVersion);
+        }
+        let norm_plan = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
+        let norm = NormPscSecond::decode_for(norm_plan, reader.get_bytes()?)?;
+        let fold_start = get_fold_start(&mut reader)?;
+        let rounds = usize::try_from(reader.get_u64()?).map_err(|_| Error::InvalidEncoding)?;
+        let mut fold_rounds = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            fold_rounds.push((reader.get_fp3()?, reader.get_fp3()?));
+        }
+        let iopp = proximity_iopp_plan(
+            &plan.proximity,
+            &plan.send,
+            None,
+            plan.norm.as_ref(),
+            ProximityGroupRole::Own,
+        )?;
+        let tail = get_tail(&mut reader, iopp.as_ref())?;
+        let seal = reader.get_digest()?;
+        reader.finish()?;
+        Ok(Self {
+            norm,
+            fold_start,
+            fold_rounds,
+            tail,
+            seal,
+        })
+    }
+}
+
 /// Proves the norm-only first stage. The norm commitment, transcript, lookup
 /// and PSC instances run exactly as in the accepted norm chain; the Dot/W rows
 /// and the table are absent.
@@ -30044,6 +30131,16 @@ mod merged_tests {
         assert!(own.base_positions > 0);
         assert!(own.mask_rows > 0);
         assert!(own.stages[0].positions > 0);
+    }
+
+    #[test]
+    fn norm_only_decoders_reject_empty_and_truncated_bytes() {
+        let activation = activation();
+        let plan = plan(&activation);
+        assert!(NormOnlyFirstMessages::decode(&plan, &[]).is_err());
+        assert!(NormOnlyFirstMessages::decode(&plan, &[1]).is_err());
+        assert!(NormOnlySecondMessages::decode(&plan, &[]).is_err());
+        assert!(NormOnlySecondMessages::decode(&plan, &[1]).is_err());
     }
 
     #[test]

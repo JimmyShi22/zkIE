@@ -418,6 +418,7 @@ fn sample_production_tables(params: &[AssetTableParams]) -> Result<Vec<AssetTabl
     for params in params {
         let randomness = if params.path.ends_with("ln_f_w_i32.bin")
             || params.path.ends_with("ln_f_b_i32.bin")
+            || params.path.ends_with("L0_lnw_i32.bin")
         {
             sample_asset_table_randomness_public(params, norm_param_seed(params))?
         } else {
