@@ -69,6 +69,11 @@ pub trait LookupTable {
     /// Streams the real rows and checks their canonical digest against the
     /// trusted content root of the table's own configuration.
     fn check_content(&self) -> Result<()>;
+    /// Reads one real row by index. Sources that can stream a single row
+    /// override this; the default refuses instead of materializing the table.
+    fn row_value(&self, _row: usize) -> Result<i64> {
+        Err(Error::UnsupportedPrimitive)
+    }
 }
 
 /// The public byte table, as a multilinear extension over eight coordinates.

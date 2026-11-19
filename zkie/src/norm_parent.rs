@@ -956,11 +956,18 @@ fn param_claim(kind: NormParamKind, shape: IndexShape) -> NormParamClaimPlan {
     }
 }
 
-/// The trusted parameter-table identities of the two final-norm assets, read
-/// from the commit's public table metadata.
-pub fn param_identities(metas: &[AssetTableMeta]) -> Result<NormParamTablesPlan> {
+/// The trusted parameter-table identities of the final-norm assets. The
+/// layer form carries a gain and a bias row; the RMS form carries the gain
+/// row alone.
+pub fn param_identities_for(
+    metas: &[AssetTableMeta],
+    specs: &[zkie_ops::proof::model_commitment::ModelAssetSpec],
+    model_identity: Digest,
+    width: u64,
+    gain: (&str, i64, i64),
+    bias: Option<(&str, i64, i64)>,
+) -> Result<NormParamTablesPlan> {
     use zkie_ops::proof::model_commitment::asset_table_identity;
-    let specs = zkie_models_gpt2::plan::asset_specs();
     let identity = |kind: NormParamKind,
                     path: &str,
                     valid_min: i64,
@@ -977,7 +984,7 @@ pub fn param_identities(metas: &[AssetTableMeta]) -> Result<NormParamTablesPlan>
         Ok(NormParamTableIdentity {
             version: NORM_PARAM_TABLE_VERSION,
             kind,
-            model_identity: zkie_models_gpt2::plan::table_model_identity()?,
+            model_identity,
             asset_table_identity: asset_table_identity(spec),
             reader: IndexReader {
                 shape: meta.shape,
@@ -986,24 +993,58 @@ pub fn param_identities(metas: &[AssetTableMeta]) -> Result<NormParamTablesPlan>
                 record: meta.record.clone(),
             },
             row: 0,
-            width: 1024,
+            width,
             valid_min,
             valid_max,
             trusted_i32_mapping: true,
         })
     };
-    let gain = identity(NormParamKind::Gain, "gpt2/weights/ln_f_w_i32.bin", -1_141_592, 1_141_592)?;
-    let bias = identity(NormParamKind::Bias, "gpt2/weights/ln_f_b_i32.bin", -482_890, 482_890)?;
-    let gain_claim = param_claim(NormParamKind::Gain, gain.reader.shape);
-    let bias_claim = param_claim(NormParamKind::Bias, bias.reader.shape);
+    let gain_identity = identity(NormParamKind::Gain, gain.0, gain.1, gain.2)?;
+    let gain_claim = param_claim(NormParamKind::Gain, gain_identity.reader.shape);
+    let (bias_identity, bias_claim) = match bias {
+        Some((path, valid_min, valid_max)) => {
+            let bias_identity = identity(NormParamKind::Bias, path, valid_min, valid_max)?;
+            let bias_claim = param_claim(NormParamKind::Bias, bias_identity.reader.shape);
+            (Some(bias_identity), Some(bias_claim))
+        }
+        None => (None, None),
+    };
     Ok(NormParamTablesPlan {
-        gain,
-        bias: Some(bias),
+        gain: gain_identity,
+        bias: bias_identity,
         column_draws: 2,
         seed_budget: 1,
         gain_claim: Some(gain_claim),
-        bias_claim: Some(bias_claim),
+        bias_claim,
     })
+}
+
+/// The accepted gpt2 parameter tables.
+pub fn param_identities(metas: &[AssetTableMeta]) -> Result<NormParamTablesPlan> {
+    param_identities_for(
+        metas,
+        &zkie_models_gpt2::plan::asset_specs(),
+        zkie_models_gpt2::plan::table_model_identity()?,
+        1024,
+        ("gpt2/weights/ln_f_w_i32.bin", -1_141_592, 1_141_592),
+        Some(("gpt2/weights/ln_f_b_i32.bin", -482_890, 482_890)),
+    )
+}
+
+/// The gemma3 parameter table: the gain-only final norm.
+pub fn param_identities_gemma3(metas: &[AssetTableMeta]) -> Result<NormParamTablesPlan> {
+    param_identities_for(
+        metas,
+        &zkie_models_gemma3::plan::asset_specs(),
+        zkie_models_gemma3::plan::table_model_identity()?,
+        1024,
+        (
+            "models/gemma3/weights/final_norm_i32.bin",
+            0,
+            zkie_models_gemma3::norm_profile::GAIN_MAX,
+        ),
+        None,
+    )
 }
 
 /// The final norm step's materialized input rows and output rows, read from
@@ -1068,15 +1109,18 @@ pub fn final_norm_rows(
     Ok((index, split(&x), split(&hd)))
 }
 
-/// Reads the two final-norm parameter vectors from the anchored assets. The
-/// file values are decoded through the same encoding as the commitment
-/// builder and the recomputed row-leaf root must equal the public leaf
-/// record, so only authenticated values reach the checks.
-pub fn read_anchored_params(
+/// Reads the final-norm parameter vectors from the anchored assets. The file
+/// values are decoded through the same encoding as the commitment builder and
+/// the recomputed row-leaf root must equal the public leaf record, so only
+/// authenticated values reach the checks. The bias vector is present only for
+/// the layer form.
+pub fn read_anchored_params_for(
     asset_root: &std::path::Path,
     assets: &[zkie_ops::proof::model_commitment::AssetMeta],
-) -> Result<(Vec<i64>, Vec<i64>)> {
-    let specs = zkie_models_gpt2::plan::asset_specs();
+    specs: &[zkie_ops::proof::model_commitment::ModelAssetSpec],
+    gain_path: &str,
+    bias_path: Option<&str>,
+) -> Result<(Vec<i64>, Option<Vec<i64>>)> {
     let read = |path: &str| -> Result<Vec<i64>> {
         let spec = specs
             .iter()
@@ -1096,12 +1140,52 @@ pub fn read_anchored_params(
         }
         Ok(values)
     };
-    let gain = read("gpt2/weights/ln_f_w_i32.bin")?;
-    let bias = read("gpt2/weights/ln_f_b_i32.bin")?;
-    if gain.len() != 1024 || bias.len() != 1024 {
+    let gain = read(gain_path)?;
+    if gain.len() != 1024 {
         return Err(Error::AssetMismatch);
     }
+    let bias = match bias_path {
+        Some(path) => {
+            let bias = read(path)?;
+            if bias.len() != 1024 {
+                return Err(Error::AssetMismatch);
+            }
+            Some(bias)
+        }
+        None => None,
+    };
     Ok((gain, bias))
+}
+
+pub fn read_anchored_params(
+    asset_root: &std::path::Path,
+    assets: &[zkie_ops::proof::model_commitment::AssetMeta],
+) -> Result<(Vec<i64>, Vec<i64>)> {
+    let (gain, bias) = read_anchored_params_for(
+        asset_root,
+        assets,
+        &zkie_models_gpt2::plan::asset_specs(),
+        "gpt2/weights/ln_f_w_i32.bin",
+        Some("gpt2/weights/ln_f_b_i32.bin"),
+    )?;
+    Ok((gain, bias.ok_or(Error::AssetMismatch)?))
+}
+
+pub fn read_anchored_params_gemma3(
+    asset_root: &std::path::Path,
+    assets: &[zkie_ops::proof::model_commitment::AssetMeta],
+) -> Result<Vec<i64>> {
+    let (gain, bias) = read_anchored_params_for(
+        asset_root,
+        assets,
+        &zkie_models_gemma3::plan::asset_specs(),
+        "models/gemma3/weights/final_norm_i32.bin",
+        None,
+    )?;
+    if bias.is_some() {
+        return Err(Error::AssetMismatch);
+    }
+    Ok(gain)
 }
 
 /// The authenticated value checks behind the segment's trusted bounds. The
@@ -1114,9 +1198,7 @@ pub fn check_authenticated_bounds(
     x_rows: &[Vec<i64>],
     gain: &[i64],
     bias: &[i64],
-    table: &zkie_ops::proof::lookup_table::RangeTable<
-        zkie_ops::proof::lookup_table::PublicFileTable,
-    >,
+    table: &dyn zkie_ops::proof::lookup::LookupTable,
 ) -> Result<()> {
     let round = plan.round.as_ref().ok_or(Error::InvalidConfig)?;
     let params = plan.params.as_ref().ok_or(Error::InvalidConfig)?;
@@ -1214,6 +1296,42 @@ pub fn read_rstd_values(
             return Err(Error::BoundViolation);
         }
         file.seek(SeekFrom::Start(index * 4)).map_err(|_| Error::Io)?;
+        let mut entry = [0u8; 4];
+        file.read_exact(&mut entry).map_err(|_| Error::Io)?;
+        values.push(i32::from_le_bytes(entry) as i64);
+    }
+    Ok(values)
+}
+
+/// Reads the combined frozen-table rstd value of every gemma3 position by
+/// index: rows below the base length come from the base file, the rest from
+/// the extension file. The index comes from the same multi-limb core the
+/// plan commits.
+pub fn read_rstd_values_gemma3(
+    asset_root: &std::path::Path,
+    profile: &NormSegmentProfile,
+    x_rows: &[Vec<i64>],
+) -> Result<Vec<i64>> {
+    let base = asset_root.join("models/gpt2/weights/rsqrt_table_i32.bin");
+    let extension = asset_root.join("cases/gemma3/rsqrt_ext_i32.bin");
+    let mut base_file = File::open(base).map_err(|_| Error::AssetMismatch)?;
+    let mut extension_file = File::open(extension).map_err(|_| Error::AssetMismatch)?;
+    let mut values = Vec::with_capacity(x_rows.len());
+    for row in x_rows {
+        let core = authenticated_core(profile, None, row)?;
+        let index = zkie_ops::registry::profile_rsqrt_index(core.variance)?;
+        if index >= profile.table_real_len {
+            return Err(Error::BoundViolation);
+        }
+        let (file, offset) = if index < zkie_models_gemma3::norm_profile::RSTD_BASE_LEN {
+            (&mut base_file, index)
+        } else {
+            (
+                &mut extension_file,
+                index - zkie_models_gemma3::norm_profile::RSTD_BASE_LEN,
+            )
+        };
+        file.seek(SeekFrom::Start(offset * 4)).map_err(|_| Error::Io)?;
         let mut entry = [0u8; 4];
         file.read_exact(&mut entry).map_err(|_| Error::Io)?;
         values.push(i32::from_le_bytes(entry) as i64);

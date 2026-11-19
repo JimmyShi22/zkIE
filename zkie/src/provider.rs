@@ -689,17 +689,18 @@ fn prove_norm_segment(
         &bias,
         &rstd,
     )?;
-    let rstd_table = rstd_table_view(asset_root)?;
+    let rstd_table = rstd_table_view(asset_root, "gpt2")?;
     check_authenticated_bounds(
         &norm_plan,
         &profile,
         &x_rows,
         &gain,
         &bias,
-        &rstd_table,
+        rstd_table.as_ref(),
     )?;
     let key = segment_table_key(request_plan.table_shape()?);
-    let asset = lm_head_asset(commitment, &matmul.weight_path)?;
+    let specs = zkie_models_gpt2::plan::asset_specs();
+    let asset = lm_head_asset(commitment, &matmul.weight_path, &specs)?;
     let work_dir = segment_work_dir(output_dir)?;
     std::fs::create_dir_all(&work_dir).map_err(|_| Error::Io)?;
     let started = Instant::now();
@@ -751,14 +752,14 @@ fn prove_norm_segment(
         &hd_rows,
         session_seed,
     )?;
-    let mut params = build_param_tables(commitment, tables)?;
+    let mut params = build_param_tables("gpt2", commitment, tables)?;
     let messages = prove_segment_bytes(
         &plan,
         &mut table,
         session_seed,
         &witness,
         &mut params,
-        &rstd_table,
+        rstd_table.as_ref(),
     )?;
     let _ = std::fs::remove_dir_all(&work_dir);
     ctx.metrics
@@ -887,10 +888,10 @@ fn verify_norm_segment(
         &hd_rows,
         session_seed,
     )?;
-    let rstd = rstd_table_view(asset_root)?;
-    check_authenticated_bounds(&norm_plan, &profile, &x_rows, &gain, &bias, &rstd)?;
+    let rstd = rstd_table_view(asset_root, "gpt2")?;
+    check_authenticated_bounds(&norm_plan, &profile, &x_rows, &gain, &bias, rstd.as_ref())?;
     let started = Instant::now();
-    let outcome = verify_segment_bytes(&plan, reader, &carrier.messages, &rstd)?;
+    let outcome = verify_segment_bytes(&plan, reader, &carrier.messages, rstd.as_ref())?;
     ctx.metrics
         .record("norm_segment_verify_ms", started.elapsed().as_millis() as u64);
     if outcome.activation.root != plan.send.activation_root {

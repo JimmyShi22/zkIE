@@ -516,6 +516,10 @@ impl<S: TableRowSource> LookupTable for RangeTable<S> {
         RangeTable::verify_content(self).map(|_| ())
     }
 
+    fn row_value(&self, row: usize) -> Result<i64> {
+        RangeTable::row_value(self, row)
+    }
+
     fn column_at(&self, column: usize, point: &[Fp3]) -> Result<Fp3> {
         if point.len() != self.table_log as usize {
             return Err(Error::ShapeMismatch);
