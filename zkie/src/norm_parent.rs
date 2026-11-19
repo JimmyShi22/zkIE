@@ -203,7 +203,7 @@ pub fn build_segment_plan_for(
         .ok_or(Error::ResourceLimit)?
         .trailing_zeros();
     let code = build_code_plan(code_log, geometry.columns as u64, 8192)?;
-    let mask_code = build_code_plan(17, 512, 256)?;
+    let mask_code = build_code_plan(code_log, 512, 256)?;
     let tree = |tree_number: u64, run: Digest, main_rows: u64| -> Result<RuntimeTreePlan> {
         Ok(RuntimeTreePlan {
             tree_number,
@@ -318,7 +318,7 @@ pub fn build_segment_plan_for(
             },
             IoppStagePlan {
                 main: build_code_plan(code_log, geometry.columns as u64, 256)?,
-                mask: build_code_plan(17, 16_384, 256)?,
+                mask: build_code_plan(code_log, 16_384, 256)?,
                 k: 0,
                 h: 0,
                 positions: 2,
@@ -337,7 +337,7 @@ pub fn build_segment_plan_for(
                 work_bits: 24,
             },
             IoppStagePlan {
-                main: build_code_plan(17, 65_536, 259)?,
+                main: build_code_plan(code_log, geometry.columns as u64, 259)?,
                 mask: build_code_plan(17, 16_384, 259)?,
                 k: 0,
                 h: 0,
@@ -404,7 +404,7 @@ pub fn build_segment_plan_for(
         code,
         mask_code,
         build_code_plan(code_log, geometry.columns as u64, 1)?,
-        build_code_plan(17, 16_384, 1)?,
+        build_code_plan(code_log, 16_384, 1)?,
         14,
         own_h,
         252,
@@ -600,8 +600,8 @@ pub fn build_segment_plan_for(
         work_bits: own_two_stage.stage_zero_work_bits,
     };
     plan.proximity.own_stages[1] = IoppStagePlan {
-        main: build_code_plan(17, 65_536, own_two_stage.last_main_r)?,
-        mask: build_code_plan(17, 16_384, own_two_stage.last_mask_r)?,
+        main: build_code_plan(code_log, geometry.columns as u64, own_two_stage.last_main_r)?,
+        mask: build_code_plan(code_log, 16_384, own_two_stage.last_mask_r)?,
         k: 0,
         h: 0,
         positions: own_two_stage.last_positions,
@@ -881,10 +881,25 @@ use zkie_ops::proof::norm_segment::{
 
 /// The trusted constants of the production norm segment.
 pub fn norm_segment_space(configuration: Digest) -> NormSegmentSpace {
+    norm_segment_space_coded(
+        configuration,
+        build_code_plan(17, 65536, 8192).expect("the session main code"),
+        build_code_plan(17, 512, 256).expect("the session mask code"),
+    )
+}
+
+/// The segment space with explicit session codes. A wider output head uses
+/// the same main and mask codes as its hidden session, so the norm groups
+/// share the proximity group.
+pub fn norm_segment_space_coded(
+    configuration: Digest,
+    code: zkie_engine::pcs::request::code::CodeParams,
+    mask_code: zkie_engine::pcs::request::code::CodeParams,
+) -> NormSegmentSpace {
     NormSegmentSpace {
         group: 7,
-        code: build_code_plan(17, 65536, 8192).expect("the session main code"),
-        mask_code: build_code_plan(17, 512, 256).expect("the session mask code"),
+        code,
+        mask_code,
         run: Digest([0x41; 32]),
         configuration,
         salt_bytes: SALT,
@@ -902,24 +917,44 @@ pub fn norm_segment_space(configuration: Digest) -> NormSegmentSpace {
 }
 
 pub fn norm_lookup_space() -> LookupSpace {
+    norm_lookup_space_coded(
+        build_code_plan(17, 65536, 8192).expect("the session main code"),
+        build_code_plan(17, 512, 256).expect("the session mask code"),
+    )
+}
+
+pub fn norm_lookup_space_coded(
+    code: zkie_engine::pcs::request::code::CodeParams,
+    mask_code: zkie_engine::pcs::request::code::CodeParams,
+) -> LookupSpace {
     LookupSpace {
         bits_oracle: 9900,
         mask_oracle: 9901,
         bits_tree: 60980,
         mask_tree: 60981,
-        code: build_code_plan(17, 65536, 8192).expect("the session main code"),
-        mask_code: build_code_plan(17, 512, 256).expect("the session mask code"),
+        code,
+        mask_code,
     }
 }
 
 pub fn norm_rstd_space() -> RstdSpace {
+    norm_rstd_space_coded(
+        build_code_plan(17, 65536, 8192).expect("the session main code"),
+        build_code_plan(17, 512, 256).expect("the session mask code"),
+    )
+}
+
+pub fn norm_rstd_space_coded(
+    code: zkie_engine::pcs::request::code::CodeParams,
+    mask_code: zkie_engine::pcs::request::code::CodeParams,
+) -> RstdSpace {
     RstdSpace {
         bits_oracle: 9800,
         mask_oracle: 9801,
         bits_tree: 60900,
         mask_tree: 60901,
-        code: build_code_plan(17, 65536, 8192).expect("the session main code"),
-        mask_code: build_code_plan(17, 512, 256).expect("the session mask code"),
+        code,
+        mask_code,
     }
 }
 
@@ -1405,6 +1440,17 @@ pub fn build_norm_plan(
     Ok(plan)
 }
 
+/// The session codes of the gemma3 segment geometry.
+pub fn gemma3_segment_codes() -> Result<(
+    zkie_engine::pcs::request::code::CodeParams,
+    zkie_engine::pcs::request::code::CodeParams,
+)> {
+    Ok((
+        build_code_plan(19, 262_144, 8192)?,
+        build_code_plan(19, 512, 256)?,
+    ))
+}
+
 /// Builds the gemma3 norm plan at the production shape: the gain-only RMS
 /// form, the combined rstd table and the accepted output/lookup attachments.
 pub fn build_norm_plan_gemma3(
@@ -1413,19 +1459,20 @@ pub fn build_norm_plan_gemma3(
     metas: &[AssetTableMeta],
     x_rows: &[Vec<i64>],
 ) -> Result<NormPlan> {
-    let space = norm_segment_space(configuration);
+    let (code, mask_code) = gemma3_segment_codes()?;
+    let space = norm_segment_space_coded(configuration, code, mask_code);
     let mut plan = build_core_plan(&space, profile, x_rows)?;
     attach_params(&mut plan, param_identities_gemma3(metas)?)?;
     attach_rstd(
         &mut plan,
         &space,
-        &norm_rstd_space(),
+        &norm_rstd_space_coded(code, mask_code),
         zkie_models_gemma3::norm_profile::rstd_table_config(),
         Fp3::from_u64(65_536_000),
         zkie_models_gemma3::norm_profile::RSTD_VALUE_BOUND,
     )?;
     attach_output(&mut plan, profile, &space, &norm_output_groups())?;
-    attach_lookup(&mut plan, &space, &norm_lookup_space())?;
+    attach_lookup(&mut plan, &space, &norm_lookup_space_coded(code, mask_code))?;
     Ok(plan)
 }
 
@@ -1438,7 +1485,8 @@ pub fn build_norm_witness_gemma3(
     gain: &[i64],
     rstd: &[i64],
 ) -> Result<zkie_ops::proof::hidden_norm_psc::NormWitness> {
-    let space = norm_segment_space(configuration);
+    let (code, mask_code) = gemma3_segment_codes()?;
+    let space = norm_segment_space_coded(configuration, code, mask_code);
     let mut witness = build_core_witness(plan, profile, &space, x_rows, rstd)?;
     attach_params_witness(&mut witness, gain, None)?;
     attach_output_witness(&mut witness, plan, profile, gain, None, rstd)?;
@@ -1457,7 +1505,8 @@ pub fn build_norm_witness(
     bias: &[i64],
     rstd: &[i64],
 ) -> Result<zkie_ops::proof::hidden_norm_psc::NormWitness> {
-    let space = norm_segment_space(configuration);
+    let (code, mask_code) = gemma3_segment_codes()?;
+    let space = norm_segment_space_coded(configuration, code, mask_code);
     let mut witness = build_core_witness(plan, profile, &space, x_rows, rstd)?;
     attach_params_witness(&mut witness, gain, Some(bias))?;
     attach_output_witness(&mut witness, plan, profile, gain, Some(bias), rstd)?;
