@@ -134,6 +134,7 @@ pub fn segment_profile(
 ) -> zkie_core::error::Result<zkie_ops::proof::norm_segment::NormSegmentProfile> {
     Ok(zkie_ops::proof::norm_segment::NormSegmentProfile {
         positions,
+        mode: zkie_ops::proof::hidden_norm::NormMode::LayerNorm,
         hidden: HIDDEN_PAD,
         valid: VALID,
         columns: u64::from(HIDDEN_PAD),

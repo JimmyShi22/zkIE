@@ -34,7 +34,7 @@ use crate::proof::committed_psc::{
     get_psc_transcript, get_tree_plan, put_psc_transcript, put_tree_plan, CommittedPscGroup,
     PositionPscChallenges, PscTranscriptTags,
 };
-use crate::proof::hidden_norm::{NormCoreRow, NormShape};
+use crate::proof::hidden_norm::{NormCoreRow, NormMode, NormShape};
 use crate::proof::hidden_send_session::{
     get_column_opening, put_column_opening, SendSamples, WShape,
 };
@@ -997,6 +997,18 @@ pub(crate) fn rel_map(
                 }
             }
         }
+        26 => {
+            // RMS statistic: sum of the squared valid cells. Both factors
+            // read the committed x row, so the product map is x_i * x_i; the
+            // extra slot carries -sum on the left and one on the right.
+            for (index, value) in values.iter().take(valid).enumerate() {
+                let value = fp3_signed(*value as i128)?;
+                left[index] = value;
+                right[index] = value;
+            }
+            left[columns] = fp3_signed(-row.sum)?;
+            right[columns] = Fp3::ONE;
+        }
         _ => return Err(Error::InvalidConfig),
     }
     Ok((left, right))
@@ -1120,14 +1132,15 @@ fn fp3_signed(value: i128) -> Result<Fp3> {
 // sumcheck and the row binding.
 
 /// Version of the integrated norm plan and first message.
-pub const NORM_BIND_VERSION: u64 = 14;
+pub const NORM_BIND_VERSION: u64 = 15;
 
 /// The relation indices the bound core supports. The map construction of
 /// every relation is fixed by the relation index; the plan may list only
-/// relations whose row binding is implemented.
-pub const NORM_BOUND_RELATIONS: [usize; 26] = [
+/// relations whose row binding is implemented. Relation 26 is the RMS sum of
+/// squares; the layer relations 0 and 1 are not part of an RMS plan.
+pub const NORM_BOUND_RELATIONS: [usize; 27] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
-    25,
+    25, 26,
 ];
 
 /// One committed witness group of the integrated norm plan.
@@ -2026,6 +2039,9 @@ pub struct NormPlan {
     pub shape: NormShape,
     pub columns: u64,
     pub variables: usize,
+    /// The fixed normalization relation: the layer form centers by the mean,
+    /// the RMS form squares the raw valid cells.
+    pub mode: NormMode,
     /// The relation indices of the product-sumcheck instances, in transcript
     /// order. The plan fixes the domain; only the relations whose row binding
     /// is implemented may be listed.
@@ -2086,6 +2102,21 @@ impl NormPlan {
         {
             return Err(Error::UnsupportedPrimitive);
         }
+        if self.mode.is_rms() {
+            // The RMS form proves the sum of squares and the two rounding
+            // equations; the centering relations of the layer form must not
+            // be listed because their equations are false for this relation.
+            if self.relations.contains(&0)
+                || self.relations.contains(&1)
+                || !self.relations.contains(&2)
+                || !self.relations.contains(&3)
+                || !self.relations.contains(&26)
+            {
+                return Err(Error::InvalidConfig);
+            }
+        } else if self.relations.contains(&26) {
+            return Err(Error::InvalidConfig);
+        }
         if self.x.columns != self.columns
             || self.sum.columns != 1
             || self.squares.columns != 1
@@ -2129,12 +2160,13 @@ impl NormPlan {
             {
                 return Err(Error::InvalidConfig);
             }
-            if norm_no_wrap(
+            if norm_no_wrap_mode(
                 round.input_bound,
                 self.shape.valid,
                 &round.layout.widths,
                 round.layout.sum_offset,
                 round.layout.mean_offset,
+                self.mode,
             )
             .is_err()
             {
@@ -2481,6 +2513,7 @@ impl NormPlan {
         writer.put_u64(self.shape.valid as u64);
         writer.put_u64(self.columns);
         writer.put_u64(self.variables as u64);
+        writer.put_u64(self.mode.encode());
         writer.put_u64(self.relations.len() as u64);
         for relation in &self.relations {
             writer.put_u64(*relation as u64);
@@ -5571,6 +5604,27 @@ pub fn norm_no_wrap(
     sum_offset: u64,
     mean_offset: u64,
 ) -> Result<NormNoWrap> {
+    norm_no_wrap_mode(
+        input_bound,
+        valid,
+        widths,
+        sum_offset,
+        mean_offset,
+        NormMode::LayerNorm,
+    )
+}
+
+/// The relation bounds of one position for the selected normalization. The
+/// layer form sums the raw cells and squares the centered cells; the RMS form
+/// sums the squared cells and uses the same sum for the squares relation.
+pub fn norm_no_wrap_mode(
+    input_bound: u64,
+    valid: u32,
+    widths: &NormRoundWidths,
+    sum_offset: u64,
+    mean_offset: u64,
+    mode: NormMode,
+) -> Result<NormNoWrap> {
     if valid == 0 || widths.fault(valid).is_some() {
         return Err(Error::InvalidConfig);
     }
@@ -5590,15 +5644,26 @@ pub fn norm_no_wrap(
         .checked_add(mean_offset as u128)
         .ok_or(Error::ResourceLimit)?;
     let bu = digit_bound(widths.offset)?;
-    let relation_sum = d
-        .checked_mul(x)
-        .and_then(|value| value.checked_add(bv))
-        .ok_or(Error::ResourceLimit)?;
+    let square = x.checked_mul(x).ok_or(Error::ResourceLimit)?;
+    let relation_sum = if mode.is_rms() {
+        d.checked_mul(square)
+            .and_then(|value| value.checked_add(bv))
+            .ok_or(Error::ResourceLimit)?
+    } else {
+        d.checked_mul(x)
+            .and_then(|value| value.checked_add(bv))
+            .ok_or(Error::ResourceLimit)?
+    };
     let sum_x_q = x.checked_add(bq).ok_or(Error::ResourceLimit)?;
-    let relation_squares = d
-        .checked_mul(sum_x_q.checked_mul(sum_x_q).ok_or(Error::ResourceLimit)?)
-        .and_then(|value| value.checked_add(bs))
-        .ok_or(Error::ResourceLimit)?;
+    let relation_squares = if mode.is_rms() {
+        d.checked_mul(square)
+            .and_then(|value| value.checked_add(bs))
+            .ok_or(Error::ResourceLimit)?
+    } else {
+        d.checked_mul(sum_x_q.checked_mul(sum_x_q).ok_or(Error::ResourceLimit)?)
+            .and_then(|value| value.checked_add(bs))
+            .ok_or(Error::ResourceLimit)?
+    };
     let relation_mean = bv
         .checked_add(bq.checked_mul(d).ok_or(Error::ResourceLimit)?)
         .and_then(|value| value.checked_add(d))
@@ -6694,6 +6759,7 @@ mod tests {
             shape: psc.shape,
             columns: psc.columns,
             variables: psc.variables,
+            mode: NormMode::LayerNorm,
             relations: vec![0, 1, 2, 3],
             x: integrated_group(&psc.groups.x),
             x_roots: psc.groups.x.roots.clone(),
@@ -7236,6 +7302,7 @@ mod tests {
                 2,
                 3,
                 None,
+                NormMode::LayerNorm,
             )
             .unwrap();
             for relation in 0..NORM_OUTPUT_TAIL_RELATIONS {
@@ -7258,8 +7325,18 @@ mod tests {
         assert_eq!(output_tail_variables(columns).unwrap(), 7);
         let row = {
             let core = NormCoreRow::from_values(&[1, 2], 2).unwrap();
-            NormOutputRow::from_core(&core, &[1, 2, 0, 0], 100, &weight, &bias, 2, 3, None)
-                .unwrap()
+            NormOutputRow::from_core(
+                &core,
+                &[1, 2, 0, 0],
+                100,
+                &weight,
+                &bias,
+                2,
+                3,
+                None,
+                NormMode::LayerNorm,
+            )
+            .unwrap()
         };
         assert!(output_rel_map(&tail_plan, &row, columns, 3, NORM_OUTPUT_TAIL_RELATIONS).is_err());
     }

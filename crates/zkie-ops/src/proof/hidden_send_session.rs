@@ -22999,6 +22999,66 @@ fn norm_plain_rows(
                 right.target = word.output.ends[1].value.sub(&constant);
                 rows.push(right);
             }
+            26 => {
+                // The RMS statistic: both factors are the committed x row,
+                // the extra slot carries -sum on the left and one on the
+                // right. The left form is sum(eq_i x_i) - eq[columns] sum;
+                // the right form is sum(eq_i x_i) + eq[columns].
+                let sum_member = bat_of
+                    .get(
+                        &norm
+                            .sum
+                            .oracle_base
+                            .checked_add(position as u64)
+                            .ok_or(Error::ResourceLimit)?,
+                    )
+                    .ok_or(Error::StatementMismatch)?;
+                let mut left = BatRow::new(BatRowKind::Plain);
+                left.add_term(
+                    x_member.bat_oracle,
+                    BatPart::Main,
+                    scatter_message_coefficients(
+                        &norm.x.shape,
+                        norm.columns,
+                        &x_coefficients,
+                    )?,
+                );
+                left.add_term(
+                    sum_member.bat_oracle,
+                    BatPart::Main,
+                    scalar_message_coefficients(
+                        &norm.sum.shape,
+                        Fp3::ZERO.sub(&eq[columns]),
+                    )?,
+                );
+                left.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown0)?,
+                    word.output.ends[0].mask_scale,
+                );
+                left.target = word.output.ends[0].value;
+                rows.push(left);
+
+                let mut right = BatRow::new(BatRowKind::Plain);
+                right.add_term(
+                    x_member.bat_oracle,
+                    BatPart::Main,
+                    scatter_message_coefficients(
+                        &norm.x.shape,
+                        norm.columns,
+                        &x_coefficients,
+                    )?,
+                );
+                right.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown1)?,
+                    word.output.ends[1].mask_scale,
+                );
+                right.target = word.output.ends[1].value.sub(&eq[columns]);
+                rows.push(right);
+            }
             4 | 5 => {
                 let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
                 let round_member = round_member.ok_or(Error::StatementMismatch)?;
@@ -29283,6 +29343,7 @@ mod merged_tests {
                 .unwrap(),
             columns,
             variables: columns.trailing_zeros() as usize + 1,
+            mode: crate::proof::hidden_norm::NormMode::LayerNorm,
             relations: vec![0, 1, 2, 3],
             x: norm_group(columns, 80, 9000, 60000),
             x_roots: (0..POSITIONS)
@@ -29592,6 +29653,7 @@ mod merged_tests {
                 .unwrap(),
             columns,
             variables: columns.trailing_zeros() as usize + 1,
+            mode: crate::proof::hidden_norm::NormMode::LayerNorm,
             relations: vec![
                 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
                 23, 24, 25,
@@ -36160,6 +36222,7 @@ mod merged_tests {
                     HIDDEN as usize,
                     shift,
                     clamp,
+                    crate::proof::hidden_norm::NormMode::LayerNorm,
                 )
                 .unwrap(),
             );
