@@ -691,6 +691,7 @@ fn prove_norm_segment(
         &bias,
         &rstd,
     )?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_before_witness");
     let rstd_table = rstd_table_view(asset_root, "gpt2")?;
     check_authenticated_bounds(
         &norm_plan,
@@ -706,6 +707,7 @@ fn prove_norm_segment(
     let work_dir = segment_work_dir(output_dir)?;
     std::fs::create_dir_all(&work_dir).map_err(|_| Error::Io)?;
     let started = Instant::now();
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_before_table");
     let mut table = build_segment_table(
         asset_root,
         &asset,
@@ -715,6 +717,7 @@ fn prove_norm_segment(
         &work_dir,
     )?;
     let reader = table.reader().clone();
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_table");
     let specs = zkie_models_gpt2::plan::asset_specs();
     let spec = specs
         .iter()
@@ -755,6 +758,7 @@ fn prove_norm_segment(
         session_seed,
     )?;
     let mut params = build_param_tables("gpt2", commitment, tables)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_before_prove");
     let messages = prove_segment_bytes(
         &plan,
         &mut table,
@@ -763,6 +767,8 @@ fn prove_norm_segment(
         &mut params,
         rstd_table.as_ref(),
     )?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_prove");
+    zkie_ops::proof::hidden_send_session::mem_trace("gemma3_after_prove");
     let _ = std::fs::remove_dir_all(&work_dir);
     ctx.metrics
         .record("norm_segment_prove_ms", started.elapsed().as_millis() as u64);
@@ -823,6 +829,7 @@ fn prove_norm_segment_gemma3(
         &gain,
         &rstd,
     )?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gemma3_before_witness");
     let rstd_table = rstd_table_view(asset_root, "gemma3")?;
     check_authenticated_bounds(
         &norm_plan,
@@ -838,6 +845,7 @@ fn prove_norm_segment_gemma3(
     let work_dir = segment_work_dir(output_dir)?;
     std::fs::create_dir_all(&work_dir).map_err(|_| Error::Io)?;
     let started = Instant::now();
+    zkie_ops::proof::hidden_send_session::mem_trace("gpt2_before_table");
     let mut table = build_segment_table(
         asset_root,
         &asset,
@@ -847,6 +855,7 @@ fn prove_norm_segment_gemma3(
         &work_dir,
     )?;
     let reader = table.reader().clone();
+    zkie_ops::proof::hidden_send_session::mem_trace("gemma3_after_table");
     let spec = specs
         .iter()
         .find(|spec| spec.path == matmul.weight_path)
@@ -887,6 +896,7 @@ fn prove_norm_segment_gemma3(
         session_seed,
     )?;
     let mut params = build_param_tables("gemma3", commitment, tables)?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gemma3_before_prove");
     let messages = prove_segment_bytes(
         &plan,
         &mut table,
@@ -895,6 +905,7 @@ fn prove_norm_segment_gemma3(
         &mut params,
         rstd_table.as_ref(),
     )?;
+    zkie_ops::proof::hidden_send_session::mem_trace("gemma3_after_prove");
     let _ = std::fs::remove_dir_all(&work_dir);
     ctx.metrics
         .record("norm_segment_prove_ms", started.elapsed().as_millis() as u64);

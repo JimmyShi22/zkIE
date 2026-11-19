@@ -26343,6 +26343,25 @@ fn verify_second(
 // Public entries
 // ---------------------------------------------------------------------------
 
+/// Emits one memory checkpoint when `ZKIE_MEM_TRACE` is set. The values are
+/// the process resident size and peak, read from procfs, in KiB.
+pub fn mem_trace(label: &str) {
+    if std::env::var_os("ZKIE_MEM_TRACE").is_none() {
+        return;
+    }
+    let text = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
+    let mut rss = 0u64;
+    let mut hwm = 0u64;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("VmRSS:") {
+            rss = rest.trim().trim_end_matches(" kB").trim().parse().unwrap_or(0);
+        } else if let Some(rest) = line.strip_prefix("VmHWM:") {
+            hwm = rest.trim().trim_end_matches(" kB").trim().parse().unwrap_or(0);
+        }
+    }
+    eprintln!("MEMTRACE {label} rss_kib={rss} hwm_kib={hwm}");
+}
+
 fn prove_hidden_lin_inner(
     plan: &HiddenLinPlan,
     activation: Option<&CommittedActivation>,
@@ -26372,6 +26391,7 @@ fn prove_hidden_lin_inner(
         plan.closure.as_ref(),
     )?;
     drop(_profile_randomness);
+    mem_trace("after_randomness");
     let (first, first_seal, send_witness, chain_rows, _section_outputs) =
         prove_first(
             plan,
@@ -26386,6 +26406,7 @@ fn prove_hidden_lin_inner(
             true,
         )
         ?;
+    mem_trace("after_first");
     let first_query = *first_chain(plan, &reader)?.value();
     let shared = prove_shared(
         plan,
@@ -26398,6 +26419,7 @@ fn prove_hidden_lin_inner(
         send_witness.fold_charge.as_ref(),
     )
     ?;
+    mem_trace("after_shared");
     let own = prove_second(
         plan,
         &reader,
@@ -26413,6 +26435,7 @@ fn prove_hidden_lin_inner(
         &chain_rows,
     )
     ?;
+    mem_trace("after_second");
     let messages = HiddenLinMessages {
         first: first.clone(),
         first_seal,
@@ -26427,6 +26450,7 @@ fn prove_hidden_lin_inner(
         omega_message: shared.witness.omega_message,
         omega_tail: shared.witness.omega_tails.concat(),
     };
+    mem_trace("after_messages");
     let _ = (&mut coins, own.claims);
     Ok((messages, witness))
 }
