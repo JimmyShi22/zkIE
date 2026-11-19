@@ -554,8 +554,14 @@ fn prove_norm_segment(
         session_seed,
     )?;
     let mut params = build_param_tables(commitment, tables)?;
-    let messages =
-        prove_segment_bytes(&plan, &mut table, session_seed, &witness, &mut params)?;
+    let messages = prove_segment_bytes(
+        &plan,
+        &mut table,
+        session_seed,
+        &witness,
+        &mut params,
+        &rstd_table,
+    )?;
     let _ = std::fs::remove_dir_all(&work_dir);
     ctx.metrics
         .record("norm_segment_prove_ms", started.elapsed().as_millis() as u64);

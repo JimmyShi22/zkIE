@@ -24,8 +24,9 @@ use zkie_ops::proof::asset_table::{
 };
 use zkie_ops::proof::hidden_norm_psc::NormWitness;
 use zkie_ops::proof::hidden_send_session::{
-    prove_hidden_lin_hidden_with_norm_hd, verify_hidden_lin_hidden_with_rstd_table,
-    HiddenLinMessages, HiddenLinOutcome, HiddenLinPlan, HiddenTableProver, NormParamTableProver,
+    prove_hidden_lin_hidden_with_norm_hd_rstd_table,
+    verify_hidden_lin_hidden_with_rstd_table, HiddenLinMessages, HiddenLinOutcome, HiddenLinPlan,
+    HiddenTableProver, NormParamTableProver,
 };
 use zkie_ops::proof::lookup::LookupTable;
 use zkie_ops::proof::lookup_table::{PublicFileTable, RangeTable};
@@ -330,9 +331,16 @@ pub fn prove_segment_bytes(
     seed: Digest,
     witness: &NormWitness,
     params: &mut SegmentParamTables,
+    rstd_table: &dyn LookupTable,
 ) -> Result<Vec<u8>> {
-    let (messages, _witness) =
-        prove_hidden_lin_hidden_with_norm_hd(plan, table, seed, witness, Some(params))?;
+    let (messages, _witness) = prove_hidden_lin_hidden_with_norm_hd_rstd_table(
+        plan,
+        table,
+        seed,
+        witness,
+        rstd_table,
+        Some(params),
+    )?;
     messages.encode()
 }
 

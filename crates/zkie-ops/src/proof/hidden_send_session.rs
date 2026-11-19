@@ -23203,7 +23203,7 @@ fn norm_plain_rows(
                 for index in 0..width {
                     let entry = dense.get_mut(start + index).ok_or(Error::ShapeMismatch)?;
                     *entry = power.mul(&eq[index]);
-                    power = power.add(&power);
+                    power = power.mul(&Fp3::from_u64(256));
                 }
                 if let Some(slot) = value_slot {
                     let entry = dense.get_mut(slot).ok_or(Error::ShapeMismatch)?;
@@ -26417,6 +26417,37 @@ pub fn prove_hidden_lin_hidden_with_norm_and_rstd_table(
         Some(norm),
         Some(rstd_table),
         None,
+        None,
+    )
+}
+
+/// Proves the norm hidden-output chain with the frozen-table rstd view and
+/// the parameter tables. This is the NormHd form of the rstd-table prover:
+/// the prover reads the same frozen table the verifier checks.
+pub fn prove_hidden_lin_hidden_with_norm_hd_rstd_table(
+    plan: &HiddenLinPlan,
+    table: &mut dyn HiddenTableProver,
+    seed: Digest,
+    norm: &NormWitness,
+    rstd_table: &dyn crate::proof::lookup::LookupTable,
+    param_tables: Option<&mut dyn NormParamTableProver>,
+) -> Result<(HiddenLinMessages, HiddenLinWitness)> {
+    if !plan.weights.is_empty()
+        || plan.norm.is_none()
+        || !plan.send.activation_source.is_norm_hd()
+    {
+        return Err(Error::InvalidConfig);
+    }
+    prove_hidden_lin_inner(
+        plan,
+        None,
+        table,
+        None,
+        seed,
+        true,
+        Some(norm),
+        Some(rstd_table),
+        param_tables,
         None,
     )
 }

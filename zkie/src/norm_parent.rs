@@ -138,6 +138,31 @@ pub fn build_segment_plan(
         table_configuration,
     )?;
     let main_rows = w.main_rows;
+    // The shared FOLD's fold shape is derived from the shared member set:
+    // the committed table's GU and Omega members plus the two parameter
+    // claim members. The stage parameters must match that derived shape or
+    // the chain refuses the stage-0 handoff.
+    let shared_main_rows = {
+        let mut rows = main_rows.checked_add(1).ok_or(Error::ResourceLimit)?;
+        if let Some(params) = norm_plan.params.as_ref() {
+            if let Some(claim) = params.gain_claim.as_ref() {
+                rows = rows
+                    .checked_add(claim.gu.u.main_rows)
+                    .ok_or(Error::ResourceLimit)?;
+            }
+            if let Some(claim) = params.bias_claim.as_ref() {
+                rows = rows
+                    .checked_add(claim.gu.u.main_rows)
+                    .ok_or(Error::ResourceLimit)?;
+            }
+        }
+        rows
+    };
+    let shared_fold_k = if shared_main_rows <= 1 {
+        1
+    } else {
+        64 - (shared_main_rows - 1).leading_zeros()
+    };
     let proximity = HiddenProximityPlan {
         gu: zkie_engine::pcs::request::gu::GuShape {
             oracle: GU_ORACLE,
@@ -190,7 +215,7 @@ pub fn build_segment_plan(
             IoppStagePlan {
                 main: code,
                 mask: mask_code,
-                k: 2,
+                k: shared_fold_k,
                 h: 0,
                 positions: 2,
                 samples: 1,
@@ -251,6 +276,44 @@ pub fn build_segment_plan(
         },
         entries: MaskEntryAllocation::new(OUTPUT_HEAD_POSITIONS as u32)?,
     };
+    let index_rows = index_mask.tree_rows()?;
+    let norm_mask_rows = norm_plan
+        .mask
+        .as_ref()
+        .map(|mask| mask.mask_rows)
+        .unwrap_or(0);
+    let lookup_mask_rows = norm_plan
+        .lookup
+        .as_ref()
+        .map(|lookup| lookup.commit.mask_rows)
+        .unwrap_or(0);
+    let rstd_mask_rows = norm_plan
+        .rstd
+        .as_ref()
+        .map(|rstd| rstd.commit.mask_rows)
+        .unwrap_or(0);
+    let total_mask_rows = norm_mask_rows
+        .checked_add(lookup_mask_rows)
+        .and_then(|value| value.checked_add(rstd_mask_rows))
+        .ok_or(Error::ResourceLimit)?;
+    let own_mask_rows = zkie_ops::proof::hidden_norm_psc::norm_own_mask_rows(
+        index_rows,
+        total_mask_rows,
+    )?;
+    let own_h = own_mask_rows.trailing_zeros();
+    // The own two-stage chain is a derived quantity: the tree's planner
+    // fixes the stage-0 position/work pair and the last tail's row count from
+    // the real main/mask codes and the fold shape. The fixture constants are
+    // not used here.
+    let own_two_stage = zkie_ops::proof::proximity_planner::plan_own_two_stage(
+        code,
+        mask_code,
+        build_code_plan(17, OUTPUT_HEAD_COLUMNS as u64, 1)?,
+        build_code_plan(17, 16_384, 1)?,
+        14,
+        own_h,
+        252,
+    )?;
     let closure_width = 2 * (OUTPUT_HEAD_RANGE_BITS + 1) + OUTPUT_HEAD_SLACK_BITS;
     let bits_columns = (OUTPUT_HEAD_COLUMNS as u64)
         .checked_mul(closure_width as u64)
@@ -430,8 +493,26 @@ pub fn build_segment_plan(
         .checked_add(lookup_mask_rows)
         .and_then(|value| value.checked_add(rstd_mask_rows))
         .ok_or(Error::ResourceLimit)?;
-    plan.proximity.own_mask_tree.mask_rows =
-        zkie_ops::proof::hidden_norm_psc::norm_own_mask_rows(index_rows, total_mask_rows)?;
+    plan.proximity.own_mask_tree.mask_rows = own_mask_rows;
+    plan.proximity.own_base_positions = own_two_stage.last_positions;
+    plan.proximity.own_stages[0] = IoppStagePlan {
+        main: code,
+        mask: mask_code,
+        k: 14,
+        h: own_h,
+        positions: own_two_stage.stage_zero_positions,
+        samples: 1,
+        work_bits: own_two_stage.stage_zero_work_bits,
+    };
+    plan.proximity.own_stages[1] = IoppStagePlan {
+        main: build_code_plan(17, 65_536, own_two_stage.last_main_r)?,
+        mask: build_code_plan(17, 16_384, own_two_stage.last_mask_r)?,
+        k: 0,
+        h: 0,
+        positions: own_two_stage.last_positions,
+        samples: 1,
+        work_bits: 0,
+    };
     plan.validate()?;
     Ok(plan)
 }
