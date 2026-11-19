@@ -205,12 +205,15 @@ fn norm_segment_carrier_negatives() {
         // the authenticated trace; the activation identity must not match.
         let trace_bytes = fs::read(proof.join("proof.bin")).unwrap();
         let mut trace: SharedTrace = bincode::deserialize(&trace_bytes).unwrap();
-        let target = zkie_ops::op::OpCode::ProfileLayerNorm as u16;
+        let targets = [
+            zkie_ops::op::OpCode::ProfileLayerNorm as u16,
+            zkie_ops::op::OpCode::ProfileRmsNorm as u16,
+        ];
         let step = trace
             .steps
             .iter_mut()
             .rev()
-            .find(|step| step.message.opcode == target)
+            .find(|step| targets.contains(&step.message.opcode))
             .expect("the trace carries the final norm step");
         step.message.proof.outputs[0][0].values[0] =
             step.message.proof.outputs[0][0].values[0].wrapping_add(1);

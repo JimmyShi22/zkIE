@@ -1301,6 +1301,21 @@ pub fn check_authenticated_bounds(
         if value < 0 || value as u64 > rstd.value_bound {
             return Err(Error::BoundViolation);
         }
+        // The RMS form also checks the correlated pre-clamp bound on the
+        // authenticated row: every reachable x * rstd * gain cell stays
+        // inside the plan's bound.
+        if let Some(rms) = &plan.rms {
+            for (column, x) in row.iter().take(profile.valid as usize).enumerate() {
+                let image = (*x as i128)
+                    .checked_mul(value as i128)
+                    .and_then(|value| value.checked_mul(gain[column] as i128))
+                    .ok_or(Error::BoundViolation)?;
+                let magnitude = image.unsigned_abs();
+                if magnitude > rms.pre_bound as u128 {
+                    return Err(Error::BoundViolation);
+                }
+            }
+        }
     }
     Ok(())
 }
