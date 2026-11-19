@@ -742,7 +742,7 @@ impl NormOutputRow {
         values: &[i64],
         rstd: i64,
         weight: &[i64],
-        bias: &[i64],
+        bias: Option<&[i64]>,
         valid: usize,
         shift: u32,
         clamp: Option<(i64, i64)>,
@@ -751,7 +751,7 @@ impl NormOutputRow {
         if valid == 0
             || valid > values.len()
             || values.len() != weight.len()
-            || values.len() != bias.len()
+            || bias.is_some_and(|bias| values.len() != bias.len())
             || shift >= 63
         {
             return Err(Error::InvalidConfig);
@@ -795,8 +795,9 @@ impl NormOutputRow {
                 0
             };
             let (quotient, remainder, selector, shifted) = shift_round(image, shift)?;
+            let bias = bias.map_or(0i128, |bias| bias[column] as i128);
             let pre_clamp = shifted
-                .checked_add(bias[column] as i128)
+                .checked_add(bias)
                 .ok_or(Error::BoundViolation)?;
             let mut value = i64::try_from(pre_clamp).map_err(|_| Error::BoundViolation)?;
             if let Some((low, high)) = clamp {
@@ -821,7 +822,7 @@ impl NormOutputRow {
         core: &NormCoreRow,
         values: &[i64],
         weight: &[i64],
-        bias: &[i64],
+        bias: Option<&[i64]>,
         valid: usize,
         mode: NormMode,
     ) -> Result<()> {
@@ -840,9 +841,10 @@ impl NormOutputRow {
             return Err(Error::InvalidProof);
         }
         for column in 0..self.out.len() {
+            let bias = bias.map_or(0i128, |bias| bias[column] as i128);
             if self.broadcast[column] != self.rstd
                 || self.shifted[column] != self.quotient[column] + self.selector[column] as i128
-                || self.pre_clamp[column] != self.shifted[column] + bias[column] as i128
+                || self.pre_clamp[column] != self.shifted[column] + bias
             {
                 return Err(Error::InvalidProof);
             }
@@ -1181,7 +1183,7 @@ mod tests {
                 padded_row,
                 rstd,
                 &weight,
-                &bias,
+                Some(&bias),
                 valid,
                 shift,
                 clamp,
@@ -1192,7 +1194,7 @@ mod tests {
                 &core,
                 padded_row,
                 &weight,
-                &bias,
+                Some(&bias),
                 valid,
                 NormMode::LayerNorm,
             )
@@ -1218,7 +1220,7 @@ mod tests {
             &padded[0],
             100,
             &weight,
-            &bias,
+            Some(&bias),
             valid,
             shift,
             Some((5, 4)),
@@ -1238,7 +1240,7 @@ mod tests {
             &values,
             100,
             &weight,
-            &bias,
+            Some(&bias),
             2,
             3,
             None,
@@ -1249,32 +1251,32 @@ mod tests {
             &core,
             &values,
             &weight,
-            &bias,
+            Some(&bias),
             2,
             NormMode::LayerNorm,
         )
         .unwrap();
         let mut changed = tail.clone();
         changed.image[0] += 1;
-        assert!(changed.check(&core, &values, &weight, &bias, 2, NormMode::LayerNorm).is_err());
+        assert!(changed.check(&core, &values, &weight, Some(&bias), 2, NormMode::LayerNorm).is_err());
         let mut changed = tail.clone();
         changed.quotient[0] += 1;
-        assert!(changed.check(&core, &values, &weight, &bias, 2, NormMode::LayerNorm).is_err());
+        assert!(changed.check(&core, &values, &weight, Some(&bias), 2, NormMode::LayerNorm).is_err());
         let mut changed = tail.clone();
         changed.selector[1] = !changed.selector[1];
-        assert!(changed.check(&core, &values, &weight, &bias, 2, NormMode::LayerNorm).is_err());
+        assert!(changed.check(&core, &values, &weight, Some(&bias), 2, NormMode::LayerNorm).is_err());
         let mut changed = tail.clone();
         changed.out[3] -= 1;
-        assert!(changed.check(&core, &values, &weight, &bias, 2, NormMode::LayerNorm).is_err());
+        assert!(changed.check(&core, &values, &weight, Some(&bias), 2, NormMode::LayerNorm).is_err());
         let mut changed = tail.clone();
         changed.broadcast[0] = -100;
-        assert!(changed.check(&core, &values, &weight, &bias, 2, NormMode::LayerNorm).is_err());
+        assert!(changed.check(&core, &values, &weight, Some(&bias), 2, NormMode::LayerNorm).is_err());
         assert!(NormOutputRow::from_core(
             &core,
             &values,
             100,
             &weight,
-            &bias[..3],
+            Some(&bias[..3]),
             2,
             3,
             None,

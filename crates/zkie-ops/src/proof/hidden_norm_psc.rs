@@ -2275,7 +2275,15 @@ impl NormPlan {
         }
         if let Some(params) = &self.params {
             params.validate()?;
-            if params.gain.width != self.columns || params.bias.width != self.columns {
+            if params.gain.width != self.columns
+                || params
+                    .bias
+                    .as_ref()
+                    .is_some_and(|bias| bias.width != self.columns)
+            {
+                return Err(Error::InvalidConfig);
+            }
+            if self.mode.is_rms() && params.bias.is_some() {
                 return Err(Error::InvalidConfig);
             }
         }
@@ -2368,12 +2376,11 @@ impl NormPlan {
             .unsigned_abs()
             .max(params.gain.valid_min.unsigned_abs())
             as u128;
-        let bias = params
-            .bias
-            .valid_max
-            .unsigned_abs()
-            .max(params.bias.valid_min.unsigned_abs())
-            as u128;
+        let bias = params.bias.as_ref().map_or(0u128, |bias| {
+            bias.valid_max
+                .unsigned_abs()
+                .max(bias.valid_min.unsigned_abs()) as u128
+        });
         let centered = (round.input_bound as u128)
             .checked_mul(2)
             .ok_or(Error::ResourceLimit)?;
@@ -4271,7 +4278,7 @@ impl NormOutputMessage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormParamWitness {
     pub gain: Vec<i64>,
-    pub bias: Vec<i64>,
+    pub bias: Option<Vec<i64>>,
     pub gain_claim: Option<NormParamClaimWitness>,
     pub bias_claim: Option<NormParamClaimWitness>,
 }
@@ -4729,16 +4736,19 @@ impl NormParamMessage {
         let gain = NormParamClaimMessage::decode(gain_claim, &plan.gain, reader.get_bytes()?)?;
         let bias = match reader.get_u64()? {
             0 => {
-                if plan.bias.reader != plan.gain.reader {
-                    return Err(Error::ShapeMismatch);
+                match &plan.bias {
+                    None => {}
+                    Some(bias) if bias.reader == plan.gain.reader => {}
+                    Some(_) => return Err(Error::ShapeMismatch),
                 }
                 None
             }
             1 => {
+                let bias_identity = plan.bias.as_ref().ok_or(Error::ShapeMismatch)?;
                 let bias_claim = plan.bias_claim.as_ref().ok_or(Error::ShapeMismatch)?;
                 Some(NormParamClaimMessage::decode(
                     bias_claim,
-                    &plan.bias,
+                    bias_identity,
                     reader.get_bytes()?,
                 )?)
             }
@@ -4751,13 +4761,14 @@ impl NormParamMessage {
     pub fn check(&self, plan: &NormParamTablesPlan) -> Result<()> {
         let gain_claim = plan.gain_claim.as_ref().ok_or(Error::ShapeMismatch)?;
         self.gain.check(gain_claim, &plan.gain)?;
-        match (&self.bias, plan.bias.reader == plan.gain.reader) {
-            (None, true) => {}
-            (Some(bias), false) => {
+        match (&self.bias, &plan.bias) {
+            (None, None) => {}
+            (None, Some(bias)) if bias.reader == plan.gain.reader => {}
+            (Some(bias_message), Some(bias)) => {
                 let bias_claim = plan.bias_claim.as_ref().ok_or(Error::ShapeMismatch)?;
-                bias.check(bias_claim, &plan.bias)?;
+                bias_message.check(bias_claim, bias)?;
             }
-            _ => return Err(Error::ShapeMismatch),
+            (None, Some(_)) | (Some(_), None) => return Err(Error::ShapeMismatch),
         }
         Ok(())
     }
@@ -6839,7 +6850,7 @@ mod tests {
         let digest = plan.digest();
         plan.params = Some(NormParamTablesPlan {
             gain: identity(NormParamKind::Gain, 0),
-            bias: identity(NormParamKind::Bias, 1),
+            bias: Some(identity(NormParamKind::Bias, 1)),
             column_draws: 2,
             seed_budget: 1,
             gain_claim: None,
@@ -6853,11 +6864,11 @@ mod tests {
         assert!(changed.validate().is_err());
 
         let mut changed = plan.clone();
-        changed.params.as_mut().unwrap().bias.kind = NormParamKind::Gain;
+        changed.params.as_mut().unwrap().bias.as_mut().unwrap().kind = NormParamKind::Gain;
         assert!(changed.validate().is_err());
 
         let mut changed = plan;
-        changed.params.as_mut().unwrap().bias.row = 0;
+        changed.params.as_mut().unwrap().bias.as_mut().unwrap().row = 0;
         assert!(changed.validate().is_err());
     }
 
@@ -6955,7 +6966,7 @@ mod tests {
         };
         plan.params = Some(NormParamTablesPlan {
             gain: identity(NormParamKind::Gain, reader(0x32, 0x31)),
-            bias: identity(NormParamKind::Bias, reader(0x37, 0x38)),
+            bias: Some(identity(NormParamKind::Bias, reader(0x37, 0x38))),
             column_draws: 2,
             seed_budget: 1,
             gain_claim: None,
@@ -7298,7 +7309,7 @@ mod tests {
                 &padded,
                 100,
                 &weight,
-                &bias,
+                Some(&bias),
                 2,
                 3,
                 None,
@@ -7330,7 +7341,7 @@ mod tests {
                 &[1, 2, 0, 0],
                 100,
                 &weight,
-                &bias,
+                Some(&bias),
                 2,
                 3,
                 None,
@@ -7392,7 +7403,7 @@ mod tests {
         let bias = identity(NormParamKind::Bias, reader(0x37, 0x38));
         plan.params = Some(NormParamTablesPlan {
             gain: gain.clone(),
-            bias: bias.clone(),
+            bias: Some(bias.clone()),
             column_draws: 2,
             seed_budget: 1,
             gain_claim: Some(claim_gu(NormParamKind::Gain, gain.reader.shape)),
@@ -7440,8 +7451,9 @@ mod tests {
         .is_err());
 
         let mut packed = plan.clone();
-        packed.params.as_mut().unwrap().bias.reader = packed.params.as_ref().unwrap().gain.reader.clone();
-        packed.params.as_mut().unwrap().bias.row = 1;
+        packed.params.as_mut().unwrap().bias.as_mut().unwrap().reader =
+            packed.params.as_ref().unwrap().gain.reader.clone();
+        packed.params.as_mut().unwrap().bias.as_mut().unwrap().row = 0;
         assert!(packed.validate().is_err());
 
         let mut missing = params;

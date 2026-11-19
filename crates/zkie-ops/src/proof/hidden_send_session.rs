@@ -16549,7 +16549,10 @@ fn norm_param_claim_inputs(
     });
     if let Some(bias) = &message.bias {
         inputs.push(NormParamClaimInput {
-            identity: params_plan.bias.clone(),
+            identity: params_plan
+                .bias
+                .clone()
+                .ok_or(Error::ShapeMismatch)?,
             claim: params_plan
                 .bias_claim
                 .clone()
@@ -19999,7 +20002,12 @@ fn prove_norm_first(
         (Some(params_plan), Some(tables)) => {
             let width = usize::try_from(norm.columns).map_err(|_| Error::ResourceLimit)?;
             let values = witness.params.as_ref().ok_or(Error::ShapeMismatch)?;
-            if values.gain.len() != width || values.bias.len() != width {
+            if values.gain.len() != width
+                || values
+                    .bias
+                    .as_ref()
+                    .is_some_and(|bias| bias.len() != width)
+            {
                 return Err(Error::ShapeMismatch);
             }
             let gain_claim = params_plan
@@ -20017,26 +20025,28 @@ fn prove_norm_first(
                 NORM_PARAM_GAIN_ANSWER_TAG,
                 NORM_PARAM_GAIN_POSITION_TAG,
             )?;
-            let bias = if params_plan.bias.reader == params_plan.gain.reader {
-                None
-            } else {
-                let bias_claim = params_plan
-                    .bias_claim
-                    .as_ref()
-                    .ok_or(Error::ShapeMismatch)?;
-                let (bias, bias_material) = prove_norm_param_claim(
-                    chain,
-                    &params_plan.bias,
-                    bias_claim,
-                    NormParamKind::Bias,
-                    &mut *tables,
-                    seed,
-                    NORM_PARAM_BIAS_ROOT_TAG,
-                    NORM_PARAM_BIAS_ANSWER_TAG,
-                    NORM_PARAM_BIAS_POSITION_TAG,
-                )?;
-                param_claims = Some((gain_material.clone(), Some(bias_material)));
-                Some(bias)
+            let bias = match &params_plan.bias {
+                Some(bias_identity) if bias_identity.reader != params_plan.gain.reader => {
+                    let bias_claim = params_plan
+                        .bias_claim
+                        .as_ref()
+                        .ok_or(Error::ShapeMismatch)?;
+                    let (bias, bias_material) = prove_norm_param_claim(
+                        chain,
+                        bias_identity,
+                        bias_claim,
+                        NormParamKind::Bias,
+                        &mut *tables,
+                        seed,
+                        NORM_PARAM_BIAS_ROOT_TAG,
+                        NORM_PARAM_BIAS_ANSWER_TAG,
+                        NORM_PARAM_BIAS_POSITION_TAG,
+                    )?;
+                    param_claims = Some((gain_material.clone(), Some(bias_material)));
+                    Some(bias)
+                }
+                Some(_) => None,
+                None => None,
             };
             if param_claims.is_none() {
                 param_claims = Some((gain_material, None));
@@ -20631,13 +20641,17 @@ fn verify_norm_first(
                 NORM_PARAM_GAIN_POSITION_TAG,
             )?;
             if let Some(bias) = &params.bias {
+                let bias_identity = params_plan
+                    .bias
+                    .as_ref()
+                    .ok_or(Error::ShapeMismatch)?;
                 let bias_claim = params_plan
                     .bias_claim
                     .as_ref()
                     .ok_or(Error::ShapeMismatch)?;
                 verify_norm_param_claim(
                     chain,
-                    &params_plan.bias,
+                    bias_identity,
                     bias_claim,
                     bias,
                     NORM_PARAM_BIAS_ROOT_TAG,
@@ -24403,10 +24417,7 @@ fn output_tail_bias_rows(
     let output_plan = norm.output.as_ref().ok_or(Error::InvalidConfig)?;
     let tail_plan = output_plan.tail.as_ref().ok_or(Error::InvalidConfig)?;
     let params_plan = norm.params.as_ref().ok_or(Error::InvalidConfig)?;
-    let bias_claim = params_plan
-        .bias_claim
-        .as_ref()
-        .ok_or(Error::InvalidConfig)?;
+    let bias_claim = params_plan.bias_claim.as_ref();
     let positions = norm.shape.positions as usize;
     let columns = usize::try_from(norm.columns).map_err(|_| Error::ResourceLimit)?;
     let slots = tail_plan.slots()?;
@@ -24438,12 +24449,17 @@ fn output_tail_bias_rows(
     };
     let target = field(half_of(tail_plan.widths.pre_clamp)?)?
         .sub(&field(half_of(tail_plan.widths.shifted)?)?);
-    let bias_coefficients =
-        norm_param_eval_coefficients(&bias_claim.gu, norm.columns, point)?;
-    let negated: Vec<Fp3> = bias_coefficients
-        .iter()
-        .map(|value| Fp3::ZERO.sub(value))
-        .collect();
+    let bias_coefficients = match bias_claim {
+        Some(claim) => Some(norm_param_eval_coefficients(
+            &claim.gu,
+            norm.columns,
+            point,
+        )?),
+        None => None,
+    };
+    let negated: Option<Vec<Fp3>> = bias_coefficients
+        .as_ref()
+        .map(|values| values.iter().map(|value| Fp3::ZERO.sub(value)).collect());
     let mut bat_of = std::collections::HashMap::new();
     for member in members {
         bat_of.insert(member.source_oracle, member);
@@ -24454,7 +24470,10 @@ fn output_tail_bias_rows(
             .copied()
             .ok_or(Error::StatementMismatch)
     };
-    let bias_member = member_for(bias_claim.gu.oracle)?;
+    let bias_member = match bias_claim {
+        Some(claim) => Some(member_for(claim.gu.oracle)?),
+        None => None,
+    };
     let mut rows = Vec::with_capacity(positions);
     for position in 0..positions {
         let tail_member = member_for(tail_plan.group.oracle_base + position as u64)?;
@@ -24477,7 +24496,9 @@ fn output_tail_bias_rows(
         }
         let mut row = BatRow::new(BatRowKind::Plain);
         row.add_term(tail_member.bat_oracle, BatPart::Main, coefficients);
-        row.add_term(bias_member.bat_oracle, BatPart::Main, negated.clone());
+        if let (Some(bias_member), Some(negated)) = (bias_member, &negated) {
+            row.add_term(bias_member.bat_oracle, BatPart::Main, negated.clone());
+        }
         row.target = target;
         rows.push(row);
     }
@@ -24497,10 +24518,7 @@ fn output_tail_padding_rows(
     let output_plan = norm.output.as_ref().ok_or(Error::InvalidConfig)?;
     let tail_plan = output_plan.tail.as_ref().ok_or(Error::InvalidConfig)?;
     let params_plan = norm.params.as_ref().ok_or(Error::InvalidConfig)?;
-    let bias_claim = params_plan
-        .bias_claim
-        .as_ref()
-        .ok_or(Error::InvalidConfig)?;
+    let bias_claim = params_plan.bias_claim.as_ref();
     let positions = norm.shape.positions as usize;
     let columns = usize::try_from(norm.columns).map_err(|_| Error::ResourceLimit)?;
     let valid = norm.shape.valid as usize;
@@ -24535,7 +24553,10 @@ fn output_tail_padding_rows(
             .copied()
             .ok_or(Error::StatementMismatch)
     };
-    let bias_member = member_for(bias_claim.gu.oracle)?;
+    let bias_member = match bias_claim {
+        Some(claim) => Some(member_for(claim.gu.oracle)?),
+        None => None,
+    };
     let mut rows = Vec::with_capacity(positions * (columns - valid));
     for position in 0..positions {
         let tail_member = member_for(tail_plan.group.oracle_base + position as u64)?;
@@ -24550,21 +24571,23 @@ fn output_tail_padding_rows(
                 coefficients[base + digit] = power;
                 power = power.mul(&Fp3::from_u64(256));
             }
-            let mut unit = vec![Fp3::ZERO; bits];
-            for bit in 0..bits {
-                if (column >> bit) & 1 == 1 {
-                    unit[bit] = Fp3::ONE;
-                }
-            }
-            let bias_coefficients =
-                norm_param_eval_coefficients(&bias_claim.gu, norm.columns, &unit)?;
-            let negated: Vec<Fp3> = bias_coefficients
-                .iter()
-                .map(|value| Fp3::ZERO.sub(value))
-                .collect();
             let mut row = BatRow::new(BatRowKind::Plain);
             row.add_term(tail_member.bat_oracle, BatPart::Main, coefficients);
-            row.add_term(bias_member.bat_oracle, BatPart::Main, negated);
+            if let (Some(claim), Some(bias_member)) = (bias_claim, bias_member) {
+                let mut unit = vec![Fp3::ZERO; bits];
+                for bit in 0..bits {
+                    if (column >> bit) & 1 == 1 {
+                        unit[bit] = Fp3::ONE;
+                    }
+                }
+                let bias_coefficients =
+                    norm_param_eval_coefficients(&claim.gu, norm.columns, &unit)?;
+                let negated: Vec<Fp3> = bias_coefficients
+                    .iter()
+                    .map(|value| Fp3::ZERO.sub(value))
+                    .collect();
+                row.add_term(bias_member.bat_oracle, BatPart::Main, negated);
+            }
             row.target = target;
             rows.push(row);
         }
@@ -30043,13 +30066,13 @@ mod merged_tests {
                 bias_identity.reader.shape,
             )),
             gain: gain_identity,
-            bias: bias_identity,
+            bias: Some(bias_identity),
             column_draws: 2,
             seed_budget: 1,
         });
         witness.params = Some(NormParamWitness {
             gain: gain_values,
-            bias: bias_values,
+            bias: Some(bias_values),
             gain_claim: None,
             bias_claim: None,
         });
@@ -36218,7 +36241,7 @@ mod merged_tests {
                     &padded,
                     100,
                     &gain,
-                    &bias,
+                    Some(&bias),
                     HIDDEN as usize,
                     shift,
                     clamp,
