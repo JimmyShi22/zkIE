@@ -2290,4 +2290,16 @@ mod streaming_tests {
             Err(Error::ResourceLimit)
         ));
     }
+
+    #[test]
+    fn a_memory_cap_below_the_stored_buffers_is_rejected() {
+        let (shape, configuration, messages, tails, salts) = fixture();
+        let mut source = VecSource { messages, tails };
+        let mut store = MemoryRowStore::new(shape.rows(), shape.code.n()).expect("store");
+        assert!(matches!(
+            commit_table_stored(&mut source, &mut store, shape, configuration, &salts, 2, 1),
+            Err(Error::ResourceLimit)
+        ));
+        store.cleanup().expect("cleanup");
+    }
 }
