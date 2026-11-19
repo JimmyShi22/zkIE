@@ -324,7 +324,7 @@ pub fn build_core_plan(
         (0..26).collect()
     };
     let round_layout =
-        NormRoundLayout::new(profile.round_widths, profile.valid, profile.sum_offset, profile.mean_offset)?;
+        NormRoundLayout::new(profile.round_widths, profile.valid, profile.sum_offset, profile.mean_offset)?.with_mode(profile.mode);
     let rms_widths = if profile.mode.is_rms() {
         Some(crate::proof::rms_limbs::RmsLimbWidths::derive(
             profile.input_bound,
