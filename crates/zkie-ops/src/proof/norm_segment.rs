@@ -319,7 +319,7 @@ pub fn build_core_plan(
     let columns = profile.columns;
     let variables = columns.trailing_zeros() as usize + 1;
     let relations: Vec<usize> = if profile.mode.is_rms() {
-        (16..=25).chain(26..=94).collect()
+        (16..=25).chain(26..=95).collect()
     } else {
         (0..26).collect()
     };
@@ -1485,7 +1485,7 @@ mod tests {
         let mut plan = build_core_plan(&space(), &profile, &rows).unwrap();
         assert!(plan.rms.is_some());
         assert!(plan.relations.contains(&26));
-        assert!(plan.relations.contains(&94));
+        assert!(plan.relations.contains(&95));
         assert!(plan.round.as_ref().unwrap().layout.rms.is_some());
         let rstd = vec![64i64, 64];
         let rms = plan.rms.as_ref().unwrap();

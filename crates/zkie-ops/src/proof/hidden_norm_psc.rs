@@ -821,6 +821,12 @@ pub fn rms_relation_terms(
             terms.push((slots.q_digits + 8, 1));
             terms.push((slots.q_digits + 9, 1));
         }
+        95 => {
+            // q7 + slack = 31 forces the mean below 2^61.
+            terms.push((slots.q_digits + 7, 1));
+            terms.push((slots.mean_top_slack, 1));
+            constant = -31;
+        }
         _ => return Err(Error::UnsupportedPrimitive),
     }
     Ok((terms, constant))
@@ -862,6 +868,8 @@ pub(crate) fn rms_slot_value(
         row.division_carries[slot - slots.division_carries] as i128
     } else if slot >= slots.division_slack && slot < slots.division_slack + 10 {
         row.division_slack[slot - slots.division_slack] as i128
+    } else if slot == slots.mean_top_slack {
+        row.mean_top_slack as i128
     } else {
         return Err(Error::InvalidIndex);
     };
@@ -1168,7 +1176,7 @@ pub(crate) fn rel_map(
             left[columns] = fp3_signed(-value)?;
             right[columns] = Fp3::ONE;
         }
-        33..=72 | 73..=92 | 94 => {
+        33..=72 | 73..=92 | 94..=95 => {
             let round = round.ok_or(Error::InvalidConfig)?;
             let rms_slots = round.layout.rms.ok_or(Error::InvalidConfig)?;
             let limb = row.rms.as_ref().ok_or(Error::InvalidConfig)?;
@@ -1364,12 +1372,12 @@ pub const NORM_BIND_VERSION: u64 = 15;
 /// every relation is fixed by the relation index; the plan may list only
 /// relations whose row binding is implemented. Relation 26 is the RMS sum of
 /// squares; the layer relations 0 and 1 are not part of an RMS plan.
-pub const NORM_BOUND_RELATIONS: [usize; 95] = [
+pub const NORM_BOUND_RELATIONS: [usize; 96] = [
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
     25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46,
     47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63, 64, 65, 66, 67, 68,
     69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 90,
-    91, 92, 93, 94,
+    91, 92, 93, 94, 95,
 ];
 
 /// One committed witness group of the integrated norm plan.
@@ -2353,7 +2361,7 @@ impl NormPlan {
             // rows; the layer relations 0..15 are not part of its plan.
             if self.relations.iter().any(|relation| *relation < 16)
                 || !(16..=25).all(|relation| self.relations.contains(&relation))
-                || !(26..=94).all(|relation| self.relations.contains(&relation))
+                || !(26..=95).all(|relation| self.relations.contains(&relation))
             {
                 return Err(Error::InvalidConfig);
             }
@@ -2581,6 +2589,12 @@ impl NormPlan {
                 {
                     return Err(Error::InvalidConfig);
                 }
+                norm_rms_no_wrap(
+                    round.input_bound,
+                    self.shape.valid,
+                    &rms.widths,
+                    rms.mean_bound,
+                )?;
             }
             (None, false) => {}
             _ => return Err(Error::InvalidConfig),
@@ -5579,6 +5593,7 @@ pub struct RmsRoundSlots {
     pub q_digits: usize,
     pub division_carries: usize,
     pub division_slack: usize,
+    pub mean_top_slack: usize,
     pub total: usize,
 }
 
@@ -5605,6 +5620,7 @@ impl RmsRoundSlots {
         let q_digits = take(10);
         let division_carries = take(10);
         let division_slack = take(10);
+        let mean_top_slack = take(1);
         Self {
             first_divisor,
             second_divisor,
@@ -5621,6 +5637,7 @@ impl RmsRoundSlots {
             q_digits,
             division_carries,
             division_slack,
+            mean_top_slack,
             total: next,
         }
     }
@@ -6077,6 +6094,7 @@ impl NormRoundLayout {
                 &mut values[slots.division_slack..slots.division_slack + 10],
                 &rms.division_slack,
             )?;
+            values[slots.mean_top_slack] = Fp3::from_u64(u64::from(rms.mean_top_slack));
         }
         Ok(values)
     }
@@ -6107,6 +6125,73 @@ fn write_digits(slot: &mut [Fp3], digits: &[u8]) -> Result<()> {
     }
     for (target, digit) in slot.iter_mut().zip(digits) {
         *target = Fp3::from_u64(*digit as u64);
+    }
+    Ok(())
+}
+
+/// The plan-level no-wrap bounds of the multi-limb RMS form. Every relation
+/// term stays below the field half range, the two-half mean reconstruction
+/// stays below it under `mean_bound`, and the rsqrt relations are rederived
+/// with the same mean bound instead of the old single-element variance
+/// capacity.
+pub fn norm_rms_no_wrap(
+    input_bound: u64,
+    valid: u32,
+    widths: &crate::proof::rms_limbs::RmsLimbWidths,
+    mean_bound: u64,
+) -> Result<()> {
+    use crate::proof::rms_limbs::{CROSS_OFFSET, LIMB_BASE, LOW_BOUND};
+    if input_bound == 0 || valid == 0 || mean_bound == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    widths.validate()?;
+    let x = input_bound as u128;
+    let d = valid as u128;
+    let low = LOW_BOUND as u128;
+    let high = (x + low - 1) / LIMB_BASE as u128;
+    let s_ll = d
+        .checked_mul(low.checked_mul(low).ok_or(Error::ResourceLimit)?)
+        .ok_or(Error::ResourceLimit)?;
+    let s_lh = d
+        .checked_mul(low.checked_mul(high).ok_or(Error::ResourceLimit)?)
+        .ok_or(Error::ResourceLimit)?;
+    let s_hh = d
+        .checked_mul(high.checked_mul(high).ok_or(Error::ResourceLimit)?)
+        .ok_or(Error::ResourceLimit)?;
+    let half = (MODULUS as u128) / 2;
+    for (value, width) in [(s_ll, widths.s_ll), (s_hh, widths.s_hh)] {
+        if value >= half || value >= 1u128 << (8 * width as u32) {
+            return Err(Error::InvalidConfig);
+        }
+    }
+    if s_lh
+        .checked_add(CROSS_OFFSET as u128)
+        .filter(|value| *value < half && *value < (1u128 << (8 * widths.s_lh as u32)))
+        .is_none()
+    {
+        return Err(Error::InvalidConfig);
+    }
+    // The mean reconstruction: m + lo + 2^32 hi, with m below mean_bound,
+    // lo below 2^32 and hi below 2^29 by the q7 slack relation.
+    let mean_reconstruction = (mean_bound as u128)
+        .checked_add((1u128 << 32) - 1)
+        .and_then(|value| {
+            value.checked_add(((1u128 << 32) - 1) * ((1u128 << 29) - 1))
+        })
+        .ok_or(Error::ResourceLimit)?;
+    if mean_reconstruction >= half {
+        return Err(Error::InvalidConfig);
+    }
+    // The rsqrt relations: raw = round(m / 2^18), index and raw digits keep
+    // their small capacities; the widest term is m + 2^17 + 2^18 raw.
+    let raw = ((mean_bound as u128) + (1u128 << 17)) / (1u128 << 18) + 1;
+    let rsqrt = (mean_bound as u128)
+        .checked_add(1u128 << 17)
+        .and_then(|value| value.checked_add((1u128 << 18) * raw))
+        .and_then(|value| value.checked_add(1u128 << 19))
+        .ok_or(Error::ResourceLimit)?;
+    if rsqrt >= half {
+        return Err(Error::InvalidConfig);
     }
     Ok(())
 }

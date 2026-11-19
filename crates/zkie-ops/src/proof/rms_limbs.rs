@@ -186,6 +186,9 @@ pub struct RmsLimbRow {
     pub mean_digits: Vec<u8>,
     pub division_carries: Vec<u8>,
     pub division_slack: Vec<u8>,
+    /// The complement of the top mean-square byte to 31, forcing the mean
+    /// below 2^61.
+    pub mean_top_slack: u8,
     /// The rounded mean square and the division remainder.
     pub mean_square: i128,
     pub remainder: u16,
@@ -306,6 +309,9 @@ impl RmsLimbRow {
                     .ok_or(Error::BoundViolation)
             })
             .collect::<Result<Vec<_>>>()?;
+        let mean_top_slack = 31u8
+            .checked_sub(*mean_digits.get(7).ok_or(Error::ShapeMismatch)?)
+            .ok_or(Error::BoundViolation)?;
         if digits_value(&mean_digits)? != mean {
             return Err(Error::InvalidProof);
         }
@@ -333,6 +339,7 @@ impl RmsLimbRow {
             mean_digits,
             division_carries,
             division_slack,
+            mean_top_slack,
             mean_square,
             remainder,
         })

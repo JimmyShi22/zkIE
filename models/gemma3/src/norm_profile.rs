@@ -213,6 +213,17 @@ mod tests {
     }
 
     #[test]
+    fn the_real_multi_limb_bounds_are_admitted() {
+        zkie_ops::proof::hidden_norm_psc::norm_rms_no_wrap(
+            INPUT_BOUND,
+            VALID,
+            &rms_widths().unwrap(),
+            MEAN_BOUND,
+        )
+        .expect("the real RMS no-wrap bounds");
+    }
+
+    #[test]
     fn the_rms_widths_cover_the_bound() {
         let widths = rms_widths().unwrap();
         assert_eq!(widths.s_ll, 5);

@@ -23303,7 +23303,7 @@ fn norm_plain_rows(
                 right.target = word.output.ends[1].value.sub(&constant);
                 rows.push(right);
             }
-            33..=72 | 73..=92 | 94 => {
+            33..=72 | 73..=92 | 94..=95 => {
                 let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
                 let round_member = round_member.ok_or(Error::StatementMismatch)?;
                 let rms_slots = round_plan.layout.rms.ok_or(Error::StatementMismatch)?;
