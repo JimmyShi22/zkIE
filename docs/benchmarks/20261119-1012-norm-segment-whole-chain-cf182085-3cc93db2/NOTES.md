@@ -94,3 +94,11 @@ segment checks rejected it. Raw outcomes in `negatives/negatives.json`.
   `20261119-0933-norm-segment-whole-chain-3cc93db2-d1812052/` kept its text
   traces; its gitignored proof binaries were deleted when this scheme started
   benching (recorded in that round's NOTES).
+
+## Acceptance record
+
+- 2026-11-19: the acceptance review approved this batch as delivered; the
+  stage is closed.
+- Follow-up evidence items (they do not block this close): coverage at 512
+  positions, and the retirement of the old step messages (the byte reduction
+  sub-step).
