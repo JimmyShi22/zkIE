@@ -1520,8 +1520,7 @@ pub fn build_norm_witness(
     bias: &[i64],
     rstd: &[i64],
 ) -> Result<zkie_ops::proof::hidden_norm_psc::NormWitness> {
-    let (code, mask_code) = gemma3_segment_codes()?;
-    let space = norm_segment_space_coded(configuration, code, mask_code);
+    let space = norm_segment_space(configuration);
     let mut witness = build_core_witness(plan, profile, &space, x_rows, rstd)?;
     attach_params_witness(&mut witness, gain, Some(bias))?;
     attach_output_witness(&mut witness, plan, profile, gain, Some(bias), rstd)?;
