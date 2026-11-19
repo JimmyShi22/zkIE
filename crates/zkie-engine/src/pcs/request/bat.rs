@@ -974,19 +974,30 @@ impl BatSession {
             kept: Vec::new(),
             target: Fp3::ZERO,
         };
-        let statement = &self.statement;
-        let layout = &input.layout;
         let mut scale = Fp3::ONE;
+        let mut chunk: Vec<(BatRow, Fp3)> = Vec::new();
+        let mut chunk_symbols = 0usize;
         {
+            let statement = &self.statement;
+            let layout = &input.layout;
             let mut sink = |row: BatRow| -> Result<()> {
-                combine_row_into(statement, layout, &mut out, &row, scale)?;
+                chunk_symbols += row_symbols(&row);
+                chunk.push((row, scale));
                 scale = scale.mul(&x);
+                if chunk_symbols >= STREAM_CHUNK_SYMBOLS {
+                    combine_chunk_into(statement, layout, &mut out, &chunk)?;
+                    chunk.clear();
+                    chunk_symbols = 0;
+                }
                 Ok(())
             };
             run(&mut sink)?;
         }
+        if !chunk.is_empty() {
+            combine_chunk_into(&self.statement, &input.layout, &mut out, &chunk)?;
+        }
         for row in input.rows.iter() {
-            combine_row_into(statement, layout, &mut out, row, scale)?;
+            combine_row_into(&self.statement, &input.layout, &mut out, row, scale)?;
             scale = scale.mul(&x);
         }
         Ok(out)
@@ -1244,21 +1255,35 @@ fn combine_with_min(
 /// are the same scatters the materialized combine applies; field addition is
 /// exact and order independent, so applying them row by row yields the same
 /// group row as the batched pass.
-fn combine_row_into(
+/// The row length in field symbols, used to bound the streaming chunk.
+fn row_symbols(row: &BatRow) -> usize {
+    let mut symbols = row.units.len() + row.runs.len() * 2;
+    for term in &row.terms {
+        symbols += term.values.len();
+    }
+    for run in &row.runs {
+        symbols += run.values.len();
+    }
+    for form in &row.forms {
+        symbols += form.values.len();
+    }
+    symbols
+}
+
+/// Streaming chunks flush at this many row symbols, so the buffer stays
+/// bounded while the place-major scatter keeps the full thread parallelism.
+const STREAM_CHUNK_SYMBOLS: usize = 1 << 25;
+
+/// Collects one row's scatters and applies the carried parts to the group
+/// row immediately. The returned scatters borrow the row values.
+fn collect_row_scatter<'a>(
     statement: &BatStatement,
     layout: &BatGroupLayout,
     out: &mut BatGroupRow,
-    row: &BatRow,
+    row: &'a BatRow,
     scale: Fp3,
-) -> Result<()> {
-    let group_bits = layout.group_row_bits(BatPart::Main);
-    let chunk_len = 1usize
-        .checked_shl(group_bits)
-        .ok_or(Error::ResourceLimit)?;
-    if chunk_len == 0 || out.main.len() % chunk_len != 0 {
-        return Err(Error::ShapeMismatch);
-    }
-    let mut row_scatter: Vec<MainScatter<'_>> = Vec::new();
+) -> Result<(Vec<MainScatter<'a>>, Vec<MainUnitScatter>)> {
+    let mut row_scatter: Vec<MainScatter<'a>> = Vec::new();
     let mut row_units: Vec<MainUnitScatter> = Vec::new();
     for term in &row.terms {
         let shape = statement.oracle(term.oracle)?.shape;
@@ -1396,8 +1421,18 @@ fn combine_row_into(
         }
     }
     out.target = out.target.add(&scale.mul(&row.target));
+    Ok((row_scatter, row_units))
+}
+
+/// Applies one row's scatters immediately, in row order.
+fn array_row_into(
+    out: &mut BatGroupRow,
+    chunk_len: usize,
+    row_scatter: &[MainScatter<'_>],
+    row_units: &[MainUnitScatter],
+) -> Result<()> {
     for (place, chunk) in out.main.chunks_mut(chunk_len).enumerate() {
-        for term in &row_scatter {
+        for term in row_scatter {
             if place >= term.places {
                 continue;
             }
@@ -1410,7 +1445,7 @@ fn combine_row_into(
                 *slot = slot.add(&term.scale.mul(value));
             }
         }
-        for unit in &row_units {
+        for unit in row_units {
             if unit.place != place {
                 continue;
             }
@@ -1418,6 +1453,89 @@ fn combine_row_into(
                 .get_mut(unit.first + unit.row)
                 .ok_or(Error::InvalidIndex)?;
             *slot = slot.add(&unit.scaled);
+        }
+    }
+    Ok(())
+}
+
+fn combine_row_into(
+    statement: &BatStatement,
+    layout: &BatGroupLayout,
+    out: &mut BatGroupRow,
+    row: &BatRow,
+    scale: Fp3,
+) -> Result<()> {
+    let chunk_len = 1usize
+        .checked_shl(layout.group_row_bits(BatPart::Main))
+        .ok_or(Error::ResourceLimit)?;
+    if chunk_len == 0 || out.main.len() % chunk_len != 0 {
+        return Err(Error::ShapeMismatch);
+    }
+    let (row_scatter, row_units) = collect_row_scatter(statement, layout, out, row, scale)?;
+    array_row_into(out, chunk_len, &row_scatter, &row_units)
+}
+
+/// Applies a bounded chunk of rows with the place-major parallel scatter the
+/// materialized combine uses, so the streaming path keeps the same thread
+/// parallelism without keeping every row resident.
+fn combine_chunk_into(
+    statement: &BatStatement,
+    layout: &BatGroupLayout,
+    out: &mut BatGroupRow,
+    chunk: &[(BatRow, Fp3)],
+) -> Result<()> {
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    let group_bits = layout.group_row_bits(BatPart::Main);
+    let chunk_len = 1usize
+        .checked_shl(group_bits)
+        .ok_or(Error::ResourceLimit)?;
+    if chunk_len == 0 || out.main.len() % chunk_len != 0 {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut scatter: Vec<Vec<MainScatter<'_>>> = Vec::with_capacity(chunk.len());
+    let mut units: Vec<Vec<MainUnitScatter>> = Vec::with_capacity(chunk.len());
+    for (row, scale) in chunk {
+        let (row_scatter, row_units) = collect_row_scatter(statement, layout, out, row, *scale)?;
+        scatter.push(row_scatter);
+        units.push(row_units);
+    }
+    let scatter_at = |place: usize, out_chunk: &mut [Fp3]| -> Result<()> {
+        for (row_scatter, row_units) in scatter.iter().zip(&units) {
+            for term in row_scatter {
+                if place >= term.places {
+                    continue;
+                }
+                let lo = place * term.rows_per_place;
+                let hi = lo + term.rows_per_place;
+                let target = out_chunk
+                    .get_mut(term.first..term.first + term.rows_per_place)
+                    .ok_or(Error::InvalidIndex)?;
+                for (slot, value) in target.iter_mut().zip(&term.values[lo..hi]) {
+                    *slot = slot.add(&term.scale.mul(value));
+                }
+            }
+            for unit in row_units {
+                if unit.place != place {
+                    continue;
+                }
+                let slot = out_chunk
+                    .get_mut(unit.first + unit.row)
+                    .ok_or(Error::InvalidIndex)?;
+                *slot = slot.add(&unit.scaled);
+            }
+        }
+        Ok(())
+    };
+    if out.main.len() >= COMBINE_PARALLEL_MIN && chunk_len <= out.main.len() {
+        out.main
+            .par_chunks_mut(chunk_len)
+            .enumerate()
+            .try_for_each(|(place, out_chunk)| scatter_at(place, out_chunk))?;
+    } else {
+        for (place, out_chunk) in out.main.chunks_mut(chunk_len).enumerate() {
+            scatter_at(place, out_chunk)?;
         }
     }
     Ok(())
@@ -2285,6 +2403,51 @@ mod tests {
             scale = scale.mul(&x);
         }
         assert_eq!(materialized, streamed);
+    }
+
+    #[test]
+    fn chunked_combine_matches_materialized_combine() {
+        let (mut st, group) = group_fixture();
+        let mut first = BatRow::new(BatRowKind::Plain);
+        first.target = Fp3::from_u64(5);
+        first.add_term(0, BatPart::Main, one_at(16, 5, 3));
+        first.add_unit(1, BatPart::Mask, 3, Fp3::from_u64(2));
+        first.add_run(2, BatPart::Main, 1, 2, vec![Fp3::from_u64(7), Fp3::from_u64(9)]);
+        first.add_form(0, one_at(16, 0, 1));
+        let mut second = BatRow::new(BatRowKind::Plain);
+        second.target = Fp3::from_u64(6);
+        second.add_term(1, BatPart::Main, one_at(32, 0, 5));
+        second.add_term(2, BatPart::Main, one_at(32, 9, 11));
+        st.add_row(group, first).unwrap();
+        st.add_row(group, second).unwrap();
+        let input = st.begin_run(group).unwrap();
+        let x = Fp3::from_u64(7);
+        let materialized = combine_with_min(&st, &input.layout, &input.rows, x, 0).unwrap();
+        let mut power = Fp3::ONE;
+        let chunk: Vec<(BatRow, Fp3)> = input
+            .rows
+            .iter()
+            .map(|row| {
+                let scaled = (row.clone(), power);
+                power = power.mul(&x);
+                scaled
+            })
+            .collect();
+        let mut chunked = BatGroupRow {
+            group,
+            main: vec![
+                Fp3::ZERO;
+                input.layout.group_len(BatPart::Main).unwrap()
+            ],
+            mask: vec![
+                Fp3::ZERO;
+                input.layout.group_len(BatPart::Mask).unwrap()
+            ],
+            kept: Vec::new(),
+            target: Fp3::ZERO,
+        };
+        combine_chunk_into(&st, &input.layout, &mut chunked, &chunk).unwrap();
+        assert_eq!(materialized, chunked);
     }
 
     #[test]
