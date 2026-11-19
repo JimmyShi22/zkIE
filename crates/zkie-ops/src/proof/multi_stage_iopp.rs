@@ -19,7 +19,7 @@ use std::sync::Arc;
 use zkie_core::error::{Error, Result};
 use zkie_core::types::Digest;
 use zkie_engine::pcs::request::chain::{Chain, KIND_ALGEBRAIC, KIND_EPSILON};
-use zkie_engine::pcs::request::code::CodeParams;
+use zkie_engine::pcs::request::code::{encode_row_fp3, CodeParams};
 use zkie_engine::pcs::request::cs_stage::{
     switch_tree_plan_multi_at, Cut, CutPart, SwitchTarget, SwitchedClaims, SwitchedRows,
 };
@@ -36,7 +36,7 @@ use zkie_engine::pcs::request::proximity::SingleRows;
 use zkie_engine::pcs::request::read::unique_sorted;
 use zkie_engine::pcs::request::relation::foldeq_weights;
 use zkie_engine::pcs::request::runtime_tree::{
-    MaskTree, MaskTreePlan, RuntimeTree, RuntimeTreeOpening, RuntimeTreePlan,
+    MaskTree, MaskTreePlan, RuntimePartRows, RuntimeTree, RuntimeTreeOpening, RuntimeTreePlan,
 };
 use zkie_engine::pcs::request::tree_book::TreeOpeningCount;
 use zkie_engine::primitives::codec::{CanonicalReader, CanonicalWriter};
@@ -331,6 +331,53 @@ impl IoppChain {
 pub struct IoppInitialMember<'a> {
     pub oracle: u64,
     pub tree: &'a RuntimeTree,
+    /// The committed rows of the member, when the session can supply them.
+    /// A member without a source is opened through the retained columns.
+    pub rows: Option<IoppRowsSource<'a>>,
+}
+
+/// The committed message rows of one initial switch member. The switch
+/// re-encodes them when it opens the member tree, so no codeword copy is
+/// retained between the commit and the opening.
+#[derive(Clone, Copy, Debug)]
+pub struct IoppRowsSource<'a> {
+    pub main: &'a [Vec<Fp3>],
+    pub main_tails: &'a [Vec<Fp3>],
+    pub main_code: CodeParams,
+    pub mask: &'a [Vec<Fp3>],
+    pub mask_tails: &'a [Vec<Fp3>],
+    pub mask_code: CodeParams,
+}
+
+impl IoppRowsSource<'_> {
+    fn parts(&self) -> Result<Vec<RuntimePartRows>> {
+        let mut parts = Vec::new();
+        if !self.main.is_empty() {
+            let mut codewords = Vec::with_capacity(self.main.len());
+            for (row, message) in self.main.iter().enumerate() {
+                let tail = self.main_tails.get(row).ok_or(Error::ShapeMismatch)?;
+                codewords.push(encode_row_fp3(&self.main_code, message, tail)?);
+            }
+            parts.push(RuntimePartRows {
+                main: codewords,
+                mask: Vec::new(),
+                main_deg: E_DEGREE as u32,
+            });
+        }
+        if !self.mask.is_empty() {
+            let mut codewords = Vec::with_capacity(self.mask.len());
+            for (row, message) in self.mask.iter().enumerate() {
+                let tail = self.mask_tails.get(row).ok_or(Error::ShapeMismatch)?;
+                codewords.push(encode_row_fp3(&self.mask_code, message, tail)?);
+            }
+            parts.push(RuntimePartRows {
+                main: Vec::new(),
+                mask: codewords,
+                main_deg: 1,
+            });
+        }
+        Ok(parts)
+    }
 }
 
 /// The hidden-session adapter for the switch stage's old-row commitments.
@@ -408,7 +455,11 @@ impl<'a> IoppSwitchMembers<'a> {
                             counted = true;
                         }
                     }
-                    openings.push(member.tree.open(positions)?);
+                    let opening = match member.rows {
+                        Some(rows) => member.tree.open_parts(positions, &rows.parts()?)?,
+                        None => member.tree.open(positions)?,
+                    };
+                    openings.push(opening);
                 }
                 if count.is_some() && !counted {
                     return Err(Error::StatementMismatch);
@@ -431,11 +482,13 @@ impl<'a> IoppSwitchMembers<'a> {
 /// The prover's stage 0 input: the BAT/FOLD handoff, its authentication basis,
 /// the folded rows, the member commitments and the two mask trees. The member
 /// trees are shared with the session's own commitments, never copied.
-pub struct IoppStageZero {
+pub struct IoppStageZero<'a> {
     pub handoff: FoldHandoff,
     pub basis: FoldBasis,
     pub rows: SingleRows,
     pub member_trees: Vec<Arc<RuntimeTree>>,
+    /// The committed rows of every initial member, parallel to the trees.
+    pub member_rows: Vec<Option<IoppRowsSource<'a>>>,
     pub old_mask_tree: Option<MaskTree>,
     pub fresh_tree: MaskTree,
     /// The owner-held per-tree opening count, when the session carries one.
@@ -717,7 +770,7 @@ struct StageFoldOutcome {
 pub fn prove_multi_stage_iopp(
     mut chain: Chain,
     plan: &IoppChain,
-    stage_zero: IoppStageZero,
+    stage_zero: IoppStageZero<'_>,
     switches: &[IoppSwitchPrivate],
     stage_folds: &[IoppStageFoldPrivate],
     base: &IoppBasePrivate,
@@ -731,6 +784,7 @@ pub fn prove_multi_stage_iopp(
         basis,
         rows,
         member_trees,
+        member_rows,
         old_mask_tree,
         fresh_tree,
         member_opening,
@@ -749,9 +803,11 @@ pub fn prove_multi_stage_iopp(
     let initial_members: Vec<IoppInitialMember> = member_trees
         .iter()
         .zip(basis.members.iter())
-        .map(|(tree, member)| IoppInitialMember {
+        .zip(member_rows.iter())
+        .map(|((tree, member), rows)| IoppInitialMember {
             oracle: member.oracle,
             tree: tree.as_ref(),
+            rows: *rows,
         })
         .collect();
     let mut handoff = handoff;
@@ -1923,7 +1979,7 @@ mod tests {
             .unwrap()
     }
 
-    fn stage_zero() -> (IoppStageZero, IoppVerifyStageZero) {
+    fn stage_zero() -> (IoppStageZero<'static>, IoppVerifyStageZero) {
         let shape = FoldShape {
             code: code(5, 8, 1),
             mask_code: code(5, 16, 1),
@@ -2050,6 +2106,7 @@ mod tests {
             basis: basis.clone(),
             rows,
             member_trees: vec![Arc::new(tree)],
+            member_rows: vec![None],
             old_mask_tree: Some(old_tree),
             fresh_tree,
             member_opening: None,
@@ -2064,7 +2121,7 @@ mod tests {
 
     /// Stage 0 whose members carry no mask rows: the trusted layout makes the
     /// old mask the zero vector, so no dedicated old mask tree is supplied.
-    fn zero_mask_stage_zero() -> (IoppStageZero, IoppVerifyStageZero) {
+    fn zero_mask_stage_zero() -> (IoppStageZero<'static>, IoppVerifyStageZero) {
         let shape = FoldShape {
             code: code(5, 8, 1),
             mask_code: code(5, 16, 1),
@@ -2210,6 +2267,7 @@ mod tests {
             basis: basis.clone(),
             rows,
             member_trees: vec![Arc::new(tree)],
+            member_rows: vec![None],
             old_mask_tree: None,
             fresh_tree,
             member_opening: None,
@@ -2319,7 +2377,7 @@ mod tests {
         .unwrap()
     }
 
-    fn h1_stage_zero() -> (IoppStageZero, IoppVerifyStageZero) {
+    fn h1_stage_zero() -> (IoppStageZero<'static>, IoppVerifyStageZero) {
         let shape = FoldShape {
             code: code(5, 8, 1),
             mask_code: code(5, 16, 1),
@@ -2475,6 +2533,7 @@ mod tests {
             basis: basis.clone(),
             rows,
             member_trees: vec![Arc::new(tree)],
+            member_rows: vec![None],
             old_mask_tree: None,
             fresh_tree,
             member_opening: None,

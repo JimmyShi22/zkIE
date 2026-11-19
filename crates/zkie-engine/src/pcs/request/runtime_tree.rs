@@ -193,6 +193,36 @@ impl MaskTree {
     }
 
     /// Open the complete leaves at `positions` (strictly increasing, unique).
+    /// The mask rows are re-encoded from their tails on demand; the tree keeps
+    /// no columns.
+    pub fn open_parts(
+        &self,
+        shape: &FoldShape,
+        positions: &[u64],
+        rows: &[Vec<Fp3>],
+        tails: &[Vec<Fp3>],
+    ) -> Result<RuntimeTreeOpening> {
+        if self.plan.log_n != shape.mask_code.log_n
+            || self.plan.mask_rows != shape.mask_rows()?
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        let mut codewords = Vec::with_capacity(rows.len());
+        for (row, tail) in rows.iter().zip(tails) {
+            codewords.push(encode_row_fp3(&shape.mask_code, row, tail)?);
+        }
+        self.inner.open_parts(
+            positions,
+            &[RuntimePartRows {
+                main: Vec::new(),
+                mask: codewords,
+                main_deg: 1,
+            }],
+        )
+    }
+
+    /// Opens the complete leaves of a mask tree committed with retained
+    /// columns.
     pub fn open(&self, positions: &[u64]) -> Result<RuntimeTreeOpening> {
         self.inner.open(positions)
     }
@@ -823,7 +853,10 @@ pub struct RuntimeTree {
     plan: RuntimeTreePlan,
     root: Digest,
     levels: Vec<Vec<Digest>>,
-    columns: Vec<Vec<Fp>>,
+    /// The materialized columns of a tree committed with `commit`. A released
+    /// tree keeps none and is opened through `open_parts`, which re-derives
+    /// the leaf values from the committed rows.
+    columns: Option<Vec<Vec<Fp>>>,
     salts: Vec<Vec<u8>>,
 }
 
@@ -833,87 +866,54 @@ impl RuntimeTree {
         parts: &[RuntimePartRows],
         salts: &[Vec<u8>],
     ) -> Result<Self> {
+        Self::commit_inner(plan, parts, salts, true)
+    }
+
+    /// Commits without retaining the materialized columns. The tree keeps the
+    /// levels, the root and the salts; `open_parts` re-derives each requested
+    /// column from the same committed rows, so the leaf values are unchanged.
+    /// A released tree is not opened through `open`: that path needs the
+    /// retained columns.
+    pub fn commit_released(
+        plan: RuntimeTreePlan,
+        parts: &[RuntimePartRows],
+        salts: &[Vec<u8>],
+    ) -> Result<Self> {
+        Self::commit_inner(plan, parts, salts, false)
+    }
+
+    fn commit_inner(
+        plan: RuntimeTreePlan,
+        parts: &[RuntimePartRows],
+        salts: &[Vec<u8>],
+        retain_columns: bool,
+    ) -> Result<Self> {
         let _profile_commit = crate::profile::Scope::new("runtime_tree.commit");
         if plan.fault().is_some() {
             return Err(Error::InvalidConfig);
         }
-        if parts.len() != plan.parts.len() || salts.len() as u64 != plan.columns() {
+        if salts.len() as u64 != plan.columns() {
             return Err(Error::ShapeMismatch);
         }
-        let columns = plan.columns();
-        let short_columns = 1u64 << plan.log_n_zk;
-        for (part, rows) in plan.parts.iter().zip(parts) {
-            if rows.main_deg != 1 && rows.main_deg != E_DEGREE as u32 {
-                return Err(Error::InvalidConfig);
-            }
-            if part.main_symbols == 0 {
-                if !rows.main.is_empty() {
-                    return Err(Error::ShapeMismatch);
-                }
-            } else {
-                if part.main_symbols % rows.main_deg as u64 != 0
-                    || rows.main.len() as u64 != part.main_symbols / rows.main_deg as u64
-                    || rows.main.iter().any(|row| row.len() as u64 != columns)
-                {
-                    return Err(Error::ShapeMismatch);
-                }
-                // A base-field row carries one coordinate per element. Two
-                // different extension-field inputs must not collapse to the
-                // same commitment, so a non-zero high coordinate is rejected
-                // rather than dropped.
-                if rows.main_deg == 1
-                    && rows
-                        .main
-                        .iter()
-                        .flatten()
-                        .any(|element| element.c[1] != Fp::ZERO || element.c[2] != Fp::ZERO)
-                {
-                    return Err(Error::ShapeMismatch);
-                }
-            }
-            if part.mask_symbols == 0 {
-                if !rows.mask.is_empty() {
-                    return Err(Error::ShapeMismatch);
-                }
-            } else {
-                if part.mask_symbols % E_DEGREE as u64 != 0
-                    || rows.mask.len() as u64 != part.mask_symbols / E_DEGREE as u64
-                    || rows
-                        .mask
-                        .iter()
-                        .any(|row| row.len() as u64 != short_columns)
-                {
-                    return Err(Error::ShapeMismatch);
-                }
-            }
-        }
+        check_parts(&plan, parts)?;
         for salt in salts {
             if salt.len() != plan.salt_bytes {
                 return Err(Error::ShapeMismatch);
             }
         }
-        let width = plan.width()? as usize;
-        let mut columns_data = Vec::with_capacity(columns as usize);
+        let columns = plan.columns();
+        let mut kept = if retain_columns {
+            Some(Vec::with_capacity(columns as usize))
+        } else {
+            None
+        };
         let mut leaves = Vec::with_capacity(columns as usize);
         for position in 0..columns {
-            let short = short_position(plan.log_n, plan.log_n_zk, position)? as usize;
-            let mut symbols = Vec::with_capacity(width);
-            for rows in parts {
-                for row in &rows.main {
-                    for coefficient in 0..rows.main_deg as usize {
-                        symbols.push(row[position as usize].c[coefficient]);
-                    }
-                }
-            }
-            for rows in parts {
-                for row in &rows.mask {
-                    for coefficient in 0..E_DEGREE {
-                        symbols.push(row[short].c[coefficient]);
-                    }
-                }
-            }
+            let symbols = column_symbols(&plan, parts, position)?;
             leaves.push(runtime_leaf(&plan, position, &salts[position as usize], &symbols)?);
-            columns_data.push(symbols);
+            if let Some(kept) = kept.as_mut() {
+                kept.push(symbols);
+            }
         }
         let mut levels = vec![leaves];
         while levels.last().expect("one level").len() > 1 {
@@ -929,7 +929,7 @@ impl RuntimeTree {
             plan,
             root,
             levels,
-            columns: columns_data,
+            columns: kept,
             salts: salts.to_vec(),
         })
     }
@@ -942,7 +942,10 @@ impl RuntimeTree {
         &self.root
     }
 
+    /// Opens the complete leaves of a tree committed with retained columns.
+    /// A released tree has no columns and must be opened through `open_parts`.
     pub fn open(&self, positions: &[u64]) -> Result<RuntimeTreeOpening> {
+        let kept = self.columns.as_ref().ok_or(Error::InvalidSessionState)?;
         if positions.is_empty() {
             return Err(Error::InvalidIndex);
         }
@@ -960,7 +963,7 @@ impl RuntimeTree {
                 }
             }
             previous = Some(*position);
-            let symbols = self.columns[*position as usize].clone();
+            let symbols = kept[*position as usize].clone();
             leaves.push(runtime_leaf(
                 &self.plan,
                 *position,
@@ -980,6 +983,126 @@ impl RuntimeTree {
             given,
         })
     }
+
+    /// Opens leaves by re-deriving each requested column from the committed
+    /// rows. Works for retained and released trees: the parts are the same
+    /// rows the commit saw, and the derived leaf values are unchanged.
+    pub fn open_parts(
+        &self,
+        positions: &[u64],
+        parts: &[RuntimePartRows],
+    ) -> Result<RuntimeTreeOpening> {
+        if positions.is_empty() {
+            return Err(Error::InvalidIndex);
+        }
+        check_parts(&self.plan, parts)?;
+        let columns = self.plan.columns();
+        let mut previous = None;
+        let mut leaves = Vec::with_capacity(positions.len());
+        let mut opened = Vec::with_capacity(positions.len());
+        for position in positions {
+            if *position >= columns {
+                return Err(Error::InvalidIndex);
+            }
+            if let Some(previous) = previous {
+                if *position <= previous {
+                    return Err(Error::InvalidIndex);
+                }
+            }
+            previous = Some(*position);
+            let symbols = column_symbols(&self.plan, parts, *position)?;
+            leaves.push(runtime_leaf(
+                &self.plan,
+                *position,
+                &self.salts[*position as usize],
+                &symbols,
+            )?);
+            opened.push(RuntimeLeafColumn {
+                position: *position,
+                salt: self.salts[*position as usize].clone(),
+                symbols,
+            });
+        }
+        let given = walk_given(&self.plan, positions, &leaves, &self.levels)?;
+        Ok(RuntimeTreeOpening {
+            positions: positions.to_vec(),
+            columns: opened,
+            given,
+        })
+    }
+}
+
+/// The structural part checks of a commit and an opening. A base-field row
+/// carries one coordinate per element, so a non-zero high coordinate is
+/// rejected rather than dropped.
+fn check_parts(plan: &RuntimeTreePlan, parts: &[RuntimePartRows]) -> Result<()> {
+    let columns = plan.columns();
+    let short_columns = 1u64 << plan.log_n_zk;
+    if parts.len() != plan.parts.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    for (part, rows) in plan.parts.iter().zip(parts) {
+        if rows.main_deg != 1 && rows.main_deg != E_DEGREE as u32 {
+            return Err(Error::InvalidConfig);
+        }
+        if part.main_symbols == 0 {
+            if !rows.main.is_empty() {
+                return Err(Error::ShapeMismatch);
+            }
+        } else if part.main_symbols % rows.main_deg as u64 != 0
+            || rows.main.len() as u64 != part.main_symbols / rows.main_deg as u64
+            || rows.main.iter().any(|row| row.len() as u64 != columns)
+        {
+            return Err(Error::ShapeMismatch);
+        } else if rows.main_deg == 1
+            && rows
+                .main
+                .iter()
+                .flatten()
+                .any(|element| element.c[1] != Fp::ZERO || element.c[2] != Fp::ZERO)
+        {
+            return Err(Error::ShapeMismatch);
+        }
+        if part.mask_symbols == 0 {
+            if !rows.mask.is_empty() {
+                return Err(Error::ShapeMismatch);
+            }
+        } else if part.mask_symbols % E_DEGREE as u64 != 0
+            || rows.mask.len() as u64 != part.mask_symbols / E_DEGREE as u64
+            || rows.mask.iter().any(|row| row.len() as u64 != short_columns)
+        {
+            return Err(Error::ShapeMismatch);
+        }
+    }
+    Ok(())
+}
+
+/// The leaf symbols of one column: every part's main rows at `position`, then
+/// every part's mask rows at the short position, in part order. The commit and
+/// the opening both derive them here, so the leaf value has one derivation.
+fn column_symbols(
+    plan: &RuntimeTreePlan,
+    parts: &[RuntimePartRows],
+    position: u64,
+) -> Result<Vec<Fp>> {
+    let short = short_position(plan.log_n, plan.log_n_zk, position)? as usize;
+    let width = plan.width()? as usize;
+    let mut symbols = Vec::with_capacity(width);
+    for rows in parts {
+        for row in &rows.main {
+            for coefficient in 0..rows.main_deg as usize {
+                symbols.push(row[position as usize].c[coefficient]);
+            }
+        }
+    }
+    for rows in parts {
+        for row in &rows.mask {
+            for coefficient in 0..E_DEGREE {
+                symbols.push(row[short].c[coefficient]);
+            }
+        }
+    }
+    Ok(symbols)
 }
 
 /// Nodes already seen under one tree root. The key is

@@ -969,6 +969,37 @@ pub struct CommittedValueGroup {
     pub trees: RetainedTrees,
 }
 
+impl CommittedValueGroup {
+    /// Opens one position's tree at the given positions by re-deriving its
+    /// columns from the retained message rows and the flat encoding tails.
+    pub fn open_position(
+        &self,
+        shape: &crate::proof::hidden_send_session::WShape,
+        tails: &[Fp3],
+        position: usize,
+        positions: &[u64],
+    ) -> Result<RuntimeTreeOpening> {
+        let tree = self.trees.get(position).ok_or(Error::ShapeMismatch)?;
+        let message_rows = self.messages.get(position).ok_or(Error::ShapeMismatch)?;
+        let tail_len = usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
+        let mut codewords = Vec::with_capacity(message_rows.len());
+        for (row, message) in message_rows.iter().enumerate() {
+            let tail = tails
+                .get(row * tail_len..(row + 1) * tail_len)
+                .ok_or(Error::ShapeMismatch)?;
+            codewords.push(encode_row_fp3(&shape.code, message, tail)?);
+        }
+        tree.open_parts(
+            positions,
+            &[RuntimePartRows {
+                main: codewords,
+                mask: Vec::new(),
+                main_deg: E_DEGREE as u32,
+            }],
+        )
+    }
+}
+
 impl PartialEq for CommittedValueGroup {
     fn eq(&self, other: &Self) -> bool {
         self.group == other.group && self.messages == other.messages && self.roots == other.roots
@@ -1052,7 +1083,7 @@ pub fn commit_value_group(
         drop(_profile_encode);
         let salt = salts.get(position).ok_or(Error::ShapeMismatch)?;
         let tree_plan = shape.tree_plan(position as u32)?;
-        let tree = RuntimeTree::commit(
+        let tree = RuntimeTree::commit_released(
             tree_plan.clone(),
             &[RuntimePartRows {
                 main: codewords,

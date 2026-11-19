@@ -7303,10 +7303,7 @@ mod tests {
             .enumerate()
             .map(|(position, list)| {
                 committed
-                    .trees
-                    .get(position)
-                    .unwrap()
-                    .open(list)
+                    .open_position(&plan.shape, &tails[position], position, list)
                     .unwrap()
             })
             .collect::<Vec<_>>();

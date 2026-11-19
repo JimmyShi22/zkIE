@@ -8368,7 +8368,24 @@ fn open_value_group_openings(
             if tree.plan() != &shape.tree_plan(position as u32)? {
                 return Err(Error::StatementMismatch);
             }
-            tree.open(&positions[position])
+            let tail_len = usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
+            let message_rows = messages.get(position).ok_or(Error::ShapeMismatch)?;
+            let flat = tails.get(position).ok_or(Error::ShapeMismatch)?;
+            let mut codewords = Vec::with_capacity(message_rows.len());
+            for (row, message) in message_rows.iter().enumerate() {
+                let tail = flat
+                    .get(row * tail_len..(row + 1) * tail_len)
+                    .ok_or(Error::ShapeMismatch)?;
+                codewords.push(encode_row_fp3(&shape.code, message, tail)?);
+            }
+            tree.open_parts(
+                &positions[position],
+                &[RuntimePartRows {
+                    main: codewords,
+                    mask: Vec::new(),
+                    main_deg: E_DEGREE as u32,
+                }],
+            )
         },
     )
 }
@@ -9947,6 +9964,38 @@ impl ProximityMemberProver {
             tree,
             opening,
         })
+    }
+
+    /// Opens the drawn positions by re-deriving each column from the member's
+    /// committed message rows and their tails. Works for retained and
+    /// released trees alike.
+    fn open_positions(&self, positions: &[u64]) -> Result<RuntimeTreeOpening> {
+        let mut parts = Vec::new();
+        if self.member.main_rows > 0 {
+            let mut codewords = Vec::with_capacity(self.member.message.len());
+            for (row, message) in self.member.message.iter().enumerate() {
+                let tail = self.member.tails.get(row).ok_or(Error::ShapeMismatch)?;
+                codewords.push(encode_row_fp3(&self.member.main_code, message, tail)?);
+            }
+            parts.push(RuntimePartRows {
+                main: codewords,
+                mask: Vec::new(),
+                main_deg: E_DEGREE as u32,
+            });
+        }
+        if self.member.mask_rows > 0 {
+            let mut codewords = Vec::with_capacity(self.member.mask_message.len());
+            for (row, message) in self.member.mask_message.iter().enumerate() {
+                let tail = self.member.mask_tails.get(row).ok_or(Error::ShapeMismatch)?;
+                codewords.push(encode_row_fp3(&self.member.mask_code, message, tail)?);
+            }
+            parts.push(RuntimePartRows {
+                main: Vec::new(),
+                mask: codewords,
+                main_deg: 1,
+            });
+        }
+        self.tree.open_parts(positions, &parts)
     }
 }
 
@@ -14211,6 +14260,19 @@ fn proximity_prove_rows(
             .iter()
             .map(|member| trees.tree_for(member))
             .collect::<Result<Vec<_>>>()?;
+        let member_rows: Vec<Option<crate::proof::multi_stage_iopp::IoppRowsSource>> = members
+            .iter()
+            .map(|member| {
+                Some(crate::proof::multi_stage_iopp::IoppRowsSource {
+                    main: &member.message,
+                    main_tails: &member.tails,
+                    main_code: member.main_code,
+                    mask: &member.mask_message,
+                    mask_tails: &member.mask_tails,
+                    mask_code: member.mask_code,
+                })
+            })
+            .collect();
         let stage_zero_rows = SingleRows {
             code: handoff.code,
             mask_code: handoff.mask_code,
@@ -14233,6 +14295,7 @@ fn proximity_prove_rows(
                 basis,
                 rows: stage_zero_rows,
                 member_trees,
+                member_rows,
                 old_mask_tree: None,
                 fresh_tree: stage_zero_tree,
                 member_opening: omega_opening.clone(),
@@ -14298,12 +14361,8 @@ fn proximity_prove_rows(
     let positions = verifier.draw_base_positions(base_positions)?;
     let unique = unique_sorted(&positions);
     let mut provers = Vec::with_capacity(members.len());
-    for mut member in members {
+    for member in members {
         let tree = trees.tree_for(&member)?;
-        member.message = Vec::new();
-        member.tails = Vec::new();
-        member.mask_message = Vec::new();
-        member.mask_tails = Vec::new();
         let opening = omega_opening
             .as_ref()
             .filter(|count| {
@@ -14323,9 +14382,12 @@ fn proximity_prove_rows(
             if let Some(opening) = &member.opening {
                 opening.reserve(unique.len())?;
             }
-            member.tree.open(&unique)
+            member.open_positions(&unique)
         },
     )?;
+    // The base openings are the last read of the member rows; drop them before
+    // the tail is assembled.
+    drop(provers);
     let mask_positions: Vec<u64> = positions
         .iter()
         .map(|position| position % fold.mask_code.n())
@@ -17358,6 +17420,22 @@ fn relation_row_bat(row: &GuRelationRow, member: &ProximityMember) -> Result<Bat
     Ok(out)
 }
 
+/// Opens one committed lookup bits tree at the drawn positions by re-deriving
+/// its columns from the retained message rows and flat tails.
+fn open_lookup_bits(
+    messages: &crate::proof::lookup_messages::LookupMessages,
+    shape: &WShape,
+    tree: &RuntimeTree,
+    positions: &[u64],
+) -> Result<RuntimeTreeOpening> {
+    if *tree.root() != messages.bits_root() {
+        return Err(Error::StatementMismatch);
+    }
+    messages
+        .bits
+        .open_position(shape, &messages.bits_tails, 0, positions)
+}
+
 fn commit_rows_tree(
     tree_plan: RuntimeTreePlan,
     code: CodeParams,
@@ -19324,7 +19402,7 @@ fn prove_norm_lookup_first(
     if bits_tree.plan() != &bits_shape.tree_plan(0)? {
         return Err(Error::StatementMismatch);
     }
-    let bits_opening = bits_tree.open(&bits_positions[0])?;
+    let bits_opening = open_lookup_bits(&messages, bits_shape, bits_tree, &bits_positions[0])?;
     let mask_positions = draw_lookup_mask_positions(chain, lookup_plan, tags.mask_position)?;
     let mask_tree = messages.mask_tree(&lookup_plan.commit)?;
     if *mask_tree.root() != messages.mask_root {
@@ -20286,7 +20364,8 @@ fn prove_norm_first(
             if bits_tree.plan() != &bits_shape.tree_plan(0)? {
                 return Err(Error::StatementMismatch);
             }
-            let bits_opening = bits_tree.open(&bits_positions[0])?;
+            let bits_opening =
+                open_lookup_bits(&messages, bits_shape, bits_tree, &bits_positions[0])?;
             let mask_positions = draw_rstd_mask_positions(chain, rstd_plan)?;
             let mask_tree = messages.mask_tree(&rstd_plan.commit)?;
             if *mask_tree.root() != messages.mask_root {
