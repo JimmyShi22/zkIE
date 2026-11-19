@@ -162,6 +162,153 @@ impl TableRowSource for PublicFileTable {
     }
 }
 
+/// A public table view over one base file and one extension file, in the
+/// same logical row order the runtime reads: rows below `base_len` come from
+/// the base file, the rest from the extension file. The configuration pins
+/// the concatenated content root, the real length and the encoding; every
+/// read stays inside the requested range and never materializes the whole
+/// table.
+#[derive(Clone, Debug)]
+pub struct SplitFileTable {
+    base: std::path::PathBuf,
+    extension: std::path::PathBuf,
+    base_len: usize,
+    config: TableConfig,
+}
+
+impl SplitFileTable {
+    pub fn new(
+        base: std::path::PathBuf,
+        base_len: usize,
+        extension: std::path::PathBuf,
+        config: TableConfig,
+    ) -> Result<Self> {
+        if config.identity == Digest::ZERO
+            || config.content_root == Digest::ZERO
+            || config.real_len == 0
+            || base_len == 0
+            || base_len >= config.real_len
+        {
+            return Err(Error::InvalidConfig);
+        }
+        Ok(Self {
+            base,
+            extension,
+            base_len,
+            config,
+        })
+    }
+
+    fn read_file(path: &std::path::Path, start: usize, count: usize, width: usize) -> Result<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(path).map_err(|_| Error::Io)?;
+        file.seek(SeekFrom::Start(
+            (start as u64)
+                .checked_mul(width as u64)
+                .ok_or(Error::ResourceLimit)?,
+        ))
+        .map_err(|_| Error::Io)?;
+        let mut bytes = vec![0u8; count.checked_mul(width).ok_or(Error::ResourceLimit)?];
+        file.read_exact(&mut bytes).map_err(|_| Error::Io)?;
+        Ok(bytes)
+    }
+
+    fn decode(encoding: TableEncoding, bytes: &[u8]) -> Vec<i64> {
+        match encoding {
+            TableEncoding::I32Le => bytes
+                .chunks_exact(4)
+                .map(|chunk| i32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as i64)
+                .collect(),
+            TableEncoding::I64Le => bytes
+                .chunks_exact(8)
+                .map(|chunk| {
+                    i64::from_le_bytes([
+                        chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6],
+                        chunk[7],
+                    ])
+                })
+                .collect(),
+        }
+    }
+}
+
+impl TableRowSource for SplitFileTable {
+    fn identity(&self) -> Digest {
+        self.config.identity
+    }
+
+    fn content_root(&self) -> Digest {
+        self.config.content_root
+    }
+
+    fn real_len(&self) -> usize {
+        self.config.real_len
+    }
+
+    fn encoding(&self) -> TableEncoding {
+        self.config.encoding
+    }
+
+    fn read_rows(&self, start: usize, count: usize) -> Result<Vec<i64>> {
+        let end = start.checked_add(count).ok_or(Error::ResourceLimit)?;
+        if end > self.config.real_len {
+            return Err(Error::ShapeMismatch);
+        }
+        let width = self.config.encoding.width();
+        if end <= self.base_len {
+            let bytes = Self::read_file(&self.base, start, count, width)?;
+            return Ok(Self::decode(self.config.encoding, &bytes));
+        }
+        if start >= self.base_len {
+            let bytes = Self::read_file(
+                &self.extension,
+                start - self.base_len,
+                count,
+                width,
+            )?;
+            return Ok(Self::decode(self.config.encoding, &bytes));
+        }
+        let base_count = self.base_len - start;
+        let extension_count = count - base_count;
+        let mut rows = Self::decode(
+            self.config.encoding,
+            &Self::read_file(&self.base, start, base_count, width)?,
+        );
+        rows.extend(Self::decode(
+            self.config.encoding,
+            &Self::read_file(&self.extension, 0, extension_count, width)?,
+        ));
+        Ok(rows)
+    }
+}
+
+/// The canonical content root of a base file followed by an extension file,
+/// read as raw encoded rows. The helper streams both and never materializes
+/// the concatenation.
+pub fn split_file_content_root(
+    encoding: TableEncoding,
+    base: &std::path::Path,
+    extension: &std::path::Path,
+) -> Result<Digest> {
+    use std::io::Read;
+    let mut chunks: Vec<Vec<u8>> = Vec::new();
+    for path in [base, extension] {
+        let mut file = std::fs::File::open(path).map_err(|_| Error::Io)?;
+        let mut buffer = vec![0u8; 1 << 20];
+        loop {
+            let read = file.read(&mut buffer).map_err(|_| Error::Io)?;
+            if read == 0 {
+                break;
+            }
+            if read % encoding.width() != 0 {
+                return Err(Error::InvalidEncoding);
+            }
+            chunks.push(buffer[..read].to_vec());
+        }
+    }
+    Ok(digest_bytes_chunks(chunks))
+}
+
 /// The canonical content digest of a row sequence in the given encoding.
 pub fn content_digest(encoding: TableEncoding, rows: &[i64]) -> Result<Digest> {
     let mut bytes = Vec::with_capacity(rows.len().saturating_mul(encoding.width()));
