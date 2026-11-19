@@ -17952,6 +17952,162 @@ pub fn norm_only_members(
     Ok((members, order))
 }
 
+/// The derived own-group stage plan of the norm-only mode. The member shapes
+/// come from the norm plan alone (groups, parameter claims, rstd/lookup and
+/// output/tail), so the caller can set the proximity plan before any witness
+/// exists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NormOnlyOwnPlan {
+    pub stages: Vec<IoppStagePlan>,
+    pub base_positions: usize,
+    pub mask_rows: usize,
+}
+
+fn norm_only_dummy_tree(code: CodeParams) -> RuntimeTreePlan {
+    RuntimeTreePlan {
+        tree_number: 0,
+        leaf_class: 0,
+        log_n: code.log_n,
+        log_n_zk: code.log_n,
+        parts: vec![RuntimeTreePart {
+            main_symbols: 1,
+            mask_symbols: 0,
+        }],
+        salt_bytes: LEAF_SALT_MIN_BYTES,
+        run: Digest([0x31; 32]),
+        configuration: Digest([0x32; 32]),
+    }
+}
+
+pub fn norm_only_own_stages(plan: &HiddenLinPlan) -> Result<NormOnlyOwnPlan> {
+    let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
+    let code = plan.proximity.code;
+    let mask_code = plan.proximity.mask_code;
+    let mut members = Vec::new();
+    let mut source_oracle = 0u64;
+    let mut push = |main_rows: u64, mask_rows: u64, members: &mut Vec<ProximityMember>| {
+        members.push(ProximityMember {
+            bat_oracle: source_oracle,
+            source_oracle,
+            main_code: code,
+            mask_code,
+            main_rows,
+            mask_rows,
+            answers: 1,
+            root: Digest([0x33; 32]),
+            tree_plan: norm_only_dummy_tree(code),
+            message: Vec::new(),
+            tails: Vec::new(),
+            mask_message: Vec::new(),
+            mask_tails: Vec::new(),
+        });
+        source_oracle += 1;
+    };
+    for group in norm_group_plans(norm) {
+        push(group.shape.main_rows, 0, &mut members);
+    }
+    let mut total_mask_rows = 0u64;
+    if let Some(mask) = &norm.mask {
+        push(0, mask.mask_rows, &mut members);
+        total_mask_rows = total_mask_rows
+            .checked_add(mask.mask_rows)
+            .ok_or(Error::ResourceLimit)?;
+    }
+    if let Some(params) = &norm.params {
+        if let Some(claim) = &params.gain_claim {
+            push(claim.gu.u.main_rows, 0, &mut members);
+        }
+        if let Some(claim) = &params.bias_claim {
+            push(claim.gu.u.main_rows, 0, &mut members);
+        }
+    }
+    if let Some(rstd) = &norm.rstd {
+        let commit = &rstd.commit;
+        push(commit.bits_shape.main_rows, 0, &mut members);
+        push(0, commit.mask_rows, &mut members);
+        total_mask_rows = total_mask_rows
+            .checked_add(commit.mask_rows)
+            .ok_or(Error::ResourceLimit)?;
+    }
+    if let Some(lookup) = &norm.lookup {
+        let commit = &lookup.commit;
+        push(commit.bits_shape.main_rows, 0, &mut members);
+        push(0, commit.mask_rows, &mut members);
+        total_mask_rows = total_mask_rows
+            .checked_add(commit.mask_rows)
+            .ok_or(Error::ResourceLimit)?;
+    }
+    if let Some(output) = &norm.output {
+        for group in [&output.broadcast, &output.product, &output.image, &output.out] {
+            push(group.shape.main_rows, 0, &mut members);
+        }
+        if let Some(tail) = &output.tail {
+            push(tail.group.shape.main_rows, 0, &mut members);
+        }
+    }
+    if members.is_empty() {
+        return Err(Error::InvalidConfig);
+    }
+    members.sort_by_key(|member| {
+        std::cmp::Reverse((member.main_rows, member.mask_rows, member.source_oracle))
+    });
+    for (index, member) in members.iter_mut().enumerate() {
+        member.bat_oracle = index as u64;
+    }
+    let fold = member_fold_shape(
+        code,
+        mask_code,
+        &members,
+        plan.proximity.own_mask_tree.leaf_class,
+    )?;
+    let last_main = build_code_plan(code.log_n, code.ell, 1)?;
+    let last_mask = build_code_plan(mask_code.log_n, 16_384, 1)?;
+    let positions = usize::try_from(norm.shape.positions).map_err(|_| Error::ResourceLimit)?;
+    let fold_k = code.r.trailing_zeros() + 1;
+    let max_stage_zero_positions = 1usize
+        .checked_shl(fold_k)
+        .ok_or(Error::ResourceLimit)?
+        .max(positions);
+    let two = crate::proof::proximity_planner::plan_own_two_stage(
+        code,
+        mask_code,
+        last_main,
+        last_mask,
+        fold_k,
+        fold.h,
+        max_stage_zero_positions,
+    )?;
+    let stages = vec![
+        IoppStagePlan {
+            main: code,
+            mask: mask_code,
+            k: fold_k,
+            h: fold.h,
+            positions: two.stage_zero_positions,
+            samples: 1,
+            work_bits: two.stage_zero_work_bits,
+        },
+        IoppStagePlan {
+            main: build_code_plan(code.log_n, code.ell, two.last_main_r)?,
+            mask: build_code_plan(mask_code.log_n, 16_384, two.last_mask_r)?,
+            k: 0,
+            h: 0,
+            positions: two.last_positions,
+            samples: 1,
+            work_bits: 0,
+        },
+    ];
+    let mask_rows = usize::try_from(
+        crate::proof::hidden_norm_psc::norm_own_mask_rows(0, total_mask_rows)?,
+    )
+    .map_err(|_| Error::ResourceLimit)?;
+    Ok(NormOnlyOwnPlan {
+        stages,
+        base_positions: two.last_positions,
+        mask_rows,
+    })
+}
+
 /// The norm-only member list and its derived fold shape. The Dot/W, Omega,
 /// request and closure members are absent; the fold is derived from the norm
 /// groups and the parameter claims with the shared member-shape rule.
@@ -29874,6 +30030,20 @@ mod merged_tests {
             output_relation: None,
             closure: None,
         }
+    }
+
+    #[test]
+    fn norm_only_own_stages_are_derived_from_the_norm_plan() {
+        let activation = activation();
+        let mut plan = plan(&activation);
+        plan.norm = Some(norm_plan());
+        plan.proximity.code = build_code_plan(17, 65_536, 8_192).unwrap();
+        plan.proximity.mask_code = build_code_plan(17, 512, 256).unwrap();
+        let own = norm_only_own_stages(&plan).expect("the derived own stages");
+        assert_eq!(own.stages.len(), 2);
+        assert!(own.base_positions > 0);
+        assert!(own.mask_rows > 0);
+        assert!(own.stages[0].positions > 0);
     }
 
     #[test]
