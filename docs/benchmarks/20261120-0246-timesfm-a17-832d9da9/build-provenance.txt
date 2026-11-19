@@ -1,0 +1,6 @@
+tree: /data/zkie-timesfm-first-asset
+head: 832d9da9496817b55bb8fc68672195f8ef06f67c
+target_dir: /data/zkIE/target
+binary: /data/zkIE/target/release/zkie
+binary_sha256: ead9b56d7fabb5e60bb7be39182ff6eec72ceebffbb46d7bbb2016f3184dae16
+built_at: 2026-11-19T18:46:41Z

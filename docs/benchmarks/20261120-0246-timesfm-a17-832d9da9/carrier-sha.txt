@@ -1,0 +1,4 @@
+carrier sha256 and size, pre-A17 vs post-A17
+pre_a17: 35e9cb87acd94b7755ef82dac56e8afac6fcf59eb4bacf19cccf1ada099a538b 1644035480 20261119-2104-timesfm-a06-5500b9c7
+post_a17: c30f942bbaec6bac3ec2576569311217482ab1b8513e25078d6d6008519e94ef
+post_a17_size: 33378520
