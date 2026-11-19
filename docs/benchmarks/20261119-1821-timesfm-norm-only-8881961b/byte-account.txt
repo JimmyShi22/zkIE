@@ -1,0 +1,7 @@
+file|bytes
+proof/statement.bin|133216
+proof/public-inputs.bin|131080
+proof/timesfm-norm-segment-carrier.bin|1644035480
+proof/proof.bin|3613502964
+proof/manifest.json|4702
+proof/COMPLETE|65

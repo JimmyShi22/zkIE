@@ -1,0 +1,43 @@
+policy_version = 1
+model = "timesfm"
+model_version = 2
+
+[[case]]
+case_id = "timesfm-16patch"
+raw_input_length = 512
+patch_tokens = 16
+anchor_id = "2ef2d1dcda4f0e5fad59e0b829119e341be79b54e80e8ae533a2bc3665a88a45"
+model_id = "c87a951844e832fcfc8022688ab86f6c7f634c86874a6b6758c1c88104460742"
+output_mode = "expected"
+expected_output_sha256 = "cc72805b7a845cb2b8505d6092dbb79477d083394a03c99cdac7f5665de56ba3"
+output_digest_algorithm = "sha256"
+output_type = "int_output"
+output_encoding = "i32-le"
+output_elements = 32768
+
+[case.limited_table_identity]
+version = 1
+model = "timesfm"
+model_version = 2
+case_id = "timesfm-16patch"
+anchor_id = "2ef2d1dcda4f0e5fad59e0b829119e341be79b54e80e8ae533a2bc3665a88a45"
+model_id = "c87a951844e832fcfc8022688ab86f6c7f634c86874a6b6758c1c88104460742"
+asset_id = 227
+asset_table_identity = "db048c83e55e7a3de7843ff368ce84ae9d06e3105de0877b40fa32e40710cb3d"
+table_root = "3f95dc848ce2bed18ca2f4210a0c8585f0cb51abe6afa9543da48fa563e7beb4"
+table_record_digest = "2f6fa6ef31a6e7b32ea4fa9c72c048033a89b438d38aa2c4637f783782dfe4c4"
+table_configuration = "2c6eed001cd9e360eb9f25158f5ca5c0cfcfd11b9d3b85960568f92973699449"
+code_log_n = 13
+code_ell = 4096
+code_r = 128
+table_v = 11
+answers = 1
+salt_bytes = 40
+distance_radius = 0
+distance_later_radius = 0
+distance_m_once = 196
+distance_m_later = 196
+matrix_rows_log = 11
+k_lo = 0
+k_col = 11
+protocol_identity = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
