@@ -531,21 +531,31 @@ pub fn open_asset(
     open_asset_from_reader(commitment, &reader, asset_id, row_start, row_count)
 }
 
+/// The largest parameter asset the value reader accepts. It covers the norm
+/// parameter vectors of the supported models with margin; the weight
+/// matrices are read through the asset readers, never here, and an over-size
+/// asset is refused before it is read.
+const PARAMETER_ASSET_MAX_BYTES: u64 = 1 << 20;
+
 /// Reads one small asset file and returns its signed values together with
 /// the recomputed row-leaf root. The file is decoded through the same
 /// encoding the commitment builder uses, so an unchanged asset reproduces its
 /// anchored leaf record. It is meant for the small parameter assets, never for
-/// the weight matrices.
+/// the weight matrices; the size is bounded by `PARAMETER_ASSET_MAX_BYTES`
+/// and the file is refused before it is read when it exceeds the bound.
 pub fn read_asset_values_with_root(
     root: &Path,
     spec: &ModelAssetSpec,
 ) -> Result<(Vec<i64>, Digest)> {
     let encoding = AssetEncoding::parse(&spec.encoding)?;
-    let bytes = std::fs::read(root.join(&spec.path)).map_err(|_| Error::AssetMismatch)?;
     let expected = spec
         .element_count
         .checked_mul(encoding.element_size())
         .ok_or(Error::ResourceLimit)?;
+    if expected > PARAMETER_ASSET_MAX_BYTES {
+        return Err(Error::ResourceLimit);
+    }
+    let bytes = std::fs::read(root.join(&spec.path)).map_err(|_| Error::AssetMismatch)?;
     if bytes.len() as u64 != expected {
         return Err(Error::AssetMismatch);
     }
@@ -1311,4 +1321,114 @@ pub fn verify_model_anchor_with_tables_on_identity(
         return Err(Error::StatementMismatch);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::path::{Path, PathBuf};
+
+    fn unique_dir(tag: &str) -> PathBuf {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!(
+            "zkie-param-{tag}-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        dir
+    }
+
+    fn write_i32_asset(dir: &Path, path: &str, values: &[i32]) {
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let file = dir.join(path);
+        if let Some(parent) = file.parent() {
+            std::fs::create_dir_all(parent).expect("asset dir");
+        }
+        std::fs::write(file, bytes).expect("asset file");
+    }
+
+    fn asset_spec(path: &str, element_count: u64, row_width: usize) -> ModelAssetSpec {
+        ModelAssetSpec {
+            asset_id: 7,
+            path: path.to_string(),
+            element_count,
+            row_width,
+            encoding: "i32-le".to_string(),
+        }
+    }
+
+    #[test]
+    fn the_parameter_read_reproduces_the_values_and_leaf_root() {
+        let dir = unique_dir("values");
+        let values: Vec<i32> = (0..(2 * 1024 + 13))
+            .map(|index| index as i32 * 7 - 40)
+            .collect();
+        write_i32_asset(&dir, "params/gain_i32.bin", &values);
+        let spec = asset_spec("params/gain_i32.bin", values.len() as u64, 1024);
+        let (read, root) = read_asset_values_with_root(&dir, &spec).expect("read");
+        assert_eq!(read.len(), values.len());
+        for (index, value) in read.iter().enumerate() {
+            assert_eq!(*value, values[index] as i64);
+        }
+        // The leaf root must equal an independent recomputation over the same
+        // row padding: the last partial row is zero-filled and the padded
+        // rows repeat the zero leaf.
+        let decoded: Vec<u64> = values.iter().map(|value| *value as u64).collect();
+        let actual_rows = spec.element_count.div_ceil(spec.row_width as u64);
+        let padded_rows = actual_rows.max(1).next_power_of_two();
+        let mut digests = Vec::new();
+        for row in 0..padded_rows {
+            let start = row * spec.row_width as u64;
+            let mut values_row = vec![0u64; spec.row_width];
+            if start < spec.element_count {
+                let available = (spec.element_count - start).min(spec.row_width as u64) as usize;
+                let first = start as usize;
+                values_row[..available].copy_from_slice(&decoded[first..first + available]);
+            }
+            digests.push(oracle_leaf(row, &values_row));
+        }
+        let start = oracle_start(&table_identity(&spec));
+        let tree = merkle_build(&start, &digests).expect("tree");
+        assert_eq!(root, tree.root);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_parameter_asset_above_the_cap_is_refused_before_reading() {
+        let dir = unique_dir("cap");
+        // The element count exceeds the cap; no file is written, so a read
+        // attempted first would fail with AssetMismatch instead.
+        let spec = asset_spec("params/missing_i32.bin", PARAMETER_ASSET_MAX_BYTES / 4 + 1, 1024);
+        assert!(matches!(
+            read_asset_values_with_root(&dir, &spec),
+            Err(Error::ResourceLimit)
+        ));
+        // The exact cap is still accepted as a size (the file length check is
+        // the next gate).
+        let exact = asset_spec("params/missing_i32.bin", PARAMETER_ASSET_MAX_BYTES / 4, 1024);
+        assert!(matches!(
+            read_asset_values_with_root(&dir, &exact),
+            Err(Error::AssetMismatch)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_truncated_parameter_asset_is_refused() {
+        let dir = unique_dir("short");
+        write_i32_asset(&dir, "params/gain_i32.bin", &[1, 2, 3]);
+        let spec = asset_spec("params/gain_i32.bin", 4, 1024);
+        assert!(matches!(
+            read_asset_values_with_root(&dir, &spec),
+            Err(Error::AssetMismatch)
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
