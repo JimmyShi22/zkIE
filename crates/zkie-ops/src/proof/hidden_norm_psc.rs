@@ -4385,6 +4385,9 @@ pub struct NormWitness {
     /// The exact integer core of every row.
     pub core: Vec<NormCoreRow>,
     pub x: NormGroupWitness,
+    /// The committed limb rows of the RMS form.
+    pub low: Option<NormGroupWitness>,
+    pub high: Option<NormGroupWitness>,
     pub sum: NormGroupWitness,
     pub squares: NormGroupWitness,
     pub mean: NormGroupWitness,
@@ -4900,6 +4903,9 @@ impl NormOutputTailMessage {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct NormFirstMessages {
     pub x: CommittedPscGroup,
+    /// The committed limb rows of the RMS form; absent in the layer form.
+    pub low: Option<CommittedPscGroup>,
+    pub high: Option<CommittedPscGroup>,
     pub sum: CommittedPscGroup,
     pub squares: CommittedPscGroup,
     pub mean: CommittedPscGroup,
@@ -4926,6 +4932,15 @@ impl NormFirstMessages {
         let mut writer = CanonicalWriter::new();
         writer.put_u64(NORM_BIND_VERSION);
         self.x.encode_into(&mut writer)?;
+        for limb in [&self.low, &self.high] {
+            match limb {
+                Some(group) => {
+                    writer.put_u64(1);
+                    group.encode_into(&mut writer)?;
+                }
+                None => writer.put_u64(0),
+            }
+        }
         self.sum.encode_into(&mut writer)?;
         self.squares.encode_into(&mut writer)?;
         self.mean.encode_into(&mut writer)?;
@@ -4970,6 +4985,28 @@ impl NormFirstMessages {
         }
         let positions = plan.shape.positions;
         let x = CommittedPscGroup::decode(&mut reader, &plan.x.shape, positions)?;
+        let mut limb_group = |plan: &NormPlan, kind: u8| -> Result<Option<CommittedPscGroup>> {
+            match reader.get_u64()? {
+                0 => {
+                    if plan.rms.is_some() {
+                        return Err(Error::ShapeMismatch);
+                    }
+                    Ok(None)
+                }
+                1 => {
+                    let rms = plan.rms.as_ref().ok_or(Error::ShapeMismatch)?;
+                    let group = if kind == 0 { &rms.low } else { &rms.high };
+                    Ok(Some(CommittedPscGroup::decode(
+                        &mut reader,
+                        &group.shape,
+                        positions,
+                    )?))
+                }
+                _ => Err(Error::InvalidEncoding),
+            }
+        };
+        let low = limb_group(plan, 0)?;
+        let high = limb_group(plan, 1)?;
         let sum = CommittedPscGroup::decode(&mut reader, &plan.sum.shape, positions)?;
         let squares = CommittedPscGroup::decode(&mut reader, &plan.squares.shape, positions)?;
         let mean = CommittedPscGroup::decode(&mut reader, &plan.mean.shape, positions)?;
@@ -5044,6 +5081,8 @@ impl NormFirstMessages {
         reader.finish()?;
         let message = Self {
             x,
+            low,
+            high,
             sum,
             squares,
             mean,
@@ -5064,13 +5103,21 @@ impl NormFirstMessages {
     /// witness group roots are proof values and are not compared with the plan.
     pub fn check_trusted(&self, plan: &NormPlan) -> Result<()> {
         plan.validate()?;
-        let groups = [
-            (&self.x, &plan.x, true),
+        let mut groups = vec![(&self.x, &plan.x, true)];
+        match (&plan.rms, &self.low, &self.high) {
+            (Some(rms), Some(low), Some(high)) => {
+                groups.push((low, &rms.low, false));
+                groups.push((high, &rms.high, false));
+            }
+            (None, None, None) => {}
+            _ => return Err(Error::ShapeMismatch),
+        }
+        groups.extend([
             (&self.sum, &plan.sum, false),
             (&self.squares, &plan.squares, false),
             (&self.mean, &plan.mean, false),
             (&self.variance, &plan.variance, false),
-        ];
+        ]);
         for (message, group_plan, trusted) in groups {
             if message.message.group.group != group_plan.group {
                 return Err(Error::StatementMismatch);
@@ -6981,6 +7028,8 @@ mod tests {
         };
         let message = NormFirstMessages {
             x: first.x.clone(),
+            low: None,
+            high: None,
             sum: first.sum.clone(),
             squares: first.squares.clone(),
             mean: first.mean.clone(),

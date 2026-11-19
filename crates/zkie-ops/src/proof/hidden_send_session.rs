@@ -20324,6 +20324,10 @@ fn prove_norm_first(
     Ok((
         NormFirstMessages {
             x: iter.next().ok_or(Error::ShapeMismatch)?,
+            // The limb groups are committed in the witness; their first
+            // message fields are wired with the RMS relation rows.
+            low: None,
+            high: None,
             sum: iter.next().ok_or(Error::ShapeMismatch)?,
             squares: iter.next().ok_or(Error::ShapeMismatch)?,
             mean: iter.next().ok_or(Error::ShapeMismatch)?,
@@ -29372,6 +29376,7 @@ mod merged_tests {
             x_roots: (0..POSITIONS)
                 .map(|position| Digest([0x90 + position as u8; 32]))
                 .collect(),
+            rms: None,
             sum: norm_group(1, 81, 9100, 60100),
             squares: norm_group(1, 82, 9200, 60200),
             mean: norm_group(1, 83, 9300, 60300),
@@ -29683,6 +29688,7 @@ mod merged_tests {
             ],
             x: group(columns, GROUP, 9000, 60000),
             x_roots: Vec::new(),
+            rms: None,
             sum: group(1, GROUP, 9100, 60100),
             squares: group(1, GROUP, 9200, 60200),
             mean: group(1, GROUP, 9300, 60300),
@@ -29827,6 +29833,8 @@ mod merged_tests {
         let witness = NormWitness {
             rows,
             core,
+            low: None,
+            high: None,
             x,
             sum,
             squares,

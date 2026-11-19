@@ -469,11 +469,17 @@ pub fn build_core_witness(
             return Err(Error::ShapeMismatch);
         }
         rows.push(row.clone());
-        core.push(NormCoreRow::from_values_mode(
-            row,
-            profile.valid as usize,
-            plan.mode,
-        )?);
+        let computed = match (&plan.rms, &plan.round) {
+            (Some(rms), Some(round)) => NormCoreRow::from_values_rms(
+                row,
+                profile.valid as usize,
+                round.input_bound,
+                rms.widths,
+                rms.mean_bound,
+            )?,
+            _ => NormCoreRow::from_values_mode(row, profile.valid as usize, plan.mode)?,
+        };
+        core.push(computed);
     }
     let rsqrt = core
         .iter()
@@ -484,6 +490,28 @@ pub fn build_core_witness(
     if x.committed.roots != plan.x_roots {
         return Err(Error::StatementMismatch);
     }
+    let (low, high) = match &plan.rms {
+        Some(rms) => {
+            let limb_values = |pick: fn(&crate::proof::rms_limbs::RmsLimbRow) -> &Vec<i64>|
+             -> Result<Vec<Vec<Fp3>>> {
+                core.iter()
+                    .map(|row| {
+                        let limb = row.rms.as_ref().ok_or(Error::ShapeMismatch)?;
+                        let mut values = vec![0i64; profile.columns as usize];
+                        for (slot, value) in values.iter_mut().zip(pick(limb)) {
+                            *slot = *value;
+                        }
+                        signed_column(&values.iter().map(|value| *value as i128).collect::<Vec<_>>())
+                    })
+                    .collect()
+            };
+            let low = commit_group(&rms.low, &limb_values(|limb| &limb.low)?, group_seed(b"low"))?;
+            let high =
+                commit_group(&rms.high, &limb_values(|limb| &limb.high)?, group_seed(b"high"))?;
+            (Some(low), Some(high))
+        }
+        None => (None, None),
+    };
     let sum = commit_group(&plan.sum, &scalar_values(&core, |row| row.sum)?, group_seed(b"sum"))?;
     let squares = commit_group(
         &plan.squares,
@@ -519,6 +547,8 @@ pub fn build_core_witness(
         rows,
         core,
         x,
+        low,
+        high,
         sum,
         squares,
         mean,
