@@ -1,0 +1,41 @@
+[
+  {
+    "case": "control",
+    "outcome": "PASS"
+  },
+  {
+    "case": "statement_identity",
+    "exit_ok": false,
+    "outcome": "FAIL"
+  },
+  {
+    "case": "statement_source_identity",
+    "exit_ok": false,
+    "outcome": "FAIL"
+  },
+  {
+    "case": "version",
+    "exit_ok": false,
+    "outcome": "FAIL"
+  },
+  {
+    "case": "reader_root",
+    "exit_ok": false,
+    "outcome": "FAIL"
+  },
+  {
+    "case": "record_digest",
+    "exit_ok": false,
+    "outcome": "FAIL"
+  },
+  {
+    "case": "messages_truncated",
+    "exit_ok": false,
+    "outcome": "FAIL"
+  },
+  {
+    "case": "source_rows",
+    "exit_ok": false,
+    "outcome": "FAIL"
+  }
+]

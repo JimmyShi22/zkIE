@@ -1,0 +1,11 @@
+{
+  "counters": {
+    "consumer_proof_bytes": 2312360,
+    "key_bytes": 4547456,
+    "key_verify_ms": 58942,
+    "norm_segment_bytes": 96666344,
+    "norm_segment_prove_ms": 616611,
+    "proof_bytes": 1879423254
+  },
+  "schema": 1
+}
