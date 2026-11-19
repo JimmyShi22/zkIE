@@ -1,0 +1,8 @@
+{
+  "counters": {
+    "key_bytes": 4549048,
+    "key_verify_ms": 59111,
+    "norm_segment_verify_ms": 145618
+  },
+  "schema": 1
+}
