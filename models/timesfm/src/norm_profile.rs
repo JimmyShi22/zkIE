@@ -14,7 +14,7 @@ use zkie_core::artifact::digest_from_hex;
 use zkie_core::error::Result;
 use zkie_core::types::Digest;
 use zkie_ops::proof::hidden_norm_psc::{
-    norm_no_wrap, NormNoWrap, NormOutputTailWidths, NormRoundLayout, NormRoundWidths,
+    NormNoWrap, NormOutputTailWidths, NormRoundLayout, NormRoundWidths,
 };
 
 /// Padded hidden width of the L0 norm (real columns 1280, padding zero).
@@ -90,7 +90,14 @@ pub fn round_layout() -> Result<NormRoundLayout> {
 
 /// The plan-level no-wrap verdict over the trusted input bound.
 pub fn no_wrap() -> Result<NormNoWrap> {
-    norm_no_wrap(INPUT_BOUND, VALID, &round_widths(), SUM_OFFSET, MEAN_OFFSET)
+    zkie_ops::proof::hidden_norm_psc::norm_no_wrap_mode(
+        INPUT_BOUND,
+        VALID,
+        &round_widths(),
+        SUM_OFFSET,
+        MEAN_OFFSET,
+        zkie_ops::proof::hidden_norm::NormMode::RmsNorm,
+    )
 }
 
 /// The content root of the frozen rstd table view.
@@ -124,6 +131,7 @@ pub fn segment_profile(
         hidden: HIDDEN_PAD,
         valid: VALID,
         columns: u64::from(HIDDEN_PAD),
+        mode: zkie_ops::proof::hidden_norm::NormMode::RmsNorm,
         shift: OUTPUT_SHIFT,
         clamp: Some((CLAMP_LOW, CLAMP_HIGH)),
         clamp_widths: Some(zkie_ops::proof::hidden_norm_psc::NormClampWidths {
