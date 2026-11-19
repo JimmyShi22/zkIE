@@ -998,17 +998,42 @@ pub(crate) fn rel_map(
                 }
             }
         }
-        26 => {
-            // RMS statistic: sum of the squared valid cells. Both factors
-            // read the committed x row, so the product map is x_i * x_i; the
-            // extra slot carries -sum on the left and one on the right.
-            for (index, value) in values.iter().take(valid).enumerate() {
-                let value = fp3_signed(*value as i128)?;
-                left[index] = value;
-                right[index] = value;
+        26..=28 => {
+            // The three bounded partial sums of the RMS statistic:
+            // S_ll = sum lo^2, S_lh = sum lo hi, S_hh = sum hi^2. Each
+            // relation has both factors over one limb row; the extra slot
+            // carries the minus of the committed scalar.
+            let rms = row.rms.as_ref().ok_or(Error::InvalidConfig)?;
+            let (left_limb, right_limb, scalar) = match relation {
+                26 => (&rms.low, &rms.low, row.sum),
+                27 => (&rms.low, &rms.high, row.squares),
+                _ => (&rms.high, &rms.high, row.mean as i128),
+            };
+            for (index, (left_value, right_value)) in
+                left_limb.iter().zip(right_limb.iter()).enumerate().take(valid)
+            {
+                left[index] = fp3_signed(*left_value as i128)?;
+                right[index] = fp3_signed(*right_value as i128)?;
             }
-            left[columns] = fp3_signed(-row.sum)?;
+            left[columns] = fp3_signed(-scalar)?;
             right[columns] = Fp3::ONE;
+        }
+        29 => {
+            // The pointwise split x = lo + 2^16 hi over the valid columns.
+            // The padding cells of every group are zero, so the relation on
+            // the valid domain fixes the padded cells at zero as well.
+            let rms = row.rms.as_ref().ok_or(Error::InvalidConfig)?;
+            if rms.low.len() != valid || rms.high.len() != valid {
+                return Err(Error::ShapeMismatch);
+            }
+            for (index, value) in values.iter().take(valid).enumerate() {
+                let high = fp3_signed(rms.high[index] as i128)?
+                    .mul(&Fp3::from_u64(1 << 16));
+                left[index] = fp3_signed(*value as i128)?
+                    .sub(&fp3_signed(rms.low[index] as i128)?)
+                    .sub(&high);
+                right[index] = Fp3::ONE;
+            }
         }
         _ => return Err(Error::InvalidConfig),
     }

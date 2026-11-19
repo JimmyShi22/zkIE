@@ -23090,15 +23090,28 @@ fn norm_plain_rows(
                 right.target = word.output.ends[1].value.sub(&constant);
                 rows.push(right);
             }
-            26 => {
-                // The RMS statistic: both factors are the committed x row,
-                // the extra slot carries -sum on the left and one on the
-                // right. The left form is sum(eq_i x_i) - eq[columns] sum;
-                // the right form is sum(eq_i x_i) + eq[columns].
-                let sum_member = bat_of
+            26..=28 => {
+                // The three bounded partial sums: both factors are one limb
+                // row and the extra slot subtracts the committed scalar.
+                let rms = norm.rms.as_ref().ok_or(Error::StatementMismatch)?;
+                let limb_member = |oracle: u64| -> Result<&ProximityMember> {
+                    bat_of
+                        .get(&oracle)
+                        .copied()
+                        .ok_or(Error::StatementMismatch)
+                };
+                let (left_group, right_group, scalar_group) = match word.relation {
+                    26 => (&rms.low, &rms.low, &norm.sum),
+                    27 => (&rms.low, &rms.high, &norm.squares),
+                    _ => (&rms.high, &rms.high, &norm.mean),
+                };
+                let left_member =
+                    limb_member(left_group.oracle_base + position as u64)?;
+                let right_member =
+                    limb_member(right_group.oracle_base + position as u64)?;
+                let scalar_member = bat_of
                     .get(
-                        &norm
-                            .sum
+                        &scalar_group
                             .oracle_base
                             .checked_add(position as u64)
                             .ok_or(Error::ResourceLimit)?,
@@ -23106,19 +23119,19 @@ fn norm_plain_rows(
                     .ok_or(Error::StatementMismatch)?;
                 let mut left = BatRow::new(BatRowKind::Plain);
                 left.add_term(
-                    x_member.bat_oracle,
+                    left_member.bat_oracle,
                     BatPart::Main,
                     scatter_message_coefficients(
-                        &norm.x.shape,
+                        &left_group.shape,
                         norm.columns,
                         &x_coefficients,
                     )?,
                 );
                 left.add_term(
-                    sum_member.bat_oracle,
+                    scalar_member.bat_oracle,
                     BatPart::Main,
                     scalar_message_coefficients(
-                        &norm.sum.shape,
+                        &scalar_group.shape,
                         Fp3::ZERO.sub(&eq[columns]),
                     )?,
                 );
@@ -23133,10 +23146,10 @@ fn norm_plain_rows(
 
                 let mut right = BatRow::new(BatRowKind::Plain);
                 right.add_term(
-                    x_member.bat_oracle,
+                    right_member.bat_oracle,
                     BatPart::Main,
                     scatter_message_coefficients(
-                        &norm.x.shape,
+                        &right_group.shape,
                         norm.columns,
                         &x_coefficients,
                     )?,
@@ -23148,6 +23161,65 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&eq[columns]);
+                rows.push(right);
+            }
+            29 => {
+                // x - lo - 2^16 hi = 0 on the valid columns. The left form
+                // carries all three committed groups; the right form is the
+                // public valid-column sum.
+                let rms = norm.rms.as_ref().ok_or(Error::StatementMismatch)?;
+                let limb_member = |oracle: u64| -> Result<&ProximityMember> {
+                    bat_of
+                        .get(&oracle)
+                        .copied()
+                        .ok_or(Error::StatementMismatch)
+                };
+                let low_member = limb_member(rms.low.oracle_base + position as u64)?;
+                let high_member = limb_member(rms.high.oracle_base + position as u64)?;
+                let mut low_coefficients = vec![Fp3::ZERO; 2 * columns];
+                let mut high_coefficients = vec![Fp3::ZERO; 2 * columns];
+                let factor = crate::proof::output_closure::fp3_signed(1 << 16)?;
+                for entry in 0..valid.min(columns) {
+                    low_coefficients[entry] = Fp3::ZERO.sub(&eq[entry]);
+                    high_coefficients[entry] = Fp3::ZERO.sub(&eq[entry].mul(&factor));
+                }
+                let mut left = BatRow::new(BatRowKind::Plain);
+                left.add_term(
+                    x_member.bat_oracle,
+                    BatPart::Main,
+                    scatter_message_coefficients(&norm.x.shape, norm.columns, &x_coefficients)?,
+                );
+                left.add_term(
+                    low_member.bat_oracle,
+                    BatPart::Main,
+                    scatter_message_coefficients(&rms.low.shape, norm.columns, &low_coefficients)?,
+                );
+                left.add_term(
+                    high_member.bat_oracle,
+                    BatPart::Main,
+                    scatter_message_coefficients(
+                        &rms.high.shape,
+                        norm.columns,
+                        &high_coefficients,
+                    )?,
+                );
+                left.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown0)?,
+                    word.output.ends[0].mask_scale,
+                );
+                left.target = word.output.ends[0].value;
+                rows.push(left);
+
+                let mut right = BatRow::new(BatRowKind::Plain);
+                right.add_unit(
+                    mask_member.bat_oracle,
+                    BatPart::Mask,
+                    mask_plan.entry_virtual_index(shown1)?,
+                    word.output.ends[1].mask_scale,
+                );
+                right.target = word.output.ends[1].value.sub(&eq_sum);
                 rows.push(right);
             }
             4 | 5 => {
