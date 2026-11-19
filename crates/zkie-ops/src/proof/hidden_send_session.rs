@@ -37721,6 +37721,7 @@ mod merged_tests {
             valid: 2,
             vocab: plan.send.columns as usize,
             mask_value: -65_536,
+            masked: true,
             winner,
             slack: wshape(plan.send.columns, 63_000),
             slack_oracle_base: 42_000,

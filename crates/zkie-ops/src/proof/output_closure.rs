@@ -335,8 +335,12 @@ pub struct ClosurePlan {
     pub valid: usize,
     /// The complete padded column domain `K`.
     pub vocab: usize,
-    /// The public mask constant `M < 0`.
+    /// The public mask constant `M < 0`. The unmasked form has no invalid
+    /// columns, so the value is zero and unused.
     pub mask_value: i64,
+    /// Whether the closure applies the vocabulary mask. An unmasked model
+    /// argmaxes over the full column domain.
+    pub masked: bool,
     /// The trusted first-maximum winner, one index per position.
     pub winner: Vec<u32>,
     /// The committed slack message shape.
@@ -434,14 +438,18 @@ impl ClosurePlan {
         if width != self.bits_per_cell as u64 {
             return Some("the closure bit layout does not match its bounds");
         }
-        if self.valid == 0
-            || self.valid >= self.vocab
+        let vocabulary = if self.masked {
+            self.valid > 0 && self.valid < self.vocab && self.mask_value < 0
+        } else {
+            self.valid == self.vocab && self.mask_value == 0
+        };
+        if !vocabulary
             || self.vocab as u64 != send.columns
             || !self.vocab.is_power_of_two()
         {
             return Some("the closure vocabulary boundary is not a padded valid range");
         }
-        if self.mask_value >= 0 || self.winner.len() != send.positions() as usize {
+        if self.winner.len() != send.positions() as usize {
             return Some("the closure public winner or mask value is not a plan value");
         }
         if self.winner.iter().any(|index| *index as usize >= self.valid) {
@@ -451,7 +459,7 @@ impl ClosurePlan {
             Ok(offset) => offset,
             Err(_) => return Some("the closure offset overflows"),
         };
-        if (self.mask_value as i128) > -((offset as i128) + 1) {
+        if self.masked && (self.mask_value as i128) > -((offset as i128) + 1) {
             return Some("the closure mask does not separate invalid columns");
         }
         let bound = match self.slack_bound() {
@@ -642,6 +650,10 @@ impl ClosurePlan {
         writer.put_u64(self.bits_per_cell as u64);
         writer.put_u64(self.boolean_variables as u64);
         self.mask.encode_into(writer);
+        if !self.masked {
+            // The masked form keeps the historical encoding unchanged.
+            writer.put_bytes(b"zkie/output-closure/unmasked-v1");
+        }
     }
 
     pub fn parameters_digest(&self) -> Digest {
@@ -1843,6 +1855,7 @@ mod tests {
             valid: 3,
             vocab: 4,
             mask_value: -4,
+            masked: true,
             winner: vec![0],
             slack: shape(4, 1),
             slack_oracle_base: 20,
