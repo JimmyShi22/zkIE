@@ -508,6 +508,15 @@ impl FoldMainTable {
     fn pair_products(&self) -> Result<[Fp3; 3]> {
         pair_products(&self.coefficients, &self.messages)
     }
+
+    /// Releases the fold-time capacity once the rounds are complete. Folding
+    /// truncates the tables in place, so a large group table keeps its full
+    /// allocation until this runs; the kept elements and their order do not
+    /// change.
+    fn shrink_capacity(&mut self) {
+        self.coefficients.shrink_to_fit();
+        self.messages.shrink_to_fit();
+    }
 }
 
 fn fold_pair(low: Fp3, high: Fp3, gamma: Fp3) -> Fp3 {
@@ -799,6 +808,15 @@ impl FoldRoundProver {
         }
         self.kept = self.kept.mul(&Fp3::ONE.sub(&gamma));
         self.next += 1;
+        if self.next == self.k {
+            // The stage-0 group messages are fully consumed by the last
+            // round; release their fold-time capacity before the next stage
+            // starts.
+            self.main.shrink_capacity();
+            self.d.shrink_to_fit();
+            self.mu.shrink_to_fit();
+            self.fresh.shrink_to_fit();
+        }
         Ok(())
     }
 
