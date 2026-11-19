@@ -2678,14 +2678,6 @@ impl NormPlan {
         let sh_cap = capacity(widths.shifted)?;
         let pre_cap = capacity(widths.pre_clamp)?;
         let pre_half = half_range(widths.pre_clamp)?;
-        let round_bounds = norm_no_wrap_mode(
-            round.input_bound,
-            self.shape.valid,
-            &round.layout.widths,
-            round.layout.sum_offset,
-            round.layout.mean_offset,
-            self.mode,
-        )?;
         let gain = params
             .gain
             .valid_max
@@ -2697,25 +2689,43 @@ impl NormPlan {
                 .unsigned_abs()
                 .max(bias.valid_min.unsigned_abs()) as u128
         });
-        let centered = (round.input_bound as u128)
-            .checked_mul(2)
-            .ok_or(Error::ResourceLimit)?;
         // The image is the pointwise product pinned by the product-sumcheck;
-        // the prover has no free choice over it. The per-column bound uses the
-        // trusted input contract and the pinned table magnitudes: the centered
-        // amplitude (twice the input bound), the rstd value bound of the
-        // frozen-table plan when present, and the gain bound. The valid-column
-        // count is not a factor: the claim target is field arithmetic and the
-        // image carries no per-row sum.
-        let rstd_bound = match &self.rstd {
-            Some(rstd) => u128::from(rstd.value_bound),
-            None => round_bounds.rsqrt,
+        // the prover has no free choice over it. The layer form bounds it by
+        // the centered amplitude, the pinned rstd value and the gain bound.
+        // The RMS form uses the correlated pre-clamp bound derived from the
+        // frozen table and checked on the authenticated rows, because the
+        // independent product of the same factors exceeds the field half.
+        let image = if self.mode.is_rms() {
+            let rms = self.rms.as_ref().ok_or(Error::InvalidConfig)?;
+            norm_rms_no_wrap(
+                round.input_bound,
+                self.shape.valid,
+                &rms.widths,
+                rms.mean_bound,
+            )?;
+            rms.pre_bound as u128
+        } else {
+            let round_bounds = norm_no_wrap_mode(
+                round.input_bound,
+                self.shape.valid,
+                &round.layout.widths,
+                round.layout.sum_offset,
+                round.layout.mean_offset,
+                self.mode,
+            )?;
+            let centered = (round.input_bound as u128)
+                .checked_mul(2)
+                .ok_or(Error::ResourceLimit)?;
+            let rstd_bound = match &self.rstd {
+                Some(rstd) => u128::from(rstd.value_bound),
+                None => round_bounds.rsqrt,
+            };
+            centered
+                .checked_mul(rstd_bound)
+                .and_then(|value| value.checked_mul(gain))
+                .and_then(|value| value.checked_add(1))
+                .ok_or(Error::ResourceLimit)?
         };
-        let image = centered
-            .checked_mul(rstd_bound)
-            .and_then(|value| value.checked_mul(gain))
-            .and_then(|value| value.checked_add(1))
-            .ok_or(Error::ResourceLimit)?;
         let shifted = q_half
             .checked_add(1)
             .ok_or(Error::ResourceLimit)?;

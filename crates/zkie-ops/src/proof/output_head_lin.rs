@@ -971,13 +971,15 @@ fn select_output_head_step_unmasked_for(
             return Err(Error::StatementMismatch);
         }
     }
-    let previous =
+    let derived =
         PreviousObjectPlan::derive_for_activation(plan, activation_step, positions, hidden)?;
-    let declared = plan
-        .previous_object
-        .as_ref()
-        .ok_or(Error::StatementMismatch)?;
-    declared.validate_for_activation(plan, activation_step, positions, hidden)?;
+    let previous = match &plan.previous_object {
+        Some(declared) => {
+            declared.validate_for_activation(plan, activation_step, positions, hidden)?;
+            declared.clone()
+        }
+        None => derived,
+    };
     Ok(OutputHeadStep {
         step,
         activation_step,

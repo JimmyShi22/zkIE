@@ -200,7 +200,7 @@ impl RmsLimbRow {
     pub fn split(value: i64) -> Result<(i64, i64)> {
         let value = value as i128;
         let low = (value + LOW_BOUND).rem_euclid(LIMB_BASE) - LOW_BOUND;
-        if low <= -LOW_BOUND || low >= LOW_BOUND {
+        if low < -LOW_BOUND || low >= LOW_BOUND {
             return Err(Error::BoundViolation);
         }
         let high = (value - low) / LIMB_BASE;

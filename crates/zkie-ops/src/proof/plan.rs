@@ -437,7 +437,10 @@ impl PreviousObjectPlan {
             .steps
             .get(activation_step)
             .ok_or(Error::StatementMismatch)?;
-        if activation.opcode != OpCode::ProfileLayerNorm || activation.outputs == 0 {
+        if (activation.opcode != OpCode::ProfileLayerNorm
+            && activation.opcode != OpCode::ProfileRmsNorm)
+            || activation.outputs == 0
+        {
             return Err(Error::StatementMismatch);
         }
         let config = literal_config_values(activation).ok_or(Error::InvalidConfig)?;
