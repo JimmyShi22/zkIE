@@ -48,8 +48,8 @@ use crate::norm_parent::{
 use crate::norm_segment_provider::{
     build_param_tables, build_segment_table, configuration_for, lm_head_asset, plan_identifier,
     prove_segment_bytes, rstd_table_view, segment_identity_binding, segment_table_key,
-    segment_work_dir, verify_segment_bytes, NormSegmentCarrier, SegmentTableIdentity,
-    NORM_SEGMENT_CARRIER_FILE, NORM_SEGMENT_CARRIER_VERSION,
+    segment_table_source_identity, segment_work_dir, verify_segment_bytes, NormSegmentCarrier,
+    SegmentTableIdentity, NORM_SEGMENT_CARRIER_FILE, NORM_SEGMENT_CARRIER_VERSION,
 };
 
 const PROTOCOL_ID: Digest = Digest([0xA1; 32]);
@@ -569,6 +569,7 @@ fn prove_norm_segment(
         table_root: reader.root,
         table_record_digest: zkie_core::artifact::digest_bytes(&reader.record.encode()),
         table_configuration: configuration,
+        source_identity: segment_table_source_identity(),
     };
     identity.validate()?;
     let binding = segment_identity_binding(&identity);
@@ -646,6 +647,9 @@ fn verify_norm_segment(
         .as_ref()
         .ok_or(Error::IncompleteArtifact)?;
     identity.validate()?;
+    if identity.source_identity != segment_table_source_identity() {
+        return Err(Error::StatementMismatch);
+    }
     let positions = statement.tokens.len();
     if positions != zkie_ops::proof::output_head_lin::OUTPUT_HEAD_POSITIONS
         || statement.model != trusted.model

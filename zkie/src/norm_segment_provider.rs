@@ -55,6 +55,20 @@ const WINDOW_BYTES: u64 = 1 << 20;
 const TOTAL_BYTES: u64 = 1 << 30;
 const STORE_MAX_BYTES: u64 = 4 << 30;
 
+/// The plan-fixed identity of the bounded output-head table source. The
+/// production consumer opens the source with exactly these bounds; the
+/// identity rides the segment statement and the verifier compares it with
+/// this derivation, so a swapped source is a statement mismatch.
+pub fn segment_table_source_identity() -> Digest {
+    let mut writer = CanonicalWriter::new();
+    writer.put_u64(1);
+    writer.put_bytes(b"bounded-asset");
+    writer.put_u64(CAP_BYTES);
+    writer.put_u64(WINDOW_BYTES);
+    writer.put_u64(TOTAL_BYTES);
+    zkie_core::artifact::digest_bytes(&writer.into_bytes())
+}
+
 /// The public carrier of the segment proof.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct NormSegmentCarrier {
@@ -105,6 +119,10 @@ pub struct SegmentTableIdentity {
     pub table_root: Digest,
     pub table_record_digest: Digest,
     pub table_configuration: Digest,
+    /// The identity of the bounded table source (kind and bounds) the prover
+    /// opened. The verifier compares it with the plan-fixed derivation, so a
+    /// statement produced from a different source is a mismatch.
+    pub source_identity: Digest,
 }
 
 impl SegmentTableIdentity {
@@ -155,6 +173,7 @@ impl SegmentTableIdentity {
             || self.table_root == Digest::ZERO
             || self.table_record_digest == Digest::ZERO
             || self.table_configuration == Digest::ZERO
+            || self.source_identity == Digest::ZERO
         {
             return Err(Error::InvalidConfig);
         }
@@ -165,7 +184,9 @@ impl SegmentTableIdentity {
 }
 
 /// The canonical digest of the segment identity. It is fixed in the plan and
-/// absorbed into the session derivation.
+/// absorbed into the session derivation. The source identity is checked
+/// directly against the plan-fixed derivation instead of entering this
+/// digest, so the session derivation and the carrier bytes stay unchanged.
 pub fn segment_identity_binding(identity: &SegmentTableIdentity) -> Digest {
     let mut writer = CanonicalWriter::new();
     writer.put_u64(1);
