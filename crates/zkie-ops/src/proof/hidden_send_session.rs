@@ -24323,10 +24323,17 @@ fn closure_plain_rows(
 ) -> Result<Vec<BatRow>> {
     let closure_plan = plan.closure.as_ref().ok_or(Error::InvalidConfig)?;
     let positions = plan.send.positions() as usize;
+    // The plan's own fault allows the unmasked form, where the full padded
+    // domain is valid (valid == vocab) and the mask constant is zero; the
+    // masked form requires a proper boundary below the padded domain.
+    let vocabulary = if closure_plan.masked {
+        closure_plan.valid > 0 && closure_plan.valid < closure_plan.vocab
+    } else {
+        closure_plan.valid == closure_plan.vocab
+    };
     if binding.positions.len() != positions
         || closure_plan.winner.len() != positions
-        || closure_plan.valid == 0
-        || closure_plan.valid >= closure_plan.vocab
+        || !vocabulary
     {
         return Err(Error::ShapeMismatch);
     }
