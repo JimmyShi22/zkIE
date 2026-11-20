@@ -15630,12 +15630,15 @@ fn prove_first(
             absorb_tagged_answers(&mut chain, 36, &map_answers)?;
             let _profile_closure_check =
                 zkie_engine::profile::Scope::new("first.closure_check");
-            closure.map = map.clone();
+            // The committed map group moves into the witness: the openings
+            // below read the same copy, so the message rows exist once until
+            // the second stage hands them to the own members.
+            closure.map = map;
             closure.map_values = map_values;
             closure.r_bool = r_bool.clone();
             closure.check(closure_plan, &plan.send)?;
             drop(_profile_closure_check);
-            Some((map, map_seeds, map_answers, r_bool))
+            Some((map_seeds, map_answers, r_bool))
         }
         (None, None, None) => None,
         _ => return Err(Error::ShapeMismatch),
@@ -15682,7 +15685,7 @@ fn prove_first(
                 mask_seeds,
                 mask_answer,
             )),
-            Some((map, map_seeds, map_answers, _r_bool)),
+            Some((map_seeds, map_answers, _r_bool)),
         ) => {
             let _profile_closure_openings =
                 zkie_engine::profile::Scope::new("first.closure_openings");
@@ -15738,11 +15741,11 @@ fn prove_first(
                 zkie_engine::profile::Scope::new("first.closure_map_openings");
             let map_openings = open_value_group_openings(
                 &closure_plan.map,
-                &map.messages,
+                &closure.map.messages,
                 &closure.map_tails,
                 &closure.map_salts,
                 &map_positions,
-                &map.trees,
+                &closure.map.trees,
             )?;
             drop(_profile_map_open);
             Some(ClosureFirstMessages {
@@ -15760,7 +15763,7 @@ fn prove_first(
                 },
                 bits_positions,
                 bits_openings,
-                map: CommittedGroupMessage::new(map.group.clone()),
+                map: CommittedGroupMessage::new(closure.map.group.clone()),
                 map_sample: SendSamples {
                     seed: map_seeds,
                     answers: map_answers,
