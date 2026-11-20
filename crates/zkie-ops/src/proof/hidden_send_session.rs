@@ -18362,13 +18362,24 @@ fn own_members(
         let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
         let norm_witness = witness.and_then(|witness| witness.norm.as_ref());
         let positions = plan.send.positions();
-        let mut groups = vec![
-            (&norm_first.x, &norm_plan.x, norm_witness.map(|w| &w.x)),
+        // The member list follows the plan's own group order, including the
+        // RMS limb groups when the plan carries them.
+        let mut groups = vec![(&norm_first.x, &norm_plan.x, norm_witness.map(|w| &w.x))];
+        match (&norm_first.low, &norm_first.high) {
+            (Some(low), Some(high)) => {
+                let rms = norm_plan.rms.as_ref().ok_or(Error::StatementMismatch)?;
+                groups.push((low, &rms.low, norm_witness.and_then(|w| w.low.as_ref())));
+                groups.push((high, &rms.high, norm_witness.and_then(|w| w.high.as_ref())));
+            }
+            (None, None) if norm_plan.rms.is_none() => {}
+            _ => return Err(Error::ShapeMismatch),
+        }
+        groups.extend([
             (&norm_first.sum, &norm_plan.sum, norm_witness.map(|w| &w.sum)),
             (&norm_first.squares, &norm_plan.squares, norm_witness.map(|w| &w.squares)),
             (&norm_first.mean, &norm_plan.mean, norm_witness.map(|w| &w.mean)),
             (&norm_first.variance, &norm_plan.variance, norm_witness.map(|w| &w.variance)),
-        ];
+        ]);
         if let (Some(round_message), Some(round_plan)) =
             (&norm_first.round, &norm_plan.round)
         {
