@@ -39080,6 +39080,55 @@ mod merged_tests {
             .collect()
     }
 
+    /// The stacked block placement and the column-major row-band runs must
+    /// agree exactly: a coefficient at block entry `c` of position `p` belongs
+    /// to the cell whose virtual index is row + place * rows, with
+    /// row = p * block_rows + c % block_rows and place = c / block_rows. This
+    /// fixture uses several positions and a multi-row block, where the row-major
+    /// contiguous form diverged from the column-major scatter.
+    #[test]
+    fn the_stacked_band_runs_place_entries_on_the_commit_cells() {
+        let positions = 4usize;
+        let block_columns = 32u64;
+        let code = zkie_engine::pcs::request::code::build_code_plan(4, 8, 1).unwrap();
+        let rows = usize::try_from((positions as u64 * block_columns) / code.ell).unwrap();
+        assert_eq!(rows, 16);
+        let block_rows = rows / positions;
+        assert_eq!(block_rows, 4);
+        assert_eq!(
+            u64::try_from(block_rows * positions).unwrap(),
+            positions as u64 * block_columns / code.ell
+        );
+        // One position's coefficients in entry order.
+        let coefficients: Vec<Fp3> = (0..block_columns)
+            .map(|entry| Fp3::from_u64(1 + 2 * entry + 7))
+            .collect();
+        let position = 2usize;
+        // The commit map: entry c sits at (row = p * block_rows + c % block_rows,
+        // place = c / block_rows) and its virtual index is row + place * rows.
+        let mut committed = vec![Fp3::ZERO; rows * (block_columns as usize)];
+        for (entry, value) in coefficients.iter().enumerate() {
+            let row = position * block_rows + entry % block_rows;
+            let place = entry / block_rows;
+            committed[row + place * rows] = *value;
+        }
+        // The row-band runs: first = p * block_rows + local, step = rows,
+        // values[i] = coefficients[local + block_rows * i].
+        let mut row = BatRow::new(BatRowKind::Plain);
+        push_block_runs(&mut row, 0, position, block_rows, rows as u64, &coefficients).unwrap();
+        assert_eq!(row.runs.len(), block_rows);
+        let mut scattered = vec![Fp3::ZERO; rows * (block_columns as usize)];
+        for (local, run) in row.runs.iter().enumerate() {
+            assert_eq!(run.step, rows as u64);
+            assert_eq!(run.first, (position * block_rows + local) as u64);
+            for (offset, value) in run.values.iter().enumerate() {
+                let index = usize::try_from(run.first).unwrap() + rows * offset;
+                scattered[index] = *value;
+            }
+        }
+        assert_eq!(scattered, committed, "the band runs and the commit cells disagree");
+    }
+
     #[test]
     fn a_stacked_closure_plan_needs_its_marker() {
         let activation = activation();
