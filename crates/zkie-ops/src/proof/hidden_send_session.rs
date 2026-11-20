@@ -18786,15 +18786,28 @@ let shape = plan.send.w.oracle_shape();
     if let Some(norm_plan) = &plan.norm {
         let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
         let groups = norm_group_plans(norm_plan);
-        let mut messages = vec![
-            &norm_first.x,
+        // The message list follows the plan's group order, with the RMS limb
+        // groups in the same place as the plan and witness lists.
+        let mut messages = vec![&norm_first.x];
+        match (&norm_first.low, &norm_first.high) {
+            (Some(low), Some(high)) => {
+                messages.push(low);
+                messages.push(high);
+            }
+            (None, None) if norm_plan.rms.is_none() => {}
+            _ => return Err(Error::ShapeMismatch),
+        }
+        messages.extend([
             &norm_first.sum,
             &norm_first.squares,
             &norm_first.mean,
             &norm_first.variance,
-        ];
+        ]);
         if let Some(round) = &norm_first.round {
             messages.push(round);
+        }
+        if messages.len() != groups.len() {
+            return Err(Error::ShapeMismatch);
         }
         let positions = plan.send.positions() as u64;
         for (group_plan, message) in groups.iter().zip(messages.iter()) {
