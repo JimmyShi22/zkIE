@@ -3002,6 +3002,41 @@ mod tests {
     use super::*;
     use zkie_engine::pcs::request::code::build_code_plan;
 
+    /// The gemma3 own-group fold shape after the stacked closure messages:
+    /// the member set drops from 16+16 closure members to one per class, so
+    /// the fold k re-derives from 14 to 13. This is the candidate report for
+    /// the error-budget rerun: the planner must converge for k = 13 at the
+    /// production geometry, and the constants do not move backwards.
+    #[test]
+    fn the_stacked_closure_member_set_plans_at_k_thirteen() {
+        let code = build_code_plan(19, 262_144, 8192).unwrap();
+        let mask = build_code_plan(19, 512, 256).unwrap();
+        let last_main = build_code_plan(19, 262_144, 1).unwrap();
+        let last_mask = build_code_plan(19, 16_384, 1).unwrap();
+        let plan = plan_own_two_stage(code, mask, last_main, last_mask, 13, 2, 252).unwrap();
+        println!(
+            "own_two_stage k=13: stage0 positions={} work_bits={} m={} last_positions={} last_r={}/{} last_m={}",
+            plan.stage_zero_positions,
+            plan.stage_zero_work_bits,
+            plan.stage_zero_m,
+            plan.last_positions,
+            plan.last_main_r,
+            plan.last_mask_r,
+            plan.last_m,
+        );
+        let old = plan_own_two_stage(code, mask, last_main, last_mask, 14, 2, 252).unwrap();
+        println!(
+            "own_two_stage k=14: stage0 positions={} work_bits={} m={} last_positions={} last_r={}/{} last_m={}",
+            old.stage_zero_positions,
+            old.stage_zero_work_bits,
+            old.stage_zero_m,
+            old.last_positions,
+            old.last_main_r,
+            old.last_mask_r,
+            old.last_m,
+        );
+    }
+
     /// The shared linear layer derives exactly the three recorded terms: the
     /// fold point's error, the agreement power at the column count, and the
     /// comparison point's field error. An unreachable agreement and a zero
