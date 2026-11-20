@@ -917,6 +917,65 @@ mod tests {
             (gemma_main, gemma_mask)
         );
     }
+
+    /// D (k=13) component check: the merged closure message shape.
+    ///
+    /// The two closure classes stack their per-position blocks into one
+    /// message each. For gemma3 each position block is 128 rows over the
+    /// session code's 2^18 places (2^25 entries per position), so the merged
+    /// message holds 16 x 2^25 = 2^29 entries. Its code keeps the session
+    /// log_n and r and raises the message length by three pads; the last
+    /// entry then lands at place 262143, before the padded capacity
+    /// (2^29 / 2^18 = 2048 rows exactly). If any other W shape condition
+    /// rejects this, the assertion names it.
+    #[test]
+    fn the_merged_closure_shape_is_two_thousand_forty_rows() {
+        use zkie_engine::pcs::request::code::build_code_plan;
+        use zkie_ops::proof::proximity_planner::rows_for_columns;
+
+        let (code, _mask_code) = super::gemma3_segment_codes().unwrap();
+        let geometry = &super::GEMMA3_SEGMENT_HEAD;
+        let closure_width = 2 * (geometry.range_bits + 1) + geometry.slack_bits;
+        let block_columns = (geometry.columns as u64)
+            .checked_mul(closure_width as u64)
+            .unwrap()
+            .next_power_of_two();
+        assert_eq!(block_columns, 1u64 << 25);
+        let positions = geometry.positions as u32;
+        let entries = block_columns * positions as u64;
+        assert_eq!(entries, 1u64 << 29);
+
+        // Each position block keeps the session place count 2^18; the merged
+        // code adds three pads so the per-row capacity is exactly 2^18.
+        let capacity = code.ell;
+        assert_eq!(capacity, 1u64 << 18);
+        let answers = 3u32;
+        let ell = capacity + answers as u64;
+        let merged_code = build_code_plan(code.log_n, ell, code.r).unwrap();
+        let block_rows = block_columns / capacity;
+        assert_eq!(block_rows, 128);
+        assert_eq!(block_rows * positions as u64, 2048);
+        assert_eq!(rows_for_columns(entries, ell, answers).unwrap(), 2048);
+
+        let configuration = Digest([0x5A; 32]);
+        for tree_number in [super::BITS_TREE_NUMBER, super::MAP_TREE_NUMBER] {
+            let shape = WShape::new(
+                entries,
+                merged_code,
+                answers,
+                1,
+                super::SALT,
+                tree_number,
+                2,
+                super::BITS_RUN,
+                configuration,
+            )
+            .expect("the merged closure shape is a message shape");
+            assert_eq!(shape.main_rows, 2048);
+            assert!(shape.fault(entries, 1).is_none());
+            assert!(shape.oracle_shape().fault().is_none());
+        }
+    }
 }
 
 use std::fs::File;
