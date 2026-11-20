@@ -24323,7 +24323,8 @@ fn closure_plain_rows(
     members: &[ProximityMember],
     first: &HiddenSendMessages,
     binding: &ClosureRowBinding,
-) -> Result<Vec<BatRow>> {
+    emit: &mut dyn FnMut(BatRow) -> Result<()>,
+) -> Result<()> {
     let closure_plan = plan.closure.as_ref().ok_or(Error::InvalidConfig)?;
     let positions = plan.send.positions() as usize;
     // The plan's own fault allows the unmasked form, where the full padded
@@ -24375,7 +24376,6 @@ fn closure_plain_rows(
         .map(|word| word.r_bool.as_slice())
         .unwrap_or(&[]);
     let eq_r = crate::proof::output_closure::eq_vector(shared_r_bool)?;
-    let mut rows = Vec::with_capacity(positions * 7);
     for position in 0..positions {
         let word = &binding.positions[position];
         if word.r_bool.len() != k
@@ -24450,7 +24450,7 @@ fn closure_plain_rows(
                 .mul(&masked_sum)
                 .add(&low_sum),
         );
-        rows.push(row);
+        emit(row)?;
 
         // Reconstruction at one random point: u = Y + A, v = A - Y and the
         // slack bit vector equal the committed slack message.
@@ -24499,7 +24499,7 @@ fn closure_plain_rows(
                 row.add_term(slack_member.bat_oracle, BatPart::Main, main_coefficients);
             }
             row.target = crate::proof::output_closure::fp3_signed(target)?;
-            rows.push(row);
+            emit(row)?;
         }
 
         let shown0 = closure_plan.mask.shown_slot(position as u32, 0)?;
@@ -24524,7 +24524,7 @@ fn closure_plain_rows(
             word.output.ends[0].mask_scale,
         );
         row.target = word.output.ends[0].value;
-        rows.push(row);
+        emit(row)?;
 
         // The committed bit map at the booleanity point, one-time masked.
         let mut coefficients = vec![Fp3::ZERO; bits_rows * bits_ell];
@@ -24538,7 +24538,7 @@ fn closure_plain_rows(
             Fp3::ONE,
         );
         row.target = word.b_point;
-        rows.push(row);
+        emit(row)?;
 
         // The virtual second map is affine in the committed bits:
         // Omega(pt) = 1 - B(pt).
@@ -24561,7 +24561,7 @@ fn closure_plain_rows(
             .value
             .sub(&Fp3::ONE)
             .add(&word.b_point);
-        rows.push(row);
+        emit(row)?;
 
         // (U): the hiding coefficients against the last-round target.
         let mut row = BatRow::new(BatRowKind::Plain);
@@ -24575,7 +24575,7 @@ fn closure_plain_rows(
             );
         }
         row.target = word.output.row_target;
-        rows.push(row);
+        emit(row)?;
 
         // D = eq(r, .) B at a fresh point, checked by two public linear
         // functionals of the committed messages and one equality row.
@@ -24601,7 +24601,7 @@ fn closure_plain_rows(
             Fp3::ONE,
         );
         row.target = word.d_value;
-        rows.push(row);
+        emit(row)?;
         let mut row = BatRow::new(BatRowKind::Plain);
         row.add_term(bits_member.bat_oracle, BatPart::Main, b_coefficients);
         row.add_unit(
@@ -24611,7 +24611,7 @@ fn closure_plain_rows(
             Fp3::ONE,
         );
         row.target = word.bq_value;
-        rows.push(row);
+        emit(row)?;
         let mut row = BatRow::new(BatRowKind::Plain);
         row.add_unit(
             mask.bat_oracle,
@@ -24626,9 +24626,9 @@ fn closure_plain_rows(
             Fp3::ZERO.sub(&Fp3::ONE),
         );
         row.target = word.d_value.sub(&word.bq_value);
-        rows.push(row);
+        emit(row)?;
     }
-    Ok(rows)
+    Ok(())
 }
 
 /// The committed column message of one output group as a BAT coefficient
@@ -25504,9 +25504,7 @@ fn own_plain_rows_each(
     }
     if let Some(binding) = closure {
         let _scope = zkie_engine::profile::Scope::new("second.plain.closure");
-        for row in closure_plain_rows(plan, members, first, binding)? {
-            emit(row)?;
-        }
+        closure_plain_rows(plan, members, first, binding, emit)?;
     }
     if let Some(binding) = norm {
         let _scope = zkie_engine::profile::Scope::new("second.plain.norm");
