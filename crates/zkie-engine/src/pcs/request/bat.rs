@@ -18,6 +18,7 @@
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
+use std::time::Instant;
 
 use rayon::prelude::*;
 
@@ -1033,6 +1034,9 @@ impl BatSession {
         let mut chunk_symbols = 0usize;
         let mut deferred_at = 0usize;
         let mut samples_started = false;
+        let combine_started = Instant::now();
+        let mut completed_rows = 0u64;
+        let mut completed_symbols = 0u64;
         {
             let statement = &self.statement;
             let layout = &input.layout;
@@ -1075,6 +1079,9 @@ impl BatSession {
                 scale = scale.mul(&x);
                 if chunk_symbols >= STREAM_CHUNK_SYMBOLS {
                     combine_chunk_into(statement, layout, &mut out, &chunk)?;
+                    completed_rows += chunk.len() as u64;
+                    completed_symbols += chunk_symbols as u64;
+                    bat_progress(completed_rows, completed_symbols, combine_started.elapsed());
                     chunk.clear();
                     chunk_symbols = 0;
                 }
@@ -1084,6 +1091,9 @@ impl BatSession {
         }
         if !chunk.is_empty() {
             combine_chunk_into(&self.statement, &input.layout, &mut out, &chunk)?;
+            completed_rows += chunk.len() as u64;
+            completed_symbols += chunk_symbols as u64;
+            bat_progress(completed_rows, completed_symbols, combine_started.elapsed());
         }
         for row in input.rows.iter() {
             combine_row_into(&self.statement, &input.layout, &mut out, row, scale)?;
@@ -1160,7 +1170,10 @@ fn combine_with_min(
         power = power.mul(&x);
     }
     let mut scatter: Vec<Vec<MainScatter<'_>>> = Vec::with_capacity(rows.len());
-    let mut units: Vec<Vec<MainUnitScatter>> = Vec::with_capacity(rows.len());
+    let mut units: Vec<MainUnitScatter> = Vec::new();
+    let started = Instant::now();
+    let mut completed_rows = 0u64;
+    let mut completed_symbols = 0u64;
     for (row, scale) in rows.iter().zip(&powers) {
         let mut row_scatter = Vec::new();
         let mut row_units = Vec::new();
@@ -1301,10 +1314,17 @@ fn combine_with_min(
         }
         out.target = out.target.add(&scale.mul(&row.target));
         scatter.push(row_scatter);
-        units.push(row_units);
+        units.append(&mut row_units);
+        completed_rows += 1;
+        completed_symbols += row_symbols(row) as u64;
+        if completed_rows % 64 == 0 {
+            bat_progress(completed_rows, completed_symbols, started.elapsed());
+        }
     }
+    let places = out.main.len() / chunk_len;
+    let buckets = BucketedUnits::build(units, places)?;
     let scatter_at = |place: usize, chunk: &mut [Fp3]| -> Result<()> {
-        for (row_scatter, row_units) in scatter.iter().zip(&units) {
+        for row_scatter in &scatter {
             for term in row_scatter {
                 if place >= term.places {
                     continue;
@@ -1318,15 +1338,12 @@ fn combine_with_min(
                     *slot = slot.add(&term.scale.mul(value));
                 }
             }
-            for unit in row_units {
-                if unit.place != place {
-                    continue;
-                }
-                let slot = chunk
-                    .get_mut(unit.first + unit.row)
-                    .ok_or(Error::InvalidIndex)?;
-                *slot = slot.add(&unit.scaled);
-            }
+        }
+        for unit in buckets.at(place) {
+            let slot = chunk
+                .get_mut(unit.first + unit.row)
+                .ok_or(Error::InvalidIndex)?;
+            *slot = slot.add(&unit.scaled);
         }
         Ok(())
     };
@@ -1521,8 +1538,10 @@ fn array_row_into(
     out: &mut BatGroupRow,
     chunk_len: usize,
     row_scatter: &[MainScatter<'_>],
-    row_units: &[MainUnitScatter],
+    row_units: Vec<MainUnitScatter>,
 ) -> Result<()> {
+    let places = out.main.len() / chunk_len;
+    let buckets = BucketedUnits::build(row_units, places)?;
     for (place, chunk) in out.main.chunks_mut(chunk_len).enumerate() {
         for term in row_scatter {
             if place >= term.places {
@@ -1537,10 +1556,7 @@ fn array_row_into(
                 *slot = slot.add(&term.scale.mul(value));
             }
         }
-        for unit in row_units {
-            if unit.place != place {
-                continue;
-            }
+        for unit in buckets.at(place) {
             let slot = chunk
                 .get_mut(unit.first + unit.row)
                 .ok_or(Error::InvalidIndex)?;
@@ -1564,7 +1580,7 @@ fn combine_row_into(
         return Err(Error::ShapeMismatch);
     }
     let (row_scatter, row_units) = collect_row_scatter(statement, layout, out, row, scale)?;
-    array_row_into(out, chunk_len, &row_scatter, &row_units)
+    array_row_into(out, chunk_len, &row_scatter, row_units)
 }
 
 /// Applies a bounded chunk of rows with the place-major parallel scatter the
@@ -1587,14 +1603,17 @@ fn combine_chunk_into(
         return Err(Error::ShapeMismatch);
     }
     let mut scatter: Vec<Vec<MainScatter<'_>>> = Vec::with_capacity(chunk.len());
-    let mut units: Vec<Vec<MainUnitScatter>> = Vec::with_capacity(chunk.len());
+    let mut units: Vec<MainUnitScatter> = Vec::new();
     for (row, scale) in chunk {
-        let (row_scatter, row_units) = collect_row_scatter(statement, layout, out, row, *scale)?;
+        let (row_scatter, mut row_units) =
+            collect_row_scatter(statement, layout, out, row, *scale)?;
         scatter.push(row_scatter);
-        units.push(row_units);
+        units.append(&mut row_units);
     }
+    let places = out.main.len() / chunk_len;
+    let buckets = BucketedUnits::build(units, places)?;
     let scatter_at = |place: usize, out_chunk: &mut [Fp3]| -> Result<()> {
-        for (row_scatter, row_units) in scatter.iter().zip(&units) {
+        for row_scatter in &scatter {
             for term in row_scatter {
                 if place >= term.places {
                     continue;
@@ -1608,15 +1627,12 @@ fn combine_chunk_into(
                     *slot = slot.add(&term.scale.mul(value));
                 }
             }
-            for unit in row_units {
-                if unit.place != place {
-                    continue;
-                }
-                let slot = out_chunk
-                    .get_mut(unit.first + unit.row)
-                    .ok_or(Error::InvalidIndex)?;
-                *slot = slot.add(&unit.scaled);
-            }
+        }
+        for unit in buckets.at(place) {
+            let slot = out_chunk
+                .get_mut(unit.first + unit.row)
+                .ok_or(Error::InvalidIndex)?;
+            *slot = slot.add(&unit.scaled);
         }
         Ok(())
     };
@@ -1647,6 +1663,7 @@ struct MainScatter<'a> {
 }
 
 /// One folded main-table point coefficient.
+#[derive(Clone, Copy)]
 struct MainUnitScatter {
     first: usize,
     place: usize,
@@ -1694,6 +1711,61 @@ fn main_unit_scatter(
         row: usize::try_from(row).map_err(|_| Error::ResourceLimit)?,
         scaled,
     })
+}
+
+/// The empty unit, used only to size the bucketed buffer first.
+const EMPTY_UNIT: MainUnitScatter = MainUnitScatter {
+    first: 0,
+    place: 0,
+    row: 0,
+    scaled: Fp3::ZERO,
+};
+
+/// Units bucketed by their place. One counting pass over the units and one
+/// over the places turn the per-place scatter into O(units + places +
+/// matches): the per-place scan over every unit made a chunk with block-local
+/// runs quadratic in the place count and held the combine for hours.
+struct BucketedUnits {
+    units: Vec<MainUnitScatter>,
+    starts: Vec<usize>,
+}
+
+impl BucketedUnits {
+    fn build(units: Vec<MainUnitScatter>, places: usize) -> Result<Self> {
+        let mut starts = vec![0usize; places + 1];
+        for unit in &units {
+            if unit.place >= places {
+                return Err(Error::InvalidIndex);
+            }
+            starts[unit.place + 1] += 1;
+        }
+        for place in 0..places {
+            starts[place + 1] += starts[place];
+        }
+        let mut sorted = vec![EMPTY_UNIT; units.len()];
+        let mut cursor = starts.clone();
+        for unit in units {
+            let place = unit.place;
+            let at = cursor[place];
+            cursor[place] += 1;
+            sorted[at] = unit;
+        }
+        Ok(Self { units: sorted, starts })
+    }
+
+    fn at(&self, place: usize) -> &[MainUnitScatter] {
+        &self.units[self.starts[place]..self.starts[place + 1]]
+    }
+}
+
+/// One in-stage combine progress line: the completed row count and symbol
+/// volume at a chunk boundary, so a long combine reports its real pace and
+/// its completed work instead of going silent.
+fn bat_progress(rows: u64, symbols: u64, elapsed: std::time::Duration) {
+    eprintln!(
+        "bat_progress completed_rows={rows} completed_symbols={symbols} elapsed_ms={}",
+        elapsed.as_millis()
+    );
 }
 
 fn kept_slot<'a>(
