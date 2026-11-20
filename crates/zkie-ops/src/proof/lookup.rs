@@ -741,8 +741,8 @@ pub struct LookupOutcome {
     pub key: GeneralClaim,
     /// The column combination challenge, one for a single-column table.
     pub theta: Fp3,
-    /// Coefficients on the multiplicity bits and the number of keys.
-    pub multiplicity: (Vec<Fp3>, Fp3),
+    /// The plan-derived multiplicity rule and the key count.
+    pub multiplicity: MultiplicityRule,
     /// The `(U)` and end claims of every sumcheck, for the caller's rows.
     pub rows: Vec<GeneralOutput>,
     /// The allocated mask slots of the shown maps, one list per output row.
@@ -981,23 +981,35 @@ fn equality_variables(point: &[Fp3], plane_count: usize) -> Result<Vec<Weight>> 
         .collect()
 }
 
-/// The multiplicity coefficients and the key total of one lookup, derived
-/// from the plan alone: the coefficient of bit `plane` of table row `row` is
-/// `2^plane`, and the total is the key count. The prover, the verifier and
-/// the message decoder all use this one rule, so the message never carries
-/// the derivable payload.
-pub fn multiplicity_from_plan(plan: &LookupPlan) -> Result<(Vec<Fp3>, Fp3)> {
-    plan.validate()?;
-    let planes = plan.planes()?;
-    let rows = plan.table_rows()?;
-    let mut coefficients = vec![Fp3::ZERO; planes * rows];
-    for plane in 0..planes {
-        let weight = Fp3::from_u64(1u64 << plane);
-        for row in 0..rows {
-            coefficients[plane + planes * row] = weight;
-        }
+/// The multiplicity rule of one lookup, derived from the plan alone: the
+/// coefficient of bit `plane` of table row `row` is `2^plane`, and the total
+/// is the key count. The prover, the verifier and the message decoder all use
+/// this one rule, so neither the message nor the outcome carries the
+/// derivable payload vector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MultiplicityRule {
+    pub planes: usize,
+    pub rows: usize,
+    pub total: Fp3,
+}
+
+impl MultiplicityRule {
+    pub fn from_plan(plan: &LookupPlan) -> Result<Self> {
+        plan.validate()?;
+        Ok(Self {
+            planes: plan.planes()?,
+            rows: plan.table_rows()?,
+            total: Fp3::from_u64(plan.key_count()? as u64),
+        })
     }
-    Ok((coefficients, Fp3::from_u64(plan.key_count()? as u64)))
+
+    /// The coefficient of bit `plane` of table row `row`.
+    pub fn coefficient(&self, plane: usize, row: usize) -> Result<Fp3> {
+        if plane >= self.planes || row >= self.rows {
+            return Err(Error::InvalidIndex);
+        }
+        Ok(Fp3::from_u64(1u64 << plane))
+    }
 }
 
 /// Commits the lookup messages and proves the lookup for one key vector over
@@ -1418,7 +1430,7 @@ fn prove_lookup_inner(
     slots_out.push(bits_step.shown.clone());
     hiding_out.push(bits_step.hiding.clone());
 
-    let multiplicity = multiplicity_from_plan(plan)?;
+    let multiplicity = MultiplicityRule::from_plan(plan)?;
 
     Ok((
         LookupProof {
@@ -1664,7 +1676,7 @@ fn verify_lookup_inner(
     slots_out.push(shown);
     hiding_out.push(hiding);
 
-    let multiplicity = multiplicity_from_plan(plan)?;
+    let multiplicity = MultiplicityRule::from_plan(plan)?;
 
     Ok(LookupOutcome {
         key,
@@ -2074,8 +2086,9 @@ impl LookupOutcome {
             || self.end_slots.len() != self.rows.len()
             || self.hiding_slots.len() != self.rows.len()
             || self.key.point.len() != plan.key_bits as usize
-            || self.multiplicity.0.len() != planes * rows
-            || self.multiplicity.1 != Fp3::from_u64(keys as u64)
+            || self.multiplicity.planes != planes
+            || self.multiplicity.rows != rows
+            || self.multiplicity.total != Fp3::from_u64(keys as u64)
         {
             return Err(Error::ShapeMismatch);
         }
@@ -2163,7 +2176,7 @@ impl LookupOutcome {
         let theta = reader.get_fp3()?;
         // The multiplicity payload is not transported; the same plan rule
         // that the prover used regenerates it here.
-        let multiplicity = multiplicity_from_plan(plan)?;
+        let multiplicity = MultiplicityRule::from_plan(plan)?;
         let row_count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
         if row_count != outcome_rows(plan)? {
             return Err(Error::ShapeMismatch);
@@ -2384,8 +2397,9 @@ mod tests {
         let (messages, proof, proven) = prove_lookup(&plan, &commit_plan(), &key_plan(&keys), &key_rows(&keys), &witness, &ByteTable, 7, &mut chain()).unwrap();
         let verified = verify_lookup(&plan, &commit_plan(), &key_plan(&keys), &messages.roots(), &proof, &ByteTable, &mut chain()).unwrap();
         assert_eq!(proven, verified);
-        assert_eq!(proven.multiplicity.0.len(), plan.planes().unwrap() * 256);
-        assert_eq!(proven.multiplicity.1, Fp3::from_u64(4));
+        assert_eq!(proven.multiplicity.planes, plan.planes().unwrap());
+        assert_eq!(proven.multiplicity.rows, 256);
+        assert_eq!(proven.multiplicity.total, Fp3::from_u64(4));
     }
 
     fn check_leaves_row(
@@ -2951,7 +2965,7 @@ mod tests {
         assert_eq!(decoded, proven);
         // Both sides derive the multiplicity payload with one plan rule, so
         // the decoded and the proven vectors are equal instance by instance.
-        let expected = multiplicity_from_plan(&plan).unwrap();
+        let expected = MultiplicityRule::from_plan(&plan).unwrap();
         assert_eq!(decoded.multiplicity, expected);
         assert_eq!(proven.multiplicity, expected);
         assert_eq!(verified.multiplicity, expected);

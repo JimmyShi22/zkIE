@@ -2080,8 +2080,8 @@ fn real_projection_consumer_closes_in_hidden_input_mode() {
         changed.digit_lookups[0].bits_root = Digest([0x5F; 32]);
         check("changed digit lookup bits root", changed);
         let mut changed = segment_messages.clone();
-        changed.digit_lookups[1].claims.multiplicity.1 =
-            changed.digit_lookups[1].claims.multiplicity.1.add(&Fp3::ONE);
+        changed.digit_lookups[1].claims.multiplicity.total =
+            changed.digit_lookups[1].claims.multiplicity.total.add(&Fp3::ONE);
         check("changed digit lookup multiplicity", changed);
         let mut changed = segment_messages.clone();
         changed.range_array[0].root = Digest([0x5E; 32]);

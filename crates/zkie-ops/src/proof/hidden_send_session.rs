@@ -22334,13 +22334,9 @@ pub(crate) fn lookup_group_rows(
     multiplicity.add_term(
         bits_oracle,
         BatPart::Main,
-        scatter_message_coefficients(
-            &commit.bits_shape,
-            bits_columns as u64,
-            &claims.multiplicity.0,
-        )?,
+        scatter_multiplicity(&commit.bits_shape, &claims.multiplicity)?,
     );
-    multiplicity.target = claims.multiplicity.1;
+    multiplicity.target = claims.multiplicity.total;
     rows.push(multiplicity);
 
     // The leaf kept-map row and the bit summand's hiding and shown-end claims
@@ -22474,9 +22470,6 @@ fn lookup_plain_rows(
     let claims = &binding.claims;
     let planes = lookup.planes()?;
     let table_rows = lookup.table_rows()?;
-    let bits_columns = planes
-        .checked_mul(table_rows)
-        .ok_or(Error::ResourceLimit)?;
     let mut bat_of = std::collections::HashMap::new();
     for member in members {
         bat_of.insert(member.source_oracle, member);
@@ -22720,13 +22713,9 @@ fn digit_lookup_rows(
     multiplicity.add_term(
         bits_member.bat_oracle,
         BatPart::Main,
-        scatter_message_coefficients(
-            &commit.bits_shape,
-            bits_columns as u64,
-            &claims.multiplicity.0,
-        )?,
+        scatter_multiplicity(&commit.bits_shape, &claims.multiplicity)?,
     );
-    multiplicity.target = claims.multiplicity.1;
+    multiplicity.target = claims.multiplicity.total;
     rows.push(multiplicity);
     let leaf_index = (planes - 1)
         .checked_add(lookup.key_bits as usize)
@@ -23087,20 +23076,21 @@ fn request_rows_bundle(
     }))
 }
 
-fn scatter_message_coefficients(
+fn scatter_message_coefficients_with<F>(
     shape: &WShape,
     columns: u64,
-    coefficients: &[Fp3],
-) -> Result<Vec<Fp3>> {
+    mut coefficient: F,
+) -> Result<Vec<Fp3>>
+where
+    F: FnMut(usize) -> Result<Fp3>,
+{
     let rows = usize::try_from(shape.main_rows).map_err(|_| Error::ResourceLimit)?;
     let ell = usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?;
     let mut values = vec![Fp3::ZERO; rows.checked_mul(ell).ok_or(Error::ResourceLimit)?];
-    for (column, coefficient) in coefficients
-        .iter()
-        .enumerate()
-        .take(usize::try_from(columns).map_err(|_| Error::ResourceLimit)?)
-    {
-        if coefficient.is_zero() {
+    let count = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    for column in 0..count {
+        let value = coefficient(column)?;
+        if value.is_zero() {
             continue;
         }
         let row = column % rows;
@@ -23108,9 +23098,35 @@ fn scatter_message_coefficients(
         let slot = values
             .get_mut(row * ell + place)
             .ok_or(Error::ShapeMismatch)?;
-        *slot = *coefficient;
+        *slot = value;
     }
     to_bat_table(&values, shape.main_rows, shape.code.ell)
+}
+
+fn scatter_message_coefficients(
+    shape: &WShape,
+    columns: u64,
+    coefficients: &[Fp3],
+) -> Result<Vec<Fp3>> {
+    scatter_message_coefficients_with(shape, columns, |column| {
+        Ok(coefficients.get(column).copied().unwrap_or(Fp3::ZERO))
+    })
+}
+
+/// The multiplicity row's coefficients on the committed multiplicity bits:
+/// entry `plane + planes * row` weighs `2^plane`, filled from the rule so the
+/// derivable payload vector is never materialized.
+fn scatter_multiplicity(
+    shape: &WShape,
+    rule: &crate::proof::lookup::MultiplicityRule,
+) -> Result<Vec<Fp3>> {
+    let columns = rule
+        .planes
+        .checked_mul(rule.rows)
+        .ok_or(Error::ResourceLimit)?;
+    scatter_message_coefficients_with(shape, columns as u64, |column| {
+        rule.coefficient(column % rule.planes, column / rule.planes)
+    })
 }
 
 fn scalar_message_coefficients(shape: &WShape, coefficient: Fp3) -> Result<Vec<Fp3>> {
@@ -32497,7 +32513,7 @@ mod merged_tests {
                 .as_mut()
                 .unwrap()
                 .claims;
-            claims.multiplicity.1 = claims.multiplicity.1.add(&Fp3::ONE);
+            claims.multiplicity.total = claims.multiplicity.total.add(&Fp3::ONE);
         }
         assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
 
@@ -35155,8 +35171,8 @@ mod merged_tests {
         )
         .is_err());
         let mut changed = messages.clone();
-        changed.first.digit_lookups[1].claims.multiplicity.1 =
-            changed.first.digit_lookups[1].claims.multiplicity.1.add(&Fp3::ONE);
+        changed.first.digit_lookups[1].claims.multiplicity.total =
+            changed.first.digit_lookups[1].claims.multiplicity.total.add(&Fp3::ONE);
         assert!(super::verify_hidden_lin_hidden_with_chain_segment(
             &plan,
             &verifier_table.reader,
@@ -37492,7 +37508,7 @@ mod merged_tests {
             .unwrap()
             .claims
             .multiplicity;
-        multiplicity.1 = multiplicity.1.add(&Fp3::ONE);
+        multiplicity.total = multiplicity.total.add(&Fp3::ONE);
         assert!(verify_hidden_lin_hidden(&verifier_plan, &table.reader(), &changed).is_err());
 
         let (planes, key_bits, table_log) = {
