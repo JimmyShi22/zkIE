@@ -987,7 +987,7 @@ mod tests {
             mean: GroupIds { oracle: 9300, tree: 60300 },
             variance: GroupIds { oracle: 9400, tree: 60400 },
             low: GroupIds { oracle: 9700, tree: 60700 },
-            high: GroupIds { oracle: 9710, tree: 60710 },
+            high: GroupIds { oracle: 9720, tree: 60720 },
             round: GroupIds { oracle: 9600, tree: 60600 },
             mask: GroupIds { oracle: 9500, tree: 60500 },
         }

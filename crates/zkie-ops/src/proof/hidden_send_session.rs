@@ -8242,15 +8242,18 @@ fn stacked_value_group_answers(
     if eq.len() != columns {
         return Err(Error::ShapeMismatch);
     }
+    if rows % blocks as usize != 0 {
+        return Err(Error::ShapeMismatch);
+    }
+    let block_rows = rows / blocks as usize;
     let mut answers = Vec::with_capacity(blocks as usize);
     for block in 0..blocks as usize {
-        let base = block.checked_mul(columns).ok_or(Error::ResourceLimit)?;
+        let base_row = block.checked_mul(block_rows).ok_or(Error::ResourceLimit)?;
         let mut answer = Fp3::ZERO;
         for (column, weight) in eq.iter().enumerate() {
-            let index = base.checked_add(column).ok_or(Error::ResourceLimit)?;
             let value = message
-                .get(index % rows)
-                .and_then(|row| row.get(index / rows))
+                .get(base_row + column % block_rows)
+                .and_then(|row| row.get(column / block_rows))
                 .ok_or(Error::ShapeMismatch)?;
             if !value.is_zero() {
                 answer = answer.add(&weight.mul(value));
@@ -19211,6 +19214,47 @@ let shape = plan.send.w.oracle_shape();
 /// The materialized sample rows of every member, in member order. The own
 /// stage defers them into the streamed run and does not call this; the
 /// materialized proximity entries keep using it.
+/// Adds one position block's coefficients as column-major row-band runs: one
+/// run per row of the block, stepping by the merged message's row count over
+/// the full place range. The contiguous block form is row-major in the
+/// message's virtual space and cannot be placed by the column-major scatter.
+fn push_block_runs(
+    row: &mut BatRow,
+    oracle: u64,
+    position: usize,
+    block_rows: usize,
+    rows: u64,
+    coefficients: &[Fp3],
+) -> Result<()> {
+    if block_rows == 0
+        || coefficients.is_empty()
+        || coefficients.len() % block_rows != 0
+        || rows % block_rows as u64 != 0
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let places = coefficients.len() / block_rows;
+    let base_row = (position as u64)
+        .checked_mul(block_rows as u64)
+        .ok_or(Error::ResourceLimit)?;
+    for local in 0..block_rows {
+        let mut values = Vec::with_capacity(places);
+        for place in 0..places {
+            values.push(coefficients[local + block_rows * place]);
+        }
+        row.add_run(
+            oracle,
+            BatPart::Main,
+            base_row
+                .checked_add(local as u64)
+                .ok_or(Error::ResourceLimit)?,
+            rows,
+            values,
+        );
+    }
+    Ok(())
+}
+
 /// Emits the sample rows of one member as BAT rows. The stacked closure
 /// classes emit one block-addressed run row per position block from the
 /// shared seed; every other member keeps the shared relation-row builder.
@@ -19363,17 +19407,21 @@ fn member_samples_into(
             if eq.len() != columns {
                 return Err(Error::ShapeMismatch);
             }
+            let rows = usize::try_from(shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+            if rows % blocks != 0 {
+                return Err(Error::ShapeMismatch);
+            }
+            let block_rows = rows / blocks;
             for (block, target) in sample.answers.iter().enumerate() {
                 let mut row = BatRow::new(BatRowKind::Sample);
-                row.add_run(
+                push_block_runs(
+                    &mut row,
                     member.bat_oracle,
-                    BatPart::Main,
-                    (block as u64)
-                        .checked_mul(closure_plan.bits_columns)
-                        .ok_or(Error::ResourceLimit)?,
-                    1,
-                    eq.clone(),
-                );
+                    block,
+                    block_rows,
+                    shape.main_rows,
+                    &eq,
+                )?;
                 row.target = *target;
                 emit(row)?;
             }
@@ -24641,6 +24689,9 @@ fn closure_plain_rows(
         usize::try_from(closure_plan.slack.code.ell).map_err(|_| Error::ResourceLimit)?;
     let bits_columns = usize::try_from(closure_plan.bits_columns)
         .map_err(|_| Error::ResourceLimit)?;
+    let bit_block_rows = usize::try_from(closure_plan.bits.main_rows)
+        .map_err(|_| Error::ResourceLimit)?
+        / positions;
     let k = closure_plan.boolean_variables as usize;
     let k_col = closure_plan.vocab.trailing_zeros() as usize;
     let offset = closure_plan.offset()? as i128;
@@ -24768,15 +24819,14 @@ fn closure_plain_rows(
                 }
             }
             let mut row = BatRow::new(BatRowKind::Plain);
-            row.add_run(
+            push_block_runs(
+                &mut row,
                 bits_member.bat_oracle,
-                BatPart::Main,
-                (position as u64)
-                    .checked_mul(closure_plan.bits_columns)
-                    .ok_or(Error::ResourceLimit)?,
-                1,
-                bit_coefficients,
-            );
+                position,
+                bit_block_rows,
+                closure_plan.bits.main_rows,
+                &bit_coefficients,
+            )?;
             if which < 2 {
                 row.add_term(w_member.bat_oracle, BatPart::Main, main_coefficients);
             } else {
@@ -24798,15 +24848,14 @@ fn closure_plain_rows(
             return Err(Error::InvalidProof);
         }
         let mut row = BatRow::new(BatRowKind::Plain);
-        row.add_run(
+        push_block_runs(
+            &mut row,
             map_member.bat_oracle,
-            BatPart::Main,
-            (position as u64)
-                .checked_mul(closure_plan.bits_columns)
-                .ok_or(Error::ResourceLimit)?,
-            1,
-            eq_point.clone(),
-        );
+            position,
+            bit_block_rows,
+            closure_plan.map.main_rows,
+            &eq_point,
+        )?;
         row.add_unit(
             mask.bat_oracle,
             BatPart::Mask,
@@ -24818,15 +24867,14 @@ fn closure_plain_rows(
 
         // The committed bit map at the booleanity point, one-time masked.
         let mut row = BatRow::new(BatRowKind::Plain);
-        row.add_run(
+        push_block_runs(
+            &mut row,
             bits_member.bat_oracle,
-            BatPart::Main,
-            (position as u64)
-                .checked_mul(closure_plan.bits_columns)
-                .ok_or(Error::ResourceLimit)?,
-            1,
-            eq_point.clone(),
-        );
+            position,
+            bit_block_rows,
+            closure_plan.bits.main_rows,
+            &eq_point,
+        )?;
         row.add_unit(
             mask.bat_oracle,
             BatPart::Mask,
@@ -24887,15 +24935,14 @@ fn closure_plain_rows(
             b_coefficients[entry] = eq_q[entry].mul(&eq_r[entry]);
         }
         let mut row = BatRow::new(BatRowKind::Plain);
-        row.add_run(
+        push_block_runs(
+            &mut row,
             map_member.bat_oracle,
-            BatPart::Main,
-            (position as u64)
-                .checked_mul(closure_plan.bits_columns)
-                .ok_or(Error::ResourceLimit)?,
-            1,
-            eq_q.clone(),
-        );
+            position,
+            bit_block_rows,
+            closure_plan.map.main_rows,
+            &eq_q,
+        )?;
         row.add_unit(
             mask.bat_oracle,
             BatPart::Mask,
@@ -24905,15 +24952,14 @@ fn closure_plain_rows(
         row.target = word.d_value;
         emit(row)?;
         let mut row = BatRow::new(BatRowKind::Plain);
-        row.add_run(
+        push_block_runs(
+            &mut row,
             bits_member.bat_oracle,
-            BatPart::Main,
-            (position as u64)
-                .checked_mul(closure_plan.bits_columns)
-                .ok_or(Error::ResourceLimit)?,
-            1,
-            b_coefficients,
-        );
+            position,
+            bit_block_rows,
+            closure_plan.bits.main_rows,
+            &b_coefficients,
+        )?;
         row.add_unit(
             mask.bat_oracle,
             BatPart::Mask,

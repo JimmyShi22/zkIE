@@ -1254,15 +1254,30 @@ pub fn commit_merged_value_group(
         return Err(Error::ShapeMismatch);
     }
     let _profile_layout = zkie_engine::profile::Scope::light("value_group.layout");
+    // The placement is the column-major convention of the BAT scatter: the
+    // virtual index of a cell is row + place * main_rows. A position owns the
+    // row block [position * block_rows, (position + 1) * block_rows) across
+    // the full place range, so entry `column` of the block sits at
+    // row = position * block_rows + column % block_rows and
+    // place = column / block_rows.
+    let blocks = values.len();
+    if blocks == 0 || rows % blocks != 0 {
+        return Err(Error::ShapeMismatch);
+    }
+    let block_rows = rows / blocks;
+    if block_rows == 0 || !block_rows.is_power_of_two() {
+        return Err(Error::ShapeMismatch);
+    }
     let mut message = vec![vec![Fp3::ZERO; ell]; rows];
     for (position, values) in values.iter().enumerate() {
-        let base = position
-            .checked_mul(usize::try_from(block_columns).map_err(|_| Error::ResourceLimit)?)
+        let base_row = position
+            .checked_mul(block_rows)
             .ok_or(Error::ResourceLimit)?;
         for (column, value) in values.iter().enumerate() {
-            let index = base.checked_add(column).ok_or(Error::ResourceLimit)?;
-            let row = index % rows;
-            let place = index / rows;
+            let row = base_row
+                .checked_add(column % block_rows)
+                .ok_or(Error::ResourceLimit)?;
+            let place = column / block_rows;
             let entry = message
                 .get_mut(row)
                 .and_then(|row| row.get_mut(place))

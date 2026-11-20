@@ -689,7 +689,7 @@ mod tests {
             mean: GroupIds { oracle: 9300, tree: 60300 },
             variance: GroupIds { oracle: 9400, tree: 60400 },
             low: GroupIds { oracle: 9700, tree: 60700 },
-            high: GroupIds { oracle: 9710, tree: 60710 },
+            high: GroupIds { oracle: 9720, tree: 60720 },
             round: GroupIds { oracle: 9600, tree: 60600 },
             mask: GroupIds { oracle: 9500, tree: 60500 },
         }
@@ -936,6 +936,93 @@ mod tests {
     /// entry then lands at place 262143, before the padded capacity
     /// (2^29 / 2^18 = 2048 rows exactly). If any other W shape condition
     /// rejects this, the assertion names it.
+    /// The norm group identifiers are plan values: every group's oracle
+    /// range and every group's tree range must be pairwise disjoint over the
+    /// complete space, not only between the limb and the round group. An
+    /// overlap silently maps one group's members onto another group's trees
+    /// (same shapes, different roots), which is a soundness defect even when
+    /// both shapes are identical.
+    #[test]
+    fn the_norm_group_identifiers_are_pairwise_disjoint() {
+        use zkie_engine::pcs::request::code::build_code_plan;
+        let (code, mask_code) = super::gemma3_segment_codes().unwrap();
+        let space = super::norm_segment_space_coded(Digest([0x21; 32]), code, mask_code);
+        let lookup = super::norm_lookup_space_coded(code, mask_code);
+        let rstd = super::norm_rstd_space_coded(code, mask_code);
+        let outputs = super::norm_output_groups();
+        let positions = super::GEMMA3_SEGMENT_HEAD.positions as u64;
+
+        // (name, first, end) with the trusted span of each group.
+        let width = |span: u64| -> u64 { span };
+        let mut oracles: Vec<(&str, u64, u64)> = vec![
+            ("x", space.x.oracle, space.x.oracle + width(positions)),
+            ("sum", space.sum.oracle, space.sum.oracle + width(positions)),
+            ("squares", space.squares.oracle, space.squares.oracle + width(positions)),
+            ("mean", space.mean.oracle, space.mean.oracle + width(positions)),
+            ("variance", space.variance.oracle, space.variance.oracle + width(positions)),
+            ("low", space.low.oracle, space.low.oracle + width(positions)),
+            ("high", space.high.oracle, space.high.oracle + width(positions)),
+            ("round", space.round.oracle, space.round.oracle + width(positions)),
+            ("mask", space.mask.oracle, space.mask.oracle + 1),
+            ("lookup_bits", lookup.bits_oracle, lookup.bits_oracle + 1),
+            ("lookup_mask", lookup.mask_oracle, lookup.mask_oracle + 1),
+            ("rstd_bits", rstd.bits_oracle, rstd.bits_oracle + 1),
+            ("rstd_mask", rstd.mask_oracle, rstd.mask_oracle + 1),
+            ("out_broadcast", outputs.broadcast.oracle, outputs.broadcast.oracle + width(positions)),
+            ("out_product", outputs.product.oracle, outputs.product.oracle + width(positions)),
+            ("out_image", outputs.image.oracle, outputs.image.oracle + width(positions)),
+            ("out_out", outputs.out.oracle, outputs.out.oracle + width(positions)),
+            ("out_tail", outputs.tail.oracle, outputs.tail.oracle + width(positions)),
+        ];
+        // The parameter claims and the closure messages share the same space.
+        oracles.extend([
+            ("param_gain", 0x8800, 0x8801),
+            ("param_bias", 0x8801, 0x8802),
+            ("closure_slack", super::SLACK_ORACLE_BASE, super::SLACK_ORACLE_BASE + positions),
+            ("closure_bits", super::BITS_ORACLE_BASE, super::BITS_ORACLE_BASE + 1),
+            ("closure_map", super::MAP_ORACLE_BASE, super::MAP_ORACLE_BASE + 1),
+            ("closure_mask", super::CLOSURE_MASK_ORACLE, super::CLOSURE_MASK_ORACLE + 1),
+        ]);
+        let mut trees: Vec<(&str, u64, u64)> = vec![
+            ("x", space.x.tree, space.x.tree + width(positions)),
+            ("sum", space.sum.tree, space.sum.tree + width(positions)),
+            ("squares", space.squares.tree, space.squares.tree + width(positions)),
+            ("mean", space.mean.tree, space.mean.tree + width(positions)),
+            ("variance", space.variance.tree, space.variance.tree + width(positions)),
+            ("low", space.low.tree, space.low.tree + width(positions)),
+            ("high", space.high.tree, space.high.tree + width(positions)),
+            ("round", space.round.tree, space.round.tree + width(positions)),
+            ("mask", space.mask.tree, space.mask.tree + 1),
+            ("lookup_bits", lookup.bits_tree, lookup.bits_tree + 1),
+            ("lookup_mask", lookup.mask_tree, lookup.mask_tree + 1),
+            ("rstd_bits", rstd.bits_tree, rstd.bits_tree + 1),
+            ("rstd_mask", rstd.mask_tree, rstd.mask_tree + 1),
+            ("out_broadcast", outputs.broadcast.tree, outputs.broadcast.tree + width(positions)),
+            ("out_product", outputs.product.tree, outputs.product.tree + width(positions)),
+            ("out_image", outputs.image.tree, outputs.image.tree + width(positions)),
+            ("out_out", outputs.out.tree, outputs.out.tree + width(positions)),
+            ("out_tail", outputs.tail.tree, outputs.tail.tree + width(positions)),
+        ];
+        trees.extend([
+            ("closure_slack", super::SLACK_TREE_NUMBER, super::SLACK_TREE_NUMBER + positions),
+            ("closure_bits", super::BITS_TREE_NUMBER, super::BITS_TREE_NUMBER + 1),
+            ("closure_map", super::MAP_TREE_NUMBER, super::MAP_TREE_NUMBER + 1),
+            ("closure_mask", super::CLOSURE_MASK_TREE, super::CLOSURE_MASK_TREE + 1),
+        ]);
+        for (label, ranges) in [("oracle", &oracles), ("tree", &trees)] {
+            for first in 0..ranges.len() {
+                for second in first + 1..ranges.len() {
+                    let (a_name, a_first, a_end) = ranges[first];
+                    let (b_name, b_first, b_end) = ranges[second];
+                    assert!(
+                        a_end <= b_first || b_end <= a_first,
+                        "{label} ranges overlap: {a_name} [{a_first},{a_end}) and {b_name} [{b_first},{b_end})"
+                    );
+                }
+            }
+        }
+    }
+
     #[test]
     fn the_merged_closure_shape_is_two_thousand_forty_rows() {
         use zkie_engine::pcs::request::code::build_code_plan;
@@ -1032,7 +1119,7 @@ pub fn norm_segment_space_coded(
         mean: GroupIds { oracle: 9300, tree: 60300 },
         variance: GroupIds { oracle: 9400, tree: 60400 },
         low: GroupIds { oracle: 9700, tree: 60700 },
-        high: GroupIds { oracle: 9710, tree: 60710 },
+        high: GroupIds { oracle: 9720, tree: 60720 },
         round: GroupIds { oracle: 9600, tree: 60600 },
         mask: GroupIds { oracle: 9500, tree: 60500 },
     }
