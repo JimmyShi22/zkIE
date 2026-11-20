@@ -22454,7 +22454,8 @@ fn lookup_plain_rows(
     lookup_plan: &dyn crate::proof::hidden_norm_psc::NormLookupView,
     members: &[ProximityMember],
     binding: &NormLookupSecond,
-) -> Result<Vec<BatRow>> {
+
+    emit: &mut dyn FnMut(BatRow) -> Result<()>) -> Result<()> {
     let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
     let round_plan = norm.round.as_ref().ok_or(Error::UnsupportedPrimitive)?;
     let lookup = lookup_plan.lookup_plan();
@@ -22487,7 +22488,6 @@ fn lookup_plain_rows(
     {
         return Err(Error::StatementMismatch);
     }
-    let mut rows = Vec::new();
 
     // The key-leaf claim expanded on the committed key group cells. The
     // frozen-table view keeps no group of its own and uses the rounding group;
@@ -22526,23 +22526,25 @@ fn lookup_plain_rows(
             columns: group.columns,
         });
     }
-    rows.push(lookup_plan.key_plan().registration_row(
+    emit(lookup_plan.key_plan().registration_row(
         lookup,
         &claims.key,
         claims.theta,
         &key_members,
         mask_member.bat_oracle,
         &|slot| lookup_mask_virtual_index(commit, slot),
-    )?);
+    )?)?;
 
-    rows.extend(lookup_group_rows(
+    for row in lookup_group_rows(
         lookup,
         commit,
         claims,
         bits_member.bat_oracle,
         mask_member.bat_oracle,
-    )?);
-    Ok(rows)
+    )? {
+        emit(row)?;
+    }
+    Ok(())
 }
 
 /// The mask-form sample row of a lookup mask message: the equality table
@@ -22964,17 +22966,16 @@ struct RequestRows {
     psi_star: Vec<Fp3>,
 }
 
-fn request_rows(request: &RequestRows) -> Result<Vec<BatRow>> {
-    let mut rows = Vec::with_capacity(2);
-    rows.push(request_eval_row(
+fn request_rows(request: &RequestRows, emit: &mut dyn FnMut(BatRow) -> Result<()>) -> Result<()> {
+    emit(request_eval_row(
         request.w_layout,
         request.w_columns,
         request.w_oracle,
         &request.psi,
         &request.masks,
         request.target,
-    )?);
-    rows.push(request_dot_row(
+    )?)?;
+    emit(request_dot_row(
         request.omega_layout,
         request.omega_columns,
         request.omega_oracle,
@@ -22983,8 +22984,8 @@ fn request_rows(request: &RequestRows) -> Result<Vec<BatRow>> {
         request.w_columns,
         request.w_oracle,
         &request.psi_star,
-    )?);
-    Ok(rows)
+    )?)?;
+    Ok(())
 }
 
 /// The trusted-layout binding of the pending claim's mask terms: for each term,
@@ -23128,7 +23129,8 @@ fn norm_plain_rows(
     members: &[ProximityMember],
     first: &HiddenSendMessages,
     binding: &NormRowBinding,
-) -> Result<Vec<BatRow>> {
+
+    emit: &mut dyn FnMut(BatRow) -> Result<()>) -> Result<()> {
     let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
     let mask_plan = norm.mask.as_ref().ok_or(Error::InvalidConfig)?;
     let norm_first = first.norm.as_ref().ok_or(Error::ShapeMismatch)?;
@@ -23155,7 +23157,6 @@ fn norm_plain_rows(
     }
     let valid = norm.shape.valid as usize;
     let columns = usize::try_from(norm.columns).map_err(|_| Error::ResourceLimit)?;
-    let mut rows = Vec::with_capacity(binding.positions.len());
     for (index, word) in binding.positions.iter().enumerate() {
         let position = index / relations;
         let relation_index = index % relations;
@@ -23255,7 +23256,7 @@ fn norm_plain_rows(
                     word.output.ends[0].mask_scale,
                 );
                 row.target = word.output.ends[0].value;
-                rows.push(row);
+                emit(row)?;
 
                 let constant = eq_sum.add(&eq[columns]);
                 let mut row = BatRow::new(BatRowKind::Plain);
@@ -23266,7 +23267,7 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 row.target = word.output.ends[1].value.sub(&constant);
-                rows.push(row);
+                emit(row)?;
             }
             1 => {
                 let mean_member = bat_of
@@ -23316,7 +23317,7 @@ fn norm_plain_rows(
                     word.output.ends[0].mask_scale,
                 );
                 left.target = word.output.ends[0].value;
-                rows.push(left);
+                emit(left)?;
 
                 let mut right = BatRow::new(BatRowKind::Plain);
                 right.add_term(
@@ -23339,7 +23340,7 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&eq[columns]);
-                rows.push(right);
+                emit(right)?;
             }
             2 => {
                 let sum_member = bat_of
@@ -23383,7 +23384,7 @@ fn norm_plain_rows(
                     word.output.ends[0].mask_scale,
                 );
                 left.target = word.output.ends[0].value;
-                rows.push(left);
+                emit(left)?;
 
                 let constant = eq[0].add(&eq[1]).add(&eq[2]);
                 let mut right = BatRow::new(BatRowKind::Plain);
@@ -23394,7 +23395,7 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&constant);
-                rows.push(right);
+                emit(right)?;
             }
             3 => {
                 let squares_member = bat_of
@@ -23444,7 +23445,7 @@ fn norm_plain_rows(
                     word.output.ends[0].mask_scale,
                 );
                 left.target = word.output.ends[0].value;
-                rows.push(left);
+                emit(left)?;
 
                 let constant = eq[0].add(&eq[1]).add(&eq[2]);
                 let mut right = BatRow::new(BatRowKind::Plain);
@@ -23455,7 +23456,7 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&constant);
-                rows.push(right);
+                emit(right)?;
             }
             26..=28 => {
                 // The three bounded partial sums: both factors are one limb
@@ -23509,7 +23510,7 @@ fn norm_plain_rows(
                     word.output.ends[0].mask_scale,
                 );
                 left.target = word.output.ends[0].value;
-                rows.push(left);
+                emit(left)?;
 
                 let mut right = BatRow::new(BatRowKind::Plain);
                 right.add_term(
@@ -23528,7 +23529,7 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&eq[columns]);
-                rows.push(right);
+                emit(right)?;
             }
             29 => {
                 // x - lo - 2^16 hi = 0 on the valid columns. The left form
@@ -23577,7 +23578,7 @@ fn norm_plain_rows(
                     word.output.ends[0].mask_scale,
                 );
                 left.target = word.output.ends[0].value;
-                rows.push(left);
+                emit(left)?;
 
                 let mut right = BatRow::new(BatRowKind::Plain);
                 right.add_unit(
@@ -23587,7 +23588,7 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&eq_sum);
-                rows.push(right);
+                emit(right)?;
             }
             30..=32 => {
                 let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
@@ -23658,7 +23659,7 @@ fn norm_plain_rows(
                     mask_plan.entry_virtual_index(shown0)?,
                     word.output.ends[0].mask_scale,
                 );
-                rows.push(left);
+                emit(left)?;
 
                 let mut right = BatRow::new(BatRowKind::Plain);
                 right.add_unit(
@@ -23668,7 +23669,7 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&constant);
-                rows.push(right);
+                emit(right)?;
             }
             33..=72 | 73..=92 | 94..=95 => {
                 let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
@@ -23702,7 +23703,7 @@ fn norm_plain_rows(
                 left.target = word.output.ends[0]
                     .value
                     .add(&crate::proof::output_closure::fp3_signed(constant)?.mul(&eq[columns]));
-                rows.push(left);
+                emit(left)?;
 
                 let constant = constant_sum.add(&eq[columns]);
                 let mut right = BatRow::new(BatRowKind::Plain);
@@ -23713,7 +23714,7 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&constant);
-                rows.push(right);
+                emit(right)?;
             }
             93 => {
                 let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
@@ -23761,7 +23762,7 @@ fn norm_plain_rows(
                     word.output.ends[0].mask_scale,
                 );
                 left.target = word.output.ends[0].value;
-                rows.push(left);
+                emit(left)?;
                 let constant = eq[..8]
                     .iter()
                     .fold(Fp3::ZERO, |sum, value| sum.add(value))
@@ -23774,7 +23775,7 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&constant);
-                rows.push(right);
+                emit(right)?;
             }
             4 | 5 => {
                 let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
@@ -23807,7 +23808,7 @@ fn norm_plain_rows(
                     word.output.ends[0].mask_scale,
                 );
                 left.target = word.output.ends[0].value.add(&constant);
-                rows.push(left);
+                emit(left)?;
 
                 let constant = eq[0].add(&eq[1]).add(&eq[2]);
                 let mut right = BatRow::new(BatRowKind::Plain);
@@ -23818,7 +23819,7 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&constant);
-                rows.push(right);
+                emit(right)?;
             }
             6 | 7 => {
                 let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
@@ -23850,7 +23851,7 @@ fn norm_plain_rows(
                     word.output.ends[0].mask_scale,
                 );
                 left.target = word.output.ends[0].value.add(&constant);
-                rows.push(left);
+                emit(left)?;
 
                 let constant = eq[0].add(&eq[1]).add(&eq[2]);
                 let mut right = BatRow::new(BatRowKind::Plain);
@@ -23861,7 +23862,7 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&constant);
-                rows.push(right);
+                emit(right)?;
             }
             8..=15 => {
                 let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
@@ -24022,7 +24023,7 @@ fn norm_plain_rows(
                     mask_plan.entry_virtual_index(shown0)?,
                     word.output.ends[0].mask_scale,
                 );
-                rows.push(left);
+                emit(left)?;
 
                 let mut right = BatRow::new(BatRowKind::Plain);
                 right.add_unit(
@@ -24032,7 +24033,7 @@ fn norm_plain_rows(
                     word.output.ends[1].mask_scale,
                 );
                 right.target = word.output.ends[1].value.sub(&constant);
-                rows.push(right);
+                emit(right)?;
             }
             16..=25 => {
                 let round_plan = round_plan.ok_or(Error::UnsupportedPrimitive)?;
@@ -24281,7 +24282,7 @@ fn norm_plain_rows(
                     mask_plan.entry_virtual_index(shown0)?,
                     word.output.ends[0].mask_scale,
                 );
-                rows.push(left);
+                emit(left)?;
 
                 let mut right = BatRow::new(BatRowKind::Plain);
                 if !right_slots.is_empty() {
@@ -24298,7 +24299,7 @@ fn norm_plain_rows(
                     mask_plan.entry_virtual_index(shown1)?,
                     word.output.ends[1].mask_scale,
                 );
-                rows.push(right);
+                emit(right)?;
             }
             _ => return Err(Error::UnsupportedPrimitive),
         }
@@ -24313,9 +24314,9 @@ fn norm_plain_rows(
             );
         }
         row.target = word.output.row_target;
-        rows.push(row);
+        emit(row)?;
     }
-    Ok(rows)
+    Ok(())
 }
 
 fn closure_plain_rows(
@@ -24660,7 +24661,8 @@ fn output_plain_rows(
     members: &[ProximityMember],
     first: &HiddenSendMessages,
     binding: &[crate::proof::hidden_norm_psc::NormOutputBinding],
-) -> Result<Vec<BatRow>> {
+
+    emit: &mut dyn FnMut(BatRow) -> Result<()>) -> Result<()> {
     let norm = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
     let output_plan = norm.output.as_ref().ok_or(Error::InvalidConfig)?;
     let params_plan = norm.params.as_ref().ok_or(Error::InvalidConfig)?;
@@ -24704,7 +24706,6 @@ fn output_plain_rows(
         .gain_claim
         .as_ref()
         .ok_or(Error::InvalidConfig)?;
-    let mut rows = Vec::with_capacity(binding.len() * 4);
     for word in binding {
         let position = word.position as usize;
         if position >= positions || word.kind > 1 {
@@ -24743,7 +24744,7 @@ fn output_plain_rows(
             Fp3::ONE,
         );
         row.target = word.claim;
-        rows.push(row);
+        emit(row)?;
 
         let shown0 = mask_plan.pointwise_shown_slot(instances, instance, 0)?;
         let shown1 = mask_plan.pointwise_shown_slot(instances, instance, 1)?;
@@ -24814,7 +24815,7 @@ fn output_plain_rows(
             mask_plan.entry_virtual_index(shown0)?,
             end0.mask_scale,
         );
-        rows.push(row);
+        emit(row)?;
 
         let mut row = BatRow::new(BatRowKind::Plain);
         match word.kind {
@@ -24844,7 +24845,7 @@ fn output_plain_rows(
             mask_plan.entry_virtual_index(shown1)?,
             end1.mask_scale,
         );
-        rows.push(row);
+        emit(row)?;
 
         let mut row = BatRow::new(BatRowKind::Plain);
         for (index, coefficient) in word.output.hiding_form.iter().enumerate() {
@@ -24865,9 +24866,9 @@ fn output_plain_rows(
             );
         }
         row.target = word.output.row_target;
-        rows.push(row);
+        emit(row)?;
     }
-    Ok(rows)
+    Ok(())
 }
 
 /// Adds one tail relation factor to its coefficient vector: a committed tail
@@ -25498,9 +25499,7 @@ fn own_plain_rows_each(
     }
     if let Some(request) = request {
         let _scope = zkie_engine::profile::Scope::new("second.plain.request");
-        for row in request_rows(request)? {
-            emit(row)?;
-        }
+        request_rows(request, emit)?;
     }
     if let Some(binding) = closure {
         let _scope = zkie_engine::profile::Scope::new("second.plain.closure");
@@ -25508,14 +25507,10 @@ fn own_plain_rows_each(
     }
     if let Some(binding) = norm {
         let _scope = zkie_engine::profile::Scope::new("second.plain.norm");
-        for row in norm_plain_rows(plan, members, first, binding)? {
-            emit(row)?;
-        }
+        norm_plain_rows(plan, members, first, binding, emit)?;
         if let Some(output) = &binding.output {
             let _scope = zkie_engine::profile::Scope::new("second.plain.output");
-            for row in output_plain_rows(plan, members, first, output)? {
-                emit(row)?;
-            }
+            output_plain_rows(plan, members, first, output, emit)?;
         }
         if let Some(tail) = &binding.tail {
             let _scope = zkie_engine::profile::Scope::new("second.plain.tail");
@@ -25533,25 +25528,23 @@ fn own_plain_rows_each(
         let norm_plan = plan.norm.as_ref().ok_or(Error::InvalidConfig)?;
         if let Some(lookup) = &binding.lookup {
             let _scope = zkie_engine::profile::Scope::new("second.plain.lookup");
-            for row in lookup_plain_rows(
+            lookup_plain_rows(
                 plan,
                 norm_plan.lookup.as_ref().ok_or(Error::InvalidConfig)?,
                 members,
                 lookup,
-            )? {
-                emit(row)?;
-            }
+                emit,
+            )?;
         }
         if let Some(rstd) = &binding.rstd {
             let _scope = zkie_engine::profile::Scope::new("second.plain.rstd");
-            for row in lookup_plain_rows(
+            lookup_plain_rows(
                 plan,
                 norm_plan.rstd.as_ref().ok_or(Error::InvalidConfig)?,
                 members,
                 rstd,
-            )? {
-                emit(row)?;
-            }
+                emit,
+            )?;
         }
     }
     // The request chain segment's remaining relations ride the same own group,
@@ -29427,7 +29420,12 @@ mod tests {
             weights: weights.to_vec(),
             psi_star: psi_star.to_vec(),
         };
-        let rows = super::request_rows(&request).unwrap();
+        let mut rows = Vec::new();
+        super::request_rows(&request, &mut |row| {
+            rows.push(row);
+            Ok(())
+        })
+        .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].target, Fp3::from_u64(99));
         assert_eq!(rows[0].terms.len(), 1);
