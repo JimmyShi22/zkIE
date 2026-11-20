@@ -8198,6 +8198,109 @@ fn value_group_answers(
     Ok(answers)
 }
 
+/// The sample cube bits of one stacked closure class: every position block
+/// is a contiguous virtual range of `bits_columns` entries, so the sample
+/// form reads the same number of coordinates as the packed width.
+fn stacked_sample_bits(plan: &ClosurePlan) -> Result<u32> {
+    if !plan.bits_columns.is_power_of_two() {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(plan.bits_columns.trailing_zeros())
+}
+
+/// The first-stage answers of one stacked closure class: one answer per
+/// position block, each the equality-weighted sum over the position's own
+/// virtual range of the one committed message. The pad cell sits on the last
+/// block's last entry, which the plan keeps zero, so no pad correction is
+/// applied.
+fn stacked_value_group_answers(
+    shape: &WShape,
+    block_columns: u64,
+    blocks: u32,
+    message: &[Vec<Fp3>],
+    seed: &SampleSeed,
+) -> Result<Vec<Fp3>> {
+    let rows = usize::try_from(shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let ell = usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+    if message.len() != rows || message.iter().any(|row| row.len() != ell) {
+        return Err(Error::ShapeMismatch);
+    }
+    if block_columns == 0 || !block_columns.is_power_of_two() || blocks == 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let entries = (block_columns as usize)
+        .checked_mul(blocks as usize)
+        .ok_or(Error::ResourceLimit)?;
+    if rows.checked_mul(ell) != Some(entries) {
+        return Err(Error::ShapeMismatch);
+    }
+    let columns = usize::try_from(block_columns).map_err(|_| Error::ResourceLimit)?;
+    if seed.z.len() != block_columns.trailing_zeros() as usize {
+        return Err(Error::ShapeMismatch);
+    }
+    let eq = crate::proof::output_closure::eq_vector(&seed.z)?;
+    if eq.len() != columns {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut answers = Vec::with_capacity(blocks as usize);
+    for block in 0..blocks as usize {
+        let base = block.checked_mul(columns).ok_or(Error::ResourceLimit)?;
+        let mut answer = Fp3::ZERO;
+        for (column, weight) in eq.iter().enumerate() {
+            let index = base.checked_add(column).ok_or(Error::ResourceLimit)?;
+            let value = message
+                .get(index % rows)
+                .and_then(|row| row.get(index / rows))
+                .ok_or(Error::ShapeMismatch)?;
+            if !value.is_zero() {
+                answer = answer.add(&weight.mul(value));
+            }
+        }
+        answers.push(answer);
+    }
+    Ok(answers)
+}
+
+/// Opens the drawn position lists of one stacked closure group against its
+/// one tree. The codewords are derived once from the single message and its
+/// tail vector; every drawn list is then opened from the same parts.
+fn open_stacked_openings(
+    shape: &WShape,
+    messages: &[Vec<Vec<Fp3>>],
+    tails: &[Vec<Fp3>],
+    salts: &[Vec<Vec<u8>>],
+    positions: &[Vec<u64>],
+    trees: &RetainedTrees,
+) -> Result<Vec<RuntimeTreeOpening>> {
+    if messages.len() != 1 || tails.len() != 1 || salts.len() != 1 || trees.len() != 1 {
+        return Err(Error::ShapeMismatch);
+    }
+    let tree = trees.get(0).ok_or(Error::ShapeMismatch)?;
+    if tree.plan() != &shape.tree_plan(0)? {
+        return Err(Error::StatementMismatch);
+    }
+    let tail_len = usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
+    let message_rows = messages.first().ok_or(Error::ShapeMismatch)?;
+    let flat = tails.first().ok_or(Error::ShapeMismatch)?;
+    let mut codewords = Vec::with_capacity(message_rows.len());
+    for (row, message) in message_rows.iter().enumerate() {
+        let tail = flat
+            .get(row * tail_len..(row + 1) * tail_len)
+            .ok_or(Error::ShapeMismatch)?;
+        codewords.push(encode_row_fp3(&shape.code, message, tail)?);
+    }
+    let parts = RuntimePartRows {
+        main: codewords,
+        mask: Vec::new(),
+        main_deg: E_DEGREE as u32,
+    };
+    let mut openings = Vec::with_capacity(positions.len());
+    for list in positions {
+        openings.push(tree.open_parts(list, std::slice::from_ref(&parts))?);
+    }
+    Ok(openings)
+}
+
 /// Absorbs one closure group before its sample seed is drawn.
 fn absorb_closure_group(chain: &mut Chain, tag: u64, group: &SendGroup) -> Result<()> {
     let mut message = chain.message();
@@ -15306,7 +15409,7 @@ fn prove_first(
             )?;
             drop(_profile_slack);
             let _profile_bits = zkie_engine::profile::Scope::new("first.closure_bits_commit");
-            let bits = commit_value_group(
+            let bits = crate::proof::output_closure::commit_merged_value_group(
                 &closure_plan.bits,
                 closure_plan.bits_columns,
                 closure_plan.bits_oracle_base,
@@ -15315,7 +15418,6 @@ fn prove_first(
                 &closure_randomness.bits_pads,
                 &closure_randomness.bits_tails,
                 &closure_randomness.bits_salts,
-                plan.send.positions(),
             )?;
             drop(_profile_bits);
             let _profile_mask = zkie_engine::profile::Scope::new("first.closure_mask_commit");
@@ -15536,8 +15638,8 @@ fn prove_first(
             let bits_seeds = draw_closure_seed_set(
                 &mut chain,
                 28,
-                closure_plan.bits.sample_bits()?,
-                closure_plan.bits.answers,
+                stacked_sample_bits(closure_plan)?,
+                1,
             )?;
             let mask_seeds = draw_closure_seed_set(
                 &mut chain,
@@ -15554,12 +15656,16 @@ fn prove_first(
                 &closure.slack.messages,
                 &slack_seeds,
             )?;
-            let bits_answers = value_group_answers(
+            let bits_answers = stacked_value_group_answers(
                 &closure_plan.bits,
-                closure_plan.bits_oracle_base,
-                plan.send.group,
-                &closure.bits.messages,
-                &bits_seeds,
+                closure_plan.bits_columns,
+                plan.send.positions(),
+                closure
+                    .bits
+                    .messages
+                    .first()
+                    .ok_or(Error::ShapeMismatch)?,
+                &bits_seeds[0],
             )?;
             let mask_answer =
                 closure_mask_answer(&closure_plan.mask, &closure.mask.rows, &mask_seeds[0])?;
@@ -15598,7 +15704,7 @@ fn prove_first(
             drop(_profile_map_values);
             let _profile_map_commit =
                 zkie_engine::profile::Scope::new("first.closure_map_commit");
-            let map = commit_value_group(
+            let map = crate::proof::output_closure::commit_merged_value_group(
                 &closure_plan.map,
                 closure_plan.bits_columns,
                 closure_plan.map_oracle_base,
@@ -15607,24 +15713,23 @@ fn prove_first(
                 &closure_randomness.map_pads,
                 &closure_randomness.map_tails,
                 &closure_randomness.map_salts,
-                plan.send.positions(),
             )?;
             drop(_profile_map_commit);
             absorb_closure_group(&mut chain, 26, &map.group)?;
             let map_seeds = draw_closure_seed_set(
                 &mut chain,
                 35,
-                closure_plan.map.sample_bits()?,
-                closure_plan.map.answers,
+                stacked_sample_bits(closure_plan)?,
+                1,
             )?;
             let _profile_map_answers =
                 zkie_engine::profile::Scope::new("first.closure_map_answers");
-            let map_answers = value_group_answers(
+            let map_answers = stacked_value_group_answers(
                 &closure_plan.map,
-                closure_plan.map_oracle_base,
-                plan.send.group,
-                &map.messages,
-                &map_seeds,
+                closure_plan.bits_columns,
+                plan.send.positions(),
+                map.messages.first().ok_or(Error::ShapeMismatch)?,
+                &map_seeds[0],
             )?;
             drop(_profile_map_answers);
             absorb_tagged_answers(&mut chain, 36, &map_answers)?;
@@ -15716,7 +15821,7 @@ fn prove_first(
             )?;
             let _profile_bits_open =
                 zkie_engine::profile::Scope::new("first.closure_bits_openings");
-            let bits_openings = open_value_group_openings(
+            let bits_openings = open_stacked_openings(
                 &closure_plan.bits,
                 &closure.bits.messages,
                 &closure.bits_tails,
@@ -15739,7 +15844,7 @@ fn prove_first(
             )?;
             let _profile_map_open =
                 zkie_engine::profile::Scope::new("first.closure_map_openings");
-            let map_openings = open_value_group_openings(
+            let map_openings = open_stacked_openings(
                 &closure_plan.map,
                 &closure.map.messages,
                 &closure.map_tails,
@@ -16065,20 +16170,20 @@ fn verify_first(
     match (&plan.closure, &messages.closure) {
         (Some(closure_plan), Some(closure)) => {
             if closure.slack.group.fault(plan.send.positions()).is_some()
-                || closure.bits.group.fault(plan.send.positions()).is_some()
+                || closure.bits.group.fault(1).is_some()
+                || closure.map.group.fault(1).is_some()
                 || closure.slack.group.group != plan.send.group
                 || closure.bits.group.group != plan.send.group
+                || closure.map.group.group != plan.send.group
                 || closure.mask.tree != closure_plan.mask.tree
                 || closure.mask.root == Digest::ZERO
                 || closure.slack_sample.seed.len() != closure_plan.slack.answers as usize
                 || closure.slack_sample.answers.len() != plan.send.positions() as usize
-                || closure.bits_sample.seed.len() != closure_plan.bits.answers as usize
+                || closure.bits_sample.seed.len() != 1
                 || closure.bits_sample.answers.len() != plan.send.positions() as usize
                 || closure.mask.sample.seed.len() != closure_plan.mask.answers as usize
                 || closure.mask.sample.answers.len() != closure_plan.mask.answers as usize
-                || closure.map.group.fault(plan.send.positions()).is_some()
-                || closure.map.group.group != plan.send.group
-                || closure.map_sample.seed.len() != closure_plan.map.answers as usize
+                || closure.map_sample.seed.len() != 1
                 || closure.map_sample.answers.len() != plan.send.positions() as usize
             {
                 return Err(Error::StatementMismatch);
@@ -16097,29 +16202,24 @@ fn verify_first(
                     return Err(Error::StatementMismatch);
                 }
             }
-            for (position, entry) in closure.bits.group.entries.iter().enumerate() {
-                if entry.position != position as u32
-                    || entry.oracle
-                        != closure_plan
-                            .bits_oracle_base
-                            .checked_add(position as u64)
-                            .ok_or(Error::ResourceLimit)?
-                    || entry.shape != closure_plan.bits.oracle_shape()
-                    || entry.tree != closure_plan.bits.tree_plan(position as u32)?
-                    || entry.root == Digest::ZERO
-                {
-                    return Err(Error::StatementMismatch);
-                }
-            }
-            for (position, entry) in closure.map.group.entries.iter().enumerate() {
-                if entry.position != position as u32
-                    || entry.oracle
-                        != closure_plan
-                            .map_oracle_base
-                            .checked_add(position as u64)
-                            .ok_or(Error::ResourceLimit)?
-                    || entry.shape != closure_plan.map.oracle_shape()
-                    || entry.tree != closure_plan.map.tree_plan(position as u32)?
+            // The bit and map classes carry one stacked message each.
+            for (entry, shape, oracle) in [
+                (
+                    closure.bits.group.entries.first(),
+                    &closure_plan.bits,
+                    closure_plan.bits_oracle_base,
+                ),
+                (
+                    closure.map.group.entries.first(),
+                    &closure_plan.map,
+                    closure_plan.map_oracle_base,
+                ),
+            ] {
+                let entry = entry.ok_or(Error::StatementMismatch)?;
+                if entry.position != 0
+                    || entry.oracle != oracle
+                    || entry.shape != shape.oracle_shape()
+                    || entry.tree != shape.tree_plan(0)?
                     || entry.root == Digest::ZERO
                 {
                     return Err(Error::StatementMismatch);
@@ -16188,8 +16288,8 @@ fn verify_first(
         let bits_seeds = draw_closure_seed_set(
             &mut chain,
             28,
-            closure_plan.bits.sample_bits()?,
-            closure_plan.bits.answers,
+            stacked_sample_bits(closure_plan)?,
+            1,
         )?;
         if bits_seeds != closure.bits_sample.seed {
             return Err(Error::InvalidProof);
@@ -16217,8 +16317,8 @@ fn verify_first(
             let map_seeds = draw_closure_seed_set(
                 &mut chain,
                 35,
-                closure_plan.map.sample_bits()?,
-                closure_plan.map.answers,
+                stacked_sample_bits(closure_plan)?,
+                1,
             )?;
             if map_seeds != closure.map_sample.seed {
                 return Err(Error::InvalidProof);
@@ -16315,20 +16415,16 @@ fn verify_first(
         {
             return Err(Error::InvalidProof);
         }
-        for (position, (list, opening)) in bits_positions
-            .iter()
-            .zip(&closure.bits_openings)
-            .enumerate()
-        {
+        for (list, opening) in bits_positions.iter().zip(&closure.bits_openings) {
             if opening.positions != *list {
                 return Err(Error::InvalidIndex);
             }
-            let tree = closure_plan.bits.tree_plan(position as u32)?;
+            let tree = closure_plan.bits.tree_plan(0)?;
             let root = closure
                 .bits
                 .group
                 .entries
-                .get(position)
+                .first()
                 .map(|entry| entry.root)
                 .ok_or(Error::ShapeMismatch)?;
             verify_runtime_opening(&tree, &root, list, opening)?;
@@ -16357,20 +16453,16 @@ fn verify_first(
         {
             return Err(Error::InvalidProof);
         }
-        for (position, (list, opening)) in map_positions
-            .iter()
-            .zip(&closure.map_openings)
-            .enumerate()
-        {
+        for (list, opening) in map_positions.iter().zip(&closure.map_openings) {
             if opening.positions != *list {
                 return Err(Error::InvalidIndex);
             }
-            let tree = closure_plan.map.tree_plan(position as u32)?;
+            let tree = closure_plan.map.tree_plan(0)?;
             let root = closure
                 .map
                 .group
                 .entries
-                .get(position)
+                .first()
                 .map(|entry| entry.root)
                 .ok_or(Error::ShapeMismatch)?;
             verify_runtime_opening(&tree, &root, list, opening)?;
@@ -18223,31 +18315,37 @@ fn own_members(
                 mask_tails: Vec::new(),
             });
         }
-        for position in 0..positions {
-            let root = closure_first
+        // The stacked bit message: one member over the merged table, one
+        // sample answer per position block.
+        {
+            let shape = &closure_plan.bits;
+            let entry = closure_first
                 .bits
                 .group
                 .entries
-                .get(position as usize)
-                .ok_or(Error::ShapeMismatch)?
-                .root;
+                .first()
+                .ok_or(Error::ShapeMismatch)?;
+            if entry.oracle != closure_plan.bits_oracle_base
+                || closure_first.bits.group.entries.len() != 1
+                || entry.tree != shape.tree_plan(0)?
+            {
+                return Err(Error::StatementMismatch);
+            }
+            let root = entry.root;
             let (message, tails) = match witness {
                 Some(witness) => {
                     let closure = witness.closure.as_ref().ok_or(Error::ShapeMismatch)?;
                     let message = closure
                         .bits
                         .messages
-                        .get(position as usize)
+                        .first()
                         .ok_or(Error::ShapeMismatch)?
                         .clone();
-                    let rows = usize::try_from(closure_plan.bits.main_rows)
+                    let rows = usize::try_from(shape.main_rows)
                         .map_err(|_| Error::ResourceLimit)?;
-                    let tail_len = usize::try_from(closure_plan.bits.code.r)
+                    let tail_len = usize::try_from(shape.code.r)
                         .map_err(|_| Error::ResourceLimit)?;
-                    let flat = closure
-                        .bits_tails
-                        .get(position as usize)
-                        .ok_or(Error::ShapeMismatch)?;
+                    let flat = closure.bits_tails.first().ok_or(Error::ShapeMismatch)?;
                     let mut tails = Vec::with_capacity(rows);
                     for row in 0..rows {
                         tails.push(
@@ -18262,48 +18360,49 @@ fn own_members(
             };
             members.push(ProximityMember {
                 bat_oracle: 0,
-                source_oracle: closure_plan
-                    .bits_oracle_base
-                    .checked_add(position as u64)
-                    .ok_or(Error::ResourceLimit)?,
-                main_code: closure_plan.bits.code,
+                source_oracle: closure_plan.bits_oracle_base,
+                main_code: shape.code,
                 mask_code: plan.proximity.mask_code,
-                main_rows: closure_plan.bits.main_rows,
+                main_rows: shape.main_rows,
                 mask_rows: 0,
-                answers: closure_plan.bits.answers,
+                answers: positions,
                 root,
-                tree_plan: closure_plan.bits.tree_plan(position)?,
+                tree_plan: shape.tree_plan(0)?,
                 message,
                 tails,
                 mask_message: Vec::new(),
                 mask_tails: Vec::new(),
             });
         }
-        for position in 0..positions {
-            let root = closure_first
+        {
+            let shape = &closure_plan.map;
+            let entry = closure_first
                 .map
                 .group
                 .entries
-                .get(position as usize)
-                .ok_or(Error::ShapeMismatch)?
-                .root;
+                .first()
+                .ok_or(Error::ShapeMismatch)?;
+            if entry.oracle != closure_plan.map_oracle_base
+                || closure_first.map.group.entries.len() != 1
+                || entry.tree != shape.tree_plan(0)?
+            {
+                return Err(Error::StatementMismatch);
+            }
+            let root = entry.root;
             let (message, tails) = match witness {
                 Some(witness) => {
                     let closure = witness.closure.as_ref().ok_or(Error::ShapeMismatch)?;
                     let message = closure
                         .map
                         .messages
-                        .get(position as usize)
+                        .first()
                         .ok_or(Error::ShapeMismatch)?
                         .clone();
-                    let rows = usize::try_from(closure_plan.map.main_rows)
+                    let rows = usize::try_from(shape.main_rows)
                         .map_err(|_| Error::ResourceLimit)?;
-                    let tail_len = usize::try_from(closure_plan.map.code.r)
+                    let tail_len = usize::try_from(shape.code.r)
                         .map_err(|_| Error::ResourceLimit)?;
-                    let flat = closure
-                        .map_tails
-                        .get(position as usize)
-                        .ok_or(Error::ShapeMismatch)?;
+                    let flat = closure.map_tails.first().ok_or(Error::ShapeMismatch)?;
                     let mut tails = Vec::with_capacity(rows);
                     for row in 0..rows {
                         tails.push(
@@ -18318,17 +18417,14 @@ fn own_members(
             };
             members.push(ProximityMember {
                 bat_oracle: 0,
-                source_oracle: closure_plan
-                    .map_oracle_base
-                    .checked_add(position as u64)
-                    .ok_or(Error::ResourceLimit)?,
-                main_code: closure_plan.map.code,
+                source_oracle: closure_plan.map_oracle_base,
+                main_code: shape.code,
                 mask_code: plan.proximity.mask_code,
-                main_rows: closure_plan.map.main_rows,
+                main_rows: shape.main_rows,
                 mask_rows: 0,
-                answers: closure_plan.map.answers,
+                answers: positions,
                 root,
-                tree_plan: closure_plan.map.tree_plan(position)?,
+                tree_plan: shape.tree_plan(0)?,
                 message,
                 tails,
                 mask_message: Vec::new(),
@@ -18989,42 +19085,18 @@ let shape = plan.send.w.oracle_shape();
                 target,
             )?]);
         }
-        if member.source_oracle >= bits_base
-            && member.source_oracle < bits_base.saturating_add(positions)
-        {
-            let position = (member.source_oracle - bits_base) as usize;
-            let target = *closure_first
-                .bits_sample
-                .answers
-                .get(position)
-                .ok_or(Error::ShapeMismatch)?;
-            return Ok(vec![oracle_sample_row(
-                member.source_oracle,
-                plan.send.group,
-                &closure_plan.bits.oracle_shape(),
-                &closure_first.bits_sample.seed,
-                0,
-                target,
-            )?]);
+        if member.source_oracle == bits_base {
+            // The stacked bit message emits one block-addressed run row per
+            // position through the streaming builder; the materialized list
+            // never carries it.
+            let _ = bits_base;
+            return Err(Error::InvalidConfig);
         }
-        let map_base = closure_plan.map_oracle_base;
-        if member.source_oracle >= map_base
-            && member.source_oracle < map_base.saturating_add(positions)
-        {
-            let position = (member.source_oracle - map_base) as usize;
-            let target = *closure_first
-                .map_sample
-                .answers
-                .get(position)
-                .ok_or(Error::ShapeMismatch)?;
-            return Ok(vec![oracle_sample_row(
-                member.source_oracle,
-                plan.send.group,
-                &closure_plan.map.oracle_shape(),
-                &closure_first.map_sample.seed,
-                0,
-                target,
-            )?]);
+        if member.source_oracle == closure_plan.map_oracle_base {
+            // The stacked map message emits one block-addressed run row per
+            // position through the streaming builder; the materialized list
+            // never carries it.
+            return Err(Error::InvalidConfig);
         }
         if member.source_oracle == closure_plan.mask.oracle {
             let target = *closure_first
@@ -19139,6 +19211,181 @@ let shape = plan.send.w.oracle_shape();
 /// The materialized sample rows of every member, in member order. The own
 /// stage defers them into the streamed run and does not call this; the
 /// materialized proximity entries keep using it.
+/// Emits the sample rows of one member as BAT rows. The stacked closure
+/// classes emit one block-addressed run row per position block from the
+/// shared seed; every other member keeps the shared relation-row builder.
+/// The own group's member row-block sum from the trusted plan alone: every
+/// member `own_members` pushes contributes `next_power_of_two(rows)` to its
+/// main or mask part. The BAT layout derives the same blocks and the FOLD k
+/// from this set, so the own stages are planned against this sum instead of
+/// a hand-set fold shape. The segment builders leave the request, source,
+/// range and digit attachments empty; a plan that carries them is rejected
+/// here rather than silently mis-sized.
+pub fn own_member_k(plan: &HiddenLinPlan) -> Result<u32> {
+    if plan.send.range.is_some()
+        || !plan.send.digit_lookups.is_empty()
+        || plan.send.request_chain.is_some()
+        || plan.send.chain_mask.is_some()
+    {
+        return Err(Error::UnsupportedPrimitive);
+    }
+    let mut main_rows = 0u64;
+    let mut mask_rows = 0u64;
+    let mut add = |main: u64, mask: u64| -> Result<()> {
+        for (total, rows) in [(&mut main_rows, main), (&mut mask_rows, mask)] {
+            if rows > 0 {
+                let block = rows.checked_next_power_of_two().ok_or(Error::ResourceLimit)?;
+                *total = total.checked_add(block).ok_or(Error::ResourceLimit)?;
+            }
+        }
+        Ok(())
+    };
+    let positions = plan.send.positions() as u64;
+    for _ in 0..positions {
+        add(plan.send.w.main_rows, 0)?;
+    }
+    add(plan.proximity.omega.u.main_rows, 0)?;
+    if let Some(rw) = &plan.send.request_w {
+        add(rw.shape.main_rows, 0)?;
+    }
+    if let Some(source) = &plan.send.source_data {
+        add(source.shape.main_rows, 0)?;
+    }
+    if let Some(dot) = &plan.send.dot {
+        if !plan.send.activation_source.is_norm_hd() {
+            add(dot.shape.main_rows, 0)?;
+        }
+    }
+    if let Some(index) = &plan.send.index_mask {
+        add(0, index.mask_rows)?;
+    }
+    if let Some(closure) = &plan.closure {
+        for _ in 0..positions {
+            add(closure.slack.main_rows, 0)?;
+        }
+        add(closure.bits.main_rows, 0)?;
+        add(closure.map.main_rows, 0)?;
+        add(0, closure.mask.mask_rows)?;
+    }
+    if let Some(norm) = &plan.norm {
+        let mut groups: Vec<&WShape> = vec![
+            &norm.x.shape,
+            &norm.sum.shape,
+            &norm.squares.shape,
+            &norm.mean.shape,
+            &norm.variance.shape,
+        ];
+        if let Some(rms) = &norm.rms {
+            groups.push(&rms.low.shape);
+            groups.push(&rms.high.shape);
+        }
+        if let Some(round) = &norm.round {
+            groups.push(&round.group.shape);
+        }
+        if let Some(output) = &norm.output {
+            for group in [
+                &output.broadcast,
+                &output.product,
+                &output.image,
+                &output.out,
+            ] {
+                groups.push(&group.shape);
+            }
+            if let Some(tail) = &output.tail {
+                groups.push(&tail.group.shape);
+            }
+        }
+        for shape in groups {
+            for _ in 0..positions {
+                add(shape.main_rows, 0)?;
+            }
+        }
+        if let Some(mask) = &norm.mask {
+            add(0, mask.mask_rows)?;
+        }
+        if let Some(lookup) = &norm.lookup {
+            add(lookup.commit.bits_shape.main_rows, 0)?;
+            add(0, lookup.commit.mask_rows)?;
+        }
+        if let Some(rstd) = &norm.rstd {
+            add(rstd.commit.bits_shape.main_rows, 0)?;
+            add(0, rstd.commit.mask_rows)?;
+        }
+    }
+    let bits = |rows: u64| -> u32 {
+        if rows <= 1 {
+            0
+        } else {
+            64 - (rows - 1).leading_zeros()
+        }
+    };
+    Ok(bits(main_rows).max(bits(mask_rows)).max(1))
+}
+
+fn member_samples_into(
+    plan: &HiddenLinPlan,
+    member: &ProximityMember,
+    first: &HiddenSendMessages,
+    shared: &HiddenSharedMessages,
+    emit: &mut dyn FnMut(BatRow) -> Result<()>,
+) -> Result<()> {
+    if let (Some(closure_plan), Some(closure_first)) = (&plan.closure, &first.closure) {
+        let classes = [
+            (
+                &closure_plan.bits,
+                closure_plan.bits_oracle_base,
+                &closure_first.bits_sample,
+            ),
+            (
+                &closure_plan.map,
+                closure_plan.map_oracle_base,
+                &closure_first.map_sample,
+            ),
+        ];
+        for (shape, base, sample) in classes {
+            if member.source_oracle != base {
+                continue;
+            }
+            let blocks = plan.send.positions() as usize;
+            if sample.seed.len() != 1 || sample.answers.len() != blocks {
+                return Err(Error::ShapeMismatch);
+            }
+            if member.main_rows != shape.main_rows {
+                return Err(Error::ShapeMismatch);
+            }
+            let seed = &sample.seed[0];
+            let columns = usize::try_from(closure_plan.bits_columns)
+                .map_err(|_| Error::ResourceLimit)?;
+            if seed.z.len() != columns.trailing_zeros() as usize {
+                return Err(Error::ShapeMismatch);
+            }
+            let eq = crate::proof::output_closure::eq_vector(&seed.z)?;
+            if eq.len() != columns {
+                return Err(Error::ShapeMismatch);
+            }
+            for (block, target) in sample.answers.iter().enumerate() {
+                let mut row = BatRow::new(BatRowKind::Sample);
+                row.add_run(
+                    member.bat_oracle,
+                    BatPart::Main,
+                    (block as u64)
+                        .checked_mul(closure_plan.bits_columns)
+                        .ok_or(Error::ResourceLimit)?,
+                    1,
+                    eq.clone(),
+                );
+                row.target = *target;
+                emit(row)?;
+            }
+            return Ok(());
+        }
+    }
+    for row in member_sample_rows(plan, member, first, shared)? {
+        emit(adapt_sample_row(&row, member)?)?;
+    }
+    Ok(())
+}
+
 fn own_sample_rows(
     plan: &HiddenLinPlan,
     members: &[ProximityMember],
@@ -24392,10 +24639,6 @@ fn closure_plain_rows(
         usize::try_from(closure_plan.slack.main_rows).map_err(|_| Error::ResourceLimit)?;
     let slack_ell =
         usize::try_from(closure_plan.slack.code.ell).map_err(|_| Error::ResourceLimit)?;
-    let bits_rows =
-        usize::try_from(closure_plan.bits.main_rows).map_err(|_| Error::ResourceLimit)?;
-    let bits_ell =
-        usize::try_from(closure_plan.bits.code.ell).map_err(|_| Error::ResourceLimit)?;
     let bits_columns = usize::try_from(closure_plan.bits_columns)
         .map_err(|_| Error::ResourceLimit)?;
     let k = closure_plan.boolean_variables as usize;
@@ -24439,21 +24682,13 @@ fn closure_plain_rows(
                     .ok_or(Error::ResourceLimit)?,
             )
             .ok_or(Error::StatementMismatch)?;
+        // The stacked classes carry one member each; every position's rows
+        // address the same member through the block offset.
         let bits_member = bat_of
-            .get(
-                &closure_plan
-                    .bits_oracle_base
-                    .checked_add(position as u64)
-                    .ok_or(Error::ResourceLimit)?,
-            )
+            .get(&closure_plan.bits_oracle_base)
             .ok_or(Error::StatementMismatch)?;
         let map_member = bat_of
-            .get(
-                &closure_plan
-                    .map_oracle_base
-                    .checked_add(position as u64)
-                    .ok_or(Error::ResourceLimit)?,
-            )
+            .get(&closure_plan.map_oracle_base)
             .ok_or(Error::StatementMismatch)?;
         let winner = closure_plan.winner[position] as usize;
 
@@ -24502,7 +24737,7 @@ fn closure_plain_rows(
             return Err(Error::ShapeMismatch);
         }
         for (which, target) in [(0u8, offset), (1u8, offset), (2u8, 0i128)] {
-            let mut bit_coefficients = vec![Fp3::ZERO; bits_rows * bits_ell];
+            let mut bit_coefficients = vec![Fp3::ZERO; bits_columns];
             let mut main_coefficients = if which < 2 {
                 vec![Fp3::ZERO; w_rows * w_ell]
             } else {
@@ -24533,7 +24768,15 @@ fn closure_plain_rows(
                 }
             }
             let mut row = BatRow::new(BatRowKind::Plain);
-            row.add_term(bits_member.bat_oracle, BatPart::Main, bit_coefficients);
+            row.add_run(
+                bits_member.bat_oracle,
+                BatPart::Main,
+                (position as u64)
+                    .checked_mul(closure_plan.bits_columns)
+                    .ok_or(Error::ResourceLimit)?,
+                1,
+                bit_coefficients,
+            );
             if which < 2 {
                 row.add_term(w_member.bat_oracle, BatPart::Main, main_coefficients);
             } else {
@@ -24554,10 +24797,16 @@ fn closure_plain_rows(
         if eq_point.len() != bits_columns {
             return Err(Error::InvalidProof);
         }
-        let mut coefficients = vec![Fp3::ZERO; bits_rows * bits_ell];
-        coefficients[..bits_columns].copy_from_slice(&eq_point);
         let mut row = BatRow::new(BatRowKind::Plain);
-        row.add_term(map_member.bat_oracle, BatPart::Main, coefficients);
+        row.add_run(
+            map_member.bat_oracle,
+            BatPart::Main,
+            (position as u64)
+                .checked_mul(closure_plan.bits_columns)
+                .ok_or(Error::ResourceLimit)?,
+            1,
+            eq_point.clone(),
+        );
         row.add_unit(
             mask.bat_oracle,
             BatPart::Mask,
@@ -24568,10 +24817,16 @@ fn closure_plain_rows(
         emit(row)?;
 
         // The committed bit map at the booleanity point, one-time masked.
-        let mut coefficients = vec![Fp3::ZERO; bits_rows * bits_ell];
-        coefficients[..bits_columns].copy_from_slice(&eq_point);
         let mut row = BatRow::new(BatRowKind::Plain);
-        row.add_term(bits_member.bat_oracle, BatPart::Main, coefficients);
+        row.add_run(
+            bits_member.bat_oracle,
+            BatPart::Main,
+            (position as u64)
+                .checked_mul(closure_plan.bits_columns)
+                .ok_or(Error::ResourceLimit)?,
+            1,
+            eq_point.clone(),
+        );
         row.add_unit(
             mask.bat_oracle,
             BatPart::Mask,
@@ -24627,14 +24882,20 @@ fn closure_plain_rows(
         if eq_q.len() != bits_columns || eq_r.len() != bits_columns {
             return Err(Error::InvalidProof);
         }
-        let mut d_coefficients = vec![Fp3::ZERO; bits_rows * bits_ell];
-        d_coefficients[..bits_columns].copy_from_slice(&eq_q);
-        let mut b_coefficients = vec![Fp3::ZERO; bits_rows * bits_ell];
+        let mut b_coefficients = vec![Fp3::ZERO; bits_columns];
         for entry in 0..bits_columns {
             b_coefficients[entry] = eq_q[entry].mul(&eq_r[entry]);
         }
         let mut row = BatRow::new(BatRowKind::Plain);
-        row.add_term(map_member.bat_oracle, BatPart::Main, d_coefficients);
+        row.add_run(
+            map_member.bat_oracle,
+            BatPart::Main,
+            (position as u64)
+                .checked_mul(closure_plan.bits_columns)
+                .ok_or(Error::ResourceLimit)?,
+            1,
+            eq_q.clone(),
+        );
         row.add_unit(
             mask.bat_oracle,
             BatPart::Mask,
@@ -24644,7 +24905,15 @@ fn closure_plain_rows(
         row.target = word.d_value;
         emit(row)?;
         let mut row = BatRow::new(BatRowKind::Plain);
-        row.add_term(bits_member.bat_oracle, BatPart::Main, b_coefficients);
+        row.add_run(
+            bits_member.bat_oracle,
+            BatPart::Main,
+            (position as u64)
+                .checked_mul(closure_plan.bits_columns)
+                .ok_or(Error::ResourceLimit)?,
+            1,
+            b_coefficients,
+        );
         row.add_unit(
             mask.bat_oracle,
             BatPart::Mask,
@@ -26357,6 +26626,9 @@ fn prove_second(
     };
     let request_bundle = request_rows_bundle(plan, &members, shared_point)?;
     let deferred_samples = plan.proximity.own_deferred_samples;
+    if plan.closure.is_some() && !deferred_samples {
+        return Err(Error::InvalidConfig);
+    }
     let mut streaming_chain_rows = Some(chain_rows);
     let mut plain_stream =
         |members: &[ProximityMember], sink: &mut dyn FnMut(BatRow) -> Result<()>| -> Result<()> {
@@ -26380,10 +26652,7 @@ fn prove_second(
                 let _profile_sample_rows =
                     zkie_engine::profile::Scope::new("second.sample_rows");
                 for member in members {
-                    let rows = member_sample_rows(plan, member, first, shared)?;
-                    for row in &rows {
-                        sink(adapt_sample_row(row, member)?)?;
-                    }
+                    member_samples_into(plan, member, first, shared, sink)?;
                 }
             }
             Ok(())
@@ -26825,6 +27094,9 @@ fn verify_second(
     };
     let (members, _order) = own_members(plan, first, shared, None, None)?;
     let deferred_samples = plan.proximity.own_deferred_samples;
+    if plan.closure.is_some() && !deferred_samples {
+        return Err(Error::InvalidConfig);
+    }
     let request_bundle = request_rows_bundle(plan, &members, shared_point)?;
     let mut streaming_chain_rows = Some(chain_rows);
     let mut plain_stream =
@@ -26849,10 +27121,7 @@ fn verify_second(
                 let _profile_sample_rows =
                     zkie_engine::profile::Scope::new("verify.second.sample_rows");
                 for member in members {
-                    let rows = member_sample_rows(plan, member, first, shared)?;
-                    for row in &rows {
-                        sink(adapt_sample_row(row, member)?)?;
-                    }
+                    member_samples_into(plan, member, first, shared, sink)?;
                 }
             }
             Ok(())
@@ -38669,6 +38938,19 @@ mod merged_tests {
             )
             .unwrap()
         };
+        let stacked = |columns: u64, tree: u64| {
+            crate::proof::output_closure::stacked_shape(
+                columns,
+                POSITIONS,
+                plan.send.w.code,
+                SALT,
+                tree,
+                1,
+                W_RUN,
+                W_CONFIGURATION,
+            )
+            .unwrap()
+        };
         crate::proof::output_closure::ClosurePlan {
             range_bits,
             slack_bits,
@@ -38680,15 +38962,16 @@ mod merged_tests {
             slack: wshape(plan.send.columns, 63_000),
             slack_oracle_base: 42_000,
             slack_openings: 1,
-            bits: wshape(bits_columns, 63_010),
+            bits: stacked(bits_columns, 63_010),
             bits_oracle_base: 42_010,
             bits_openings: 1,
-            map: wshape(bits_columns, 63_020),
+            map: stacked(bits_columns, 63_020),
             map_oracle_base: 42_020,
             map_openings: 1,
             bits_columns,
             bits_per_cell: width as u32,
             boolean_variables: boolean_variables as u32,
+            tail_pad: true,
             mask: crate::proof::output_closure::ClosureMaskPlan {
                 oracle: 42_030,
                 group: plan.send.group,
@@ -38749,6 +39032,22 @@ mod merged_tests {
                 best as u32
             })
             .collect()
+    }
+
+    #[test]
+    fn a_stacked_closure_plan_needs_its_marker() {
+        let activation = activation();
+        let (plan, _, _) = norm_hd_fixture(&activation);
+        let mut closure = norm_hd_closure_plan(&plan, vec![0u32; POSITIONS as usize]);
+        assert!(closure.fault(&plan.send).is_none());
+        // Without the plan marker the stacked fill must be refused.
+        closure.tail_pad = false;
+        assert!(closure.fault(&plan.send).is_some());
+        // With the marker, a bit message that does not exactly fill the
+        // stacked rows must be refused too.
+        let mut closure = norm_hd_closure_plan(&plan, vec![0u32; POSITIONS as usize]);
+        closure.bits.main_rows *= 2;
+        assert!(closure.fault(&plan.send).is_some());
     }
 
     #[test]

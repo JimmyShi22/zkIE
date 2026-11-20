@@ -364,6 +364,11 @@ pub struct ClosurePlan {
     pub bits_per_cell: u32,
     /// The number of variables of the booleanity instance.
     pub boolean_variables: u32,
+    /// The stacked message form: one message per class over every position,
+    /// with its single sample pad on the message's last cell, a packed tail
+    /// entry the plan keeps zero. The form is a plan value absorbed by the
+    /// closure digest; a message outside it is refused.
+    pub tail_pad: bool,
     /// The mask-only closure message.
     pub mask: ClosureMaskPlan,
 }
@@ -509,8 +514,27 @@ impl ClosurePlan {
         if self.bits.code != send.w.code || self.bits.answers != 1 {
             return Some("the bit message does not share the own-group main code");
         }
-        if self.bits.main_rows.checked_mul(self.bits.code.ell) < Some(self.bits_columns) {
-            return Some("the bit message is shorter than its packed width");
+        if !self.tail_pad {
+            return Some("the closure messages are not the stacked tail-pad form");
+        }
+        let blocks = send.positions() as u64;
+        if self.bits.code.ell % blocks != 0 {
+            return Some("the stacked bit message places do not split by position");
+        }
+        let block_places = self.bits.code.ell / blocks;
+        if block_places == 0 || !block_places.is_power_of_two() {
+            return Some("a stacked bit message block has no power-of-two place range");
+        }
+        let stacked_columns = match blocks.checked_mul(self.bits_columns) {
+            Some(value) => value,
+            None => return Some("the stacked bit message width overflows"),
+        };
+        if self.bits.main_rows.checked_mul(self.bits.code.ell) != Some(stacked_columns) {
+            return Some("the stacked bit message is not exactly filled by the positions");
+        }
+        let packed = (self.vocab as u64).saturating_mul(self.bits_per_cell as u64);
+        if self.bits_columns <= packed {
+            return Some("the stacked bit message has no zero tail entry for its pad cell");
         }
         if self.map.fault(self.bits_columns, send.positions()).is_some() {
             return Some("the map message shape is not a message shape");
@@ -521,8 +545,11 @@ impl ClosurePlan {
         if self.map_openings == 0 || self.map_openings as u64 > self.map.code.r {
             return Some("the map opening count exceeds its tail");
         }
-        if self.map.main_rows.checked_mul(self.map.code.ell) < Some(self.bits_columns) {
-            return Some("the map message is shorter than the bit vector width");
+        if self.map.main_rows.checked_mul(self.map.code.ell) != Some(stacked_columns) {
+            return Some("the stacked map message is not exactly filled by the positions");
+        }
+        if self.map.main_rows != self.bits.main_rows || self.map.code != self.bits.code {
+            return Some("the stacked map message does not share the bit message shape");
         }
         if self.mask.fault(self.boolean_variables as usize).is_some() {
             return Some("the closure-mask message is not a mask-only message");
@@ -649,6 +676,7 @@ impl ClosurePlan {
         writer.put_u64(self.bits_columns);
         writer.put_u64(self.bits_per_cell as u64);
         writer.put_u64(self.boolean_variables as u64);
+        writer.put_u64(self.tail_pad as u64);
         self.mask.encode_into(writer);
         if !self.masked {
             // The masked form keeps the historical encoding unchanged.
@@ -710,12 +738,17 @@ impl ClosureRandomness {
         let slack_tails = draw_shape_tails(coins, &plan.slack, positions)?;
         let slack_pads = draw_shape_pads(coins, &plan.slack, positions)?;
         let slack_salts = draw_shape_salts(coins, &plan.slack, positions)?;
-        let bits_tails = draw_shape_tails(coins, &plan.bits, positions)?;
-        let bits_pads = draw_shape_pads(coins, &plan.bits, positions)?;
-        let bits_salts = draw_shape_salts(coins, &plan.bits, positions)?;
-        let map_tails = draw_shape_tails(coins, &plan.map, positions)?;
-        let map_pads = draw_shape_pads(coins, &plan.map, positions)?;
-        let map_salts = draw_shape_salts(coins, &plan.map, positions)?;
+        // The stacked classes carry one message each: one tail vector, one
+        // salt set and the single plan-zero pad cell.
+        if !plan.tail_pad {
+            return Err(Error::InvalidConfig);
+        }
+        let bits_tails = draw_shape_tails(coins, &plan.bits, 1)?;
+        let bits_pads = vec![Fp3::ZERO; plan.bits.answers as usize];
+        let bits_salts = draw_shape_salts(coins, &plan.bits, 1)?;
+        let map_tails = draw_shape_tails(coins, &plan.map, 1)?;
+        let map_pads = vec![Fp3::ZERO; plan.map.answers as usize];
+        let map_salts = draw_shape_salts(coins, &plan.map, 1)?;
         let mask_row_count =
             usize::try_from(plan.mask.mask_rows).map_err(|_| Error::ResourceLimit)?;
         let ell = usize::try_from(plan.mask.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
@@ -777,20 +810,23 @@ impl ClosureRandomness {
             &self.slack_tails,
             &self.slack_salts,
             &self.slack_pads,
+            false,
         )?;
         check_shape_randomness(
             &plan.bits,
-            send.positions(),
+            1,
             &self.bits_tails,
             &self.bits_salts,
             &self.bits_pads,
+            true,
         )?;
         check_shape_randomness(
             &plan.map,
-            send.positions(),
+            1,
             &self.map_tails,
             &self.map_salts,
             &self.map_pads,
+            true,
         )?;
         let rows = usize::try_from(plan.mask.mask_rows).map_err(|_| Error::ResourceLimit)?;
         let ell = usize::try_from(plan.mask.mask_code.ell).map_err(|_| Error::ResourceLimit)?;
@@ -904,6 +940,7 @@ fn check_shape_randomness(
     tails: &[Vec<Fp3>],
     salts: &[Vec<Vec<u8>>],
     pads: &[Fp3],
+    pads_zero: bool,
 ) -> Result<()> {
     let count = positions as usize;
     let rows = usize::try_from(shape.main_rows).map_err(|_| Error::ResourceLimit)?;
@@ -917,7 +954,11 @@ fn check_shape_randomness(
             values.len() != columns || values.iter().any(|salt| salt.len() != shape.salt_bytes)
         })
         || pads.len() != count * answers
-        || pads.iter().any(|pad| *pad == Fp3::ZERO)
+        || if pads_zero {
+            pads.iter().any(|pad| *pad != Fp3::ZERO)
+        } else {
+            pads.iter().any(|pad| *pad == Fp3::ZERO)
+        }
     {
         return Err(Error::ShapeMismatch);
     }
@@ -1118,6 +1159,175 @@ pub fn commit_value_group(
     })
 }
 
+/// The stacked closure message shape: one message per class over every
+/// position block of `block_columns` entries each, with the row count derived
+/// from the real entry count and the shared code. The single sample pad sits
+/// on the message's last cell, a packed tail entry the plan keeps zero, so
+/// the message is exactly filled by the positions.
+#[allow(clippy::too_many_arguments)]
+pub fn stacked_shape(
+    block_columns: u64,
+    positions: u32,
+    code: zkie_engine::pcs::request::code::CodeParams,
+    salt_bytes: usize,
+    tree_number: u64,
+    leaf_class: u32,
+    run: Digest,
+    configuration: Digest,
+) -> Result<crate::proof::hidden_send_session::WShape> {
+    if block_columns == 0
+        || !block_columns.is_power_of_two()
+        || positions == 0
+        || code.ell == 0
+        || !code.ell.is_power_of_two()
+    {
+        return Err(Error::InvalidConfig);
+    }
+    zkie_engine::pcs::request::code::build_code_plan(code.log_n, code.ell, code.r)?;
+    let blocks = positions as u64;
+    if code.ell % blocks != 0 {
+        return Err(Error::InvalidConfig);
+    }
+    let places = code.ell / blocks;
+    if places == 0 || !places.is_power_of_two() {
+        return Err(Error::InvalidConfig);
+    }
+    let entries = blocks
+        .checked_mul(block_columns)
+        .ok_or(Error::ResourceLimit)?;
+    let rows_needed = entries.div_ceil(code.ell);
+    let main_rows = rows_needed
+        .checked_next_power_of_two()
+        .ok_or(Error::ResourceLimit)?;
+    if main_rows.checked_mul(code.ell) != Some(entries) {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(crate::proof::hidden_send_session::WShape {
+        code,
+        main_rows,
+        answers: 1,
+        salt_bytes,
+        tree_number,
+        leaf_class,
+        run,
+        configuration,
+    })
+}
+
+/// Commits the stacked closure message of one class: every position block is
+/// scattered into the one message through the shared entry map (position
+/// entries are one contiguous virtual range), the single sample pad is
+/// written on the last cell (which the plan keeps zero before the write), and
+/// one runtime tree is committed for the whole class.
+#[allow(clippy::too_many_arguments)]
+pub fn commit_merged_value_group(
+    shape: &crate::proof::hidden_send_session::WShape,
+    block_columns: u64,
+    oracle: u64,
+    group: u64,
+    values: &[Vec<Fp3>],
+    pads: &[Fp3],
+    tails: &[Vec<Fp3>],
+    salts: &[Vec<Vec<u8>>],
+) -> Result<CommittedValueGroup> {
+    let _profile_commit = zkie_engine::profile::Scope::new("value_group.commit");
+    if values.is_empty()
+        || values.iter().any(|row| row.len() as u64 != block_columns)
+        || pads.len() != shape.answers as usize
+        || tails.len() != 1
+        || salts.len() != 1
+    {
+        return Err(Error::ShapeMismatch);
+    }
+    let rows = usize::try_from(shape.main_rows).map_err(|_| Error::ResourceLimit)?;
+    let ell = usize::try_from(shape.code.ell).map_err(|_| Error::ResourceLimit)?;
+    let tail_len = usize::try_from(shape.code.r).map_err(|_| Error::ResourceLimit)?;
+    let entries = values
+        .len()
+        .checked_mul(usize::try_from(block_columns).map_err(|_| Error::ResourceLimit)?)
+        .ok_or(Error::ResourceLimit)?;
+    if rows.checked_mul(ell) != Some(entries) {
+        return Err(Error::ShapeMismatch);
+    }
+    let flat = tails.first().ok_or(Error::ShapeMismatch)?;
+    if flat.len() != rows.checked_mul(tail_len).ok_or(Error::ResourceLimit)? {
+        return Err(Error::ShapeMismatch);
+    }
+    let _profile_layout = zkie_engine::profile::Scope::light("value_group.layout");
+    let mut message = vec![vec![Fp3::ZERO; ell]; rows];
+    for (position, values) in values.iter().enumerate() {
+        let base = position
+            .checked_mul(usize::try_from(block_columns).map_err(|_| Error::ResourceLimit)?)
+            .ok_or(Error::ResourceLimit)?;
+        for (column, value) in values.iter().enumerate() {
+            let index = base.checked_add(column).ok_or(Error::ResourceLimit)?;
+            let row = index % rows;
+            let place = index / rows;
+            let entry = message
+                .get_mut(row)
+                .and_then(|row| row.get_mut(place))
+                .ok_or(Error::ShapeMismatch)?;
+            *entry = *value;
+        }
+    }
+    let answers = shape.answers as usize;
+    for answer in 0..answers {
+        let pad = *pads.get(answer).ok_or(Error::ShapeMismatch)?;
+        let place = ell
+            .checked_sub(answers)
+            .and_then(|first| first.checked_add(answer))
+            .ok_or(Error::ResourceLimit)?;
+        let entry = message
+            .get_mut(rows - 1)
+            .and_then(|row| row.get_mut(place))
+            .ok_or(Error::ShapeMismatch)?;
+        if !entry.is_zero() {
+            return Err(Error::StatementMismatch);
+        }
+        *entry = pad;
+    }
+    drop(_profile_layout);
+    let _profile_encode = zkie_engine::profile::Scope::light("value_group.encode");
+    let mut codewords = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let message_row = message.get(row).ok_or(Error::ShapeMismatch)?;
+        let row_tail = flat
+            .get(row * tail_len..(row + 1) * tail_len)
+            .ok_or(Error::ShapeMismatch)?;
+        codewords.push(encode_row_fp3(&shape.code, message_row, row_tail)?);
+    }
+    drop(_profile_encode);
+    let salt = salts.first().ok_or(Error::ShapeMismatch)?;
+    let tree_plan = shape.tree_plan(0)?;
+    let tree = RuntimeTree::commit_released(
+        tree_plan.clone(),
+        &[RuntimePartRows {
+            main: codewords,
+            mask: Vec::new(),
+            main_deg: E_DEGREE as u32,
+        }],
+        salt,
+    )?;
+    let root = *tree.root();
+    let entries = vec![crate::proof::hidden_send_session::SendGroupEntry {
+        position: 0,
+        oracle,
+        shape: shape.oracle_shape(),
+        tree: tree_plan,
+        root,
+    }];
+    let group = crate::proof::hidden_send_session::SendGroup { group, entries };
+    if group.fault(1).is_some() {
+        return Err(Error::InvalidConfig);
+    }
+    Ok(CommittedValueGroup {
+        group,
+        messages: vec![message],
+        roots: vec![root],
+        trees: RetainedTrees(vec![std::sync::Arc::new(tree)]),
+    })
+}
+
 /// The committed mask-only closure message.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommittedClosureMask {
@@ -1211,20 +1421,32 @@ impl ClosureFirstMessages {
             openings: &self.slack_openings,
         }
         .encode_into(&mut writer)?;
-        CommittedPscGroupRef {
-            message: &self.bits,
-            sample: &self.bits_sample,
-            positions: &self.bits_positions,
-            openings: &self.bits_openings,
+        for (group, sample, positions, openings) in [
+            (
+                &self.bits,
+                &self.bits_sample,
+                &self.bits_positions,
+                &self.bits_openings,
+            ),
+            (
+                &self.map,
+                &self.map_sample,
+                &self.map_positions,
+                &self.map_openings,
+            ),
+        ] {
+            writer.put_bytes(&group.group.encode());
+            writer.put_bytes(&sample.encode());
+            crate::proof::committed_psc::put_positions(&mut writer, positions)?;
+            let tree = group
+                .group
+                .entries
+                .first()
+                .ok_or(Error::ShapeMismatch)?
+                .tree
+                .clone();
+            crate::proof::committed_psc::put_stacked_openings(&mut writer, &tree, openings)?;
         }
-        .encode_into(&mut writer)?;
-        CommittedPscGroupRef {
-            message: &self.map,
-            sample: &self.map_sample,
-            positions: &self.map_positions,
-            openings: &self.map_openings,
-        }
-        .encode_into(&mut writer)?;
         put_tree_plan(&mut writer, &self.mask.tree);
         writer.put_digest(&self.mask.root);
         writer.put_bytes(&self.mask.sample.encode());
@@ -1245,8 +1467,29 @@ impl ClosureFirstMessages {
             return Err(Error::InvalidEncoding);
         }
         let slack = CommittedPscGroup::decode(&mut reader, &plan.slack, positions)?;
-        let bits = CommittedPscGroup::decode(&mut reader, &plan.bits, positions)?;
-        let map = CommittedPscGroup::decode(&mut reader, &plan.map, positions)?;
+        let mut stacked = Vec::with_capacity(2);
+        for shape in [&plan.bits, &plan.map] {
+            let message = crate::proof::committed_psc::CommittedGroupMessage::new(
+                crate::proof::hidden_send_session::SendGroup::decode(reader.get_bytes()?)?,
+            );
+            let sample =
+                crate::proof::hidden_send_session::SendSamples::decode(reader.get_bytes()?)?;
+            let position_lists = crate::proof::committed_psc::get_positions(&mut reader)?;
+            let tree = shape.tree_plan(0)?;
+            let openings = crate::proof::committed_psc::get_stacked_openings(
+                &mut reader,
+                &tree,
+                &position_lists,
+            )?;
+            stacked.push(crate::proof::committed_psc::CommittedPscGroup {
+                message,
+                sample,
+                positions: position_lists,
+                openings,
+            });
+        }
+        let map = stacked.pop().ok_or(Error::ShapeMismatch)?;
+        let bits = stacked.pop().ok_or(Error::ShapeMismatch)?;
         let tree = get_tree_plan(&mut reader)?;
         if tree != plan.mask.tree {
             return Err(Error::StatementMismatch);
@@ -1364,13 +1607,14 @@ impl ClosureWitness {
         }
         let bit_rows = usize::try_from(plan.bits.main_rows).map_err(|_| Error::ResourceLimit)?;
         let bit_ell = usize::try_from(plan.bits.code.ell).map_err(|_| Error::ResourceLimit)?;
-        if self.bits.messages.len() != positions
+        if self.bits.messages.len() != 1
             || self.bits.messages.iter().any(|message| {
                 message.len() != bit_rows || message.iter().any(|row| row.len() != bit_ell)
             })
-            || self.bits_tails.len() != positions
-            || self.bits_salts.len() != positions
-            || self.bits_pads.len() != positions
+            || self.bits_tails.len() != 1
+            || self.bits_salts.len() != 1
+            || self.bits_pads.len() != plan.bits.answers as usize
+            || self.bits_pads.iter().any(|pad| *pad != Fp3::ZERO)
             || self.bit_values.len() != positions
             || self
                 .bit_values
@@ -1381,13 +1625,14 @@ impl ClosureWitness {
         }
         let map_rows = usize::try_from(plan.map.main_rows).map_err(|_| Error::ResourceLimit)?;
         let map_ell = usize::try_from(plan.map.code.ell).map_err(|_| Error::ResourceLimit)?;
-        if self.map.messages.len() != positions
+        if self.map.messages.len() != 1
             || self.map.messages.iter().any(|message| {
                 message.len() != map_rows || message.iter().any(|row| row.len() != map_ell)
             })
-            || self.map_tails.len() != positions
-            || self.map_salts.len() != positions
-            || self.map_pads.len() != positions
+            || self.map_tails.len() != 1
+            || self.map_salts.len() != 1
+            || self.map_pads.len() != plan.map.answers as usize
+            || self.map_pads.iter().any(|pad| *pad != Fp3::ZERO)
             || self.map_values.len() != positions
             || self
                 .map_values
@@ -1910,21 +2155,73 @@ mod tests {
             slack: shape(4, 1),
             slack_oracle_base: 20,
             slack_openings: 1,
-            bits: shape(bits_columns, 2),
+            bits: stacked_shape(
+                bits_columns,
+                1,
+                code(),
+                SALT,
+                2,
+                1,
+                Digest([0x41; 32]),
+                Digest([0x51; 32]),
+            )
+            .unwrap(),
             bits_oracle_base: 30,
             bits_openings: 1,
-            map: shape(bits_columns, 3),
+            map: stacked_shape(
+                bits_columns,
+                1,
+                code(),
+                SALT,
+                3,
+                1,
+                Digest([0x41; 32]),
+                Digest([0x51; 32]),
+            )
+            .unwrap(),
             map_oracle_base: 40,
             map_openings: 1,
             bits_columns,
             bits_per_cell: width as u32,
             boolean_variables: bits_columns.trailing_zeros(),
+            tail_pad: true,
             mask,
         }
     }
 
     fn signed(value: i64) -> Fp3 {
         crate::proof::output_closure::fp3_signed(value as i128).unwrap()
+    }
+
+    #[test]
+    fn a_nonzero_pad_cell_is_rejected() {
+        let plan = plan();
+        let rows = usize::try_from(plan.bits.main_rows).unwrap();
+        let ell = usize::try_from(plan.bits.code.ell).unwrap();
+        let tail_len = usize::try_from(plan.bits.code.r).unwrap();
+        let mut values = vec![vec![Fp3::ZERO; plan.bits_columns as usize]];
+        // The last packed entry is the message's last cell: the single sample
+        // pad sits on it, so the plan keeps it zero and the commit refuses a
+        // value there.
+        let last = values[0].len() - 1;
+        values[0][last] = Fp3::ONE;
+        let tails = vec![vec![Fp3::ZERO; rows * tail_len]];
+        let salts = vec![vec![vec![0x11u8; SALT]; plan.bits.code.n() as usize]];
+        let outcome = commit_merged_value_group(
+            &plan.bits,
+            plan.bits_columns,
+            plan.bits_oracle_base,
+            1,
+            &values,
+            &[Fp3::ZERO],
+            &tails,
+            &salts,
+        );
+        assert!(
+            matches!(outcome, Err(Error::StatementMismatch)),
+            "a nonzero pad cell must be refused"
+        );
+        let _ = ell;
     }
 
     #[test]

@@ -702,6 +702,7 @@ fn hidden_plan(
                 bits_columns,
                 bits_per_cell: width as u32,
                 boolean_variables,
+                tail_pad: true,
                 mask: closure.mask.clone(),
             };
             if plan.fault(&send).is_some() {
@@ -2478,11 +2479,10 @@ mod tests {
             .unwrap(),
             slack_oracle_base: SLACK_ORACLE_BASE,
             slack_openings: 1,
-            bits: WShape::new(
+            bits: crate::proof::output_closure::stacked_shape(
                 bits_columns,
-                group_code(),
-                1,
                 TOY_POSITIONS as u32,
+                group_code(),
                 SALT,
                 BITS_TREE_NUMBER,
                 1,
@@ -2492,11 +2492,10 @@ mod tests {
             .unwrap(),
             bits_oracle_base: BITS_ORACLE_BASE,
             bits_openings: 1,
-            map: WShape::new(
+            map: crate::proof::output_closure::stacked_shape(
                 bits_columns,
-                group_code(),
-                1,
                 TOY_POSITIONS as u32,
+                group_code(),
                 SALT,
                 MAP_TREE_NUMBER,
                 1,

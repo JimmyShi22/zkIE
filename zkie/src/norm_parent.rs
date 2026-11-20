@@ -425,15 +425,6 @@ pub fn build_segment_plan_for(
     // fixes the stage-0 position/work pair and the last tail's row count from
     // the real main/mask codes and the fold shape. The fixture constants are
     // not used here.
-    let own_two_stage = zkie_ops::proof::proximity_planner::plan_own_two_stage(
-        code,
-        mask_code,
-        build_code_plan(code_log, geometry.columns as u64, 1)?,
-        build_code_plan(code_log, 16_384, 1)?,
-        14,
-        own_h,
-        252,
-    )?;
     let closure_width = 2 * (geometry.range_bits + 1) + geometry.slack_bits;
     let bits_columns = (geometry.columns as u64)
         .checked_mul(closure_width as u64)
@@ -451,11 +442,13 @@ pub fn build_segment_plan_for(
         SLACK_RUN,
         table_configuration,
     )?;
-    let closure_bits = WShape::new(
+    // The bit and map classes stack every position block into one message
+    // each: the row count, the exact fill and the tail-pad cell come from the
+    // stacked shape, not from a per-position message.
+    let closure_bits = zkie_ops::proof::output_closure::stacked_shape(
         bits_columns,
-        code,
-        1,
         geometry.positions as u32,
+        code,
         SALT,
         BITS_TREE_NUMBER,
         2,
@@ -494,11 +487,10 @@ pub fn build_segment_plan_for(
         bits: closure_bits,
         bits_oracle_base: BITS_ORACLE_BASE,
         bits_openings: 2,
-        map: WShape::new(
+        map: zkie_ops::proof::output_closure::stacked_shape(
             bits_columns,
-            code,
-            1,
             geometry.positions as u32,
+            code,
             SALT,
             MAP_TREE_NUMBER,
             2,
@@ -614,11 +606,27 @@ pub fn build_segment_plan_for(
         .and_then(|value| value.checked_add(rstd_mask_rows))
         .ok_or(Error::ResourceLimit)?;
     plan.proximity.own_mask_tree.mask_rows = own_mask_rows;
+    if let Some(closure) = plan.closure.as_mut() {
+        closure.tail_pad = true;
+    }
+    // The own fold shape is re-derived from the assembled member set: the
+    // BAT layout and the FOLD k follow this sum, so the stage plan is built
+    // against it instead of a hand-set constant.
+    let own_k = zkie_ops::proof::hidden_send_session::own_member_k(&plan)?;
+    let own_two_stage = zkie_ops::proof::proximity_planner::plan_own_two_stage(
+        code,
+        mask_code,
+        build_code_plan(code_log, geometry.columns as u64, 1)?,
+        build_code_plan(code_log, 16_384, 1)?,
+        own_k,
+        own_h,
+        252,
+    )?;
     plan.proximity.own_base_positions = own_two_stage.last_positions;
     plan.proximity.own_stages[0] = IoppStagePlan {
         main: code,
         mask: mask_code,
-        k: 14,
+        k: own_k,
         h: own_h,
         positions: own_two_stage.stage_zero_positions,
         samples: 1,

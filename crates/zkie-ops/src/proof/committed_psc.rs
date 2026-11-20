@@ -170,7 +170,45 @@ impl<const POINTS: usize> PscRowBinding<POINTS> {
     }
 }
 
-fn put_positions(writer: &mut CanonicalWriter, positions: &[Vec<u64>]) -> Result<()> {
+pub(crate) fn put_stacked_openings(
+    writer: &mut CanonicalWriter,
+    tree: &RuntimeTreePlan,
+    openings: &[RuntimeTreeOpening],
+) -> Result<()> {
+    writer.put_u64(openings.len() as u64);
+    for opening in openings {
+        writer.put_bytes(
+            &zkie_engine::pcs::request::runtime_tree::encode_runtime_opening(tree, opening)?,
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn get_stacked_openings(
+    reader: &mut CanonicalReader,
+    tree: &RuntimeTreePlan,
+    opening_positions: &[Vec<u64>],
+) -> Result<Vec<RuntimeTreeOpening>> {
+    let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
+    if count != opening_positions.len() {
+        return Err(Error::ShapeMismatch);
+    }
+    let mut openings = Vec::with_capacity(count);
+    for list in opening_positions {
+        let opening = zkie_engine::pcs::request::runtime_tree::decode_runtime_opening(
+            tree,
+            list,
+            reader.get_bytes()?,
+        )?;
+        if opening.positions != *list {
+            return Err(Error::InvalidEncoding);
+        }
+        openings.push(opening);
+    }
+    Ok(openings)
+}
+
+pub(crate) fn put_positions(writer: &mut CanonicalWriter, positions: &[Vec<u64>]) -> Result<()> {
     writer.put_u64(positions.len() as u64);
     for list in positions {
         writer.put_u64(list.len() as u64);
@@ -181,7 +219,7 @@ fn put_positions(writer: &mut CanonicalWriter, positions: &[Vec<u64>]) -> Result
     Ok(())
 }
 
-fn get_positions(reader: &mut CanonicalReader) -> Result<Vec<Vec<u64>>> {
+pub(crate) fn get_positions(reader: &mut CanonicalReader) -> Result<Vec<Vec<u64>>> {
     let count = usize::try_from(reader.get_u64()?).map_err(|_| Error::ResourceLimit)?;
     let mut positions = Vec::with_capacity(count);
     for _ in 0..count {
