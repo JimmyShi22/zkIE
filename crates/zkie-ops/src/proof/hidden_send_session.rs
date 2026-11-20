@@ -39106,7 +39106,8 @@ mod merged_tests {
         let position = 2usize;
         // The commit map: entry c sits at (row = p * block_rows + c % block_rows,
         // place = c / block_rows) and its virtual index is row + place * rows.
-        let mut committed = vec![Fp3::ZERO; rows * (block_columns as usize)];
+        let ell = usize::try_from(code.ell).unwrap();
+        let mut committed = vec![Fp3::ZERO; rows * ell];
         for (entry, value) in coefficients.iter().enumerate() {
             let row = position * block_rows + entry % block_rows;
             let place = entry / block_rows;
@@ -39117,7 +39118,7 @@ mod merged_tests {
         let mut row = BatRow::new(BatRowKind::Plain);
         push_block_runs(&mut row, 0, position, block_rows, rows as u64, &coefficients).unwrap();
         assert_eq!(row.runs.len(), block_rows);
-        let mut scattered = vec![Fp3::ZERO; rows * (block_columns as usize)];
+        let mut scattered = vec![Fp3::ZERO; rows * ell];
         for (local, run) in row.runs.iter().enumerate() {
             assert_eq!(run.step, rows as u64);
             assert_eq!(run.first, (position * block_rows + local) as u64);
@@ -39127,6 +39128,25 @@ mod merged_tests {
             }
         }
         assert_eq!(scattered, committed, "the band runs and the commit cells disagree");
+        // The claim-side dense converter must produce the same vector: the
+        // row-major table of the member (rows x ell) converted by to_bat_table
+        // is the cell map the runs above must reproduce.
+        let mut table = vec![Fp3::ZERO; rows * ell];
+        for (entry, value) in coefficients.iter().enumerate() {
+            let row = position * block_rows + entry % block_rows;
+            let place = entry / block_rows;
+            table[row * ell + place] = *value;
+        }
+        let converted = crate::proof::hidden_send_session::to_bat_table(
+            &table,
+            rows as u64,
+            code.ell,
+        )
+        .unwrap();
+        assert_eq!(
+            scattered, converted,
+            "the band runs and the claim-side dense converter disagree"
+        );
     }
 
     #[test]
