@@ -1,0 +1,4 @@
+EVIDENCE_DIR=/data/a04g-gemma3-merged-20261121-1133
+HEAD=b698bbea
+Sat Nov 21 11:33:54 CST 2026
+-rwxr-xr-x 2 root root 7452912 Nov 21 10:13 /data/a04-gemma3/target/release/zkie
