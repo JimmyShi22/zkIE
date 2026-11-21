@@ -73,7 +73,7 @@ use zkie_ops::proof::fold_handoff::{FoldHandoff, FoldHandoffAnchor};
 use zkie_ops::proof::session_baseline::SESSION_PROTOCOL_IDENTITY;
 
 use crate::policy::LimitedTableIdentity;
-use crate::s7_context::{LmHeadAsset, LmHeadContext};
+use crate::lm_head_context::{LmHeadAsset, LmHeadContext};
 
 /// One LIN request declaration of the output-head relation. It names the
 /// trusted MatMul step, its activation source and its output consumer, binds
@@ -5287,7 +5287,7 @@ mod tests {
     use super::*;
     use std::path::{Path, PathBuf};
 
-    use crate::s7_context::load_gpt2_lm_head_context;
+    use crate::lm_head_context::load_gpt2_lm_head_context;
     use crate::provider::StatementData;
 
     fn repo_root() -> PathBuf {
@@ -6835,7 +6835,7 @@ mod tests {
         let statement_bytes = std::fs::read(&statement_path).expect("statement");
         let statement_data: crate::provider::StatementData =
             bincode::deserialize(&statement_bytes).expect("statement data");
-        let context = crate::s7_context::load_gpt2_lm_head_context(
+        let context = crate::lm_head_context::load_gpt2_lm_head_context(
             &case,
             &policy_path,
             &public,
@@ -6930,7 +6930,7 @@ mod tests {
         // identity is computed from the committed public reader and record and
         // an updated policy copy is written. Prove and verify consume that
         // copy; the table root is never accepted without it.
-        let committed_identity = crate::s7_context::committed_limited_table_identity(
+        let committed_identity = crate::lm_head_context::committed_limited_table_identity(
             &context,
             holder.reader(),
             &masked,
@@ -6948,7 +6948,7 @@ mod tests {
         std::fs::create_dir_all(&operator_dir).expect("operator dir");
         let operator_policy = operator_dir.join("case.policy");
         crate::policy::write_document(&operator_policy, &document).expect("write policy");
-        let operator_context = crate::s7_context::load_gpt2_lm_head_context(
+        let operator_context = crate::lm_head_context::load_gpt2_lm_head_context(
             &case,
             &operator_policy,
             &public,
@@ -6980,7 +6980,7 @@ mod tests {
         for (name, tampered) in [("asset", asset_swap), ("version", version_swap)] {
             let path = operator_dir.join(format!("tampered-{name}.policy"));
             crate::policy::write_document(&path, &tampered).expect("tampered policy");
-            assert!(crate::s7_context::load_gpt2_lm_head_context(
+            assert!(crate::lm_head_context::load_gpt2_lm_head_context(
                 &case,
                 &path,
                 &public,
@@ -7970,7 +7970,7 @@ mod stage_tests {
         claim_budget, initialize_budget, read_private, read_public, read_public_file,
         write_private, write_public, write_public_file, LmHeadPrivateState, LmHeadTableState,
     };
-    use crate::s7_context::load_gpt2_lm_head_context;
+    use crate::lm_head_context::load_gpt2_lm_head_context;
     use zkie_engine::pcs::request::field::{Fp, Fp3};
     use zkie_engine::pcs::request::runtime_tree::MaskTreePlan;
     use zkie_engine::pcs::request::relation::gu_sample_pad_offsets;
@@ -8263,7 +8263,7 @@ mod stage_tests {
         // public reader and record, then write the policy copy that prove and
         // verify consume. The table was not known before this commit.
         let committed_identity =
-            crate::s7_context::committed_limited_table_identity(&inputs.context, &reader, &statement)?;
+            crate::lm_head_context::committed_limited_table_identity(&inputs.context, &reader, &statement)?;
         let base_policy = std::fs::read(base_policy_path()).map_err(|_| Error::Io)?;
         let document = crate::policy::parse(&base_policy)?;
         let document = crate::policy::bind_limited_table_identity(

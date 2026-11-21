@@ -3,7 +3,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use zkie::provider::StatementData;
-use zkie::s7_context::{find_lm_head_matmul, load_gpt2_lm_head_context};
+use zkie::lm_head_context::{find_lm_head_matmul, load_gpt2_lm_head_context};
 use zkie_core::types::Digest;
 use zkie_ops::proof::model_commitment::ModelCommitmentPublic;
 

@@ -127,7 +127,7 @@ impl LmHeadPublicHandoff {
     /// or roots.
     pub fn verify_trusted_identity(
         &self,
-        context: &crate::s7_context::LmHeadContext,
+        context: &crate::lm_head_context::LmHeadContext,
     ) -> Result<LimitedKeyStatement> {
         let statement = self.validate()?;
         context.verify_committed_limited_table_identity(&self.reader, &statement)?;

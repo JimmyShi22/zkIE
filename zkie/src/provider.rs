@@ -668,7 +668,7 @@ fn prove_norm_segment(
     let public = ModelCommitmentPublic::from_commitment(commitment);
     let trace_plan = zkie_models_gpt2::plan::trace_plan(positions)?;
     zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_trace_plan");
-    let matmul = crate::s7_context::find_lm_head_matmul(&trace_plan)?;
+    let matmul = crate::lm_head_context::find_lm_head_matmul(&trace_plan)?;
     zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_matmul");
     let identifier = plan_identifier(&public, &trace_plan, matmul.index)?;
     let request_plan = zkie_models_gpt2::lm_head_plan::lm_head_plan()?;
@@ -808,7 +808,7 @@ fn prove_norm_segment_gemma3(
     let model = commitment.anchor.record.model_commitment;
     let public = ModelCommitmentPublic::from_commitment(commitment);
     let trace_plan = zkie_models_gemma3::plan::trace_plan_public(positions)?;
-    let matmul = crate::s7_context::find_lm_head_matmul_for(
+    let matmul = crate::lm_head_context::find_lm_head_matmul_for(
         &trace_plan,
         GEMMA3_SEGMENT_HEAD.asset_path,
     )?;
@@ -988,7 +988,7 @@ fn verify_norm_segment(
     }
     let trace_plan = zkie_models_gpt2::plan::trace_plan(positions)?;
     zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_trace_plan");
-    let matmul = crate::s7_context::find_lm_head_matmul(&trace_plan)?;
+    let matmul = crate::lm_head_context::find_lm_head_matmul(&trace_plan)?;
     zkie_ops::proof::hidden_send_session::mem_trace("gpt2_after_matmul");
     let specs = zkie_models_gpt2::plan::asset_specs();
     let spec = specs
@@ -1113,7 +1113,7 @@ fn verify_norm_segment_gemma3(
         return Err(Error::StatementMismatch);
     }
     let trace_plan = zkie_models_gemma3::plan::trace_plan_public(positions)?;
-    let matmul = crate::s7_context::find_lm_head_matmul_for(
+    let matmul = crate::lm_head_context::find_lm_head_matmul_for(
         &trace_plan,
         GEMMA3_SEGMENT_HEAD.asset_path,
     )?;

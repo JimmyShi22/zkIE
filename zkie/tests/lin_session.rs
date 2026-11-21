@@ -577,7 +577,7 @@ fn selected_gpt2_output_head_request_session() {
     fs::create_dir_all(&work_dir).unwrap();
     let statement_path = work_dir.join("statement.bin");
     fs::write(&statement_path, bincode::serialize(&statement).unwrap()).unwrap();
-    let context = zkie::s7_context::load_gpt2_lm_head_context(
+    let context = zkie::lm_head_context::load_gpt2_lm_head_context(
         &case_path,
         &root.join("policy.toml"),
         &root.join("public"),

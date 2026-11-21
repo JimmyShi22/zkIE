@@ -40,7 +40,7 @@ use crate::lm_head_key::{
     build_lm_head_holder_from_asset, fixed_lm_head_key_randomness, limited_key_binding_parameters,
     LmHeadAssetSource, LmHeadKeyRandomness,
 };
-use crate::s7_context::LmHeadAsset;
+use crate::lm_head_context::LmHeadAsset;
 
 /// The proof-dir carrier of the segment: the published public reader and the
 /// canonical session messages. The name and the version are the reserved
