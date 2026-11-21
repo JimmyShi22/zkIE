@@ -1,0 +1,1879 @@
+warning: unused variable: `number`
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1513:9
+     |
+1513 |         number: u32,
+     |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_number`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `target`
+   --> crates/zkie-engine/src/pcs/request/relation.rs:919:5
+    |
+919 |     target: Fp3,
+    |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_target`
+
+warning: unused variable: `columns_usize`
+   --> crates/zkie-engine/src/pcs/request/table.rs:952:13
+    |
+952 |         let columns_usize = usize::try_from(columns).map_err(|_| Error::ResourceLimit)?;
+    |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_columns_usize`
+
+warning: field `target` is never read
+    --> crates/zkie-engine/src/pcs/request/fold.rs:1118:5
+     |
+1112 | struct FoldOutputMeta {
+     |        -------------- field in this struct
+...
+1118 |     target: Fp3,
+     |     ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie-engine` (lib) generated 4 warnings (run `cargo fix --lib -p zkie-engine` to apply 3 suggestions)
+warning: unused import: `MODULUS`
+   --> crates/zkie-ops/src/proof/bat_fold_session.rs:147:59
+    |
+147 | use zkie_engine::pcs::request::field::{Fp, Fp3, E_DEGREE, MODULUS};
+    |                                                           ^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `crate::proof::psc::multilinear_eval`
+  --> crates/zkie-ops/src/proof/consumer_first.rs:60:5
+   |
+60 | use crate::proof::psc::multilinear_eval;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `zkie_engine::pcs::request::gu::GuOracleShape`
+   --> crates/zkie-ops/src/proof/consumer_second.rs:231:5
+    |
+231 | use zkie_engine::pcs::request::gu::GuOracleShape;
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `RuntimeTreePlan`
+   --> crates/zkie-ops/src/proof/consumer_second.rs:235:49
+    |
+235 |     MaskTreePlan, RuntimePartRows, RuntimeTree, RuntimeTreePlan,
+    |                                                 ^^^^^^^^^^^^^^^
+
+warning: unused import: `ConsumerFirstObligations`
+  --> crates/zkie-ops/src/proof/consumer_proof.rs:17:28
+   |
+17 |     ConsumerFirstMessages, ConsumerFirstObligations, ConsumerFirstPlan,
+   |                            ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `Fp`
+  --> crates/zkie-ops/src/proof/consumer_session.rs:26:45
+   |
+26 | use zkie_engine::pcs::request::field::{Fp3, Fp};
+   |                                             ^^
+
+warning: unused import: `crate::proof::hidden_member::PendingRow`
+  --> crates/zkie-ops/src/proof/consumer_session.rs:69:5
+   |
+69 | use crate::proof::hidden_member::PendingRow;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `verify_last_base_proof_with_positions`
+  --> crates/zkie-ops/src/proof/multi_stage_iopp.rs:47:29
+   |
+47 |     encode_last_base_proof, verify_last_base_proof_with_positions, verify_last_base_proof_with_positions_and_chain, LastBaseProver,
+   |                             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `zkie_engine::pcs::request::field::Fp3`
+   --> crates/zkie-ops/src/proof/asset_table.rs:389:9
+    |
+389 |     use zkie_engine::pcs::request::field::Fp3;
+    |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `PrimeCharacteristicRing`
+  --> crates/zkie-ops/src/proof/table_range.rs:26:32
+   |
+26 | use zkie_core::common::field::{PrimeCharacteristicRing, PrimeField64};
+   |                                ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `HiddenTableProver`
+  --> crates/zkie-ops/src/proof/consumer_session.rs:72:5
+   |
+72 |     HiddenTableProver, WShape,
+   |     ^^^^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/base_last_session.rs:603:13
+    |
+603 |         let mut message = self.chain.message();
+    |             ----^^^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `plan`
+   --> crates/zkie-ops/src/proof/consumer_first.rs:499:26
+    |
+499 | fn consumer_mask_row_bat(plan: &ConsumerFirstPlan, mask_row: &ConsumerMaskRow) -> Result<BatRow> {
+    |                          ^^^^ help: if this is intentional, prefix it with an underscore: `_plan`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `reader`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:3073:5
+     |
+3073 |     reader: &IndexReader,
+     |     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_reader`
+
+warning: unused variable: `combinations`
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:6751:17
+     |
+6751 |             let combinations = range_plan.combinations as usize;
+     |                 ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_combinations`
+
+warning: variable does not need to be mutable
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:11377:9
+      |
+11377 |     let mut chain = group_proof.chain;
+      |         ----^^^^^
+      |         |
+      |         help: remove this `mut`
+
+warning: unused variable: `plan`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:12950:5
+      |
+12950 |     plan: &KeyFirstPlan,
+      |     ^^^^ help: if this is intentional, prefix it with an underscore: `_plan`
+
+warning: unused variable: `planes`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:22779:9
+      |
+22779 |     let planes = lookup.planes()?;
+      |         ^^^^^^ help: if this is intentional, prefix it with an underscore: `_planes`
+
+warning: unused variable: `table_rows`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:22780:9
+      |
+22780 |     let table_rows = lookup.table_rows()?;
+      |         ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_table_rows`
+
+warning: unused variable: `rms`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:23932:21
+      |
+23932 |                 let rms = norm.rms.as_ref().ok_or(Error::StatementMismatch)?;
+      |                     ^^^ help: if this is intentional, prefix it with an underscore: `_rms`
+
+warning: unused variable: `first`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:24660:5
+      |
+24660 |     first: &HiddenSendMessages,
+      |     ^^^^^ help: if this is intentional, prefix it with an underscore: `_first`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:25508:9
+      |
+25508 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: unused variable: `q_at`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:25615:9
+      |
+25615 |     let q_at = 0usize;
+      |         ^^^^ help: if this is intentional, prefix it with an underscore: `_q_at`
+
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/norm_segment.rs:346:9
+    |
+346 |     let mut plan = NormPlan {
+    |         ----^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/zkie-ops/src/proof/norm_segment.rs:676:9
+    |
+676 |     let mut commit_rows = |group: &crate::proof::hidden_norm_psc::NormGroupPlan,
+    |         ----^^^^^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: unused variable: `n`
+   --> crates/zkie-ops/src/proof/proximity_planner.rs:218:9
+    |
+218 |     let n = word_n(word)?;
+    |         ^ help: if this is intentional, prefix it with an underscore: `_n`
+
+warning: value assigned to `serves_folded` is never read
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:2295:29
+     |
+2295 |     let mut serves_folded = false;
+     |                             ^^^^^ this value is reassigned later and never used
+...
+2334 |         serves_folded = folded_step.1;
+     |         ----------------------------- `serves_folded` is overwritten here before the previous value is read
+     |
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `serves_omega` is never read
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:2296:28
+     |
+2296 |     let mut serves_omega = false;
+     |                            ^^^^^ this value is reassigned later and never used
+...
+2335 |         serves_omega = omega_step.map_or(false, |step| step.1);
+     |         ------------------------------------------------------ `serves_omega` is overwritten here before the previous value is read
+
+warning: value assigned to `serves_own` is never read
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:2297:26
+     |
+2297 |     let mut serves_own = false;
+     |                          ^^^^^ this value is reassigned later and never used
+...
+2336 |         serves_own = own_step.1;
+     |         ----------------------- `serves_own` is overwritten here before the previous value is read
+
+warning: type `ConsumerOwnPlan` is more private than the item `consumer_total_acceptance`
+   --> crates/zkie-ops/src/proof/consumer_second.rs:152:1
+    |
+152 | / pub fn consumer_total_acceptance(
+153 | |     plan: &ConsumerFirstPlan,
+154 | |     activation: &[Fp3],
+155 | |     outputs: &[Vec<i64>],
+...   |
+163 | |     own: &ConsumerOwnProof,
+164 | | ) -> Result<ConsumerTotalAccepted> {
+    | |__________________________________^ function `consumer_total_acceptance` is reachable at visibility `pub`
+    |
+note: but type `ConsumerOwnPlan` is only usable at visibility `pub(crate)`
+   --> crates/zkie-ops/src/proof/consumer_second.rs:252:1
+    |
+252 | pub(crate) struct ConsumerOwnPlan {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `ConsumerOwnProof` is more private than the item `consumer_total_acceptance`
+   --> crates/zkie-ops/src/proof/consumer_second.rs:152:1
+    |
+152 | / pub fn consumer_total_acceptance(
+153 | |     plan: &ConsumerFirstPlan,
+154 | |     activation: &[Fp3],
+155 | |     outputs: &[Vec<i64>],
+...   |
+163 | |     own: &ConsumerOwnProof,
+164 | | ) -> Result<ConsumerTotalAccepted> {
+    | |__________________________________^ function `consumer_total_acceptance` is reachable at visibility `pub`
+    |
+note: but type `ConsumerOwnProof` is only usable at visibility `pub(crate)`
+   --> crates/zkie-ops/src/proof/consumer_second.rs:378:1
+    |
+378 | pub(crate) struct ConsumerOwnProof {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ConsumerOwnProof` is more private than the item `ConsumerProofFile::assemble`
+   --> crates/zkie-ops/src/proof/consumer_proof.rs:113:5
+    |
+113 | /     pub fn assemble(
+114 | |         first_plan: &ConsumerFirstPlan,
+115 | |         first: &ConsumerFirstMessages,
+116 | |         shared: &HiddenSharedMessages,
+...   |
+119 | |         binding_path: LinBindingPath,
+120 | |     ) -> Result<Self> {
+    | |_____________________^ associated function `ConsumerProofFile::assemble` is reachable at visibility `pub`
+    |
+note: but type `ConsumerOwnProof` is only usable at visibility `pub(crate)`
+   --> crates/zkie-ops/src/proof/consumer_second.rs:378:1
+    |
+378 | pub(crate) struct ConsumerOwnProof {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ConsumerOwnProof` is more private than the item `ConsumerProofFile::assemble_with_totals`
+   --> crates/zkie-ops/src/proof/consumer_proof.rs:137:5
+    |
+137 | /     pub fn assemble_with_totals(
+138 | |         first_plan: &ConsumerFirstPlan,
+139 | |         first: &ConsumerFirstMessages,
+140 | |         shared: &HiddenSharedMessages,
+...   |
+143 | |         binding_path: LinBindingPath,
+144 | |     ) -> Result<Self> {
+    | |_____________________^ associated function `ConsumerProofFile::assemble_with_totals` is reachable at visibility `pub`
+    |
+note: but type `ConsumerOwnProof` is only usable at visibility `pub(crate)`
+   --> crates/zkie-ops/src/proof/consumer_second.rs:378:1
+    |
+378 | pub(crate) struct ConsumerOwnProof {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ConsumerOwnProof` is more private than the item `ConsumerProofFile::own_proof`
+   --> crates/zkie-ops/src/proof/consumer_proof.rs:243:5
+    |
+243 |     pub fn own_proof(&self) -> Result<ConsumerOwnProof> {
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method `ConsumerProofFile::own_proof` is reachable at visibility `pub`
+    |
+note: but type `ConsumerOwnProof` is only usable at visibility `pub(crate)`
+   --> crates/zkie-ops/src/proof/consumer_second.rs:378:1
+    |
+378 | pub(crate) struct ConsumerOwnProof {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ConsumerOwnPlan` is more private than the item `verify_consumer_chain`
+   --> crates/zkie-ops/src/proof/consumer_proof.rs:287:1
+    |
+287 | / pub fn verify_consumer_chain(
+288 | |     first_plan: &ConsumerFirstPlan,
+289 | |     activation: &[Fp3],
+290 | |     outputs: &[Vec<i64>],
+...   |
+295 | |     file: &ConsumerProofFile,
+296 | | ) -> Result<ConsumerTotalAccepted> {
+    | |__________________________________^ function `verify_consumer_chain` is reachable at visibility `pub`
+    |
+note: but type `ConsumerOwnPlan` is only usable at visibility `pub(crate)`
+   --> crates/zkie-ops/src/proof/consumer_second.rs:252:1
+    |
+252 | pub(crate) struct ConsumerOwnPlan {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ConsumerOwnProof` is more private than the item `encode_own_proof`
+   --> crates/zkie-ops/src/proof/consumer_proof.rs:358:1
+    |
+358 | pub fn encode_own_proof(own: &ConsumerOwnProof) -> Result<Vec<u8>> {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `encode_own_proof` is reachable at visibility `pub`
+    |
+note: but type `ConsumerOwnProof` is only usable at visibility `pub(crate)`
+   --> crates/zkie-ops/src/proof/consumer_second.rs:378:1
+    |
+378 | pub(crate) struct ConsumerOwnProof {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ConsumerOwnProof` is more private than the item `decode_own_proof`
+   --> crates/zkie-ops/src/proof/consumer_proof.rs:376:1
+    |
+376 | pub fn decode_own_proof(bytes: &[u8]) -> Result<ConsumerOwnProof> {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ function `decode_own_proof` is reachable at visibility `pub`
+    |
+note: but type `ConsumerOwnProof` is only usable at visibility `pub(crate)`
+   --> crates/zkie-ops/src/proof/consumer_second.rs:378:1
+    |
+378 | pub(crate) struct ConsumerOwnProof {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `hidden_send_session::ProximityMessages` is more private than the item `ConsumerGroupProof::proximity_messages`
+     --> crates/zkie-ops/src/proof/consumer_group.rs:942:5
+      |
+  942 |     pub fn proximity_messages(&self, plan: &ConsumerGroupPlan) -> Result<ProximityMessages> {
+      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method `ConsumerGroupProof::proximity_messages` is reachable at visibility `pub`
+      |
+note: but type `hidden_send_session::ProximityMessages` is only usable at visibility `pub(crate)`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:10110:1
+      |
+10110 | pub(crate) struct ProximityMessages {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `KeyFirstMessages` is more private than the item `encode_key_proof`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:13089:1
+      |
+13089 | / pub fn encode_key_proof(
+13090 | |     plan: &KeyFirstPlan,
+13091 | |     first: &KeyFirstMessages,
+13092 | |     shared: &HiddenSharedMessages,
+13093 | |     second: &KeySecondMessages,
+13094 | | ) -> Result<Vec<u8>> {
+      | |____________________^ function `encode_key_proof` is reachable at visibility `pub`
+      |
+note: but type `KeyFirstMessages` is only usable at visibility `pub(crate)`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:11102:1
+      |
+11102 | pub(crate) struct KeyFirstMessages {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `KeySecondMessages` is more private than the item `encode_key_proof`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:13089:1
+      |
+13089 | / pub fn encode_key_proof(
+13090 | |     plan: &KeyFirstPlan,
+13091 | |     first: &KeyFirstMessages,
+13092 | |     shared: &HiddenSharedMessages,
+13093 | |     second: &KeySecondMessages,
+13094 | | ) -> Result<Vec<u8>> {
+      | |____________________^ function `encode_key_proof` is reachable at visibility `pub`
+      |
+note: but type `KeySecondMessages` is only usable at visibility `pub(crate)`
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:12299:1
+      |
+12299 | pub(crate) struct KeySecondMessages {
+      | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `points` is never read
+   --> crates/zkie-ops/src/proof/consumer_shared.rs:445:16
+    |
+440 | pub struct ConsumerSharedProof {
+    |            ------------------- field in this struct
+...
+445 |     pub(crate) points: crate::proof::hidden_send_session::SharedPoints,
+    |                ^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `w_seeds`, `w_answers`, `claims`, and `base` are never read
+   --> crates/zkie-ops/src/proof/consumer_second.rs:729:9
+    |
+727 | pub(crate) struct ConsumerOwnVerified {
+    |                   ------------------- fields in this struct
+728 |     pub seal: Digest,
+729 |     pub w_seeds: Vec<SampleSeed>,
+    |         ^^^^^^^
+730 |     pub w_answers: Vec<Fp3>,
+    |         ^^^^^^^^^
+731 |     pub claims: Vec<GuRelationRow>,
+    |         ^^^^^^
+732 |     pub base: ProximityBaseOutcome,
+    |         ^^^^
+    |
+    = note: `ConsumerOwnVerified` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: field `plan` is never read
+   --> crates/zkie-ops/src/proof/cs_multi_session.rs:201:5
+    |
+195 | pub struct CsMultiSession {
+    |            -------------- field in this struct
+...
+201 |     plan: RuntimeTreePlan,
+    |     ^^^^
+
+warning: field `stack_hiding` is never read
+    --> crates/zkie-ops/src/proof/hidden_send_session.rs:7471:5
+     |
+7469 | struct SegmentSlotLayout {
+     |        ----------------- field in this struct
+7470 |     token_hiding: usize,
+7471 |     stack_hiding: usize,
+     |     ^^^^^^^^^^^^
+
+warning: fields `lookup`, `member`, and `eval_row` are never read
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:11122:9
+      |
+11119 | pub(crate) struct KeyFirstWitness {
+      |                   --------------- fields in this struct
+...
+11122 |     pub lookup: KeyLookupProof,
+      |         ^^^^^^
+...
+11128 |     pub member: crate::proof::hidden_member::PendingRow,
+      |         ^^^^^^
+11129 |     pub eval_row: BatRow,
+      |         ^^^^^^^^
+
+warning: fields `samples` and `index_answer` are never read
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:11172:9
+      |
+11168 | pub(crate) struct KeyFirstVerified {
+      |                   ---------------- fields in this struct
+...
+11172 |     pub samples: [KeySample; 2],
+      |         ^^^^^^^
+...
+11175 |     pub index_answer: Fp3,
+      |         ^^^^^^^^^^^^
+
+warning: fields `omega`, `gu_seeds`, `gu_answers`, `claims`, and `base` are never read
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:12108:9
+      |
+12102 | pub(crate) struct KeySharedVerified {
+      |                   ----------------- fields in this struct
+...
+12108 |     pub omega: OmegaShapePlan,
+      |         ^^^^^
+12109 |     pub gu_root: Digest,
+12110 |     pub gu_seeds: Vec<zkie_engine::pcs::request::table::SampleSeed>,
+      |         ^^^^^^^^
+12111 |     pub gu_answers: Vec<Fp3>,
+      |         ^^^^^^^^^^
+...
+12117 |     pub claims: Vec<GuRelationRow>,
+      |         ^^^^^^
+12118 |     pub base: ProximityBaseOutcome,
+      |         ^^^^
+      |
+      = note: `KeySharedVerified` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: fields `w_seeds`, `w_answers`, `claims`, and `base` are never read
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:12313:9
+      |
+12311 | pub(crate) struct KeySecondVerified {
+      |                   ----------------- fields in this struct
+12312 |     pub seal: Digest,
+12313 |     pub w_seeds: Vec<SampleSeed>,
+      |         ^^^^^^^
+12314 |     pub w_answers: Vec<Fp3>,
+      |         ^^^^^^^^^
+12315 |     pub claims: Vec<GuRelationRow>,
+      |         ^^^^^^
+12316 |     pub base: ProximityBaseOutcome,
+      |         ^^^^
+      |
+      = note: `KeySecondVerified` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `derive_key_group_plan` is never used
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:13737:15
+      |
+13737 | pub(crate) fn derive_key_group_plan(
+      |               ^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `output_tail_plain_rows` is never used
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:25266:4
+      |
+25266 | fn output_tail_plain_rows(
+      |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: variant `Borrowed` is never constructed
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:25686:5
+      |
+25685 | enum ChainRows<'a> {
+      |      --------- variant in this enum
+25686 |     Borrowed(&'a [BatRow]),
+      |     ^^^^^^^^
+
+warning: function `own_plain_rows` is never used
+     --> crates/zkie-ops/src/proof/hidden_send_session.rs:25690:4
+      |
+25690 | fn own_plain_rows(
+      |    ^^^^^^^^^^^^^^
+
+warning: field `m` is never read
+  --> crates/zkie-ops/src/proof/proximity_planner.rs:57:5
+   |
+52 | struct Proximity {
+   |        --------- field in this struct
+...
+57 |     m: u64,
+   |     ^
+   |
+   = note: `Proximity` has derived impls for the traits `Debug` and `Clone`, but these are intentionally ignored during dead code analysis
+
+warning: function `batched_rows` is never used
+    --> crates/zkie-ops/src/proof/proximity_planner.rs:2859:4
+     |
+2859 | fn batched_rows(word: &Word) -> u64 {
+     |    ^^^^^^^^^^^^
+
+warning: function `eq_at` is never used
+   --> crates/zkie-ops/src/proof/projection_claim.rs:187:4
+    |
+187 | fn eq_at(point: &[Fp3], index: u64) -> Fp3 {
+    |    ^^^^^
+
+warning: method `format_fault` is never used
+   --> crates/zkie-ops/src/proof/rms_limbs.rs:154:8
+    |
+ 60 | impl RmsLimbWidths {
+    | ------------------ method in this implementation
+...
+154 |     fn format_fault(&self, width: usize, value: u128) -> bool {
+    |        ^^^^^^^^^^^^
+
+warning: `zkie-ops` (lib) generated 56 warnings (run `cargo fix --lib -p zkie-ops` to apply 24 suggestions)
+warning: unused import: `zkie_engine::pcs::request::field::E_DEGREE`
+  --> models/gpt2/src/lm_head_plan.rs:11:5
+   |
+11 | use zkie_engine::pcs::request::field::E_DEGREE;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `CodeParams`
+  --> models/gpt2/src/plan.rs:10:56
+   |
+10 | use zkie_engine::pcs::request::code::{build_code_plan, CodeParams};
+   |                                                        ^^^^^^^^^^
+
+warning: unused variable: `k_step`
+   --> models/gpt2/src/executor.rs:445:21
+    |
+445 |             let (k, k_step) = {
+    |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_step`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `m`
+   --> models/gemma3/src/executor.rs:319:5
+    |
+319 |     m: usize,
+    |     ^ help: if this is intentional, prefix it with an underscore: `_m`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `k_rot_step`
+   --> models/gemma3/src/executor.rs:469:21
+    |
+469 |         let (k_rot, k_rot_step) = rope(&mut builder, k, k_step, cos_prefix.clone(), sin_prefix.clone(), m)?;
+    |                     ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_k_rot_step`
+
+warning: `zkie-models-gpt2` (lib) generated 3 warnings (run `cargo fix --lib -p zkie-models-gpt2` to apply 3 suggestions)
+warning: `zkie-models-gemma3` (lib) generated 2 warnings (run `cargo fix --lib -p zkie-models-gemma3` to apply 2 suggestions)
+warning: unused import: `build_output_head_output_plan`
+  --> zkie/src/norm_parent.rs:29:36
+   |
+29 |     build_output_head_hidden_plan, build_output_head_output_plan,
+   |                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `digest_to_hex`
+  --> zkie/src/policy.rs:12:58
+   |
+12 | use zkie_core::artifact::{digest_bytes, digest_from_hex, digest_to_hex};
+   |                                                          ^^^^^^^^^^^^^
+
+warning: unused imports: `VecTableSource` and `commit_table_streaming`
+  --> zkie/src/lm_head_key.rs:59:5
+   |
+59 |     commit_table_streaming, verify_columns, ColumnOpening, IndexReader, IndexShape, SampleSeed,
+   |     ^^^^^^^^^^^^^^^^^^^^^^
+60 |     EncodedRowStore, StreamingHolder, TableRowSource, VecTableSource,
+   |                                                       ^^^^^^^^^^^^^^
+
+warning: variable does not need to be mutable
+   --> zkie/src/bounded_trace.rs:705:9
+    |
+705 |     let mut file = fs::File::open(path).map_err(|_| Error::IncompleteArtifact)?;
+    |         ----^^^^
+    |         |
+    |         help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `index_rows`
+   --> zkie/src/norm_parent.rs:596:9
+    |
+596 |     let index_rows = match plan.send.index_mask.as_ref() {
+    |         ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_index_rows`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `total_mask_rows`
+   --> zkie/src/norm_parent.rs:604:9
+    |
+604 |     let total_mask_rows = norm_mask_rows
+    |         ^^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_total_mask_rows`
+
+warning: unused variable: `mask_oracle`
+    --> zkie/src/lm_head_key.rs:3509:9
+     |
+3509 |     let mask_oracle = MaskOracle {
+     |         ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_oracle`
+
+warning: variable does not need to be mutable
+    --> zkie/src/lm_head_key.rs:4375:9
+     |
+4375 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ----^^^^^^^^^
+     |         |
+     |         help: remove this `mut`
+
+warning: unused variable: `mask_tail`
+    --> zkie/src/lm_head_key.rs:4375:9
+     |
+4375 |     let mut mask_tail = vec![Fp3::ZERO; mask_tail_len];
+     |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_mask_tail`
+
+warning: variable does not need to be mutable
+   --> zkie/src/lm_head_stage.rs:288:9
+    |
+288 |     let mut options = if private {
+    |         ----^^^^^^^
+    |         |
+    |         help: remove this `mut`
+
+warning: field `tree` is never read
+    --> zkie/src/lm_head_key.rs:1569:5
+     |
+1565 | pub struct LmHeadOmegaProvider {
+     |            ------------------- field in this struct
+...
+1569 |     tree: RuntimeTreePlan,
+     |     ^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `zkie` (lib) generated 11 warnings (run `cargo fix --lib -p zkie` to apply 10 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running tests/acceptance_rounds.rs (target/release/deps/acceptance_rounds-f672b8188307457b)
+
+running 1 test
+test acceptance_rounds has been running for over 60 seconds
+bat_progress completed_rows=64 completed_symbols=1014 elapsed_ms=0
+bat_progress completed_rows=64 completed_symbols=1014 elapsed_ms=0
+bat_progress completed_rows=64 completed_symbols=1014 elapsed_ms=0
+hidden_profile_begin
+hidden_profile_segment name=code.encode_row_fp wall_ms=440.917 calls=9220 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=code.encode_row_fp3 wall_ms=97199.831 calls=4286 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=runtime_tree.commit wall_ms=25731.046 calls=29 bytes=0 table_bytes=0 rss_start_kb=496912 rss_end_kb=14723928 hwm_kb=17654456 threads=66
+hidden_profile_segment name=value_group.layout wall_ms=367.085 calls=2 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=value_group.encode wall_ms=48434.982 calls=2 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=value_group.commit wall_ms=71566.513 calls=2 bytes=0 table_bytes=0 rss_start_kb=1416644 rss_end_kb=14723976 hwm_kb=14723976 threads=2
+hidden_profile_segment name=prox.bat wall_ms=701.008 calls=3 bytes=0 table_bytes=0 rss_start_kb=13940880 rss_end_kb=13941500 hwm_kb=17654456 threads=66
+hidden_profile_segment name=prox.group_tables wall_ms=89.253 calls=3 bytes=0 table_bytes=0 rss_start_kb=13940880 rss_end_kb=13941500 hwm_kb=17654456 threads=66
+hidden_profile_segment name=mask_tree.commit wall_ms=1772.980 calls=9 bytes=0 table_bytes=0 rss_start_kb=13940880 rss_end_kb=13941504 hwm_kb=17654456 threads=66
+hidden_profile_segment name=prox.fold_start wall_ms=1217.044 calls=3 bytes=0 table_bytes=0 rss_start_kb=13940880 rss_end_kb=13941500 hwm_kb=17654456 threads=66
+hidden_profile_segment name=prox.fold_rounds wall_ms=992.628 calls=3 bytes=0 table_bytes=0 rss_start_kb=13940888 rss_end_kb=13941500 hwm_kb=17654456 threads=66
+hidden_profile_segment name=prox.fold_output wall_ms=982.319 calls=3 bytes=0 table_bytes=0 rss_start_kb=13940888 rss_end_kb=13941500 hwm_kb=17654456 threads=66
+hidden_profile_segment name=prox.proximity_prove wall_ms=69881.220 calls=3 bytes=0 table_bytes=0 rss_start_kb=13940880 rss_end_kb=13941504 hwm_kb=17654456 threads=66
+hidden_profile_segment name=verify.proximity.statement wall_ms=1121.993 calls=5 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.proximity.bat wall_ms=270.853 calls=5 bytes=0 table_bytes=0 rss_start_kb=13544248 rss_end_kb=13941476 hwm_kb=17654456 threads=66
+hidden_profile_segment name=verify.proximity.fold wall_ms=329.899 calls=5 bytes=0 table_bytes=0 rss_start_kb=13544248 rss_end_kb=13941476 hwm_kb=17654456 threads=66
+hidden_profile_segment name=verify.proximity.base wall_ms=29355.848 calls=5 bytes=0 table_bytes=0 rss_start_kb=13544248 rss_end_kb=13941476 hwm_kb=17654456 threads=66
+hidden_profile_segment name=verify.proximity wall_ms=31079.418 calls=5 bytes=0 table_bytes=0 rss_start_kb=13544248 rss_end_kb=13941476 hwm_kb=17654456 threads=66
+hidden_profile_segment name=shared.fold_table wall_ms=10.728 calls=1 bytes=0 table_bytes=0 rss_start_kb=13941336 rss_end_kb=13941336 hwm_kb=17654456 threads=66
+hidden_profile_segment name=shared.gu_table wall_ms=0.080 calls=1 bytes=0 table_bytes=0 rss_start_kb=13941336 rss_end_kb=13941336 hwm_kb=17654456 threads=66
+hidden_profile_segment name=commit_rows_tree.encode wall_ms=69.318 calls=3 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=shared.gu_commit wall_ms=175.394 calls=1 bytes=0 table_bytes=0 rss_start_kb=13941336 rss_end_kb=13941336 hwm_kb=17654456 threads=66
+hidden_profile_segment name=shared.table_open_columns wall_ms=51.499 calls=1 bytes=0 table_bytes=0 rss_start_kb=13941336 rss_end_kb=13941432 hwm_kb=17654456 threads=66
+hidden_profile_segment name=shared.column_rows wall_ms=10.581 calls=1 bytes=0 table_bytes=0 rss_start_kb=13941432 rss_end_kb=13941432 hwm_kb=17654456 threads=66
+hidden_profile_segment name=shared.omega_vector wall_ms=0.019 calls=1 bytes=0 table_bytes=0 rss_start_kb=13941432 rss_end_kb=13941432 hwm_kb=17654456 threads=66
+hidden_profile_segment name=shared.omega_commit wall_ms=175.660 calls=1 bytes=0 table_bytes=0 rss_start_kb=13941432 rss_end_kb=13941432 hwm_kb=17654456 threads=66
+hidden_profile_segment name=shared.plain_rows wall_ms=3.608 calls=1 bytes=0 table_bytes=0 rss_start_kb=13941432 rss_end_kb=13941432 hwm_kb=17654456 threads=66
+hidden_profile_segment name=shared.proximity wall_ms=6516.251 calls=1 bytes=0 table_bytes=0 rss_start_kb=13941432 rss_end_kb=13941440 hwm_kb=17654456 threads=66
+hidden_profile_segment name=shared.prove_shared wall_ms=7181.494 calls=1 bytes=0 table_bytes=0 rss_start_kb=13941336 rss_end_kb=13941440 hwm_kb=17654456 threads=66
+hidden_profile_segment name=verify.shared.columns wall_ms=1.881 calls=2 bytes=0 table_bytes=0 rss_start_kb=13544272 rss_end_kb=13941476 hwm_kb=17654456 threads=66
+hidden_profile_segment name=verify.shared.record_rows wall_ms=0.995 calls=2 bytes=0 table_bytes=0 rss_start_kb=13544272 rss_end_kb=13941476 hwm_kb=17654456 threads=66
+hidden_profile_segment name=verify.shared.column_rows wall_ms=19.328 calls=2 bytes=0 table_bytes=0 rss_start_kb=13544272 rss_end_kb=13941476 hwm_kb=17654456 threads=66
+hidden_profile_segment name=verify.shared.plain_rows wall_ms=8.444 calls=2 bytes=0 table_bytes=0 rss_start_kb=13544272 rss_end_kb=13941476 hwm_kb=17654456 threads=66
+hidden_profile_segment name=verify.shared.proximity wall_ms=11776.650 calls=2 bytes=0 table_bytes=0 rss_start_kb=13544272 rss_end_kb=13941480 hwm_kb=17654456 threads=66
+hidden_profile_segment name=verify.shared wall_ms=11811.300 calls=2 bytes=0 table_bytes=0 rss_start_kb=13544272 rss_end_kb=13941480 hwm_kb=17654456 threads=66
+hidden_profile_end
+bat_progress completed_rows=64 completed_symbols=1014 elapsed_ms=0
+MEMTRACE gemma3_before_witness rss_kib=42466004 hwm_kib=42470356
+MEMTRACE gpt2_before_table rss_kib=42513112 hwm_kib=42513112
+MEMTRACE segment_store_open rss_kib=42513224 hwm_kib=42513224
+MEMTRACE segment_holder_built rss_kib=43715680 hwm_kib=43744128
+MEMTRACE segment_holder_dropped rss_kib=42718264 hwm_kib=43762516
+MEMTRACE segment_store_cleaned rss_kib=42718264 hwm_kib=43762516
+MEMTRACE segment_table_rebuilt rss_kib=42718264 hwm_kib=43762516
+MEMTRACE segment_source_open rss_kib=42718264 hwm_kib=43762516
+MEMTRACE gemma3_after_table rss_kib=42718264 hwm_kib=43762516
+MEMTRACE gemma3_before_prove rss_kib=44183964 hwm_kib=45023180
+MEMTRACE after_randomness rss_kib=45735436 hwm_kib=45735436
+MEMTRACE after_first rss_kib=158979024 hwm_kib=158979024
+bat_progress completed_rows=64 completed_symbols=33554432 elapsed_ms=0
+bat_progress completed_rows=128 completed_symbols=67108864 elapsed_ms=0
+bat_progress completed_rows=192 completed_symbols=100663296 elapsed_ms=0
+bat_progress completed_rows=256 completed_symbols=134217728 elapsed_ms=0
+bat_progress completed_rows=320 completed_symbols=167772160 elapsed_ms=0
+bat_progress completed_rows=384 completed_symbols=201326592 elapsed_ms=0
+bat_progress completed_rows=448 completed_symbols=234881024 elapsed_ms=0
+bat_progress completed_rows=512 completed_symbols=268435456 elapsed_ms=0
+bat_progress completed_rows=576 completed_symbols=301989888 elapsed_ms=0
+MEMTRACE after_shared rss_kib=158979124 hwm_kib=158979124
+bat_progress completed_rows=38 completed_symbols=56361321 elapsed_ms=2704
+bat_progress completed_rows=39 completed_symbols=90440297 elapsed_ms=5091
+bat_progress completed_rows=40 completed_symbols=124519273 elapsed_ms=7503
+bat_progress completed_rows=41 completed_symbols=158073962 elapsed_ms=9743
+bat_progress completed_rows=42 completed_symbols=191628651 elapsed_ms=11814
+bat_progress completed_rows=45 completed_symbols=225183395 elapsed_ms=14704
+bat_progress completed_rows=46 completed_symbols=258738084 elapsed_ms=16778
+bat_progress completed_rows=49 completed_symbols=293865638 elapsed_ms=19191
+bat_progress completed_rows=50 completed_symbols=327944614 elapsed_ms=21587
+bat_progress completed_rows=51 completed_symbols=362023590 elapsed_ms=24001
+bat_progress completed_rows=52 completed_symbols=395578279 elapsed_ms=26246
+bat_progress completed_rows=53 completed_symbols=429132968 elapsed_ms=28319
+bat_progress completed_rows=56 completed_symbols=462687712 elapsed_ms=31219
+bat_progress completed_rows=57 completed_symbols=496242401 elapsed_ms=33297
+bat_progress completed_rows=60 completed_symbols=531369955 elapsed_ms=35725
+bat_progress completed_rows=61 completed_symbols=565448931 elapsed_ms=38134
+bat_progress completed_rows=62 completed_symbols=599527907 elapsed_ms=40558
+bat_progress completed_rows=63 completed_symbols=633082596 elapsed_ms=42811
+bat_progress completed_rows=64 completed_symbols=666637285 elapsed_ms=44889
+bat_progress completed_rows=67 completed_symbols=700192029 elapsed_ms=47799
+bat_progress completed_rows=68 completed_symbols=733746718 elapsed_ms=49891
+bat_progress completed_rows=71 completed_symbols=768874272 elapsed_ms=52315
+bat_progress completed_rows=72 completed_symbols=802953248 elapsed_ms=54722
+bat_progress completed_rows=73 completed_symbols=837032224 elapsed_ms=57147
+bat_progress completed_rows=74 completed_symbols=870586913 elapsed_ms=59409
+bat_progress completed_rows=75 completed_symbols=904141602 elapsed_ms=61499
+bat_progress completed_rows=78 completed_symbols=937696346 elapsed_ms=64413
+bat_progress completed_rows=79 completed_symbols=971251035 elapsed_ms=66535
+bat_progress completed_rows=82 completed_symbols=1006378589 elapsed_ms=68993
+bat_progress completed_rows=83 completed_symbols=1040457565 elapsed_ms=71432
+bat_progress completed_rows=84 completed_symbols=1074536541 elapsed_ms=73889
+bat_progress completed_rows=85 completed_symbols=1108091230 elapsed_ms=76135
+bat_progress completed_rows=86 completed_symbols=1141645919 elapsed_ms=78210
+bat_progress completed_rows=89 completed_symbols=1175200663 elapsed_ms=81109
+bat_progress completed_rows=90 completed_symbols=1208755352 elapsed_ms=83197
+bat_progress completed_rows=93 completed_symbols=1243882906 elapsed_ms=85614
+bat_progress completed_rows=94 completed_symbols=1277961882 elapsed_ms=88015
+bat_progress completed_rows=95 completed_symbols=1312040858 elapsed_ms=90433
+bat_progress completed_rows=96 completed_symbols=1345595547 elapsed_ms=92681
+bat_progress completed_rows=97 completed_symbols=1379150236 elapsed_ms=94758
+bat_progress completed_rows=100 completed_symbols=1412704980 elapsed_ms=97676
+bat_progress completed_rows=101 completed_symbols=1446259669 elapsed_ms=99769
+bat_progress completed_rows=104 completed_symbols=1481387223 elapsed_ms=102199
+bat_progress completed_rows=105 completed_symbols=1515466199 elapsed_ms=104580
+bat_progress completed_rows=106 completed_symbols=1549545175 elapsed_ms=106977
+bat_progress completed_rows=107 completed_symbols=1583099864 elapsed_ms=109225
+bat_progress completed_rows=108 completed_symbols=1616654553 elapsed_ms=111299
+bat_progress completed_rows=111 completed_symbols=1650209297 elapsed_ms=114205
+bat_progress completed_rows=112 completed_symbols=1683763986 elapsed_ms=116292
+bat_progress completed_rows=115 completed_symbols=1718891540 elapsed_ms=118707
+bat_progress completed_rows=116 completed_symbols=1752970516 elapsed_ms=121107
+bat_progress completed_rows=117 completed_symbols=1787049492 elapsed_ms=123517
+bat_progress completed_rows=118 completed_symbols=1820604181 elapsed_ms=125759
+bat_progress completed_rows=119 completed_symbols=1854158870 elapsed_ms=127835
+bat_progress completed_rows=122 completed_symbols=1887713614 elapsed_ms=130734
+bat_progress completed_rows=123 completed_symbols=1921268303 elapsed_ms=132818
+bat_progress completed_rows=126 completed_symbols=1956395857 elapsed_ms=135232
+bat_progress completed_rows=127 completed_symbols=1990474833 elapsed_ms=137627
+bat_progress completed_rows=128 completed_symbols=2024553809 elapsed_ms=140047
+bat_progress completed_rows=129 completed_symbols=2058108498 elapsed_ms=142301
+bat_progress completed_rows=130 completed_symbols=2091663187 elapsed_ms=144387
+bat_progress completed_rows=133 completed_symbols=2125217931 elapsed_ms=147312
+bat_progress completed_rows=134 completed_symbols=2158772620 elapsed_ms=149399
+bat_progress completed_rows=137 completed_symbols=2193900174 elapsed_ms=151815
+bat_progress completed_rows=138 completed_symbols=2227979150 elapsed_ms=154212
+bat_progress completed_rows=139 completed_symbols=2262058126 elapsed_ms=156621
+bat_progress completed_rows=140 completed_symbols=2295612815 elapsed_ms=158912
+bat_progress completed_rows=141 completed_symbols=2329167504 elapsed_ms=161027
+bat_progress completed_rows=144 completed_symbols=2362722248 elapsed_ms=163980
+bat_progress completed_rows=145 completed_symbols=2396276937 elapsed_ms=166107
+bat_progress completed_rows=148 completed_symbols=2431404491 elapsed_ms=168524
+bat_progress completed_rows=149 completed_symbols=2465483467 elapsed_ms=170928
+bat_progress completed_rows=150 completed_symbols=2499562443 elapsed_ms=173351
+bat_progress completed_rows=151 completed_symbols=2533117132 elapsed_ms=175598
+bat_progress completed_rows=152 completed_symbols=2566671821 elapsed_ms=177699
+bat_progress completed_rows=155 completed_symbols=2600226565 elapsed_ms=180623
+bat_progress completed_rows=156 completed_symbols=2633781254 elapsed_ms=182728
+bat_progress completed_rows=159 completed_symbols=2668908808 elapsed_ms=185139
+bat_progress completed_rows=160 completed_symbols=2702987784 elapsed_ms=187541
+bat_progress completed_rows=161 completed_symbols=2737066760 elapsed_ms=189951
+bat_progress completed_rows=162 completed_symbols=2770621449 elapsed_ms=192196
+bat_progress completed_rows=163 completed_symbols=2804176138 elapsed_ms=194269
+bat_progress completed_rows=166 completed_symbols=2837730882 elapsed_ms=197172
+bat_progress completed_rows=167 completed_symbols=2871285571 elapsed_ms=199256
+bat_progress completed_rows=170 completed_symbols=2906413125 elapsed_ms=201669
+bat_progress completed_rows=171 completed_symbols=2940492101 elapsed_ms=204066
+bat_progress completed_rows=172 completed_symbols=2974571077 elapsed_ms=206478
+bat_progress completed_rows=173 completed_symbols=3008125766 elapsed_ms=208723
+bat_progress completed_rows=174 completed_symbols=3041680455 elapsed_ms=210796
+bat_progress completed_rows=177 completed_symbols=3075235199 elapsed_ms=213727
+bat_progress completed_rows=178 completed_symbols=3108789888 elapsed_ms=215805
+bat_progress completed_rows=181 completed_symbols=3143917442 elapsed_ms=218211
+bat_progress completed_rows=182 completed_symbols=3177996418 elapsed_ms=220649
+bat_progress completed_rows=183 completed_symbols=3212075394 elapsed_ms=223105
+bat_progress completed_rows=184 completed_symbols=3245630083 elapsed_ms=225337
+bat_progress completed_rows=185 completed_symbols=3279184772 elapsed_ms=227398
+bat_progress completed_rows=188 completed_symbols=3312739516 elapsed_ms=230285
+bat_progress completed_rows=189 completed_symbols=3346294205 elapsed_ms=232353
+bat_progress completed_rows=192 completed_symbols=3381421759 elapsed_ms=234752
+bat_progress completed_rows=193 completed_symbols=3415500735 elapsed_ms=237132
+bat_progress completed_rows=194 completed_symbols=3449579711 elapsed_ms=239527
+bat_progress completed_rows=195 completed_symbols=3483134400 elapsed_ms=241752
+bat_progress completed_rows=196 completed_symbols=3516689089 elapsed_ms=243811
+bat_progress completed_rows=199 completed_symbols=3550243833 elapsed_ms=246693
+bat_progress completed_rows=200 completed_symbols=3583798522 elapsed_ms=248762
+bat_progress completed_rows=203 completed_symbols=3618926076 elapsed_ms=251179
+bat_progress completed_rows=204 completed_symbols=3653005052 elapsed_ms=253578
+bat_progress completed_rows=205 completed_symbols=3687084028 elapsed_ms=255994
+bat_progress completed_rows=206 completed_symbols=3720638717 elapsed_ms=258242
+bat_progress completed_rows=207 completed_symbols=3754193406 elapsed_ms=260317
+bat_progress completed_rows=210 completed_symbols=3787748150 elapsed_ms=263216
+bat_progress completed_rows=211 completed_symbols=3821302839 elapsed_ms=265299
+bat_progress completed_rows=492 completed_symbols=3854859785 elapsed_ms=265488
+bat_progress completed_rows=810 completed_symbols=3888417079 elapsed_ms=265678
+bat_progress completed_rows=1137 completed_symbols=3921974454 elapsed_ms=265869
+bat_progress completed_rows=1440 completed_symbols=3955531613 elapsed_ms=266057
+bat_progress completed_rows=1734 completed_symbols=3989088691 elapsed_ms=266248
+bat_progress completed_rows=2061 completed_symbols=4022646066 elapsed_ms=266437
+bat_progress completed_rows=2380 completed_symbols=4056203361 elapsed_ms=266626
+bat_progress completed_rows=2661 completed_symbols=4090022474 elapsed_ms=266818
+bat_progress completed_rows=2988 completed_symbols=4123579849 elapsed_ms=267010
+bat_progress completed_rows=3315 completed_symbols=4157137224 elapsed_ms=267202
+bat_progress completed_rows=3607 completed_symbols=4190694276 elapsed_ms=267390
+bat_progress completed_rows=3912 completed_symbols=4224251461 elapsed_ms=267580
+bat_progress completed_rows=4143 completed_symbols=4257807758 elapsed_ms=267713
+bat_progress completed_rows=4229 completed_symbols=4291887306 elapsed_ms=267842
+bat_progress completed_rows=4293 completed_symbols=4325704618 elapsed_ms=267973
+bat_progress completed_rows=4358 completed_symbols=4359521963 elapsed_ms=268107
+bat_progress completed_rows=4422 completed_symbols=4393339275 elapsed_ms=268238
+bat_progress completed_rows=4487 completed_symbols=4427156620 elapsed_ms=268373
+bat_progress completed_rows=4551 completed_symbols=4460973932 elapsed_ms=268503
+bat_progress completed_rows=4616 completed_symbols=4494791277 elapsed_ms=268638
+bat_progress completed_rows=4680 completed_symbols=4528608589 elapsed_ms=268768
+bat_progress completed_rows=4782 completed_symbols=4562163369 elapsed_ms=268877
+bat_progress completed_rows=4910 completed_symbols=4595717801 elapsed_ms=268966
+bat_progress completed_rows=5038 completed_symbols=4629272233 elapsed_ms=269058
+bat_progress completed_rows=5166 completed_symbols=4662826665 elapsed_ms=269150
+bat_progress completed_rows=5294 completed_symbols=4696381097 elapsed_ms=269239
+bat_progress completed_rows=5422 completed_symbols=4729935529 elapsed_ms=269331
+bat_progress completed_rows=5550 completed_symbols=4763489961 elapsed_ms=269423
+bat_progress completed_rows=5678 completed_symbols=4797044393 elapsed_ms=269515
+bat_progress completed_rows=5806 completed_symbols=4830598825 elapsed_ms=269607
+bat_progress completed_rows=5934 completed_symbols=4864153257 elapsed_ms=269699
+bat_progress completed_rows=6062 completed_symbols=4897707689 elapsed_ms=269790
+bat_progress completed_rows=6190 completed_symbols=4931262121 elapsed_ms=269882
+bat_progress completed_rows=6318 completed_symbols=4964816553 elapsed_ms=269974
+bat_progress completed_rows=6446 completed_symbols=4998370985 elapsed_ms=270066
+bat_progress completed_rows=6574 completed_symbols=5031925417 elapsed_ms=270158
+bat_progress completed_rows=6702 completed_symbols=5065479849 elapsed_ms=270250
+bat_progress completed_rows=6830 completed_symbols=5099034281 elapsed_ms=270342
+bat_progress completed_rows=6958 completed_symbols=5132588713 elapsed_ms=270434
+bat_progress completed_rows=7086 completed_symbols=5166143145 elapsed_ms=270525
+bat_progress completed_rows=7214 completed_symbols=5199697577 elapsed_ms=270616
+bat_progress completed_rows=7342 completed_symbols=5233252009 elapsed_ms=270709
+bat_progress completed_rows=7470 completed_symbols=5266806441 elapsed_ms=270800
+bat_progress completed_rows=7598 completed_symbols=5300360873 elapsed_ms=270893
+bat_progress completed_rows=7726 completed_symbols=5333915305 elapsed_ms=270985
+bat_progress completed_rows=7854 completed_symbols=5367469737 elapsed_ms=271077
+bat_progress completed_rows=7982 completed_symbols=5401024169 elapsed_ms=271169
+bat_progress completed_rows=8110 completed_symbols=5434578601 elapsed_ms=271258
+bat_progress completed_rows=8238 completed_symbols=5468133033 elapsed_ms=271349
+bat_progress completed_rows=8366 completed_symbols=5501687465 elapsed_ms=271441
+bat_progress completed_rows=8494 completed_symbols=5535241897 elapsed_ms=271534
+bat_progress completed_rows=8622 completed_symbols=5568796329 elapsed_ms=271625
+bat_progress completed_rows=8750 completed_symbols=5602350761 elapsed_ms=271716
+bat_progress completed_rows=8878 completed_symbols=5635905193 elapsed_ms=271808
+bat_progress completed_rows=9006 completed_symbols=5669459625 elapsed_ms=271899
+bat_progress completed_rows=9134 completed_symbols=5703014057 elapsed_ms=271992
+bat_progress completed_rows=9262 completed_symbols=5736568489 elapsed_ms=272083
+bat_progress completed_rows=9390 completed_symbols=5770122921 elapsed_ms=272176
+bat_progress completed_rows=9518 completed_symbols=5803677353 elapsed_ms=272268
+bat_progress completed_rows=9646 completed_symbols=5837231785 elapsed_ms=272360
+bat_progress completed_rows=9774 completed_symbols=5870786217 elapsed_ms=272452
+bat_progress completed_rows=9902 completed_symbols=5904340649 elapsed_ms=272544
+bat_progress completed_rows=10030 completed_symbols=5937895081 elapsed_ms=272636
+bat_progress completed_rows=10158 completed_symbols=5971449513 elapsed_ms=272729
+bat_progress completed_rows=10286 completed_symbols=6005003945 elapsed_ms=272821
+bat_progress completed_rows=10414 completed_symbols=6038558377 elapsed_ms=272911
+bat_progress completed_rows=10542 completed_symbols=6072112809 elapsed_ms=273002
+bat_progress completed_rows=10670 completed_symbols=6105667241 elapsed_ms=273093
+bat_progress completed_rows=10798 completed_symbols=6139221673 elapsed_ms=273184
+bat_progress completed_rows=10926 completed_symbols=6172776105 elapsed_ms=273277
+bat_progress completed_rows=11054 completed_symbols=6206330537 elapsed_ms=273369
+bat_progress completed_rows=11182 completed_symbols=6239884969 elapsed_ms=273462
+bat_progress completed_rows=11310 completed_symbols=6273439401 elapsed_ms=273555
+bat_progress completed_rows=11438 completed_symbols=6306993833 elapsed_ms=273647
+bat_progress completed_rows=11566 completed_symbols=6340548265 elapsed_ms=273738
+bat_progress completed_rows=11694 completed_symbols=6374102697 elapsed_ms=273828
+bat_progress completed_rows=11822 completed_symbols=6407657129 elapsed_ms=273920
+bat_progress completed_rows=11950 completed_symbols=6441211561 elapsed_ms=274010
+bat_progress completed_rows=12078 completed_symbols=6474765993 elapsed_ms=274102
+bat_progress completed_rows=12206 completed_symbols=6508320425 elapsed_ms=274194
+bat_progress completed_rows=12334 completed_symbols=6541874857 elapsed_ms=274285
+bat_progress completed_rows=12462 completed_symbols=6575429289 elapsed_ms=274376
+bat_progress completed_rows=12590 completed_symbols=6608983721 elapsed_ms=274468
+bat_progress completed_rows=12718 completed_symbols=6642538153 elapsed_ms=274559
+bat_progress completed_rows=12846 completed_symbols=6676092585 elapsed_ms=274650
+bat_progress completed_rows=12974 completed_symbols=6709647017 elapsed_ms=274742
+bat_progress completed_rows=13102 completed_symbols=6743201449 elapsed_ms=274834
+bat_progress completed_rows=13230 completed_symbols=6776755881 elapsed_ms=274925
+bat_progress completed_rows=13358 completed_symbols=6810310313 elapsed_ms=275016
+bat_progress completed_rows=13486 completed_symbols=6843864745 elapsed_ms=275107
+bat_progress completed_rows=13614 completed_symbols=6877419177 elapsed_ms=275197
+bat_progress completed_rows=13742 completed_symbols=6910973609 elapsed_ms=275289
+bat_progress completed_rows=13870 completed_symbols=6944528041 elapsed_ms=275381
+bat_progress completed_rows=13998 completed_symbols=6978082473 elapsed_ms=275473
+bat_progress completed_rows=14126 completed_symbols=7011636905 elapsed_ms=275564
+bat_progress completed_rows=14254 completed_symbols=7045191337 elapsed_ms=275655
+bat_progress completed_rows=14382 completed_symbols=7078745769 elapsed_ms=275746
+bat_progress completed_rows=14510 completed_symbols=7112300201 elapsed_ms=275837
+bat_progress completed_rows=14638 completed_symbols=7145854633 elapsed_ms=275929
+bat_progress completed_rows=14766 completed_symbols=7179409065 elapsed_ms=276022
+bat_progress completed_rows=14894 completed_symbols=7212963497 elapsed_ms=276113
+bat_progress completed_rows=15022 completed_symbols=7246517929 elapsed_ms=276206
+bat_progress completed_rows=15150 completed_symbols=7280072361 elapsed_ms=276298
+bat_progress completed_rows=15278 completed_symbols=7313626793 elapsed_ms=276390
+bat_progress completed_rows=15406 completed_symbols=7347181225 elapsed_ms=276481
+bat_progress completed_rows=15534 completed_symbols=7380735657 elapsed_ms=276575
+bat_progress completed_rows=15662 completed_symbols=7414290089 elapsed_ms=276666
+bat_progress completed_rows=15790 completed_symbols=7447844521 elapsed_ms=276757
+bat_progress completed_rows=15918 completed_symbols=7481398953 elapsed_ms=276848
+bat_progress completed_rows=16046 completed_symbols=7514953385 elapsed_ms=276939
+bat_progress completed_rows=16174 completed_symbols=7548507817 elapsed_ms=277031
+bat_progress completed_rows=16302 completed_symbols=7582062249 elapsed_ms=277123
+bat_progress completed_rows=16430 completed_symbols=7615616681 elapsed_ms=277216
+bat_progress completed_rows=16558 completed_symbols=7649171113 elapsed_ms=277307
+bat_progress completed_rows=16686 completed_symbols=7682725545 elapsed_ms=277399
+bat_progress completed_rows=16814 completed_symbols=7716279977 elapsed_ms=277491
+bat_progress completed_rows=16942 completed_symbols=7749834409 elapsed_ms=277583
+bat_progress completed_rows=17070 completed_symbols=7783388841 elapsed_ms=277675
+bat_progress completed_rows=17198 completed_symbols=7816943273 elapsed_ms=277767
+bat_progress completed_rows=17326 completed_symbols=7850497705 elapsed_ms=277858
+bat_progress completed_rows=17454 completed_symbols=7884052137 elapsed_ms=277949
+bat_progress completed_rows=17582 completed_symbols=7917606569 elapsed_ms=278041
+bat_progress completed_rows=17710 completed_symbols=7951161001 elapsed_ms=278133
+bat_progress completed_rows=17838 completed_symbols=7984715433 elapsed_ms=278223
+bat_progress completed_rows=17966 completed_symbols=8018269865 elapsed_ms=278314
+bat_progress completed_rows=18094 completed_symbols=8051824297 elapsed_ms=278406
+bat_progress completed_rows=18222 completed_symbols=8085378729 elapsed_ms=278497
+bat_progress completed_rows=18350 completed_symbols=8118933161 elapsed_ms=278589
+bat_progress completed_rows=18478 completed_symbols=8152487593 elapsed_ms=278680
+bat_progress completed_rows=18606 completed_symbols=8186042025 elapsed_ms=278772
+bat_progress completed_rows=18734 completed_symbols=8219596457 elapsed_ms=278864
+bat_progress completed_rows=18862 completed_symbols=8253150889 elapsed_ms=278955
+bat_progress completed_rows=18990 completed_symbols=8286705321 elapsed_ms=279047
+bat_progress completed_rows=19118 completed_symbols=8320259753 elapsed_ms=279137
+bat_progress completed_rows=19246 completed_symbols=8353814185 elapsed_ms=279229
+bat_progress completed_rows=19374 completed_symbols=8387368617 elapsed_ms=279321
+bat_progress completed_rows=19502 completed_symbols=8420923049 elapsed_ms=279411
+bat_progress completed_rows=19630 completed_symbols=8454477481 elapsed_ms=279503
+bat_progress completed_rows=19758 completed_symbols=8488031913 elapsed_ms=279595
+bat_progress completed_rows=19886 completed_symbols=8521586345 elapsed_ms=279686
+bat_progress completed_rows=20014 completed_symbols=8555140777 elapsed_ms=279777
+bat_progress completed_rows=20142 completed_symbols=8588695209 elapsed_ms=279868
+bat_progress completed_rows=20270 completed_symbols=8622249641 elapsed_ms=279960
+bat_progress completed_rows=20398 completed_symbols=8655804073 elapsed_ms=280052
+bat_progress completed_rows=20526 completed_symbols=8689358505 elapsed_ms=280143
+bat_progress completed_rows=20654 completed_symbols=8722912937 elapsed_ms=280234
+bat_progress completed_rows=20782 completed_symbols=8756467369 elapsed_ms=280325
+bat_progress completed_rows=20910 completed_symbols=8790021801 elapsed_ms=280416
+bat_progress completed_rows=21038 completed_symbols=8823576233 elapsed_ms=280508
+bat_progress completed_rows=21166 completed_symbols=8857130665 elapsed_ms=280598
+bat_progress completed_rows=21294 completed_symbols=8890685097 elapsed_ms=280688
+bat_progress completed_rows=21422 completed_symbols=8924239529 elapsed_ms=280779
+bat_progress completed_rows=21550 completed_symbols=8957793961 elapsed_ms=280870
+bat_progress completed_rows=21678 completed_symbols=8991348393 elapsed_ms=280962
+bat_progress completed_rows=21806 completed_symbols=9024902825 elapsed_ms=281054
+bat_progress completed_rows=21934 completed_symbols=9058457257 elapsed_ms=281145
+bat_progress completed_rows=22062 completed_symbols=9092011689 elapsed_ms=281237
+bat_progress completed_rows=22190 completed_symbols=9125566121 elapsed_ms=281329
+bat_progress completed_rows=22318 completed_symbols=9159120553 elapsed_ms=281420
+bat_progress completed_rows=22446 completed_symbols=9192674985 elapsed_ms=281513
+bat_progress completed_rows=22574 completed_symbols=9226229417 elapsed_ms=281605
+bat_progress completed_rows=22702 completed_symbols=9259783849 elapsed_ms=281697
+bat_progress completed_rows=22830 completed_symbols=9293338281 elapsed_ms=281787
+bat_progress completed_rows=22958 completed_symbols=9326892713 elapsed_ms=281878
+bat_progress completed_rows=23086 completed_symbols=9360447145 elapsed_ms=281969
+bat_progress completed_rows=23214 completed_symbols=9394001577 elapsed_ms=282062
+bat_progress completed_rows=23342 completed_symbols=9427556009 elapsed_ms=282154
+bat_progress completed_rows=23470 completed_symbols=9461110441 elapsed_ms=282245
+bat_progress completed_rows=23598 completed_symbols=9494664873 elapsed_ms=282337
+bat_progress completed_rows=23726 completed_symbols=9528219305 elapsed_ms=282430
+bat_progress completed_rows=23854 completed_symbols=9561773737 elapsed_ms=282522
+bat_progress completed_rows=23982 completed_symbols=9595328169 elapsed_ms=282614
+bat_progress completed_rows=24110 completed_symbols=9628882601 elapsed_ms=282706
+bat_progress completed_rows=24238 completed_symbols=9662437033 elapsed_ms=282796
+bat_progress completed_rows=24366 completed_symbols=9695991465 elapsed_ms=282887
+bat_progress completed_rows=24494 completed_symbols=9729545897 elapsed_ms=282978
+bat_progress completed_rows=24622 completed_symbols=9763100329 elapsed_ms=283070
+bat_progress completed_rows=24750 completed_symbols=9796654761 elapsed_ms=283162
+bat_progress completed_rows=24878 completed_symbols=9830209193 elapsed_ms=283252
+bat_progress completed_rows=25006 completed_symbols=9863763625 elapsed_ms=283344
+bat_progress completed_rows=25134 completed_symbols=9897318057 elapsed_ms=283436
+bat_progress completed_rows=25262 completed_symbols=9930872489 elapsed_ms=283527
+bat_progress completed_rows=25390 completed_symbols=9964426921 elapsed_ms=283619
+bat_progress completed_rows=25518 completed_symbols=9997981353 elapsed_ms=283709
+bat_progress completed_rows=25646 completed_symbols=10031535785 elapsed_ms=283800
+bat_progress completed_rows=25774 completed_symbols=10065090217 elapsed_ms=283892
+bat_progress completed_rows=25902 completed_symbols=10098644649 elapsed_ms=283984
+bat_progress completed_rows=26030 completed_symbols=10132199081 elapsed_ms=284076
+bat_progress completed_rows=26158 completed_symbols=10165753513 elapsed_ms=284167
+bat_progress completed_rows=26286 completed_symbols=10199307945 elapsed_ms=284259
+bat_progress completed_rows=26414 completed_symbols=10232862377 elapsed_ms=284350
+bat_progress completed_rows=26542 completed_symbols=10266416809 elapsed_ms=284442
+bat_progress completed_rows=26670 completed_symbols=10299971241 elapsed_ms=284535
+bat_progress completed_rows=26798 completed_symbols=10333525673 elapsed_ms=284627
+bat_progress completed_rows=26926 completed_symbols=10367080105 elapsed_ms=284718
+bat_progress completed_rows=27054 completed_symbols=10400634537 elapsed_ms=284809
+bat_progress completed_rows=27182 completed_symbols=10434188969 elapsed_ms=284900
+bat_progress completed_rows=27310 completed_symbols=10467743401 elapsed_ms=284993
+bat_progress completed_rows=27438 completed_symbols=10501297833 elapsed_ms=285085
+bat_progress completed_rows=27566 completed_symbols=10534852265 elapsed_ms=285177
+bat_progress completed_rows=27694 completed_symbols=10568406697 elapsed_ms=285269
+bat_progress completed_rows=27822 completed_symbols=10601961129 elapsed_ms=285362
+bat_progress completed_rows=27950 completed_symbols=10635515561 elapsed_ms=285455
+bat_progress completed_rows=28078 completed_symbols=10669069993 elapsed_ms=285546
+bat_progress completed_rows=28206 completed_symbols=10702624425 elapsed_ms=285637
+bat_progress completed_rows=28334 completed_symbols=10736178857 elapsed_ms=285728
+bat_progress completed_rows=28462 completed_symbols=10769733289 elapsed_ms=285820
+bat_progress completed_rows=28590 completed_symbols=10803287721 elapsed_ms=285911
+bat_progress completed_rows=28718 completed_symbols=10836842153 elapsed_ms=286002
+bat_progress completed_rows=28846 completed_symbols=10870396585 elapsed_ms=286093
+bat_progress completed_rows=28974 completed_symbols=10903951017 elapsed_ms=286186
+bat_progress completed_rows=29102 completed_symbols=10937505449 elapsed_ms=286279
+bat_progress completed_rows=29230 completed_symbols=10971059881 elapsed_ms=286371
+bat_progress completed_rows=29358 completed_symbols=11004614313 elapsed_ms=286463
+bat_progress completed_rows=29486 completed_symbols=11038168745 elapsed_ms=286556
+bat_progress completed_rows=29614 completed_symbols=11071723177 elapsed_ms=286647
+bat_progress completed_rows=29742 completed_symbols=11105277609 elapsed_ms=286739
+bat_progress completed_rows=29870 completed_symbols=11138832041 elapsed_ms=286830
+bat_progress completed_rows=29998 completed_symbols=11172386473 elapsed_ms=286922
+bat_progress completed_rows=30126 completed_symbols=11205940905 elapsed_ms=287014
+bat_progress completed_rows=30254 completed_symbols=11239495337 elapsed_ms=287107
+bat_progress completed_rows=30382 completed_symbols=11273049769 elapsed_ms=287199
+bat_progress completed_rows=30510 completed_symbols=11306604201 elapsed_ms=287292
+bat_progress completed_rows=30638 completed_symbols=11340158633 elapsed_ms=287384
+bat_progress completed_rows=30766 completed_symbols=11373713065 elapsed_ms=287476
+bat_progress completed_rows=30894 completed_symbols=11407267497 elapsed_ms=287568
+bat_progress completed_rows=31022 completed_symbols=11440821929 elapsed_ms=287660
+bat_progress completed_rows=31150 completed_symbols=11474376361 elapsed_ms=287752
+bat_progress completed_rows=31278 completed_symbols=11507930793 elapsed_ms=287845
+bat_progress completed_rows=31406 completed_symbols=11541485225 elapsed_ms=287936
+bat_progress completed_rows=31534 completed_symbols=11575039657 elapsed_ms=288028
+bat_progress completed_rows=31662 completed_symbols=11608594089 elapsed_ms=288119
+bat_progress completed_rows=31790 completed_symbols=11642148521 elapsed_ms=288209
+bat_progress completed_rows=31918 completed_symbols=11675702953 elapsed_ms=288302
+bat_progress completed_rows=32046 completed_symbols=11709257385 elapsed_ms=288396
+bat_progress completed_rows=32174 completed_symbols=11742811817 elapsed_ms=288488
+bat_progress completed_rows=32302 completed_symbols=11776366249 elapsed_ms=288580
+bat_progress completed_rows=32430 completed_symbols=11809920681 elapsed_ms=288672
+bat_progress completed_rows=32558 completed_symbols=11843475113 elapsed_ms=288765
+bat_progress completed_rows=32686 completed_symbols=11877029545 elapsed_ms=288857
+bat_progress completed_rows=32814 completed_symbols=11910583977 elapsed_ms=288948
+bat_progress completed_rows=32942 completed_symbols=11944138409 elapsed_ms=289038
+bat_progress completed_rows=33070 completed_symbols=11977692841 elapsed_ms=289129
+bat_progress completed_rows=33198 completed_symbols=12011247273 elapsed_ms=289221
+bat_progress completed_rows=33326 completed_symbols=12044801705 elapsed_ms=289312
+bat_progress completed_rows=33454 completed_symbols=12078356137 elapsed_ms=289404
+bat_progress completed_rows=33582 completed_symbols=12111910569 elapsed_ms=289494
+bat_progress completed_rows=33710 completed_symbols=12145465001 elapsed_ms=289585
+bat_progress completed_rows=33838 completed_symbols=12179019433 elapsed_ms=289675
+bat_progress completed_rows=33966 completed_symbols=12212573865 elapsed_ms=289767
+bat_progress completed_rows=34094 completed_symbols=12246128297 elapsed_ms=289858
+bat_progress completed_rows=34222 completed_symbols=12279682729 elapsed_ms=289950
+bat_progress completed_rows=34350 completed_symbols=12313237161 elapsed_ms=290042
+bat_progress completed_rows=34478 completed_symbols=12346791593 elapsed_ms=290133
+bat_progress completed_rows=34606 completed_symbols=12380346025 elapsed_ms=290224
+bat_progress completed_rows=34734 completed_symbols=12413900457 elapsed_ms=290315
+bat_progress completed_rows=34862 completed_symbols=12447454889 elapsed_ms=290406
+bat_progress completed_rows=34990 completed_symbols=12481009321 elapsed_ms=290497
+bat_progress completed_rows=35118 completed_symbols=12514563753 elapsed_ms=290589
+bat_progress completed_rows=35246 completed_symbols=12548118185 elapsed_ms=290681
+bat_progress completed_rows=35374 completed_symbols=12581672617 elapsed_ms=290773
+bat_progress completed_rows=35502 completed_symbols=12615227049 elapsed_ms=290866
+bat_progress completed_rows=35630 completed_symbols=12648781481 elapsed_ms=290959
+bat_progress completed_rows=35758 completed_symbols=12682335913 elapsed_ms=291052
+bat_progress completed_rows=35886 completed_symbols=12715890345 elapsed_ms=291145
+bat_progress completed_rows=36014 completed_symbols=12749444777 elapsed_ms=291239
+bat_progress completed_rows=36142 completed_symbols=12782999209 elapsed_ms=291332
+bat_progress completed_rows=36270 completed_symbols=12816553641 elapsed_ms=291425
+bat_progress completed_rows=36398 completed_symbols=12850108073 elapsed_ms=291517
+bat_progress completed_rows=36526 completed_symbols=12883662505 elapsed_ms=291610
+bat_progress completed_rows=36654 completed_symbols=12917216937 elapsed_ms=291701
+bat_progress completed_rows=36782 completed_symbols=12950771369 elapsed_ms=291793
+bat_progress completed_rows=36910 completed_symbols=12984325801 elapsed_ms=291884
+bat_progress completed_rows=37038 completed_symbols=13017880233 elapsed_ms=291976
+bat_progress completed_rows=37166 completed_symbols=13051434665 elapsed_ms=292068
+bat_progress completed_rows=37294 completed_symbols=13084989097 elapsed_ms=292158
+bat_progress completed_rows=37422 completed_symbols=13118543529 elapsed_ms=292249
+bat_progress completed_rows=37550 completed_symbols=13152097961 elapsed_ms=296909
+bat_progress completed_rows=37678 completed_symbols=13185652393 elapsed_ms=296930
+bat_progress completed_rows=37806 completed_symbols=13219206825 elapsed_ms=296951
+bat_progress completed_rows=37934 completed_symbols=13252761257 elapsed_ms=296971
+bat_progress completed_rows=38062 completed_symbols=13286315689 elapsed_ms=296992
+bat_progress completed_rows=38190 completed_symbols=13319870121 elapsed_ms=297014
+bat_progress completed_rows=38318 completed_symbols=13353424553 elapsed_ms=297035
+bat_progress completed_rows=38446 completed_symbols=13386978985 elapsed_ms=297057
+bat_progress completed_rows=38574 completed_symbols=13420533417 elapsed_ms=297079
+bat_progress completed_rows=38702 completed_symbols=13454087849 elapsed_ms=297100
+bat_progress completed_rows=38830 completed_symbols=13487642281 elapsed_ms=297122
+bat_progress completed_rows=38958 completed_symbols=13521196713 elapsed_ms=297143
+bat_progress completed_rows=39086 completed_symbols=13554751145 elapsed_ms=297165
+bat_progress completed_rows=39214 completed_symbols=13588305577 elapsed_ms=297186
+bat_progress completed_rows=39342 completed_symbols=13621860009 elapsed_ms=297208
+bat_progress completed_rows=39470 completed_symbols=13655414441 elapsed_ms=297229
+bat_progress completed_rows=39598 completed_symbols=13688968873 elapsed_ms=297250
+bat_progress completed_rows=39726 completed_symbols=13722523305 elapsed_ms=297272
+bat_progress completed_rows=39854 completed_symbols=13756077737 elapsed_ms=297294
+bat_progress completed_rows=39982 completed_symbols=13789632169 elapsed_ms=297316
+bat_progress completed_rows=40110 completed_symbols=13823186601 elapsed_ms=297337
+bat_progress completed_rows=40238 completed_symbols=13856741033 elapsed_ms=297359
+bat_progress completed_rows=40366 completed_symbols=13890295465 elapsed_ms=297381
+bat_progress completed_rows=40494 completed_symbols=13923849897 elapsed_ms=297403
+bat_progress completed_rows=40622 completed_symbols=13957404329 elapsed_ms=297425
+bat_progress completed_rows=40750 completed_symbols=13990958761 elapsed_ms=297447
+bat_progress completed_rows=40878 completed_symbols=14024513193 elapsed_ms=297468
+bat_progress completed_rows=41006 completed_symbols=14058067625 elapsed_ms=297490
+bat_progress completed_rows=41134 completed_symbols=14091622057 elapsed_ms=297511
+bat_progress completed_rows=41262 completed_symbols=14125176489 elapsed_ms=297533
+bat_progress completed_rows=41390 completed_symbols=14158730921 elapsed_ms=297554
+bat_progress completed_rows=41518 completed_symbols=14192285353 elapsed_ms=297575
+bat_progress completed_rows=41646 completed_symbols=14225839785 elapsed_ms=297597
+bat_progress completed_rows=41774 completed_symbols=14259394217 elapsed_ms=297618
+bat_progress completed_rows=41902 completed_symbols=14292948649 elapsed_ms=297639
+bat_progress completed_rows=42030 completed_symbols=14326503081 elapsed_ms=297659
+bat_progress completed_rows=42158 completed_symbols=14360057513 elapsed_ms=297679
+bat_progress completed_rows=42286 completed_symbols=14393611945 elapsed_ms=297699
+bat_progress completed_rows=42414 completed_symbols=14427166377 elapsed_ms=297720
+bat_progress completed_rows=42542 completed_symbols=14460720809 elapsed_ms=297741
+bat_progress completed_rows=42670 completed_symbols=14494275241 elapsed_ms=297763
+bat_progress completed_rows=42798 completed_symbols=14527829673 elapsed_ms=297784
+bat_progress completed_rows=42926 completed_symbols=14561384105 elapsed_ms=297806
+bat_progress completed_rows=43054 completed_symbols=14594938537 elapsed_ms=297827
+bat_progress completed_rows=43182 completed_symbols=14628492969 elapsed_ms=297849
+bat_progress completed_rows=43310 completed_symbols=14662047401 elapsed_ms=297870
+bat_progress completed_rows=43438 completed_symbols=14695601833 elapsed_ms=297892
+bat_progress completed_rows=43566 completed_symbols=14729156265 elapsed_ms=297913
+bat_progress completed_rows=43643 completed_symbols=15297746659 elapsed_ms=372412
+bat_progress completed_rows=43644 completed_symbols=15834617627 elapsed_ms=372865
+bat_progress completed_rows=43646 completed_symbols=16371488599 elapsed_ms=373151
+bat_progress completed_rows=43647 completed_symbols=16908359511 elapsed_ms=407300
+bat_progress completed_rows=43648 completed_symbols=16941914199 elapsed_ms=409604
+bat_progress completed_rows=43649 completed_symbols=16975468887 elapsed_ms=411676
+bat_progress completed_rows=43650 completed_symbols=17009023575 elapsed_ms=413751
+bat_progress completed_rows=43651 completed_symbols=17042578263 elapsed_ms=415826
+bat_progress completed_rows=43652 completed_symbols=17076132951 elapsed_ms=417896
+bat_progress completed_rows=43653 completed_symbols=17109687639 elapsed_ms=419972
+bat_progress completed_rows=43654 completed_symbols=17143242327 elapsed_ms=422049
+bat_progress completed_rows=43655 completed_symbols=17176797015 elapsed_ms=424122
+bat_progress completed_rows=43656 completed_symbols=17210351703 elapsed_ms=426201
+bat_progress completed_rows=43657 completed_symbols=17243906391 elapsed_ms=428277
+bat_progress completed_rows=43658 completed_symbols=17277461079 elapsed_ms=430353
+bat_progress completed_rows=43659 completed_symbols=17311015767 elapsed_ms=432425
+bat_progress completed_rows=43660 completed_symbols=17344570455 elapsed_ms=434498
+bat_progress completed_rows=43661 completed_symbols=17378125143 elapsed_ms=436574
+bat_progress completed_rows=43662 completed_symbols=17411679831 elapsed_ms=438650
+bat_progress completed_rows=43663 completed_symbols=17445234519 elapsed_ms=440729
+bat_progress completed_rows=43664 completed_symbols=17478789207 elapsed_ms=442976
+bat_progress completed_rows=43665 completed_symbols=17512343895 elapsed_ms=445059
+bat_progress completed_rows=43666 completed_symbols=17545898583 elapsed_ms=447141
+bat_progress completed_rows=43667 completed_symbols=17579453271 elapsed_ms=449222
+bat_progress completed_rows=43668 completed_symbols=17613007959 elapsed_ms=451301
+bat_progress completed_rows=43669 completed_symbols=17646562647 elapsed_ms=453380
+bat_progress completed_rows=43670 completed_symbols=17680117335 elapsed_ms=455453
+bat_progress completed_rows=43671 completed_symbols=17713672023 elapsed_ms=457524
+bat_progress completed_rows=43672 completed_symbols=17747226711 elapsed_ms=459601
+bat_progress completed_rows=43673 completed_symbols=17780781399 elapsed_ms=461671
+bat_progress completed_rows=43674 completed_symbols=17814336087 elapsed_ms=463744
+bat_progress completed_rows=43675 completed_symbols=17847890775 elapsed_ms=465815
+bat_progress completed_rows=43676 completed_symbols=17881445463 elapsed_ms=467881
+bat_progress completed_rows=43677 completed_symbols=17915000151 elapsed_ms=469954
+bat_progress completed_rows=43678 completed_symbols=17948554839 elapsed_ms=472023
+bat_progress completed_rows=43679 completed_symbols=17982109527 elapsed_ms=474093
+bat_progress completed_rows=43774 completed_symbols=18015663959 elapsed_ms=476107
+bat_progress completed_rows=43902 completed_symbols=18049218391 elapsed_ms=478110
+bat_progress completed_rows=43927 completed_symbols=18054531927 elapsed_ms=478446
+MEMTRACE after_second rss_kib=173762536 hwm_kib=285789604
+MEMTRACE after_messages rss_kib=173762536 hwm_kib=285789604
+MEMTRACE gemma3_after_prove rss_kib=160393120 hwm_kib=285789604
+hidden_profile_begin
+hidden_profile_segment name=code.encode_row_fp wall_ms=20697.823 calls=11273 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.proximity.statement wall_ms=714.261 calls=4 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.proximity.bat wall_ms=197.547 calls=4 bytes=0 table_bytes=0 rss_start_kb=97360 rss_end_kb=10064472 hwm_kb=12164492 threads=66
+hidden_profile_segment name=verify.proximity.fold wall_ms=214.363 calls=4 bytes=0 table_bytes=0 rss_start_kb=97360 rss_end_kb=10064472 hwm_kb=12164492 threads=66
+hidden_profile_segment name=code.encode_row_fp3 wall_ms=1160038.760 calls=20506 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.proximity.base wall_ms=17894.180 calls=4 bytes=0 table_bytes=0 rss_start_kb=97360 rss_end_kb=10064472 hwm_kb=12164492 threads=66
+hidden_profile_segment name=verify.proximity wall_ms=19024.469 calls=4 bytes=0 table_bytes=0 rss_start_kb=97360 rss_end_kb=10064472 hwm_kb=12164492 threads=66
+hidden_profile_segment name=verify.shared.columns wall_ms=1.842 calls=2 bytes=0 table_bytes=0 rss_start_kb=97360 rss_end_kb=10064472 hwm_kb=12164492 threads=66
+hidden_profile_segment name=verify.shared.record_rows wall_ms=1.004 calls=2 bytes=0 table_bytes=0 rss_start_kb=97360 rss_end_kb=10064472 hwm_kb=12164492 threads=66
+hidden_profile_segment name=verify.shared.column_rows wall_ms=18.350 calls=2 bytes=0 table_bytes=0 rss_start_kb=97360 rss_end_kb=10064472 hwm_kb=12164492 threads=66
+hidden_profile_segment name=verify.shared.plain_rows wall_ms=7.000 calls=2 bytes=0 table_bytes=0 rss_start_kb=97360 rss_end_kb=10064472 hwm_kb=12164492 threads=66
+hidden_profile_segment name=verify.shared.proximity wall_ms=6050.580 calls=2 bytes=0 table_bytes=0 rss_start_kb=97360 rss_end_kb=10064472 hwm_kb=12164492 threads=66
+hidden_profile_segment name=verify.shared wall_ms=6082.666 calls=2 bytes=0 table_bytes=0 rss_start_kb=97360 rss_end_kb=10064472 hwm_kb=12164492 threads=66
+hidden_profile_segment name=value_group.layout wall_ms=15655.191 calls=270 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=value_group.encode wall_ms=377337.088 calls=270 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=runtime_tree.commit wall_ms=255351.028 calls=333 bytes=0 table_bytes=0 rss_start_kb=7149276 rss_end_kb=274425840 hwm_kb=285789604 threads=66
+hidden_profile_segment name=value_group.commit wall_ms=610899.212 calls=24 bytes=0 table_bytes=0 rss_start_kb=7120408 rss_end_kb=158845240 hwm_kb=158845240 threads=66
+hidden_profile_segment name=psc.product_new wall_ms=3020.678 calls=1475 bytes=0 table_bytes=0 rss_start_kb=9527376 rss_end_kb=173762300 hwm_kb=192621756 threads=66
+hidden_profile_segment name=psc.hiding_new wall_ms=3.155 calls=1475 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=psc.product_round wall_ms=41546.431 calls=17150 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=psc.hiding_round wall_ms=1.822 calls=17150 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=psc.bind wall_ms=15732.041 calls=17150 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=psc.end wall_ms=6.686 calls=1475 bytes=0 table_bytes=0 rss_start_kb=9527380 rss_end_kb=173762300 hwm_kb=192621756 threads=66
+hidden_profile_segment name=psc.prove_dot_sumcheck wall_ms=60388.373 calls=1475 bytes=0 table_bytes=0 rss_start_kb=9527376 rss_end_kb=173762300 hwm_kb=192621756 threads=66
+hidden_profile_segment name=prox.bat wall_ms=496664.256 calls=5 bytes=0 table_bytes=0 rss_start_kb=9630928 rss_end_kb=224094188 hwm_kb=285789604 threads=66
+hidden_profile_segment name=prox.group_tables wall_ms=7153.046 calls=5 bytes=0 table_bytes=0 rss_start_kb=9665872 rss_end_kb=274425840 hwm_kb=285789604 threads=66
+hidden_profile_segment name=mask_tree.commit wall_ms=30760.774 calls=11 bytes=0 table_bytes=0 rss_start_kb=9678344 rss_end_kb=274425840 hwm_kb=285789604 threads=66
+hidden_profile_segment name=prox.fold_start wall_ms=16277.303 calls=5 bytes=0 table_bytes=0 rss_start_kb=9665872 rss_end_kb=274425840 hwm_kb=285789604 threads=66
+hidden_profile_segment name=prox.fold_rounds wall_ms=62234.012 calls=5 bytes=0 table_bytes=0 rss_start_kb=9747972 rss_end_kb=274425840 hwm_kb=285789604 threads=66
+hidden_profile_segment name=prox.fold_output wall_ms=27766.952 calls=5 bytes=0 table_bytes=0 rss_start_kb=9747972 rss_end_kb=173762536 hwm_kb=285789604 threads=66
+hidden_profile_segment name=prox.proximity_prove wall_ms=1056727.421 calls=5 bytes=0 table_bytes=0 rss_start_kb=9630928 rss_end_kb=173762536 hwm_kb=285789604 threads=66
+hidden_profile_segment name=shared.fold_table wall_ms=2510.276 calls=2 bytes=0 table_bytes=1073741824 rss_start_kb=9792316 rss_end_kb=158979024 hwm_kb=158979024 threads=66
+hidden_profile_segment name=shared.gu_table wall_ms=7.244 calls=2 bytes=0 table_bytes=0 rss_start_kb=9792316 rss_end_kb=158979024 hwm_kb=158979024 threads=66
+hidden_profile_segment name=commit_rows_tree.encode wall_ms=622.461 calls=8 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=shared.gu_commit wall_ms=592.464 calls=2 bytes=0 table_bytes=0 rss_start_kb=9792316 rss_end_kb=158979028 hwm_kb=158979028 threads=66
+hidden_profile_segment name=shared.table_open_columns wall_ms=10964.806 calls=2 bytes=0 table_bytes=1073741824 rss_start_kb=9792316 rss_end_kb=158979124 hwm_kb=158979124 threads=66
+hidden_profile_segment name=shared.column_rows wall_ms=15073.612 calls=2 bytes=0 table_bytes=0 rss_start_kb=9792412 rss_end_kb=158979124 hwm_kb=158979124 threads=66
+hidden_profile_segment name=shared.omega_vector wall_ms=41.557 calls=2 bytes=0 table_bytes=0 rss_start_kb=9792412 rss_end_kb=158979124 hwm_kb=158979124 threads=66
+hidden_profile_segment name=shared.omega_commit wall_ms=541.613 calls=2 bytes=0 table_bytes=0 rss_start_kb=9792412 rss_end_kb=158979124 hwm_kb=158979124 threads=66
+hidden_profile_segment name=shared.plain_rows wall_ms=1858.465 calls=2 bytes=0 table_bytes=0 rss_start_kb=9792412 rss_end_kb=158979124 hwm_kb=158979124 threads=66
+hidden_profile_segment name=prox.base_prover wall_ms=826.974 calls=2 bytes=0 table_bytes=0 rss_start_kb=9811716 rss_end_kb=10204888 hwm_kb=12164492 threads=66
+hidden_profile_segment name=prox.base_openings wall_ms=387.265 calls=2 bytes=0 table_bytes=0 rss_start_kb=10141644 rss_end_kb=10232332 hwm_kb=12164492 threads=66
+hidden_profile_segment name=prox.base_finish wall_ms=108.906 calls=2 bytes=0 table_bytes=0 rss_start_kb=10160508 rss_end_kb=10250760 hwm_kb=12164492 threads=66
+hidden_profile_segment name=shared.proximity wall_ms=16444.587 calls=2 bytes=0 table_bytes=0 rss_start_kb=9792412 rss_end_kb=158979124 hwm_kb=158979124 threads=66
+hidden_profile_segment name=shared.prove_shared wall_ms=49333.544 calls=2 bytes=0 table_bytes=2147483648 rss_start_kb=9792316 rss_end_kb=158979124 hwm_kb=158979124 threads=66
+hidden_profile_segment name=table.open wall_ms=28.575 calls=1 bytes=0 table_bytes=0 rss_start_kb=42513224 rss_end_kb=42578856 hwm_kb=42578856 threads=66
+hidden_profile_segment name=table.commit.encode_rows wall_ms=17135.703 calls=1 bytes=0 table_bytes=1073741824 rss_start_kb=42580968 rss_end_kb=43644040 hwm_kb=43644040 threads=66
+hidden_profile_segment name=table.commit.store_finish wall_ms=5728.222 calls=1 bytes=0 table_bytes=0 rss_start_kb=43644040 rss_end_kb=43644040 hwm_kb=43644040 threads=66
+hidden_profile_segment name=table.commit.leaves wall_ms=9392.001 calls=1 bytes=0 table_bytes=0 rss_start_kb=43676816 rss_end_kb=43678828 hwm_kb=43678828 threads=66
+hidden_profile_segment name=table.commit.merkle wall_ms=112.349 calls=1 bytes=0 table_bytes=0 rss_start_kb=43678828 rss_end_kb=43711564 hwm_kb=43711564 threads=66
+hidden_profile_segment name=table.commit.record wall_ms=92830.412 calls=1 bytes=0 table_bytes=1073741824 rss_start_kb=43711572 rss_end_kb=43711592 hwm_kb=43711592 threads=66
+hidden_profile_segment name=table.commit wall_ms=125227.101 calls=1 bytes=0 table_bytes=2147483648 rss_start_kb=42578856 rss_end_kb=43715680 hwm_kb=43744128 threads=66
+hidden_profile_segment name=session.w_commit_randomness wall_ms=15581.319 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=first.derive_w_rows wall_ms=4065.326 calls=1 bytes=0 table_bytes=1073741824 rss_start_kb=45786760 rss_end_kb=46884936 hwm_kb=46884936 threads=66
+hidden_profile_segment name=first.commit_w_rows wall_ms=8125.175 calls=1 bytes=0 table_bytes=0 rss_start_kb=46884936 rss_end_kb=49547328 hwm_kb=49547328 threads=66
+hidden_profile_segment name=closure.values_from_rows wall_ms=3684.024 calls=1 bytes=0 table_bytes=0 rss_start_kb=49547332 rss_end_kb=62228608 hwm_kb=62228608 threads=66
+hidden_profile_segment name=first.closure_values wall_ms=3684.089 calls=1 bytes=0 table_bytes=0 rss_start_kb=49547332 rss_end_kb=62228612 hwm_kb=62228612 threads=66
+hidden_profile_segment name=first.closure_slack_commit wall_ms=6851.598 calls=1 bytes=0 table_bytes=0 rss_start_kb=62228612 rss_end_kb=63563936 hwm_kb=63563936 threads=66
+hidden_profile_segment name=first.closure_bits_commit wall_ms=171850.055 calls=1 bytes=0 table_bytes=0 rss_start_kb=63563936 rss_end_kb=101358084 hwm_kb=101358084 threads=66
+hidden_profile_segment name=first.closure_mask_commit wall_ms=393.977 calls=1 bytes=0 table_bytes=0 rss_start_kb=101358084 rss_end_kb=101358084 hwm_kb=101358084 threads=66
+hidden_profile_segment name=first.closure_mask_entries wall_ms=0.007 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=first.witness_check wall_ms=768.473 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=first.w_answers wall_ms=576.823 calls=1 bytes=0 table_bytes=0 rss_start_kb=122442096 rss_end_kb=122442096 hwm_kb=134995300 threads=66
+hidden_profile_segment name=first.closure_answers wall_ms=16719.046 calls=1 bytes=0 table_bytes=0 rss_start_kb=122442096 rss_end_kb=122442100 hwm_kb=134995300 threads=66
+hidden_profile_segment name=first.closure_map_values wall_ms=513.274 calls=1 bytes=0 table_bytes=0 rss_start_kb=122442100 rss_end_kb=122442788 hwm_kb=134995300 threads=66
+hidden_profile_segment name=first.closure_map_commit wall_ms=172518.481 calls=1 bytes=0 table_bytes=0 rss_start_kb=122442788 rss_end_kb=158845240 hwm_kb=158845240 threads=66
+hidden_profile_segment name=first.closure_map_answers wall_ms=16024.988 calls=1 bytes=0 table_bytes=0 rss_start_kb=158845240 rss_end_kb=158845248 hwm_kb=158845248 threads=66
+hidden_profile_segment name=first.closure_check wall_ms=379.270 calls=1 bytes=0 table_bytes=0 rss_start_kb=158845248 rss_end_kb=158845248 hwm_kb=158845248 threads=66
+hidden_profile_segment name=first.index_mask_openings wall_ms=378.962 calls=1 bytes=0 table_bytes=0 rss_start_kb=158845248 rss_end_kb=158845248 hwm_kb=158845248 threads=66
+hidden_profile_segment name=first.w_openings wall_ms=0.324 calls=1 bytes=0 table_bytes=0 rss_start_kb=158845248 rss_end_kb=158845260 hwm_kb=158845260 threads=66
+hidden_profile_segment name=first.closure_slack_openings wall_ms=476.179 calls=1 bytes=0 table_bytes=0 rss_start_kb=158845260 rss_end_kb=158978640 hwm_kb=158978640 threads=66
+hidden_profile_segment name=first.closure_bits_openings wall_ms=118673.220 calls=1 bytes=0 table_bytes=0 rss_start_kb=158978640 rss_end_kb=158978832 hwm_kb=158978832 threads=66
+hidden_profile_segment name=first.closure_mask_openings wall_ms=383.271 calls=1 bytes=0 table_bytes=0 rss_start_kb=158978832 rss_end_kb=158978832 hwm_kb=158978832 threads=66
+hidden_profile_segment name=first.closure_map_openings wall_ms=118629.662 calls=1 bytes=0 table_bytes=0 rss_start_kb=158978832 rss_end_kb=158979024 hwm_kb=158979024 threads=66
+hidden_profile_segment name=first.closure_openings wall_ms=238162.553 calls=1 bytes=0 table_bytes=0 rss_start_kb=158845260 rss_end_kb=158979024 hwm_kb=158979024 threads=66
+hidden_profile_segment name=first.eval_targets wall_ms=2767.436 calls=1 bytes=0 table_bytes=0 rss_start_kb=158979024 rss_end_kb=158979024 hwm_kb=158979024 threads=66
+hidden_profile_segment name=first.prove_first wall_ms=984203.236 calls=1 bytes=0 table_bytes=1073741824 rss_start_kb=45735524 rss_end_kb=158979024 hwm_kb=158979024 threads=66
+hidden_profile_segment name=second.own_members wall_ms=7752.009 calls=1 bytes=0 table_bytes=0 rss_start_kb=158979124 rss_end_kb=173754968 hwm_kb=173754968 threads=66
+hidden_profile_segment name=second.tilde wall_ms=1402.902 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=second.dot_identity wall_ms=0.474 calls=1 bytes=0 table_bytes=0 rss_start_kb=173754968 rss_end_kb=173754968 hwm_kb=173754968 threads=66
+hidden_profile_segment name=second.closure_psc_position wall_ms=97727.721 calls=16 bytes=0 table_bytes=0 rss_start_kb=173754968 rss_end_kb=173755092 hwm_kb=173755092 threads=66
+hidden_profile_segment name=second.closure_psc wall_ms=97900.810 calls=1 bytes=0 table_bytes=0 rss_start_kb=173754968 rss_end_kb=173755092 hwm_kb=173755092 threads=66
+hidden_profile_segment name=second.plain.eval wall_ms=101.429 calls=1 bytes=0 table_bytes=0 rss_start_kb=224093952 rss_end_kb=224093952 hwm_kb=224093952 threads=66
+hidden_profile_segment name=second.plain.dot wall_ms=12.967 calls=1 bytes=0 table_bytes=0 rss_start_kb=224093952 rss_end_kb=224093952 hwm_kb=224093952 threads=66
+hidden_profile_segment name=second.plain.closure wall_ms=265185.176 calls=1 bytes=0 table_bytes=0 rss_start_kb=224093952 rss_end_kb=224093980 hwm_kb=224093980 threads=66
+hidden_profile_segment name=second.plain.output wall_ms=89.726 calls=1 bytes=0 table_bytes=0 rss_start_kb=224093980 rss_end_kb=224093980 hwm_kb=224093980 threads=66
+hidden_profile_segment name=second.plain.tail wall_ms=24548.429 calls=1 bytes=0 table_bytes=0 rss_start_kb=224093980 rss_end_kb=224094036 hwm_kb=224094036 threads=66
+hidden_profile_segment name=second.plain.bias wall_ms=5634.287 calls=1 bytes=0 table_bytes=0 rss_start_kb=224094036 rss_end_kb=235466624 hwm_kb=235466624 threads=66
+hidden_profile_segment name=second.plain.lookup wall_ms=234.987 calls=1 bytes=0 table_bytes=0 rss_start_kb=235466624 rss_end_kb=235466624 hwm_kb=235466624 threads=66
+hidden_profile_segment name=second.plain.rstd wall_ms=75028.124 calls=1 bytes=0 table_bytes=0 rss_start_kb=235466624 rss_end_kb=224094176 hwm_kb=285789604 threads=66
+hidden_profile_segment name=second.plain.norm wall_ms=107877.367 calls=1 bytes=0 table_bytes=0 rss_start_kb=224093980 rss_end_kb=224094176 hwm_kb=285789604 threads=66
+hidden_profile_segment name=second.plain.chain wall_ms=0.000 calls=1 bytes=0 table_bytes=0 rss_start_kb=224094176 rss_end_kb=224094176 hwm_kb=285789604 threads=66
+hidden_profile_segment name=second.sample_rows wall_ms=105262.809 calls=1 bytes=0 table_bytes=0 rss_start_kb=224094176 rss_end_kb=224094188 hwm_kb=285789604 threads=66
+hidden_profile_segment name=witness_tree.omega wall_ms=376.133 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=witness_tree.mask wall_ms=370.782 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=witness_tree.index_mask wall_ms=370.454 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=second.proximity wall_ms=1031832.928 calls=1 bytes=0 table_bytes=0 rss_start_kb=173762300 rss_end_kb=173762536 hwm_kb=285789604 threads=66
+hidden_profile_segment name=second.prove_second wall_ms=1639563.533 calls=1 bytes=0 table_bytes=0 rss_start_kb=158979124 rss_end_kb=173762536 hwm_kb=285789604 threads=66
+hidden_profile_segment name=session.prove_hidden_lin_inner wall_ms=2687533.972 calls=1 bytes=0 table_bytes=3221225472 rss_start_kb=44183996 rss_end_kb=172976096 hwm_kb=285789604 threads=66
+hidden_profile_end
+bat_progress completed_rows=64 completed_symbols=1014 elapsed_ms=0
+bat_progress completed_rows=64 completed_symbols=33554432 elapsed_ms=0
+bat_progress completed_rows=128 completed_symbols=67108864 elapsed_ms=0
+bat_progress completed_rows=192 completed_symbols=100663296 elapsed_ms=0
+bat_progress completed_rows=256 completed_symbols=134217728 elapsed_ms=0
+bat_progress completed_rows=320 completed_symbols=167772160 elapsed_ms=0
+bat_progress completed_rows=384 completed_symbols=201326592 elapsed_ms=0
+bat_progress completed_rows=448 completed_symbols=234881024 elapsed_ms=0
+bat_progress completed_rows=512 completed_symbols=268435456 elapsed_ms=0
+bat_progress completed_rows=576 completed_symbols=301989888 elapsed_ms=0
+bat_progress completed_rows=38 completed_symbols=56361321 elapsed_ms=2637
+bat_progress completed_rows=39 completed_symbols=90440297 elapsed_ms=5005
+bat_progress completed_rows=40 completed_symbols=124519273 elapsed_ms=7388
+bat_progress completed_rows=41 completed_symbols=158073962 elapsed_ms=9601
+bat_progress completed_rows=42 completed_symbols=191628651 elapsed_ms=11644
+bat_progress completed_rows=45 completed_symbols=225183395 elapsed_ms=14584
+bat_progress completed_rows=46 completed_symbols=258738084 elapsed_ms=16704
+bat_progress completed_rows=49 completed_symbols=293865638 elapsed_ms=19043
+bat_progress completed_rows=50 completed_symbols=327944614 elapsed_ms=21364
+bat_progress completed_rows=51 completed_symbols=362023590 elapsed_ms=23698
+bat_progress completed_rows=52 completed_symbols=395578279 elapsed_ms=25926
+bat_progress completed_rows=53 completed_symbols=429132968 elapsed_ms=27980
+bat_progress completed_rows=56 completed_symbols=462687712 elapsed_ms=30738
+bat_progress completed_rows=57 completed_symbols=496242401 elapsed_ms=32759
+bat_progress completed_rows=60 completed_symbols=531369955 elapsed_ms=35113
+bat_progress completed_rows=61 completed_symbols=565448931 elapsed_ms=37451
+bat_progress completed_rows=62 completed_symbols=599527907 elapsed_ms=39812
+bat_progress completed_rows=63 completed_symbols=633082596 elapsed_ms=42040
+bat_progress completed_rows=64 completed_symbols=666637285 elapsed_ms=44100
+bat_progress completed_rows=67 completed_symbols=700192029 elapsed_ms=46791
+bat_progress completed_rows=68 completed_symbols=733746718 elapsed_ms=48796
+bat_progress completed_rows=71 completed_symbols=768874272 elapsed_ms=51128
+bat_progress completed_rows=72 completed_symbols=802953248 elapsed_ms=53446
+bat_progress completed_rows=73 completed_symbols=837032224 elapsed_ms=55777
+bat_progress completed_rows=74 completed_symbols=870586913 elapsed_ms=57994
+bat_progress completed_rows=75 completed_symbols=904141602 elapsed_ms=60050
+bat_progress completed_rows=78 completed_symbols=937696346 elapsed_ms=62760
+bat_progress completed_rows=79 completed_symbols=971251035 elapsed_ms=64774
+bat_progress completed_rows=82 completed_symbols=1006378589 elapsed_ms=67120
+bat_progress completed_rows=83 completed_symbols=1040457565 elapsed_ms=69453
+bat_progress completed_rows=84 completed_symbols=1074536541 elapsed_ms=71804
+bat_progress completed_rows=85 completed_symbols=1108091230 elapsed_ms=74006
+bat_progress completed_rows=86 completed_symbols=1141645919 elapsed_ms=76044
+bat_progress completed_rows=89 completed_symbols=1175200663 elapsed_ms=78726
+bat_progress completed_rows=90 completed_symbols=1208755352 elapsed_ms=80717
+bat_progress completed_rows=93 completed_symbols=1243882906 elapsed_ms=83055
+bat_progress completed_rows=94 completed_symbols=1277961882 elapsed_ms=85380
+bat_progress completed_rows=95 completed_symbols=1312040858 elapsed_ms=87722
+bat_progress completed_rows=96 completed_symbols=1345595547 elapsed_ms=89934
+bat_progress completed_rows=97 completed_symbols=1379150236 elapsed_ms=91978
+bat_progress completed_rows=100 completed_symbols=1412704980 elapsed_ms=94712
+bat_progress completed_rows=101 completed_symbols=1446259669 elapsed_ms=96750
+bat_progress completed_rows=104 completed_symbols=1481387223 elapsed_ms=99117
+bat_progress completed_rows=105 completed_symbols=1515466199 elapsed_ms=101474
+bat_progress completed_rows=106 completed_symbols=1549545175 elapsed_ms=103850
+bat_progress completed_rows=107 completed_symbols=1583099864 elapsed_ms=106088
+bat_progress completed_rows=108 completed_symbols=1616654553 elapsed_ms=108157
+bat_progress completed_rows=111 completed_symbols=1650209297 elapsed_ms=110872
+bat_progress completed_rows=112 completed_symbols=1683763986 elapsed_ms=112899
+bat_progress completed_rows=115 completed_symbols=1718891540 elapsed_ms=115261
+bat_progress completed_rows=116 completed_symbols=1752970516 elapsed_ms=117613
+bat_progress completed_rows=117 completed_symbols=1787049492 elapsed_ms=119949
+bat_progress completed_rows=118 completed_symbols=1820604181 elapsed_ms=122155
+bat_progress completed_rows=119 completed_symbols=1854158870 elapsed_ms=124197
+bat_progress completed_rows=122 completed_symbols=1887713614 elapsed_ms=126912
+bat_progress completed_rows=123 completed_symbols=1921268303 elapsed_ms=128916
+bat_progress completed_rows=126 completed_symbols=1956395857 elapsed_ms=131256
+bat_progress completed_rows=127 completed_symbols=1990474833 elapsed_ms=133583
+bat_progress completed_rows=128 completed_symbols=2024553809 elapsed_ms=135921
+bat_progress completed_rows=129 completed_symbols=2058108498 elapsed_ms=138135
+bat_progress completed_rows=130 completed_symbols=2091663187 elapsed_ms=140179
+bat_progress completed_rows=133 completed_symbols=2125217931 elapsed_ms=142889
+bat_progress completed_rows=134 completed_symbols=2158772620 elapsed_ms=144897
+bat_progress completed_rows=137 completed_symbols=2193900174 elapsed_ms=147238
+bat_progress completed_rows=138 completed_symbols=2227979150 elapsed_ms=149568
+bat_progress completed_rows=139 completed_symbols=2262058126 elapsed_ms=151919
+bat_progress completed_rows=140 completed_symbols=2295612815 elapsed_ms=154136
+bat_progress completed_rows=141 completed_symbols=2329167504 elapsed_ms=156190
+bat_progress completed_rows=144 completed_symbols=2362722248 elapsed_ms=158895
+bat_progress completed_rows=145 completed_symbols=2396276937 elapsed_ms=160910
+bat_progress completed_rows=148 completed_symbols=2431404491 elapsed_ms=163255
+bat_progress completed_rows=149 completed_symbols=2465483467 elapsed_ms=165587
+bat_progress completed_rows=150 completed_symbols=2499562443 elapsed_ms=167932
+bat_progress completed_rows=151 completed_symbols=2533117132 elapsed_ms=170151
+bat_progress completed_rows=152 completed_symbols=2566671821 elapsed_ms=172208
+bat_progress completed_rows=155 completed_symbols=2600226565 elapsed_ms=174911
+bat_progress completed_rows=156 completed_symbols=2633781254 elapsed_ms=176928
+bat_progress completed_rows=159 completed_symbols=2668908808 elapsed_ms=179279
+bat_progress completed_rows=160 completed_symbols=2702987784 elapsed_ms=181611
+bat_progress completed_rows=161 completed_symbols=2737066760 elapsed_ms=183964
+bat_progress completed_rows=162 completed_symbols=2770621449 elapsed_ms=186176
+bat_progress completed_rows=163 completed_symbols=2804176138 elapsed_ms=188218
+bat_progress completed_rows=166 completed_symbols=2837730882 elapsed_ms=190913
+bat_progress completed_rows=167 completed_symbols=2871285571 elapsed_ms=192913
+bat_progress completed_rows=170 completed_symbols=2906413125 elapsed_ms=195247
+bat_progress completed_rows=171 completed_symbols=2940492101 elapsed_ms=197567
+bat_progress completed_rows=172 completed_symbols=2974571077 elapsed_ms=199909
+bat_progress completed_rows=173 completed_symbols=3008125766 elapsed_ms=202119
+bat_progress completed_rows=174 completed_symbols=3041680455 elapsed_ms=204164
+bat_progress completed_rows=177 completed_symbols=3075235199 elapsed_ms=206864
+bat_progress completed_rows=178 completed_symbols=3108789888 elapsed_ms=208869
+bat_progress completed_rows=181 completed_symbols=3143917442 elapsed_ms=211207
+bat_progress completed_rows=182 completed_symbols=3177996418 elapsed_ms=213533
+bat_progress completed_rows=183 completed_symbols=3212075394 elapsed_ms=215874
+bat_progress completed_rows=184 completed_symbols=3245630083 elapsed_ms=218084
+bat_progress completed_rows=185 completed_symbols=3279184772 elapsed_ms=220128
+bat_progress completed_rows=188 completed_symbols=3312739516 elapsed_ms=222813
+bat_progress completed_rows=189 completed_symbols=3346294205 elapsed_ms=224812
+bat_progress completed_rows=192 completed_symbols=3381421759 elapsed_ms=227158
+bat_progress completed_rows=193 completed_symbols=3415500735 elapsed_ms=229490
+bat_progress completed_rows=194 completed_symbols=3449579711 elapsed_ms=231841
+bat_progress completed_rows=195 completed_symbols=3483134400 elapsed_ms=234066
+bat_progress completed_rows=196 completed_symbols=3516689089 elapsed_ms=236118
+bat_progress completed_rows=199 completed_symbols=3550243833 elapsed_ms=238830
+bat_progress completed_rows=200 completed_symbols=3583798522 elapsed_ms=240842
+bat_progress completed_rows=203 completed_symbols=3618926076 elapsed_ms=243183
+bat_progress completed_rows=204 completed_symbols=3653005052 elapsed_ms=245511
+bat_progress completed_rows=205 completed_symbols=3687084028 elapsed_ms=247853
+bat_progress completed_rows=206 completed_symbols=3720638717 elapsed_ms=250068
+bat_progress completed_rows=207 completed_symbols=3754193406 elapsed_ms=252118
+bat_progress completed_rows=210 completed_symbols=3787748150 elapsed_ms=254846
+bat_progress completed_rows=211 completed_symbols=3821302839 elapsed_ms=256864
+bat_progress completed_rows=492 completed_symbols=3854859785 elapsed_ms=257055
+bat_progress completed_rows=810 completed_symbols=3888417079 elapsed_ms=257243
+bat_progress completed_rows=1137 completed_symbols=3921974454 elapsed_ms=257433
+bat_progress completed_rows=1440 completed_symbols=3955531613 elapsed_ms=257619
+bat_progress completed_rows=1734 completed_symbols=3989088691 elapsed_ms=257808
+bat_progress completed_rows=2061 completed_symbols=4022646066 elapsed_ms=257994
+bat_progress completed_rows=2380 completed_symbols=4056203361 elapsed_ms=258181
+bat_progress completed_rows=2661 completed_symbols=4090022474 elapsed_ms=258369
+bat_progress completed_rows=2988 completed_symbols=4123579849 elapsed_ms=258557
+bat_progress completed_rows=3315 completed_symbols=4157137224 elapsed_ms=258744
+bat_progress completed_rows=3607 completed_symbols=4190694276 elapsed_ms=258930
+bat_progress completed_rows=3912 completed_symbols=4224251461 elapsed_ms=259117
+bat_progress completed_rows=4143 completed_symbols=4257807758 elapsed_ms=259254
+bat_progress completed_rows=4229 completed_symbols=4291887306 elapsed_ms=259379
+bat_progress completed_rows=4293 completed_symbols=4325704618 elapsed_ms=259506
+bat_progress completed_rows=4358 completed_symbols=4359521963 elapsed_ms=259638
+bat_progress completed_rows=4422 completed_symbols=4393339275 elapsed_ms=259766
+bat_progress completed_rows=4487 completed_symbols=4427156620 elapsed_ms=259898
+bat_progress completed_rows=4551 completed_symbols=4460973932 elapsed_ms=260025
+bat_progress completed_rows=4616 completed_symbols=4494791277 elapsed_ms=260157
+bat_progress completed_rows=4680 completed_symbols=4528608589 elapsed_ms=260286
+bat_progress completed_rows=4782 completed_symbols=4562163369 elapsed_ms=260395
+bat_progress completed_rows=4910 completed_symbols=4595717801 elapsed_ms=260485
+bat_progress completed_rows=5038 completed_symbols=4629272233 elapsed_ms=260575
+bat_progress completed_rows=5166 completed_symbols=4662826665 elapsed_ms=260666
+bat_progress completed_rows=5294 completed_symbols=4696381097 elapsed_ms=260757
+bat_progress completed_rows=5422 completed_symbols=4729935529 elapsed_ms=260846
+bat_progress completed_rows=5550 completed_symbols=4763489961 elapsed_ms=260934
+bat_progress completed_rows=5678 completed_symbols=4797044393 elapsed_ms=261023
+bat_progress completed_rows=5806 completed_symbols=4830598825 elapsed_ms=261113
+bat_progress completed_rows=5934 completed_symbols=4864153257 elapsed_ms=261200
+bat_progress completed_rows=6062 completed_symbols=4897707689 elapsed_ms=261289
+bat_progress completed_rows=6190 completed_symbols=4931262121 elapsed_ms=261379
+bat_progress completed_rows=6318 completed_symbols=4964816553 elapsed_ms=261468
+bat_progress completed_rows=6446 completed_symbols=4998370985 elapsed_ms=261558
+bat_progress completed_rows=6574 completed_symbols=5031925417 elapsed_ms=261647
+bat_progress completed_rows=6702 completed_symbols=5065479849 elapsed_ms=261737
+bat_progress completed_rows=6830 completed_symbols=5099034281 elapsed_ms=261827
+bat_progress completed_rows=6958 completed_symbols=5132588713 elapsed_ms=261916
+bat_progress completed_rows=7086 completed_symbols=5166143145 elapsed_ms=262006
+bat_progress completed_rows=7214 completed_symbols=5199697577 elapsed_ms=262094
+bat_progress completed_rows=7342 completed_symbols=5233252009 elapsed_ms=262183
+bat_progress completed_rows=7470 completed_symbols=5266806441 elapsed_ms=262272
+bat_progress completed_rows=7598 completed_symbols=5300360873 elapsed_ms=262361
+bat_progress completed_rows=7726 completed_symbols=5333915305 elapsed_ms=262450
+bat_progress completed_rows=7854 completed_symbols=5367469737 elapsed_ms=262540
+bat_progress completed_rows=7982 completed_symbols=5401024169 elapsed_ms=262630
+bat_progress completed_rows=8110 completed_symbols=5434578601 elapsed_ms=262719
+bat_progress completed_rows=8238 completed_symbols=5468133033 elapsed_ms=262810
+bat_progress completed_rows=8366 completed_symbols=5501687465 elapsed_ms=262900
+bat_progress completed_rows=8494 completed_symbols=5535241897 elapsed_ms=262989
+bat_progress completed_rows=8622 completed_symbols=5568796329 elapsed_ms=263079
+bat_progress completed_rows=8750 completed_symbols=5602350761 elapsed_ms=263169
+bat_progress completed_rows=8878 completed_symbols=5635905193 elapsed_ms=263258
+bat_progress completed_rows=9006 completed_symbols=5669459625 elapsed_ms=263349
+bat_progress completed_rows=9134 completed_symbols=5703014057 elapsed_ms=263438
+bat_progress completed_rows=9262 completed_symbols=5736568489 elapsed_ms=263528
+bat_progress completed_rows=9390 completed_symbols=5770122921 elapsed_ms=263617
+bat_progress completed_rows=9518 completed_symbols=5803677353 elapsed_ms=263707
+bat_progress completed_rows=9646 completed_symbols=5837231785 elapsed_ms=263795
+bat_progress completed_rows=9774 completed_symbols=5870786217 elapsed_ms=263883
+bat_progress completed_rows=9902 completed_symbols=5904340649 elapsed_ms=263972
+bat_progress completed_rows=10030 completed_symbols=5937895081 elapsed_ms=264062
+bat_progress completed_rows=10158 completed_symbols=5971449513 elapsed_ms=264152
+bat_progress completed_rows=10286 completed_symbols=6005003945 elapsed_ms=264241
+bat_progress completed_rows=10414 completed_symbols=6038558377 elapsed_ms=264331
+bat_progress completed_rows=10542 completed_symbols=6072112809 elapsed_ms=264419
+bat_progress completed_rows=10670 completed_symbols=6105667241 elapsed_ms=264509
+bat_progress completed_rows=10798 completed_symbols=6139221673 elapsed_ms=264598
+bat_progress completed_rows=10926 completed_symbols=6172776105 elapsed_ms=264688
+bat_progress completed_rows=11054 completed_symbols=6206330537 elapsed_ms=264778
+bat_progress completed_rows=11182 completed_symbols=6239884969 elapsed_ms=264867
+bat_progress completed_rows=11310 completed_symbols=6273439401 elapsed_ms=264957
+bat_progress completed_rows=11438 completed_symbols=6306993833 elapsed_ms=265047
+bat_progress completed_rows=11566 completed_symbols=6340548265 elapsed_ms=265136
+bat_progress completed_rows=11694 completed_symbols=6374102697 elapsed_ms=265226
+bat_progress completed_rows=11822 completed_symbols=6407657129 elapsed_ms=265317
+bat_progress completed_rows=11950 completed_symbols=6441211561 elapsed_ms=265408
+bat_progress completed_rows=12078 completed_symbols=6474765993 elapsed_ms=265496
+bat_progress completed_rows=12206 completed_symbols=6508320425 elapsed_ms=265587
+bat_progress completed_rows=12334 completed_symbols=6541874857 elapsed_ms=265676
+bat_progress completed_rows=12462 completed_symbols=6575429289 elapsed_ms=265766
+bat_progress completed_rows=12590 completed_symbols=6608983721 elapsed_ms=265857
+bat_progress completed_rows=12718 completed_symbols=6642538153 elapsed_ms=265946
+bat_progress completed_rows=12846 completed_symbols=6676092585 elapsed_ms=266036
+bat_progress completed_rows=12974 completed_symbols=6709647017 elapsed_ms=266126
+bat_progress completed_rows=13102 completed_symbols=6743201449 elapsed_ms=266217
+bat_progress completed_rows=13230 completed_symbols=6776755881 elapsed_ms=266305
+bat_progress completed_rows=13358 completed_symbols=6810310313 elapsed_ms=266395
+bat_progress completed_rows=13486 completed_symbols=6843864745 elapsed_ms=266485
+bat_progress completed_rows=13614 completed_symbols=6877419177 elapsed_ms=266574
+bat_progress completed_rows=13742 completed_symbols=6910973609 elapsed_ms=266664
+bat_progress completed_rows=13870 completed_symbols=6944528041 elapsed_ms=266754
+bat_progress completed_rows=13998 completed_symbols=6978082473 elapsed_ms=266845
+bat_progress completed_rows=14126 completed_symbols=7011636905 elapsed_ms=266934
+bat_progress completed_rows=14254 completed_symbols=7045191337 elapsed_ms=267024
+bat_progress completed_rows=14382 completed_symbols=7078745769 elapsed_ms=267115
+bat_progress completed_rows=14510 completed_symbols=7112300201 elapsed_ms=267207
+bat_progress completed_rows=14638 completed_symbols=7145854633 elapsed_ms=267297
+bat_progress completed_rows=14766 completed_symbols=7179409065 elapsed_ms=267388
+bat_progress completed_rows=14894 completed_symbols=7212963497 elapsed_ms=267479
+bat_progress completed_rows=15022 completed_symbols=7246517929 elapsed_ms=267570
+bat_progress completed_rows=15150 completed_symbols=7280072361 elapsed_ms=267661
+bat_progress completed_rows=15278 completed_symbols=7313626793 elapsed_ms=267752
+bat_progress completed_rows=15406 completed_symbols=7347181225 elapsed_ms=267843
+bat_progress completed_rows=15534 completed_symbols=7380735657 elapsed_ms=267933
+bat_progress completed_rows=15662 completed_symbols=7414290089 elapsed_ms=268023
+bat_progress completed_rows=15790 completed_symbols=7447844521 elapsed_ms=268113
+bat_progress completed_rows=15918 completed_symbols=7481398953 elapsed_ms=268204
+bat_progress completed_rows=16046 completed_symbols=7514953385 elapsed_ms=268294
+bat_progress completed_rows=16174 completed_symbols=7548507817 elapsed_ms=268385
+bat_progress completed_rows=16302 completed_symbols=7582062249 elapsed_ms=268476
+bat_progress completed_rows=16430 completed_symbols=7615616681 elapsed_ms=268567
+bat_progress completed_rows=16558 completed_symbols=7649171113 elapsed_ms=268657
+bat_progress completed_rows=16686 completed_symbols=7682725545 elapsed_ms=268748
+bat_progress completed_rows=16814 completed_symbols=7716279977 elapsed_ms=268839
+bat_progress completed_rows=16942 completed_symbols=7749834409 elapsed_ms=268928
+bat_progress completed_rows=17070 completed_symbols=7783388841 elapsed_ms=269019
+bat_progress completed_rows=17198 completed_symbols=7816943273 elapsed_ms=269110
+bat_progress completed_rows=17326 completed_symbols=7850497705 elapsed_ms=269202
+bat_progress completed_rows=17454 completed_symbols=7884052137 elapsed_ms=269292
+bat_progress completed_rows=17582 completed_symbols=7917606569 elapsed_ms=269383
+bat_progress completed_rows=17710 completed_symbols=7951161001 elapsed_ms=269474
+bat_progress completed_rows=17838 completed_symbols=7984715433 elapsed_ms=269565
+bat_progress completed_rows=17966 completed_symbols=8018269865 elapsed_ms=269658
+bat_progress completed_rows=18094 completed_symbols=8051824297 elapsed_ms=269749
+bat_progress completed_rows=18222 completed_symbols=8085378729 elapsed_ms=269840
+bat_progress completed_rows=18350 completed_symbols=8118933161 elapsed_ms=269930
+bat_progress completed_rows=18478 completed_symbols=8152487593 elapsed_ms=270020
+bat_progress completed_rows=18606 completed_symbols=8186042025 elapsed_ms=270110
+bat_progress completed_rows=18734 completed_symbols=8219596457 elapsed_ms=270202
+bat_progress completed_rows=18862 completed_symbols=8253150889 elapsed_ms=270292
+bat_progress completed_rows=18990 completed_symbols=8286705321 elapsed_ms=270382
+bat_progress completed_rows=19118 completed_symbols=8320259753 elapsed_ms=270472
+bat_progress completed_rows=19246 completed_symbols=8353814185 elapsed_ms=270563
+bat_progress completed_rows=19374 completed_symbols=8387368617 elapsed_ms=270653
+bat_progress completed_rows=19502 completed_symbols=8420923049 elapsed_ms=270743
+bat_progress completed_rows=19630 completed_symbols=8454477481 elapsed_ms=270833
+bat_progress completed_rows=19758 completed_symbols=8488031913 elapsed_ms=270922
+bat_progress completed_rows=19886 completed_symbols=8521586345 elapsed_ms=271013
+bat_progress completed_rows=20014 completed_symbols=8555140777 elapsed_ms=271104
+bat_progress completed_rows=20142 completed_symbols=8588695209 elapsed_ms=271194
+bat_progress completed_rows=20270 completed_symbols=8622249641 elapsed_ms=271285
+bat_progress completed_rows=20398 completed_symbols=8655804073 elapsed_ms=271375
+bat_progress completed_rows=20526 completed_symbols=8689358505 elapsed_ms=271465
+bat_progress completed_rows=20654 completed_symbols=8722912937 elapsed_ms=271555
+bat_progress completed_rows=20782 completed_symbols=8756467369 elapsed_ms=271645
+bat_progress completed_rows=20910 completed_symbols=8790021801 elapsed_ms=271735
+bat_progress completed_rows=21038 completed_symbols=8823576233 elapsed_ms=271825
+bat_progress completed_rows=21166 completed_symbols=8857130665 elapsed_ms=271916
+bat_progress completed_rows=21294 completed_symbols=8890685097 elapsed_ms=272005
+bat_progress completed_rows=21422 completed_symbols=8924239529 elapsed_ms=272094
+bat_progress completed_rows=21550 completed_symbols=8957793961 elapsed_ms=272184
+bat_progress completed_rows=21678 completed_symbols=8991348393 elapsed_ms=272275
+bat_progress completed_rows=21806 completed_symbols=9024902825 elapsed_ms=272365
+bat_progress completed_rows=21934 completed_symbols=9058457257 elapsed_ms=272454
+bat_progress completed_rows=22062 completed_symbols=9092011689 elapsed_ms=272544
+bat_progress completed_rows=22190 completed_symbols=9125566121 elapsed_ms=272634
+bat_progress completed_rows=22318 completed_symbols=9159120553 elapsed_ms=272723
+bat_progress completed_rows=22446 completed_symbols=9192674985 elapsed_ms=272813
+bat_progress completed_rows=22574 completed_symbols=9226229417 elapsed_ms=272902
+bat_progress completed_rows=22702 completed_symbols=9259783849 elapsed_ms=272991
+bat_progress completed_rows=22830 completed_symbols=9293338281 elapsed_ms=273081
+bat_progress completed_rows=22958 completed_symbols=9326892713 elapsed_ms=273169
+bat_progress completed_rows=23086 completed_symbols=9360447145 elapsed_ms=273258
+bat_progress completed_rows=23214 completed_symbols=9394001577 elapsed_ms=273347
+bat_progress completed_rows=23342 completed_symbols=9427556009 elapsed_ms=273436
+bat_progress completed_rows=23470 completed_symbols=9461110441 elapsed_ms=273526
+bat_progress completed_rows=23598 completed_symbols=9494664873 elapsed_ms=273615
+bat_progress completed_rows=23726 completed_symbols=9528219305 elapsed_ms=273704
+bat_progress completed_rows=23854 completed_symbols=9561773737 elapsed_ms=273794
+bat_progress completed_rows=23982 completed_symbols=9595328169 elapsed_ms=273883
+bat_progress completed_rows=24110 completed_symbols=9628882601 elapsed_ms=273972
+bat_progress completed_rows=24238 completed_symbols=9662437033 elapsed_ms=274060
+bat_progress completed_rows=24366 completed_symbols=9695991465 elapsed_ms=274149
+bat_progress completed_rows=24494 completed_symbols=9729545897 elapsed_ms=274238
+bat_progress completed_rows=24622 completed_symbols=9763100329 elapsed_ms=274326
+bat_progress completed_rows=24750 completed_symbols=9796654761 elapsed_ms=274416
+bat_progress completed_rows=24878 completed_symbols=9830209193 elapsed_ms=274505
+bat_progress completed_rows=25006 completed_symbols=9863763625 elapsed_ms=274594
+bat_progress completed_rows=25134 completed_symbols=9897318057 elapsed_ms=274684
+bat_progress completed_rows=25262 completed_symbols=9930872489 elapsed_ms=274773
+bat_progress completed_rows=25390 completed_symbols=9964426921 elapsed_ms=274862
+bat_progress completed_rows=25518 completed_symbols=9997981353 elapsed_ms=274952
+bat_progress completed_rows=25646 completed_symbols=10031535785 elapsed_ms=275042
+bat_progress completed_rows=25774 completed_symbols=10065090217 elapsed_ms=275131
+bat_progress completed_rows=25902 completed_symbols=10098644649 elapsed_ms=275220
+bat_progress completed_rows=26030 completed_symbols=10132199081 elapsed_ms=275310
+bat_progress completed_rows=26158 completed_symbols=10165753513 elapsed_ms=275400
+bat_progress completed_rows=26286 completed_symbols=10199307945 elapsed_ms=275490
+bat_progress completed_rows=26414 completed_symbols=10232862377 elapsed_ms=275579
+bat_progress completed_rows=26542 completed_symbols=10266416809 elapsed_ms=275670
+bat_progress completed_rows=26670 completed_symbols=10299971241 elapsed_ms=275760
+bat_progress completed_rows=26798 completed_symbols=10333525673 elapsed_ms=275850
+bat_progress completed_rows=26926 completed_symbols=10367080105 elapsed_ms=275940
+bat_progress completed_rows=27054 completed_symbols=10400634537 elapsed_ms=276032
+bat_progress completed_rows=27182 completed_symbols=10434188969 elapsed_ms=276122
+bat_progress completed_rows=27310 completed_symbols=10467743401 elapsed_ms=276212
+bat_progress completed_rows=27438 completed_symbols=10501297833 elapsed_ms=276303
+bat_progress completed_rows=27566 completed_symbols=10534852265 elapsed_ms=276394
+bat_progress completed_rows=27694 completed_symbols=10568406697 elapsed_ms=276484
+bat_progress completed_rows=27822 completed_symbols=10601961129 elapsed_ms=276574
+bat_progress completed_rows=27950 completed_symbols=10635515561 elapsed_ms=276665
+bat_progress completed_rows=28078 completed_symbols=10669069993 elapsed_ms=276756
+bat_progress completed_rows=28206 completed_symbols=10702624425 elapsed_ms=276847
+bat_progress completed_rows=28334 completed_symbols=10736178857 elapsed_ms=276935
+bat_progress completed_rows=28462 completed_symbols=10769733289 elapsed_ms=277026
+bat_progress completed_rows=28590 completed_symbols=10803287721 elapsed_ms=277117
+bat_progress completed_rows=28718 completed_symbols=10836842153 elapsed_ms=277207
+bat_progress completed_rows=28846 completed_symbols=10870396585 elapsed_ms=277300
+bat_progress completed_rows=28974 completed_symbols=10903951017 elapsed_ms=277391
+bat_progress completed_rows=29102 completed_symbols=10937505449 elapsed_ms=277480
+bat_progress completed_rows=29230 completed_symbols=10971059881 elapsed_ms=277569
+bat_progress completed_rows=29358 completed_symbols=11004614313 elapsed_ms=277659
+bat_progress completed_rows=29486 completed_symbols=11038168745 elapsed_ms=277750
+bat_progress completed_rows=29614 completed_symbols=11071723177 elapsed_ms=277840
+bat_progress completed_rows=29742 completed_symbols=11105277609 elapsed_ms=277928
+bat_progress completed_rows=29870 completed_symbols=11138832041 elapsed_ms=278019
+bat_progress completed_rows=29998 completed_symbols=11172386473 elapsed_ms=278109
+bat_progress completed_rows=30126 completed_symbols=11205940905 elapsed_ms=278199
+bat_progress completed_rows=30254 completed_symbols=11239495337 elapsed_ms=278288
+bat_progress completed_rows=30382 completed_symbols=11273049769 elapsed_ms=278378
+bat_progress completed_rows=30510 completed_symbols=11306604201 elapsed_ms=278468
+bat_progress completed_rows=30638 completed_symbols=11340158633 elapsed_ms=278558
+bat_progress completed_rows=30766 completed_symbols=11373713065 elapsed_ms=278649
+bat_progress completed_rows=30894 completed_symbols=11407267497 elapsed_ms=278739
+bat_progress completed_rows=31022 completed_symbols=11440821929 elapsed_ms=278829
+bat_progress completed_rows=31150 completed_symbols=11474376361 elapsed_ms=278919
+bat_progress completed_rows=31278 completed_symbols=11507930793 elapsed_ms=279007
+bat_progress completed_rows=31406 completed_symbols=11541485225 elapsed_ms=279096
+bat_progress completed_rows=31534 completed_symbols=11575039657 elapsed_ms=279185
+bat_progress completed_rows=31662 completed_symbols=11608594089 elapsed_ms=279276
+bat_progress completed_rows=31790 completed_symbols=11642148521 elapsed_ms=279366
+bat_progress completed_rows=31918 completed_symbols=11675702953 elapsed_ms=279455
+bat_progress completed_rows=32046 completed_symbols=11709257385 elapsed_ms=279544
+bat_progress completed_rows=32174 completed_symbols=11742811817 elapsed_ms=279634
+bat_progress completed_rows=32302 completed_symbols=11776366249 elapsed_ms=279724
+bat_progress completed_rows=32430 completed_symbols=11809920681 elapsed_ms=279815
+bat_progress completed_rows=32558 completed_symbols=11843475113 elapsed_ms=279905
+bat_progress completed_rows=32686 completed_symbols=11877029545 elapsed_ms=279994
+bat_progress completed_rows=32814 completed_symbols=11910583977 elapsed_ms=280083
+bat_progress completed_rows=32942 completed_symbols=11944138409 elapsed_ms=280173
+bat_progress completed_rows=33070 completed_symbols=11977692841 elapsed_ms=280263
+bat_progress completed_rows=33198 completed_symbols=12011247273 elapsed_ms=280353
+bat_progress completed_rows=33326 completed_symbols=12044801705 elapsed_ms=280442
+bat_progress completed_rows=33454 completed_symbols=12078356137 elapsed_ms=280532
+bat_progress completed_rows=33582 completed_symbols=12111910569 elapsed_ms=280621
+bat_progress completed_rows=33710 completed_symbols=12145465001 elapsed_ms=280709
+bat_progress completed_rows=33838 completed_symbols=12179019433 elapsed_ms=280798
+bat_progress completed_rows=33966 completed_symbols=12212573865 elapsed_ms=280888
+bat_progress completed_rows=34094 completed_symbols=12246128297 elapsed_ms=280976
+bat_progress completed_rows=34222 completed_symbols=12279682729 elapsed_ms=281065
+bat_progress completed_rows=34350 completed_symbols=12313237161 elapsed_ms=281154
+bat_progress completed_rows=34478 completed_symbols=12346791593 elapsed_ms=281243
+bat_progress completed_rows=34606 completed_symbols=12380346025 elapsed_ms=281332
+bat_progress completed_rows=34734 completed_symbols=12413900457 elapsed_ms=281421
+bat_progress completed_rows=34862 completed_symbols=12447454889 elapsed_ms=281509
+bat_progress completed_rows=34990 completed_symbols=12481009321 elapsed_ms=281598
+bat_progress completed_rows=35118 completed_symbols=12514563753 elapsed_ms=281686
+bat_progress completed_rows=35246 completed_symbols=12548118185 elapsed_ms=281774
+bat_progress completed_rows=35374 completed_symbols=12581672617 elapsed_ms=281862
+bat_progress completed_rows=35502 completed_symbols=12615227049 elapsed_ms=281950
+bat_progress completed_rows=35630 completed_symbols=12648781481 elapsed_ms=282040
+bat_progress completed_rows=35758 completed_symbols=12682335913 elapsed_ms=282129
+bat_progress completed_rows=35886 completed_symbols=12715890345 elapsed_ms=282218
+bat_progress completed_rows=36014 completed_symbols=12749444777 elapsed_ms=282309
+bat_progress completed_rows=36142 completed_symbols=12782999209 elapsed_ms=282397
+bat_progress completed_rows=36270 completed_symbols=12816553641 elapsed_ms=282486
+bat_progress completed_rows=36398 completed_symbols=12850108073 elapsed_ms=282576
+bat_progress completed_rows=36526 completed_symbols=12883662505 elapsed_ms=282664
+bat_progress completed_rows=36654 completed_symbols=12917216937 elapsed_ms=282752
+bat_progress completed_rows=36782 completed_symbols=12950771369 elapsed_ms=282840
+bat_progress completed_rows=36910 completed_symbols=12984325801 elapsed_ms=282930
+bat_progress completed_rows=37038 completed_symbols=13017880233 elapsed_ms=283018
+bat_progress completed_rows=37166 completed_symbols=13051434665 elapsed_ms=283107
+bat_progress completed_rows=37294 completed_symbols=13084989097 elapsed_ms=283195
+bat_progress completed_rows=37422 completed_symbols=13118543529 elapsed_ms=283284
+bat_progress completed_rows=37550 completed_symbols=13152097961 elapsed_ms=289798
+bat_progress completed_rows=37678 completed_symbols=13185652393 elapsed_ms=289818
+bat_progress completed_rows=37806 completed_symbols=13219206825 elapsed_ms=289838
+bat_progress completed_rows=37934 completed_symbols=13252761257 elapsed_ms=289859
+bat_progress completed_rows=38062 completed_symbols=13286315689 elapsed_ms=289879
+bat_progress completed_rows=38190 completed_symbols=13319870121 elapsed_ms=289900
+bat_progress completed_rows=38318 completed_symbols=13353424553 elapsed_ms=289920
+bat_progress completed_rows=38446 completed_symbols=13386978985 elapsed_ms=289940
+bat_progress completed_rows=38574 completed_symbols=13420533417 elapsed_ms=289961
+bat_progress completed_rows=38702 completed_symbols=13454087849 elapsed_ms=289981
+bat_progress completed_rows=38830 completed_symbols=13487642281 elapsed_ms=290001
+bat_progress completed_rows=38958 completed_symbols=13521196713 elapsed_ms=290022
+bat_progress completed_rows=39086 completed_symbols=13554751145 elapsed_ms=290042
+bat_progress completed_rows=39214 completed_symbols=13588305577 elapsed_ms=290062
+bat_progress completed_rows=39342 completed_symbols=13621860009 elapsed_ms=290082
+bat_progress completed_rows=39470 completed_symbols=13655414441 elapsed_ms=290103
+bat_progress completed_rows=39598 completed_symbols=13688968873 elapsed_ms=290123
+bat_progress completed_rows=39726 completed_symbols=13722523305 elapsed_ms=290143
+bat_progress completed_rows=39854 completed_symbols=13756077737 elapsed_ms=290164
+bat_progress completed_rows=39982 completed_symbols=13789632169 elapsed_ms=290184
+bat_progress completed_rows=40110 completed_symbols=13823186601 elapsed_ms=290204
+bat_progress completed_rows=40238 completed_symbols=13856741033 elapsed_ms=290224
+bat_progress completed_rows=40366 completed_symbols=13890295465 elapsed_ms=290245
+bat_progress completed_rows=40494 completed_symbols=13923849897 elapsed_ms=290266
+bat_progress completed_rows=40622 completed_symbols=13957404329 elapsed_ms=290286
+bat_progress completed_rows=40750 completed_symbols=13990958761 elapsed_ms=290306
+bat_progress completed_rows=40878 completed_symbols=14024513193 elapsed_ms=290326
+bat_progress completed_rows=41006 completed_symbols=14058067625 elapsed_ms=290347
+bat_progress completed_rows=41134 completed_symbols=14091622057 elapsed_ms=290367
+bat_progress completed_rows=41262 completed_symbols=14125176489 elapsed_ms=290386
+bat_progress completed_rows=41390 completed_symbols=14158730921 elapsed_ms=290407
+bat_progress completed_rows=41518 completed_symbols=14192285353 elapsed_ms=290427
+bat_progress completed_rows=41646 completed_symbols=14225839785 elapsed_ms=290448
+bat_progress completed_rows=41774 completed_symbols=14259394217 elapsed_ms=290469
+bat_progress completed_rows=41902 completed_symbols=14292948649 elapsed_ms=290490
+bat_progress completed_rows=42030 completed_symbols=14326503081 elapsed_ms=290511
+bat_progress completed_rows=42158 completed_symbols=14360057513 elapsed_ms=290532
+bat_progress completed_rows=42286 completed_symbols=14393611945 elapsed_ms=290553
+bat_progress completed_rows=42414 completed_symbols=14427166377 elapsed_ms=290574
+bat_progress completed_rows=42542 completed_symbols=14460720809 elapsed_ms=290594
+bat_progress completed_rows=42670 completed_symbols=14494275241 elapsed_ms=290615
+bat_progress completed_rows=42798 completed_symbols=14527829673 elapsed_ms=290636
+bat_progress completed_rows=42926 completed_symbols=14561384105 elapsed_ms=290657
+bat_progress completed_rows=43054 completed_symbols=14594938537 elapsed_ms=290678
+bat_progress completed_rows=43182 completed_symbols=14628492969 elapsed_ms=290700
+bat_progress completed_rows=43310 completed_symbols=14662047401 elapsed_ms=290721
+bat_progress completed_rows=43438 completed_symbols=14695601833 elapsed_ms=290742
+bat_progress completed_rows=43566 completed_symbols=14729156265 elapsed_ms=290763
+bat_progress completed_rows=43643 completed_symbols=15297746659 elapsed_ms=364519
+bat_progress completed_rows=43644 completed_symbols=15834617627 elapsed_ms=365238
+bat_progress completed_rows=43646 completed_symbols=16371488599 elapsed_ms=365527
+bat_progress completed_rows=43647 completed_symbols=16908359511 elapsed_ms=399417
+bat_progress completed_rows=43648 completed_symbols=16941914199 elapsed_ms=401686
+bat_progress completed_rows=43649 completed_symbols=16975468887 elapsed_ms=403731
+bat_progress completed_rows=43650 completed_symbols=17009023575 elapsed_ms=405774
+bat_progress completed_rows=43651 completed_symbols=17042578263 elapsed_ms=407816
+bat_progress completed_rows=43652 completed_symbols=17076132951 elapsed_ms=409861
+bat_progress completed_rows=43653 completed_symbols=17109687639 elapsed_ms=411905
+bat_progress completed_rows=43654 completed_symbols=17143242327 elapsed_ms=413948
+bat_progress completed_rows=43655 completed_symbols=17176797015 elapsed_ms=415990
+bat_progress completed_rows=43656 completed_symbols=17210351703 elapsed_ms=418033
+bat_progress completed_rows=43657 completed_symbols=17243906391 elapsed_ms=420075
+bat_progress completed_rows=43658 completed_symbols=17277461079 elapsed_ms=422116
+bat_progress completed_rows=43659 completed_symbols=17311015767 elapsed_ms=424160
+bat_progress completed_rows=43660 completed_symbols=17344570455 elapsed_ms=426205
+bat_progress completed_rows=43661 completed_symbols=17378125143 elapsed_ms=428251
+bat_progress completed_rows=43662 completed_symbols=17411679831 elapsed_ms=430296
+bat_progress completed_rows=43663 completed_symbols=17445234519 elapsed_ms=432337
+bat_progress completed_rows=43664 completed_symbols=17478789207 elapsed_ms=434548
+bat_progress completed_rows=43665 completed_symbols=17512343895 elapsed_ms=436592
+bat_progress completed_rows=43666 completed_symbols=17545898583 elapsed_ms=438635
+bat_progress completed_rows=43667 completed_symbols=17579453271 elapsed_ms=440676
+bat_progress completed_rows=43668 completed_symbols=17613007959 elapsed_ms=442717
+bat_progress completed_rows=43669 completed_symbols=17646562647 elapsed_ms=444763
+bat_progress completed_rows=43670 completed_symbols=17680117335 elapsed_ms=446808
+bat_progress completed_rows=43671 completed_symbols=17713672023 elapsed_ms=448852
+bat_progress completed_rows=43672 completed_symbols=17747226711 elapsed_ms=450891
+bat_progress completed_rows=43673 completed_symbols=17780781399 elapsed_ms=452934
+bat_progress completed_rows=43674 completed_symbols=17814336087 elapsed_ms=454977
+bat_progress completed_rows=43675 completed_symbols=17847890775 elapsed_ms=457020
+bat_progress completed_rows=43676 completed_symbols=17881445463 elapsed_ms=459062
+bat_progress completed_rows=43677 completed_symbols=17915000151 elapsed_ms=461107
+bat_progress completed_rows=43678 completed_symbols=17948554839 elapsed_ms=463151
+bat_progress completed_rows=43679 completed_symbols=17982109527 elapsed_ms=465191
+bat_progress completed_rows=43774 completed_symbols=18015663959 elapsed_ms=467216
+bat_progress completed_rows=43902 completed_symbols=18049218391 elapsed_ms=469220
+bat_progress completed_rows=43927 completed_symbols=18054531927 elapsed_ms=469555
+hidden_profile_begin
+hidden_profile_segment name=verify.proximity.statement wall_ms=714.464 calls=8 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.proximity.bat wall_ms=488242.871 calls=8 bytes=0 table_bytes=0 rss_start_kb=5724104 rss_end_kb=71701040 hwm_kb=146450184 threads=66
+hidden_profile_segment name=verify.proximity.fold wall_ms=16468.088 calls=8 bytes=0 table_bytes=0 rss_start_kb=5725148 rss_end_kb=122032692 hwm_kb=146450184 threads=66
+hidden_profile_segment name=code.encode_row_fp3 wall_ms=2249.622 calls=50 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.proximity.base wall_ms=82402.964 calls=8 bytes=0 table_bytes=0 rss_start_kb=5725148 rss_end_kb=122032692 hwm_kb=146450184 threads=66
+hidden_profile_segment name=verify.proximity wall_ms=588053.314 calls=8 bytes=0 table_bytes=0 rss_start_kb=5723328 rss_end_kb=21369388 hwm_kb=146450184 threads=66
+hidden_profile_segment name=verify.shared.columns wall_ms=13.717 calls=3 bytes=0 table_bytes=0 rss_start_kb=5678920 rss_end_kb=7397112 hwm_kb=10835608 threads=66
+hidden_profile_segment name=verify.shared.record_rows wall_ms=92.198 calls=3 bytes=0 table_bytes=0 rss_start_kb=5680808 rss_end_kb=7397112 hwm_kb=10835608 threads=66
+hidden_profile_segment name=verify.shared.column_rows wall_ms=15424.483 calls=3 bytes=0 table_bytes=0 rss_start_kb=5681192 rss_end_kb=13872768 hwm_kb=13872768 threads=66
+hidden_profile_segment name=verify.shared.plain_rows wall_ms=2363.908 calls=3 bytes=0 table_bytes=0 rss_start_kb=5702716 rss_end_kb=21405320 hwm_kb=21405320 threads=66
+hidden_profile_segment name=verify.shared.proximity wall_ms=18812.857 calls=3 bytes=0 table_bytes=0 rss_start_kb=5723092 rss_end_kb=21368584 hwm_kb=21474236 threads=66
+hidden_profile_segment name=verify.shared wall_ms=36788.396 calls=3 bytes=0 table_bytes=0 rss_start_kb=5678920 rss_end_kb=21368584 hwm_kb=21474236 threads=66
+hidden_profile_segment name=value_group.layout wall_ms=8.843 calls=32 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=value_group.encode wall_ms=1925.216 calls=32 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=runtime_tree.commit wall_ms=9865.234 calls=32 bytes=0 table_bytes=0 rss_start_kb=6898056 rss_end_kb=8211900 hwm_kb=10835608 threads=66
+hidden_profile_segment name=value_group.commit wall_ms=11801.117 calls=2 bytes=0 table_bytes=0 rss_start_kb=6869188 rss_end_kb=8211900 hwm_kb=10835608 threads=66
+hidden_profile_segment name=verify.first.openings wall_ms=5.440 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.first wall_ms=1476.942 calls=1 bytes=0 table_bytes=0 rss_start_kb=7397112 rss_end_kb=7397112 hwm_kb=10835608 threads=66
+hidden_profile_segment name=verify.hidden_lin.first wall_ms=1476.991 calls=1 bytes=0 table_bytes=0 rss_start_kb=7397112 rss_end_kb=7397112 hwm_kb=10835608 threads=66
+hidden_profile_segment name=verify.hidden_lin.first_query wall_ms=63.879 calls=1 bytes=0 table_bytes=0 rss_start_kb=0 rss_end_kb=0 hwm_kb=0 threads=0
+hidden_profile_segment name=verify.hidden_lin.shared wall_ms=30801.314 calls=1 bytes=0 table_bytes=0 rss_start_kb=7397112 rss_end_kb=21368584 hwm_kb=21474236 threads=66
+hidden_profile_segment name=verify.second.members wall_ms=0.000 calls=1 bytes=0 table_bytes=0 rss_start_kb=21368584 rss_end_kb=21368584 hwm_kb=21474236 threads=66
+hidden_profile_segment name=verify.second.sample_rows wall_ms=103995.491 calls=2 bytes=0 table_bytes=0 rss_start_kb=21368584 rss_end_kb=71701040 hwm_kb=146450184 threads=66
+hidden_profile_segment name=verify.second.dot wall_ms=0.026 calls=1 bytes=0 table_bytes=0 rss_start_kb=21368584 rss_end_kb=21368584 hwm_kb=21474236 threads=66
+hidden_profile_segment name=verify.second.closure wall_ms=0.512 calls=1 bytes=0 table_bytes=0 rss_start_kb=21368584 rss_end_kb=21368584 hwm_kb=21474236 threads=66
+hidden_profile_segment name=second.plain.eval wall_ms=100.035 calls=1 bytes=0 table_bytes=0 rss_start_kb=71700284 rss_end_kb=71700284 hwm_kb=71700284 threads=66
+hidden_profile_segment name=second.plain.dot wall_ms=12.997 calls=1 bytes=0 table_bytes=0 rss_start_kb=71700284 rss_end_kb=71700284 hwm_kb=71700284 threads=66
+hidden_profile_segment name=second.plain.closure wall_ms=256751.770 calls=1 bytes=0 table_bytes=0 rss_start_kb=71700284 rss_end_kb=71700816 hwm_kb=73268296 threads=66
+hidden_profile_segment name=second.plain.output wall_ms=92.147 calls=1 bytes=0 table_bytes=0 rss_start_kb=71700820 rss_end_kb=71700820 hwm_kb=73268296 threads=66
+hidden_profile_segment name=second.plain.tail wall_ms=24042.679 calls=1 bytes=0 table_bytes=0 rss_start_kb=71700820 rss_end_kb=71700988 hwm_kb=73268296 threads=66
+hidden_profile_segment name=second.plain.bias wall_ms=7451.106 calls=1 bytes=0 table_bytes=0 rss_start_kb=71700988 rss_end_kb=102414796 hwm_kb=102414796 threads=66
+hidden_profile_segment name=second.plain.lookup wall_ms=230.951 calls=1 bytes=0 table_bytes=0 rss_start_kb=102414796 rss_end_kb=102414796 hwm_kb=102414796 threads=66
+hidden_profile_segment name=second.plain.rstd wall_ms=74559.090 calls=1 bytes=0 table_bytes=0 rss_start_kb=102414796 rss_end_kb=71701024 hwm_kb=146450184 threads=66
+hidden_profile_segment name=second.plain.norm wall_ms=108688.903 calls=1 bytes=0 table_bytes=0 rss_start_kb=71700816 rss_end_kb=71701024 hwm_kb=146450184 threads=66
+hidden_profile_segment name=second.plain.chain wall_ms=0.000 calls=1 bytes=0 table_bytes=0 rss_start_kb=71701024 rss_end_kb=71701024 hwm_kb=146450184 threads=66
+hidden_profile_segment name=verify.second.proximity wall_ms=550280.363 calls=1 bytes=0 table_bytes=0 rss_start_kb=21368632 rss_end_kb=21369388 hwm_kb=146450184 threads=66
+hidden_profile_segment name=verify.second wall_ms=552554.816 calls=1 bytes=0 table_bytes=0 rss_start_kb=21368584 rss_end_kb=21369388 hwm_kb=146450184 threads=66
+hidden_profile_segment name=verify.hidden_lin.second wall_ms=552554.850 calls=1 bytes=0 table_bytes=0 rss_start_kb=21368584 rss_end_kb=21369388 hwm_kb=146450184 threads=66
+hidden_profile_segment name=verify.hidden_lin wall_ms=584975.928 calls=1 bytes=0 table_bytes=0 rss_start_kb=7397112 rss_end_kb=21369388 hwm_kb=146450184 threads=66
+hidden_profile_end
+ROUND 1 commit=274672 prove=3084227 verify=696984 proof_bytes=5808750389
+test acceptance_rounds ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4058.15s
+
+DRIVER_EXIT=0
+Sat Nov 21 11:21:28 CST 2026

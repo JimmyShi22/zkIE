@@ -1,0 +1,43 @@
+policy_version = 1
+model = "gemma3"
+model_version = 2
+
+[[case]]
+case_id = "gemma3-seq16"
+sequence_length = 16
+anchor_id = "f339b2f1472731eb82e350656562fb47a8763564808d980cec8d8d4e10f53c33"
+model_id = "39b607c9f6156a8df155ca1a97e1fa70f0adf74730cc670ec67b5c8fd6410e34"
+output_mode = "expected"
+expected_output_sha256 = "8683f5e22e51d1405fe3efcc7487a9a4df2e694c5d9f0bed64e921810d77c562"
+output_digest_algorithm = "sha256"
+output_type = "argmax"
+output_encoding = "i32-le"
+output_elements = 16
+
+
+[case.limited_table_identity]
+version = 1
+model = "gemma3"
+model_version = 2
+case_id = "gemma3-seq16"
+anchor_id = "f339b2f1472731eb82e350656562fb47a8763564808d980cec8d8d4e10f53c33"
+model_id = "39b607c9f6156a8df155ca1a97e1fa70f0adf74730cc670ec67b5c8fd6410e34"
+asset_id = 0
+asset_table_identity = "1ac33344163a47057ee9831bca25b08eae0a7e7ddc96261cbf074963a9337d6a"
+table_root = "dcfe329403e291be5ef202a81c1b3bd7058e88c26ed0a3972d062823ec52a98f"
+table_record_digest = "fadeaf20b041d9d4befe279a3edbea1bfac1dd19768201be20b12a38b770d174"
+table_configuration = "905764b49a0e31ebcf233bb3be7a3bfc7550f8140e7894f2bb8c64cf3cbb5e34"
+code_log_n = 12
+code_ell = 2048
+code_r = 128
+table_v = 10
+answers = 1
+salt_bytes = 40
+distance_radius = 0
+distance_later_radius = 0
+distance_m_once = 284
+distance_m_later = 284
+matrix_rows_log = 10
+k_lo = 0
+k_col = 10
+protocol_identity = "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"

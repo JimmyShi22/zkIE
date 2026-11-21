@@ -1,0 +1,4 @@
+EVIDENCE_DIR=/data/a04g-d-accept-20261121-1013
+HEAD=faa29817
+Sat Nov 21 10:13:50 CST 2026
+-rwxr-xr-x 2 root root 7452912 Nov 21 10:13 /data/a04-gemma3/target/release/zkie
