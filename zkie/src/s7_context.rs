@@ -1,4 +1,4 @@
-//! S7a callable adapter: the trusted gpt2 context and the lm_head asset identity.
+//! Callable adapter: the trusted gpt2 context and the lm_head asset identity.
 //!
 //! This module reuses the production verification checks (policy selection, model
 //! commitment, anchor rebuild, asset specification checks) and exposes the

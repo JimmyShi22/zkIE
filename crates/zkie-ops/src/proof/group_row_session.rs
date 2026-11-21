@@ -8,7 +8,7 @@
 //! equivalent) is not implemented: the stored tail fields are fixture values,
 //! they do not participate in FOLD folding, and the outcome must not be read as
 //! a completed witness fold. The candidate witness derivation conditions are
-//! incomplete for that reason; this does not change the T-002 final
+//! incomplete for that reason; this does not change the final
 //! acceptance. It does not run G_u or BAT, does not authenticate the fresh
 //! mask as a production commitment, and does not accept a proof. The production
 //! verify entry is unchanged.

@@ -2196,14 +2196,14 @@ impl FoldeqSession {
     /// Draw the mask opening positions from the verifier's own transcript.
     /// The plan supplies only the query count; the positions are not the
     /// plan's list and are not supplied by the caller or the proof. With a G_u
-    /// shape this legacy path is unavailable; the S1 flow proceeds through the
+    /// shape this legacy path is unavailable; the flow proceeds through the
     /// fixed FOLD rounds. The opening/authentication and plan error-parameter
     /// checks remain unconnected.
     pub fn draw_mask_queries(&mut self) -> Result<()> {
         if self.stage != Stage::FoldStarted {
             return Err(Error::InvalidSessionState);
         }
-        // With a G_u shape the S1 path continues through the fixed FOLD rounds
+        // With a G_u shape the folding path continues through the fixed FOLD rounds
         // and their final constraint; the legacy mask-query path is not an
         // alternative and remains unavailable.
         if self.plan.gu.is_some() {

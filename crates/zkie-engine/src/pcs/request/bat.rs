@@ -717,7 +717,7 @@ impl BatStatement {
     /// isolated FOLD candidate checker passes and that checker's member-order
     /// implied main/mask first offsets equal BAT's actual main_first/mask_first.
     /// A legal BAT layout whose descending blocks that checker rejects is
-    /// outside this S2 subset and fails closed here; it is not a general
+    /// outside this subset and fails closed here; it is not a general
     /// GroupLayout handoff. The only BAT layout derivation is
     /// `BatStatement::layout`; production must rebuild the same
     /// members/first offsets/k/h/kept from an authenticated statement, and must
