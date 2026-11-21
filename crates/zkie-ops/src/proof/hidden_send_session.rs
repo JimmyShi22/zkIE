@@ -24037,7 +24037,7 @@ fn norm_plain_rows(
                 );
                 left.target = word.output.ends[0]
                     .value
-                    .add(&crate::proof::output_closure::fp3_signed(constant)?.mul(&eq[columns]));
+                    .sub(&crate::proof::output_closure::fp3_signed(constant)?.mul(&eq[columns]));
                 emit(left)?;
 
                 let constant = constant_sum.add(&eq[columns]);
