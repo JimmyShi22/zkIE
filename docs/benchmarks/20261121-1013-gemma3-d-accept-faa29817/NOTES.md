@@ -44,15 +44,17 @@
 
 ## Boundaries
 - This round's data is the acceptance performance evidence (clean binary, no row audit).
-- The case-template version update (model_version 1->2 per the A01 precedent: MODEL_VERSION
-  bump, old v1 evidence moved out, version negative test) is a close-out hygiene item and
+- The case-template version update (model_version 1->2) follows the earlier
+  case-template version bump precedent (c15c11a3): MODEL_VERSION bump, old v1
+  evidence moved out, version negative test. It is a close-out hygiene item and
   does not block this round.
 
 ## In-tree record
 - Recorded at docs/benchmarks/20261121-1013-gemma3-d-accept-faa29817/ as the
   lane's acceptance record; proof binaries (proof.bin, carrier, consumer proof)
   are excluded per the evidence convention; every textual artifact stays.
-- Hygiene status in this tree (A01 precedent c15c11a3/2a0cd7d0):
+- Hygiene status in this tree (earlier case-template version bump precedent,
+  c15c11a3 and 2a0cd7d0):
   models/gemma3/case.policy already model_version=2, MODEL_VERSION=2, the
   version negative is in zkie/tests/consumer_request_evidence.rs, and the old
   version 1 evidence directory is already out of the tree.
